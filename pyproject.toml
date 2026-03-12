@@ -1,0 +1,196 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# ---------------------------------------------------------------------------
+# Project metadata
+# ---------------------------------------------------------------------------
+[project]
+name = "django-rls-tenants"
+version = "0.1.0"
+description = "Database-enforced multitenancy for Django using PostgreSQL Row-Level Security."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Jan Dvořák" },
+]
+keywords = [
+    "django",
+    "multitenancy",
+    "postgresql",
+    "row-level-security",
+    "rls",
+    "tenants",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Web Environment",
+    "Framework :: Django",
+    "Framework :: Django :: 4.2",
+    "Framework :: Django :: 5.0",
+    "Framework :: Django :: 5.1",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "django>=4.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/dvoraj75/django-rls-tenants"
+Documentation = "https://github.com/dvoraj75/django-rls-tenants#readme"
+Repository = "https://github.com/dvoraj75/django-rls-tenants"
+Issues = "https://github.com/dvoraj75/django-rls-tenants/issues"
+Changelog = "https://github.com/dvoraj75/django-rls-tenants/blob/main/CHANGELOG.md"
+
+# ---------------------------------------------------------------------------
+# Dependency groups (PEP 735)
+# ---------------------------------------------------------------------------
+[dependency-groups]
+dev = [
+    "pre-commit>=3.0",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "django-stubs[compatible-mypy]>=5.0",
+]
+test = [
+    "pytest>=8.0",
+    "pytest-django>=4.9",
+    "pytest-cov>=6.0",
+    "coverage[toml]>=7.0",
+]
+
+# ---------------------------------------------------------------------------
+# Build configuration
+# ---------------------------------------------------------------------------
+[tool.hatch.build.targets.wheel]
+packages = ["django_rls_tenants"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "django_rls_tenants/",
+    "tests/",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md",
+    "pyproject.toml",
+]
+
+# ---------------------------------------------------------------------------
+# Ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py311"
+line-length = 99
+src = [".", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "F",        # pyflakes
+    "E", "W",   # pycodestyle
+    "I",        # isort
+    "N",        # pep8-naming
+    "UP",       # pyupgrade
+    "S",        # flake8-bandit
+    "B",        # flake8-bugbear
+    "A",        # flake8-builtins
+    "C4",       # flake8-comprehensions
+    "DTZ",      # flake8-datetimez
+    "T10",      # flake8-debugger
+    "DJ",       # flake8-django
+    "ISC",      # flake8-implicit-str-concat
+    "G",        # flake8-logging-format
+    "PIE",      # flake8-pie
+    "T20",      # flake8-print
+    "PT",       # flake8-pytest-style
+    "RSE",      # flake8-raise
+    "RET",      # flake8-return
+    "SLF",      # flake8-self
+    "SIM",      # flake8-simplify
+    "TID",      # flake8-tidy-imports
+    "TCH",      # flake8-type-checking
+    "ARG",      # flake8-unused-arguments
+    "PL",       # pylint
+    "TRY",      # tryceratops
+    "FLY",      # flynt
+    "PERF",     # perflint
+    "RUF",      # ruff-specific
+]
+ignore = [
+    "S608",     # SQL injection (developer-controlled RLS policy strings)
+    "TRY003",   # long exception messages
+    "PLR0913",  # too many arguments
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "S101",     # assert allowed in tests
+    "ARG",      # unused arguments (fixtures)
+    "SLF001",   # private member access
+    "PLR2004",  # magic values
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["django_rls_tenants"]
+
+# ---------------------------------------------------------------------------
+# mypy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["mypy_django_plugin.main"]
+mypy_path = "."
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+
+[tool.django-stubs]
+django_settings_module = "tests.settings"
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+django_find_project = false
+DJANGO_SETTINGS_MODULE = "tests.settings"
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "-ra",
+]
+markers = [
+    "integration: end-to-end tests requiring a live PostgreSQL database",
+]
+
+# ---------------------------------------------------------------------------
+# coverage
+# ---------------------------------------------------------------------------
+[tool.coverage.run]
+source = ["django_rls_tenants"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+fail_under = 90
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.",
+    "@overload",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]
