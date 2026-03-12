@@ -6,5 +6,31 @@ and testing utilities.
 
 from __future__ import annotations
 
-# Public re-exports will be added as modules are implemented.
-# See plan/implementation-plan.md Phase 2, Step 2.10.
+from django_rls_tenants.tenants.bypass import (
+    bypass_flag,
+    clear_bypass_flag,
+    set_bypass_flag,
+)
+from django_rls_tenants.tenants.conf import rls_tenants_config
+from django_rls_tenants.tenants.context import (
+    admin_context,
+    tenant_context,
+    with_rls_context,
+)
+from django_rls_tenants.tenants.managers import RLSManager, TenantQuerySet
+from django_rls_tenants.tenants.models import RLSProtectedModel
+from django_rls_tenants.tenants.types import TenantUser
+
+__all__ = [
+    "RLSManager",
+    "RLSProtectedModel",
+    "TenantQuerySet",
+    "TenantUser",
+    "admin_context",
+    "bypass_flag",
+    "clear_bypass_flag",
+    "rls_tenants_config",
+    "set_bypass_flag",
+    "tenant_context",
+    "with_rls_context",
+]
