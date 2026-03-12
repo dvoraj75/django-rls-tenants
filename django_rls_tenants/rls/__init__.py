@@ -7,5 +7,15 @@ It provides reusable building blocks: GUC variable helpers, a migration-aware
 
 from __future__ import annotations
 
-# Public re-exports will be added as modules are implemented.
-# See plan/implementation-plan.md Phase 1, Step 1.4.
+from django_rls_tenants.rls.constraints import RLSConstraint
+from django_rls_tenants.rls.context import bypass_flag, rls_context
+from django_rls_tenants.rls.guc import clear_guc, get_guc, set_guc
+
+__all__ = [
+    "RLSConstraint",
+    "bypass_flag",
+    "clear_guc",
+    "get_guc",
+    "rls_context",
+    "set_guc",
+]
