@@ -132,6 +132,12 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"django_rls_tenants/tenants/conf.py" = [
+    "N802",     # uppercase property names mirror Django settings keys
+]
+"django_rls_tenants/tenants/testing.py" = [
+    "S101",     # assert used intentionally in test assertion helpers
+]
 "tests/**/*.py" = [
     "S101",     # assert allowed in tests
     "ARG",      # unused arguments (fixtures)

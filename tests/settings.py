@@ -22,6 +22,7 @@ INSTALLED_APPS = [
     "django.contrib.auth",
     "django_rls_tenants",
     "tests",
+    "tests.test_app",
 ]
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
@@ -29,7 +30,10 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 USE_TZ = True
 
 RLS_TENANTS = {
-    "TENANT_MODEL": "tests.Tenant",
-    "TENANT_FK_NAME": "tenant",
-    "GUC_NAME": "rls.tenant_id",
+    "TENANT_MODEL": "test_app.Tenant",
+    "GUC_PREFIX": "rls",
+    "TENANT_FK_FIELD": "tenant",
+    "USER_PARAM_NAME": "as_user",
+    "TENANT_PK_TYPE": "int",
+    "USE_LOCAL_SET": False,
 }
