@@ -57,6 +57,21 @@ class RLSConstraint(BaseConstraint):
         self.tenant_pk_type = tenant_pk_type
         self.extra_bypass_flags = extra_bypass_flags or []
 
+    def constraint_sql(  # type: ignore[override]
+        self,
+        model: type[Model],
+        schema_editor: BaseDatabaseSchemaEditor,
+    ) -> str:
+        """No inline constraint SQL; defer RLS DDL to after ``CREATE TABLE``.
+
+        Django calls ``constraint_sql`` during ``CREATE TABLE`` for inline
+        constraints.  RLS policies require the table to exist first, so we
+        defer the actual DDL and return an empty string (filtered out by
+        Django's ``if statement`` guard).
+        """
+        schema_editor.deferred_sql.append(self.create_sql(model, schema_editor))
+        return ""
+
     def create_sql(  # type: ignore[override]
         self,
         model: type[Model] | None,

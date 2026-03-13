@@ -144,6 +144,11 @@ ignore = [
     "SLF001",   # private member access
     "PLR2004",  # magic values
 ]
+"**/migrations/*.py" = [
+    "E501",     # line length (Django-generated)
+    "I001",     # import order (Django-generated)
+    "RUF012",   # mutable class defaults (Django convention)
+]
 
 [tool.ruff.lint.isort]
 known-first-party = ["django_rls_tenants"]
