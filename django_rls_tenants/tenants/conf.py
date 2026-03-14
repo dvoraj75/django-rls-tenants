@@ -6,9 +6,22 @@ Provides ``RLSTenantsConfig`` which reads and validates
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 from django.conf import settings
+
+# All recognized keys in the RLS_TENANTS configuration dict.
+_KNOWN_KEYS = frozenset(
+    {
+        "TENANT_MODEL",
+        "GUC_PREFIX",
+        "TENANT_FK_FIELD",
+        "USER_PARAM_NAME",
+        "TENANT_PK_TYPE",
+        "USE_LOCAL_SET",
+    }
+)
 
 
 class RLSTenantsConfig:
@@ -66,14 +79,26 @@ class RLSTenantsConfig:
         """Use ``SET LOCAL`` instead of ``set_config``. Default: ``False``."""
         return self._get("USE_LOCAL_SET", default=False)  # type: ignore[no-any-return]
 
+    def __init__(self) -> None:
+        self._config_cache: dict[str, Any] | None = None
+        self._unknown_keys_checked: bool = False
+
     def _get(self, key: str, default: Any = None) -> Any:
         """Read a key from ``settings.RLS_TENANTS``.
+
+        Caches the config dict on first access so repeated property
+        reads don't call ``getattr(settings, ...)`` each time.
+        On first access, warns about any unrecognized keys (likely typos).
 
         Raises:
             ValueError: If ``key`` is required (no default) and missing.
         """
-        config: dict[str, Any] = getattr(settings, "RLS_TENANTS", {})
-        value = config.get(key, default)
+        cached = self._config_cache
+        if cached is None:
+            cached = dict(getattr(settings, "RLS_TENANTS", {}))
+            self._config_cache = cached
+        self._warn_unknown_keys(cached)
+        value = cached.get(key, default)
         if value is None:
             msg = (
                 f"RLS_TENANTS['{key}'] is required. "
@@ -82,6 +107,24 @@ class RLSTenantsConfig:
             )
             raise ValueError(msg)
         return value
+
+    def _warn_unknown_keys(self, config: dict[str, Any]) -> None:
+        """Emit a warning for any unrecognized keys in ``RLS_TENANTS``.
+
+        Only runs once per instance to avoid repeated warnings.
+        """
+        if self._unknown_keys_checked:
+            return
+        self._unknown_keys_checked = True
+        unknown = set(config.keys()) - _KNOWN_KEYS
+        for key in sorted(unknown):
+            warnings.warn(
+                f"Unknown key {key!r} in RLS_TENANTS settings. "
+                f"Known keys: {', '.join(sorted(_KNOWN_KEYS))}. "
+                f"Did you mean one of those?",
+                UserWarning,
+                stacklevel=4,
+            )
 
 
 rls_tenants_config = RLSTenantsConfig()

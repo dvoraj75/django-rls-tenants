@@ -7,7 +7,7 @@ from decimal import Decimal
 import pytest
 
 from django_rls_tenants.rls.guc import get_guc
-from tests.test_app.models import Order, Tenant
+from tests.test_app.models import Order
 
 pytestmark = pytest.mark.django_db
 
@@ -77,15 +77,42 @@ class TestForUserLazy:
         assert list(qs2.values_list("product", flat=True)) == ["Widget A1"]
 
 
+class TestFetchAllGucCleanupOnException:
+    """Tests that GUC variables are cleaned up even when _fetch_all raises."""
+
+    def test_guc_cleared_after_db_error(self, tenant_a_user, monkeypatch):
+        """GUC variables are cleared even when the underlying query raises.
+
+        This verifies the try/finally in _fetch_all properly cleans up
+        GUC state on failure, preventing stale tenant context.
+        """
+        qs = Order.objects.for_user(tenant_a_user)
+
+        def exploding_fetch_all(self_inner):
+            raise RuntimeError("Simulated DB error")
+
+        import django.db.models.query  # noqa: PLC0415
+
+        monkeypatch.setattr(django.db.models.query.QuerySet, "_fetch_all", exploding_fetch_all)
+
+        with pytest.raises(RuntimeError, match="Simulated DB error"):
+            list(qs)  # trigger _fetch_all
+
+        # GUC should be cleared despite the error
+        assert get_guc("rls.current_tenant") is None
+        assert get_guc("rls.is_admin") is None
+
+
 class TestPrepareTenantInModelData:
     """Tests for RLSManager.prepare_tenant_in_model_data()."""
 
     def test_resolves_raw_id(self, tenant_a, tenant_a_user):
-        """Raw tenant ID (int) is resolved to a Tenant model instance."""
+        """Raw tenant ID (int) sets FK column directly (no model fetch)."""
         data = {"tenant": tenant_a.pk, "product": "Widget"}
         Order.objects.prepare_tenant_in_model_data(data, as_user=tenant_a_user)
-        assert isinstance(data["tenant"], Tenant)
-        assert data["tenant"].pk == tenant_a.pk
+        # The FK field is replaced by the FK column (tenant -> tenant_id)
+        assert "tenant" not in data
+        assert data["tenant_id"] == tenant_a.pk
 
     def test_skips_model_instance(self, tenant_a, tenant_a_user):
         """Already a Tenant instance -- no change."""

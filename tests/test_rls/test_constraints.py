@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from django_rls_tenants.rls.constraints import RLSConstraint
 
 
@@ -160,3 +162,69 @@ class TestEquality:
         a = RLSConstraint(field="tenant", name="rls")
         b = RLSConstraint(field="tenant", name="other")
         assert hash(a) != hash(b)
+
+
+class TestInputValidation:
+    """Tests for SQL injection prevention via input validation."""
+
+    def test_invalid_field_name_semicolon(self):
+        """Field name with semicolon is rejected."""
+        with pytest.raises(ValueError, match="Invalid field name"):
+            RLSConstraint(field="field; DROP", name="test_rls")
+
+    def test_invalid_field_name_dotted(self):
+        """Dotted field name is rejected (dots not valid for column names)."""
+        with pytest.raises(ValueError, match="Invalid field name"):
+            RLSConstraint(field="a.b", name="test_rls")
+
+    def test_invalid_field_name_space(self):
+        """Field name with space is rejected."""
+        with pytest.raises(ValueError, match="Invalid field name"):
+            RLSConstraint(field="tenant id", name="test_rls")
+
+    def test_invalid_field_name_empty(self):
+        """Empty field name is rejected."""
+        with pytest.raises(ValueError, match="Invalid field name"):
+            RLSConstraint(field="", name="test_rls")
+
+    def test_invalid_pk_type(self):
+        """Non-allowlisted tenant_pk_type is rejected."""
+        with pytest.raises(ValueError, match="Invalid tenant_pk_type"):
+            RLSConstraint(field="tenant", name="test_rls", tenant_pk_type="varchar")
+
+    def test_invalid_pk_type_injection(self):
+        """SQL injection via tenant_pk_type is rejected."""
+        with pytest.raises(ValueError, match="Invalid tenant_pk_type"):
+            RLSConstraint(field="tenant", name="test_rls", tenant_pk_type="int; DROP TABLE")
+
+    def test_invalid_guc_tenant_var(self):
+        """Invalid guc_tenant_var is rejected."""
+        with pytest.raises(ValueError, match="Invalid GUC name"):
+            RLSConstraint(field="tenant", name="test_rls", guc_tenant_var="; DROP TABLE")
+
+    def test_invalid_guc_admin_var(self):
+        """Invalid guc_admin_var is rejected."""
+        with pytest.raises(ValueError, match="Invalid GUC name"):
+            RLSConstraint(field="tenant", name="test_rls", guc_admin_var="a b")
+
+    def test_invalid_extra_bypass_flag(self):
+        """Invalid extra_bypass_flags entry is rejected."""
+        with pytest.raises(ValueError, match="Invalid GUC name"):
+            RLSConstraint(
+                field="tenant",
+                name="test_rls",
+                extra_bypass_flags=["rls.ok", "bad; --"],
+            )
+
+    def test_valid_inputs_accepted(self):
+        """Valid inputs with all custom params are accepted."""
+        c = RLSConstraint(
+            field="organization",
+            name="test_rls",
+            guc_tenant_var="myapp.current_org",
+            guc_admin_var="myapp.is_superuser",
+            tenant_pk_type="uuid",
+            extra_bypass_flags=["myapp.is_login"],
+        )
+        assert c.field == "organization"
+        assert c.tenant_pk_type == "uuid"

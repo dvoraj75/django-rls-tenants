@@ -14,6 +14,7 @@ from django.db import models
 
 from django_rls_tenants.rls.guc import clear_guc, set_guc
 from django_rls_tenants.tenants.conf import rls_tenants_config
+from django_rls_tenants.tenants.context import _resolve_user_guc_vars
 
 if TYPE_CHECKING:
     from django_rls_tenants.tenants.types import TenantUser
@@ -63,38 +64,26 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         return clone
 
     def _fetch_all(self) -> None:
-        """Set GUC variables just before query execution."""
+        """Set GUC variables just before query execution.
+
+        Uses ``self.db`` so GUCs target the correct connection in
+        multi-database setups (e.g., ``.using("replica")``).
+        """
         if self._rls_user is not None:
             conf = rls_tenants_config
-            user = self._rls_user
-            if user.is_tenant_admin:
-                set_guc(
-                    conf.GUC_IS_ADMIN,
-                    "true",
-                    is_local=conf.USE_LOCAL_SET,
-                )
-                set_guc(
-                    conf.GUC_CURRENT_TENANT,
-                    "-1",
-                    is_local=conf.USE_LOCAL_SET,
-                )
-            else:
-                set_guc(
-                    conf.GUC_IS_ADMIN,
-                    "false",
-                    is_local=conf.USE_LOCAL_SET,
-                )
-                set_guc(
-                    conf.GUC_CURRENT_TENANT,
-                    str(user.rls_tenant_id),
-                    is_local=conf.USE_LOCAL_SET,
-                )
+            db_alias = self.db
+            guc_vars = _resolve_user_guc_vars(self._rls_user, conf)
+            for guc_name, guc_value in guc_vars.items():
+                if guc_value:
+                    set_guc(guc_name, guc_value, is_local=conf.USE_LOCAL_SET, using=db_alias)
+                else:
+                    clear_guc(guc_name, using=db_alias)
             try:
                 super()._fetch_all()
             finally:
                 if not conf.USE_LOCAL_SET:
-                    clear_guc(conf.GUC_IS_ADMIN)
-                    clear_guc(conf.GUC_CURRENT_TENANT)
+                    clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
+                    clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
         else:
             super()._fetch_all()
 
@@ -119,12 +108,12 @@ class RLSManager(models.Manager):  # type: ignore[type-arg]
         model_data: dict[str, Any],
         as_user: TenantUser,  # noqa: ARG002  -- part of public API
     ) -> None:
-        """Resolve a raw tenant ID to a Tenant model instance.
+        """Resolve a raw tenant ID for model creation.
 
         If ``model_data`` contains a raw tenant ID (int/str) under
-        the configured FK field name, replace it with the actual
-        ``Tenant`` model instance. Allows passing ``tenant=42``
-        in creation data.
+        the configured FK field name, sets the FK column directly
+        (``{field}_id``) to avoid a ``SELECT`` query. Allows passing
+        ``tenant=42`` in creation data without N+1 overhead.
 
         Args:
             model_data: Dict of field names to values.
@@ -138,4 +127,8 @@ class RLSManager(models.Manager):  # type: ignore[type-arg]
 
         tenant = model_data.get(field_name)
         if tenant is not None and not isinstance(tenant, tenant_model):
-            model_data[field_name] = tenant_model.objects.get(pk=tenant)
+            # Set the FK column directly to avoid a model fetch query.
+            # For bulk creates this eliminates N identical SELECTs.
+            fk_column = f"{field_name}_id"
+            model_data[fk_column] = tenant
+            del model_data[field_name]

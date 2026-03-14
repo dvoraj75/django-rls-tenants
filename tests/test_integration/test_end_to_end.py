@@ -13,7 +13,7 @@ import pytest
 from django.core.management import call_command
 from django.db import connection
 
-from django_rls_tenants.rls.guc import clear_guc, get_guc, set_guc
+from django_rls_tenants.rls.guc import get_guc, set_guc
 from django_rls_tenants.tenants.bypass import bypass_flag
 from django_rls_tenants.tenants.context import admin_context, tenant_context
 from tests.test_app.models import Document, Order, ProtectedUser
@@ -150,16 +150,11 @@ class TestBypassFlags:
         set_guc("rls.is_admin", "false")
         set_guc("rls.current_tenant", str(tenant_a.pk))
         set_guc("rls.is_login_request", "true")
-        try:
-            # ProtectedUser: login bypass allows seeing all users
-            assert ProtectedUser.objects.count() == 2
-            # Order: only tenant_a's rows visible (bypass has no effect)
-            orders = list(Order.objects.values_list("product", flat=True))
-            assert sorted(orders) == ["Widget A1", "Widget A2"]
-        finally:
-            clear_guc("rls.is_admin")
-            clear_guc("rls.current_tenant")
-            clear_guc("rls.is_login_request")
+        # ProtectedUser: login bypass allows seeing all users
+        assert ProtectedUser.objects.count() == 2
+        # Order: only tenant_a's rows visible (bypass has no effect)
+        orders = list(Order.objects.values_list("product", flat=True))
+        assert sorted(orders) == ["Widget A1", "Widget A2"]
 
     def test_bypass_flag_no_leak(self, sample_protected_users, tenant_a):
         """Bypass flag does not persist after context manager exits."""
@@ -245,6 +240,75 @@ class TestWriteOperations:
 
 
 # ---------------------------------------------------------------------------
+# UPDATE / DELETE tenant isolation
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateDeleteIsolation:
+    """Verify RLS prevents cross-tenant UPDATE and DELETE operations."""
+
+    @pytest.mark.django_db(transaction=True)
+    def test_update_other_tenant_row_fails(self, sample_orders, tenant_a, tenant_b):
+        """Tenant A cannot UPDATE Tenant B's rows.
+
+        With tenant_a context, an update targeting tenant_b's order should
+        affect zero rows (RLS USING clause filters them out).
+        """
+        with tenant_context(tenant_a.pk):
+            updated = Order.objects.filter(pk=sample_orders["b1"].pk).update(product="Hacked")
+        assert updated == 0
+        # Verify original value is intact
+        with admin_context():
+            sample_orders["b1"].refresh_from_db()
+        assert sample_orders["b1"].product == "Gadget B1"
+
+    @pytest.mark.django_db(transaction=True)
+    def test_delete_other_tenant_row_fails(self, sample_orders, tenant_a, tenant_b):
+        """Tenant A cannot DELETE Tenant B's rows.
+
+        With tenant_a context, a delete targeting tenant_b's order should
+        affect zero rows (RLS USING clause filters them out).
+        """
+        with tenant_context(tenant_a.pk):
+            deleted_count, _ = Order.objects.filter(pk=sample_orders["b1"].pk).delete()
+        assert deleted_count == 0
+        # Verify row still exists
+        with admin_context():
+            assert Order.objects.filter(pk=sample_orders["b1"].pk).exists()
+
+    @pytest.mark.django_db(transaction=True)
+    def test_update_tenant_id_to_other_tenant_fails(self, sample_orders, tenant_a, tenant_b):
+        """Tenant A cannot reassign own rows to Tenant B via UPDATE.
+
+        The WITH CHECK clause prevents changing tenant_id to a value
+        that doesn't match the current GUC context.
+        """
+        from django.db.utils import InternalError  # noqa: PLC0415
+
+        with pytest.raises((InternalError, Exception)), tenant_context(tenant_a.pk):
+            Order.objects.filter(pk=sample_orders["a1"].pk).update(tenant_id=tenant_b.pk)
+
+    @pytest.mark.django_db(transaction=True)
+    def test_delete_own_row_succeeds(self, sample_orders, tenant_a):
+        """Tenant A CAN delete its own rows."""
+        with tenant_context(tenant_a.pk):
+            deleted_count, _ = Order.objects.filter(pk=sample_orders["a1"].pk).delete()
+        assert deleted_count == 1
+
+    @pytest.mark.django_db(transaction=True)
+    def test_update_own_row_succeeds(self, sample_orders, tenant_a):
+        """Tenant A CAN update its own rows."""
+        with tenant_context(tenant_a.pk):
+            updated = Order.objects.filter(pk=sample_orders["a1"].pk).update(
+                product="Updated Widget"
+            )
+        assert updated == 1
+        with admin_context():
+            sample_orders["a1"].refresh_from_db()
+        assert sample_orders["a1"].product == "Updated Widget"
+
+
+# ---------------------------------------------------------------------------
 # Cross-model isolation
 # ---------------------------------------------------------------------------
 
@@ -288,3 +352,24 @@ class TestCheckRlsCommand:
         assert "Order" in output
         assert "Document" in output
         assert "ProtectedUser" in output
+
+    def test_exits_with_error_when_rls_missing(self):
+        """Command exits with SystemExit(1) when RLS is missing on a table.
+
+        Temporarily disables RLS on a table, runs the command, then
+        re-enables RLS to restore the original state.
+        """
+        # Must RESET ROLE to superuser for ALTER TABLE (enforce_rls sets
+        # a non-superuser role).
+        with connection.cursor() as cur:
+            cur.execute("RESET ROLE")
+            cur.execute('ALTER TABLE "test_order" DISABLE ROW LEVEL SECURITY')
+        try:
+            err = StringIO()
+            with pytest.raises(SystemExit) as exc_info:
+                call_command("check_rls", stderr=err)
+            assert exc_info.value.code == 1
+            assert "RLS not enabled" in err.getvalue()
+        finally:
+            with connection.cursor() as cur:
+                cur.execute('ALTER TABLE "test_order" ENABLE ROW LEVEL SECURITY')

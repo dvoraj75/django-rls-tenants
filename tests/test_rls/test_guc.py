@@ -14,7 +14,6 @@ def test_set_get_roundtrip():
     """set_guc then get_guc returns the value."""
     set_guc("rls.test_var", "hello")
     assert get_guc("rls.test_var") == "hello"
-    clear_guc("rls.test_var")  # cleanup
 
 
 def test_get_unset_returns_none():
@@ -52,4 +51,64 @@ def test_session_guc_survives_multiple_queries():
     # Multiple get_guc calls (each opens a new cursor)
     assert get_guc("rls.test_persist") == "persistent"
     assert get_guc("rls.test_persist") == "persistent"
-    clear_guc("rls.test_persist")
+
+
+# ---------------------------------------------------------------------------
+# GUC name validation (SQL injection prevention)
+# ---------------------------------------------------------------------------
+
+
+class TestGucNameValidation:
+    """Tests for _validate_guc_name rejecting invalid GUC names."""
+
+    def test_sql_injection_semicolon(self):
+        """GUC name with SQL injection via semicolon is rejected."""
+        with pytest.raises(ValueError, match="Invalid GUC variable name"):
+            set_guc("; DROP TABLE users", "val")
+
+    def test_sql_injection_comment(self):
+        """GUC name with SQL comment injection is rejected."""
+        with pytest.raises(ValueError, match="Invalid GUC variable name"):
+            set_guc("rls.tenant; --", "val")
+
+    def test_empty_string(self):
+        """Empty string is rejected as GUC name."""
+        with pytest.raises(ValueError, match="Invalid GUC variable name"):
+            set_guc("", "val")
+
+    def test_spaces(self):
+        """GUC name with spaces is rejected."""
+        with pytest.raises(ValueError, match="Invalid GUC variable name"):
+            set_guc("rls current_tenant", "val")
+
+    def test_single_quotes(self):
+        """GUC name with single quotes is rejected."""
+        with pytest.raises(ValueError, match="Invalid GUC variable name"):
+            set_guc("rls'tenant", "val")
+
+    def test_parentheses(self):
+        """GUC name with parentheses is rejected."""
+        with pytest.raises(ValueError, match="Invalid GUC variable name"):
+            set_guc("rls()", "val")
+
+    def test_get_guc_also_validates(self):
+        """get_guc rejects invalid names too."""
+        with pytest.raises(ValueError, match="Invalid GUC variable name"):
+            get_guc("; DROP TABLE users")
+
+    def test_clear_guc_also_validates(self):
+        """clear_guc rejects invalid names too."""
+        with pytest.raises(ValueError, match="Invalid GUC variable name"):
+            clear_guc("; DROP TABLE users")
+
+    def test_valid_dotted_name_accepted(self):
+        """Valid dotted GUC names like 'myapp.is_admin' are accepted."""
+        set_guc("myapp.is_admin", "true")
+        assert get_guc("myapp.is_admin") == "true"
+        clear_guc("myapp.is_admin")
+
+    def test_valid_underscore_start_accepted(self):
+        """GUC names starting with underscore are accepted."""
+        set_guc("_internal.flag", "yes")
+        assert get_guc("_internal.flag") == "yes"
+        clear_guc("_internal.flag")

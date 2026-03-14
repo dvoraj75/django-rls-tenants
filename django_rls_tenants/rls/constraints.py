@@ -7,14 +7,67 @@ bypass flags.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Any
 
 from django.db.backends.ddl_references import Statement
 from django.db.models import BaseConstraint
 
+from django_rls_tenants.rls.guc import _GUC_NAME_RE
+
 if TYPE_CHECKING:
     from django.db.backends.base.schema import BaseDatabaseSchemaEditor
     from django.db.models import Model
+
+# Allowed SQL cast types for tenant PK to prevent injection via tenant_pk_type.
+_ALLOWED_PK_TYPES = frozenset({"int", "bigint", "uuid"})
+
+# Valid SQL identifier for field names (no dots, just a column name).
+_FIELD_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def _validate_field_name(field: str) -> None:
+    """Validate a field name for safe SQL interpolation.
+
+    Raises:
+        ValueError: If ``field`` contains invalid characters.
+    """
+    if not _FIELD_NAME_RE.match(field):
+        msg = (
+            f"Invalid field name: {field!r}. "
+            f"Field names must match [a-zA-Z_][a-zA-Z0-9_]* "
+            f"(e.g., 'tenant')."
+        )
+        raise ValueError(msg)
+
+
+def _validate_pk_type(tenant_pk_type: str) -> None:
+    """Validate tenant_pk_type against an allowlist.
+
+    Raises:
+        ValueError: If ``tenant_pk_type`` is not in the allowlist.
+    """
+    if tenant_pk_type not in _ALLOWED_PK_TYPES:
+        msg = (
+            f"Invalid tenant_pk_type: {tenant_pk_type!r}. "
+            f"Allowed values: {', '.join(sorted(_ALLOWED_PK_TYPES))}."
+        )
+        raise ValueError(msg)
+
+
+def _validate_guc_name_for_ddl(name: str, param: str) -> None:
+    """Validate a GUC name used in DDL generation.
+
+    Raises:
+        ValueError: If ``name`` contains invalid characters.
+    """
+    if not _GUC_NAME_RE.match(name):
+        msg = (
+            f"Invalid GUC name for {param}: {name!r}. "
+            f"GUC names must match [a-zA-Z_][a-zA-Z0-9_.]* "
+            f"(e.g., 'rls.current_tenant')."
+        )
+        raise ValueError(msg)
 
 
 class RLSConstraint(BaseConstraint):
@@ -51,6 +104,12 @@ class RLSConstraint(BaseConstraint):
         extra_bypass_flags: list[str] | None = None,
     ) -> None:
         super().__init__(name=name)
+        _validate_field_name(field)
+        _validate_pk_type(tenant_pk_type)
+        _validate_guc_name_for_ddl(guc_tenant_var, "guc_tenant_var")
+        _validate_guc_name_for_ddl(guc_admin_var, "guc_admin_var")
+        for flag in extra_bypass_flags or []:
+            _validate_guc_name_for_ddl(flag, "extra_bypass_flags")
         self.field = field
         self.guc_tenant_var = guc_tenant_var
         self.guc_admin_var = guc_admin_var

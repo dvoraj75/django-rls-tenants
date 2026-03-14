@@ -6,7 +6,7 @@ import logging
 
 import pytest
 
-from django_rls_tenants.rls.guc import clear_guc, get_guc, set_guc
+from django_rls_tenants.rls.guc import get_guc, set_guc
 from django_rls_tenants.tenants.context import (
     admin_context,
     tenant_context,
@@ -41,8 +41,6 @@ class TestTenantContext:
             assert get_guc("rls.current_tenant") == str(tenant_a.pk)
         assert get_guc("rls.is_admin") == "true"
         assert get_guc("rls.current_tenant") == "999"
-        clear_guc("rls.is_admin")
-        clear_guc("rls.current_tenant")
 
     def test_none_raises_valueerror(self):
         """tenant_context(None) raises ValueError."""
@@ -60,10 +58,11 @@ class TestAdminContext:
     """Tests for admin_context()."""
 
     def test_sets_gucs(self):
-        """Sets is_admin=true and current_tenant=-1."""
+        """Sets is_admin=true and clears current_tenant."""
         with admin_context():
             assert get_guc("rls.is_admin") == "true"
-            assert get_guc("rls.current_tenant") == "-1"
+            # Admin mode clears tenant GUC; admin_bypass clause handles access.
+            assert get_guc("rls.current_tenant") is None
 
     def test_clears_on_exit(self):
         """Clears GUCs after the context exits."""
@@ -80,8 +79,6 @@ class TestAdminContext:
             assert get_guc("rls.is_admin") == "true"
         assert get_guc("rls.is_admin") == "false"
         assert get_guc("rls.current_tenant") == str(tenant_a.pk)
-        clear_guc("rls.is_admin")
-        clear_guc("rls.current_tenant")
 
 
 class TestNesting:
@@ -104,7 +101,8 @@ class TestNesting:
                 assert get_guc("rls.is_admin") == "false"
                 assert get_guc("rls.current_tenant") == str(tenant_a.pk)
             assert get_guc("rls.is_admin") == "true"
-            assert get_guc("rls.current_tenant") == "-1"
+            # Admin mode clears tenant GUC; admin_bypass handles access.
+            assert get_guc("rls.current_tenant") is None
 
     def test_exception_in_body_cleans_up(self, tenant_a):
         """GUCs are restored even when an exception occurs in the block."""
@@ -189,3 +187,60 @@ class TestWithRlsContext:
         my_func(as_user=tenant_a_user)
         assert get_guc("rls.current_tenant") is None
         assert get_guc("rls.is_admin") is None
+
+
+class TestIsLocalMode:
+    """Tests for USE_LOCAL_SET=True (transaction-scoped GUCs)."""
+
+    @pytest.mark.django_db(transaction=True)
+    def test_tenant_context_is_local(self, tenant_a):
+        """tenant_context with USE_LOCAL_SET=True auto-clears on commit."""
+        from django.db import transaction  # noqa: PLC0415
+        from django.test import override_settings  # noqa: PLC0415
+
+        with override_settings(
+            RLS_TENANTS={
+                "TENANT_MODEL": "test_app.Tenant",
+                "USE_LOCAL_SET": True,
+            }
+        ):
+            # Reset config cache so override is picked up
+            from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
+
+            rls_tenants_config._config_cache = None
+            rls_tenants_config._unknown_keys_checked = False
+            try:
+                with transaction.atomic(), tenant_context(tenant_a.pk):
+                    assert get_guc("rls.is_admin") == "false"
+                    assert get_guc("rls.current_tenant") == str(tenant_a.pk)
+                # After transaction, SET LOCAL values are gone
+                assert get_guc("rls.is_admin") is None
+                assert get_guc("rls.current_tenant") is None
+            finally:
+                rls_tenants_config._config_cache = None
+                rls_tenants_config._unknown_keys_checked = False
+
+    @pytest.mark.django_db(transaction=True)
+    def test_admin_context_is_local(self):
+        """admin_context with USE_LOCAL_SET=True auto-clears on commit."""
+        from django.db import transaction  # noqa: PLC0415
+        from django.test import override_settings  # noqa: PLC0415
+
+        with override_settings(
+            RLS_TENANTS={
+                "TENANT_MODEL": "test_app.Tenant",
+                "USE_LOCAL_SET": True,
+            }
+        ):
+            from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
+
+            rls_tenants_config._config_cache = None
+            rls_tenants_config._unknown_keys_checked = False
+            try:
+                with transaction.atomic(), admin_context():
+                    assert get_guc("rls.is_admin") == "true"
+                # After transaction, SET LOCAL values are gone
+                assert get_guc("rls.is_admin") is None
+            finally:
+                rls_tenants_config._config_cache = None
+                rls_tenants_config._unknown_keys_checked = False

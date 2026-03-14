@@ -2,15 +2,38 @@
 
 from __future__ import annotations
 
+import contextlib
 from decimal import Decimal
 
 import pytest
 from django.db import connection
 
+from django_rls_tenants.rls.guc import clear_guc
 from django_rls_tenants.tenants.context import admin_context
 from tests.test_app.models import Document, Order, ProtectedUser, Tenant, TenantUser
 
 _RLS_ROLE = "rls_test_role"
+
+# GUC variable names that may be set during tests.
+_GUC_NAMES_TO_CLEAR = (
+    "rls.is_admin",
+    "rls.current_tenant",
+    "rls.is_login_request",
+    "rls.is_preauth_request",
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_gucs_after_test(db):
+    """Clear known GUC variables after each test.
+
+    Prevents GUC state from leaking between tests when a test fails
+    before reaching manual cleanup. Runs automatically for all tests.
+    """
+    yield
+    for name in _GUC_NAMES_TO_CLEAR:
+        with contextlib.suppress(Exception):
+            clear_guc(name)
 
 
 @pytest.fixture(scope="session")

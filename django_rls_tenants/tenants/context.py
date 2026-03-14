@@ -19,9 +19,43 @@ from django_rls_tenants.tenants.conf import rls_tenants_config
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
+    from django_rls_tenants.tenants.conf import RLSTenantsConfig
     from django_rls_tenants.tenants.types import TenantUser
 
 logger = logging.getLogger("django_rls_tenants")
+
+
+def _resolve_user_guc_vars(
+    user: TenantUser,
+    conf: RLSTenantsConfig | None = None,
+) -> dict[str, str]:
+    """Map a ``TenantUser`` to GUC variable name-value pairs.
+
+    Centralises the "if admin then X, else Y" mapping so that
+    middleware, managers, and context managers all use the same logic.
+
+    For admin users, ``GUC_CURRENT_TENANT`` is cleared (empty string)
+    instead of a magic sentinel. The ``admin_bypass`` clause in the
+    RLS policy handles access independently.
+
+    Args:
+        user: User satisfying the ``TenantUser`` protocol.
+        conf: Config instance. Defaults to the module-level singleton.
+
+    Returns:
+        Dict mapping GUC variable names to their string values.
+    """
+    if conf is None:
+        conf = rls_tenants_config
+    if user.is_tenant_admin:
+        return {
+            conf.GUC_IS_ADMIN: "true",
+            conf.GUC_CURRENT_TENANT: "",
+        }
+    return {
+        conf.GUC_IS_ADMIN: "false",
+        conf.GUC_CURRENT_TENANT: str(user.rls_tenant_id),
+    }
 
 
 @contextmanager
@@ -89,12 +123,10 @@ def admin_context(
         prev_tenant = get_guc(conf.GUC_CURRENT_TENANT, using=using)
 
     set_guc(conf.GUC_IS_ADMIN, "true", is_local=is_local, using=using)
-    set_guc(
-        conf.GUC_CURRENT_TENANT,
-        "-1",
-        is_local=is_local,
-        using=using,
-    )
+    # Clear tenant GUC for admin mode; the admin_bypass clause in the
+    # RLS policy handles access independently. Avoids the old "-1"
+    # sentinel which could collide with integer PKs or fail UUID casts.
+    clear_guc(conf.GUC_CURRENT_TENANT, using=using)
     try:
         yield
     finally:
@@ -117,51 +149,89 @@ def _restore_guc(
 
 
 def _get_arg_from_signature(
-    func: Callable[..., Any],
+    sig: inspect.Signature,
     arg_name: str,
     *args: Any,
     **kwargs: Any,
 ) -> Any:
-    """Extract a named argument from a call, positional or keyword."""
-    sig = inspect.signature(func)
+    """Extract a named argument from a call using a pre-computed signature.
+
+    Args:
+        sig: Pre-computed ``inspect.Signature`` of the target function.
+        arg_name: Name of the parameter to extract.
+        *args: Positional arguments from the call.
+        **kwargs: Keyword arguments from the call.
+
+    Returns:
+        The value of the named argument, or ``None`` if not found.
+    """
     bound = sig.bind_partial(*args, **kwargs)
     bound.apply_defaults()
     return bound.arguments.get(arg_name)
 
 
-def with_rls_context(func: Callable[..., Any]) -> Callable[..., Any]:
-    """Decorator that extracts ``as_user`` and sets RLS context.
+def with_rls_context(
+    func: Callable[..., Any] | None = None,
+    *,
+    user_param: str | None = None,
+) -> Callable[..., Any]:
+    """Decorator that extracts a user argument and sets RLS context.
 
-    Inspects the decorated function's signature to find the parameter
-    named by ``RLS_TENANTS["USER_PARAM_NAME"]`` (default: ``"as_user"``).
-    Based on the user's ``TenantUser`` protocol, sets either
-    ``admin_context`` or ``tenant_context``.
+    Can be used bare or with an explicit ``user_param``::
 
-    When ``as_user`` is ``None``, logs a warning and proceeds without
-    context (fail-closed: RLS blocks all access).
+        @with_rls_context
+        def my_view(request, as_user): ...
+
+        @with_rls_context(user_param="current_user")
+        def my_view(request, current_user): ...
+
+    Args:
+        func: The function to decorate (when used without parentheses).
+        user_param: Override the parameter name to look for. Defaults to
+            ``RLS_TENANTS["USER_PARAM_NAME"]`` (default: ``"as_user"``).
+
+    When the user argument is ``None``, logs a warning and proceeds
+    without context (fail-closed: RLS blocks all access).
     """
 
-    @functools.wraps(func)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        conf = rls_tenants_config
-        as_user: TenantUser | None = _get_arg_from_signature(
-            func, conf.USER_PARAM_NAME, *args, **kwargs
-        )
+    def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+        # Cache signature at decoration time (not per-invocation).
+        sig = inspect.signature(fn)
+        param_name = user_param if user_param is not None else rls_tenants_config.USER_PARAM_NAME
 
-        if as_user is not None and as_user.is_tenant_admin:
-            ctx = admin_context()
-        elif as_user is not None:
-            tenant_id = as_user.rls_tenant_id
-            # tenant_context validates None at runtime; narrow type for mypy
-            ctx = tenant_context(tenant_id)  # type: ignore[arg-type]
-        else:
+        if param_name not in sig.parameters:
             logger.warning(
-                "with_rls_context: %s is None, no RLS context set (fail-closed)",
-                conf.USER_PARAM_NAME,
+                "with_rls_context: parameter %r not found in signature of %s. "
+                "RLS context will never be set (fail-closed). "
+                "Use @with_rls_context(user_param='your_param') to specify explicitly.",
+                param_name,
+                fn.__qualname__,
             )
-            return func(*args, **kwargs)
 
-        with ctx:
-            return func(*args, **kwargs)
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            as_user: TenantUser | None = _get_arg_from_signature(sig, param_name, *args, **kwargs)
 
-    return wrapper
+            if as_user is not None and as_user.is_tenant_admin:
+                ctx = admin_context()
+            elif as_user is not None:
+                tenant_id = as_user.rls_tenant_id
+                # tenant_context validates None at runtime; narrow type for mypy
+                ctx = tenant_context(tenant_id)  # type: ignore[arg-type]
+            else:
+                logger.warning(
+                    "with_rls_context: %s is None in call to %s, no RLS context set (fail-closed)",
+                    param_name,
+                    fn.__qualname__,
+                )
+                return fn(*args, **kwargs)
+
+            with ctx:
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    # Support both @with_rls_context and @with_rls_context(user_param="x")
+    if func is not None:
+        return decorator(func)
+    return decorator

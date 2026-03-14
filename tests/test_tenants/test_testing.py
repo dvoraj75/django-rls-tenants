@@ -24,7 +24,8 @@ class TestRlsBypass:
         """rls_bypass sets admin GUC variables."""
         with rls_bypass():
             assert get_guc("rls.is_admin") == "true"
-            assert get_guc("rls.current_tenant") == "-1"
+            # Admin mode clears tenant GUC; admin_bypass clause handles access.
+            assert get_guc("rls.current_tenant") is None
 
     def test_clears_on_exit(self):
         """GUCs are cleared after rls_bypass exits."""

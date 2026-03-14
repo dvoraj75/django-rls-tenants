@@ -12,6 +12,20 @@ from django.core.management.base import BaseCommand
 from django.db import connection
 
 
+def _collect_rls_tables() -> dict[str, str]:
+    """Return ``{db_table: ModelName}`` for all concrete ``RLSProtectedModel`` subclasses."""
+    from django.apps import apps  # noqa: PLC0415
+
+    from django_rls_tenants.tenants.models import RLSProtectedModel  # noqa: PLC0415
+
+    table_to_model: dict[str, str] = {}
+    for model in apps.get_models():
+        if not issubclass(model, RLSProtectedModel) or model._meta.abstract:  # noqa: SLF001
+            continue
+        table_to_model[model._meta.db_table] = model.__name__  # noqa: SLF001
+    return table_to_model
+
+
 class Command(BaseCommand):
     """Verify RLS policies on all protected tables."""
 
@@ -19,48 +33,16 @@ class Command(BaseCommand):
 
     def handle(self, *args: Any, **options: Any) -> None:  # noqa: ARG002
         """Check each RLSProtectedModel subclass."""
-        from django.apps import apps  # noqa: PLC0415
+        table_to_model = _collect_rls_tables()
+        if not table_to_model:
+            self.stdout.write("No RLS-protected models found.")
+            return
 
-        from django_rls_tenants.tenants.models import (  # noqa: PLC0415
-            RLSProtectedModel,
-        )
-
+        tables = list(table_to_model.keys())
         errors: list[str] = []
-        checked = 0
 
-        for model in apps.get_models():
-            if (
-                not issubclass(model, RLSProtectedModel) or model._meta.abstract  # noqa: SLF001
-            ):
-                continue
-
-            table = model._meta.db_table  # noqa: SLF001
-            checked += 1
-
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = %s",
-                    [table],
-                )
-                row = cursor.fetchone()
-                if row is None:
-                    errors.append(f"  {model.__name__} ({table}): table does not exist")
-                    continue
-                if not row[0]:
-                    errors.append(f"  {model.__name__} ({table}): RLS not enabled")
-                if not row[1]:
-                    errors.append(f"  {model.__name__} ({table}): RLS not forced")
-
-                cursor.execute(
-                    "SELECT policyname FROM pg_policies WHERE tablename = %s",
-                    [table],
-                )
-                policies = cursor.fetchall()
-                if not policies:
-                    errors.append(f"  {model.__name__} ({table}): no RLS policies found")
-                else:
-                    names = [p[0] for p in policies]
-                    self.stdout.write(f"  {model.__name__} ({table}): {', '.join(names)}")
+        self._check_rls_status(tables, table_to_model, errors)
+        self._check_policies(tables, table_to_model, errors)
 
         if errors:
             self.stderr.write(self.style.ERROR(f"\nFound {len(errors)} issue(s):"))
@@ -68,4 +50,57 @@ class Command(BaseCommand):
                 self.stderr.write(self.style.ERROR(error))
             raise SystemExit(1)
 
-        self.stdout.write(self.style.SUCCESS(f"\nAll {checked} RLS-protected tables verified."))
+        self.stdout.write(
+            self.style.SUCCESS(f"\nAll {len(table_to_model)} RLS-protected tables verified.")
+        )
+
+    def _check_rls_status(
+        self,
+        tables: list[str],
+        table_to_model: dict[str, str],
+        errors: list[str],
+    ) -> None:
+        """Batch-check ``relrowsecurity`` / ``relforcerowsecurity`` via ``pg_class``."""
+        with connection.cursor() as cursor:
+            placeholders = ", ".join(["%s"] * len(tables))
+            cursor.execute(
+                f"SELECT relname, relrowsecurity, relforcerowsecurity "
+                f"FROM pg_class WHERE relname IN ({placeholders})",
+                tables,
+            )
+            rls_status = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
+
+        for table, model_name in table_to_model.items():
+            if table not in rls_status:
+                errors.append(f"  {model_name} ({table}): table does not exist")
+                continue
+            enabled, forced = rls_status[table]
+            if not enabled:
+                errors.append(f"  {model_name} ({table}): RLS not enabled")
+            if not forced:
+                errors.append(f"  {model_name} ({table}): RLS not forced")
+
+    def _check_policies(
+        self,
+        tables: list[str],
+        table_to_model: dict[str, str],
+        errors: list[str],
+    ) -> None:
+        """Batch-check RLS policies via ``pg_policies``."""
+        with connection.cursor() as cursor:
+            placeholders = ", ".join(["%s"] * len(tables))
+            cursor.execute(
+                f"SELECT tablename, policyname "
+                f"FROM pg_policies WHERE tablename IN ({placeholders})",
+                tables,
+            )
+            policies_by_table: dict[str, list[str]] = {}
+            for row in cursor.fetchall():
+                policies_by_table.setdefault(row[0], []).append(row[1])
+
+        for table, model_name in table_to_model.items():
+            policies = policies_by_table.get(table, [])
+            if not policies:
+                errors.append(f"  {model_name} ({table}): no RLS policies found")
+            else:
+                self.stdout.write(f"  {model_name} ({table}): {', '.join(policies)}")

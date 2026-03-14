@@ -84,8 +84,8 @@ class Order(RLSProtectedModel):
 ```python
 RLS_TENANTS = {
     "TENANT_MODEL": "myapp.Tenant",
-    "TENANT_FK_NAME": "tenant",
-    "GUC_NAME": "rls.tenant_id",
+    "TENANT_FK_FIELD": "tenant",
+    "GUC_PREFIX": "rls",
 }
 ```
 

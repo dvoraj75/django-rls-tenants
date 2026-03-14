@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from django_rls_tenants.rls.guc import clear_guc, get_guc
+from django_rls_tenants.rls.guc import get_guc
 from django_rls_tenants.tenants.middleware import RLSTenantMiddleware
 
 pytestmark = pytest.mark.django_db
@@ -32,9 +32,6 @@ class TestProcessRequest:
         mw.process_request(request)
         assert get_guc("rls.is_admin") == "false"
         assert get_guc("rls.current_tenant") == str(tenant_a_user.rls_tenant_id)
-        # cleanup
-        clear_guc("rls.is_admin")
-        clear_guc("rls.current_tenant")
 
     def test_admin_user_sets_gucs(self, admin_user):
         """Authenticated admin user sets admin GUCs."""
@@ -42,9 +39,8 @@ class TestProcessRequest:
         request = _make_request(user=admin_user)
         mw.process_request(request)
         assert get_guc("rls.is_admin") == "true"
-        assert get_guc("rls.current_tenant") == "-1"
-        clear_guc("rls.is_admin")
-        clear_guc("rls.current_tenant")
+        # Admin mode clears tenant GUC; admin_bypass clause handles access.
+        assert get_guc("rls.current_tenant") is None
 
     def test_unauthenticated_no_gucs(self):
         """Unauthenticated request sets no GUCs."""
