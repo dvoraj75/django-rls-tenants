@@ -5,9 +5,48 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
+from django.db import connection
 
 from django_rls_tenants.tenants.context import admin_context
 from tests.test_app.models import Document, Order, ProtectedUser, Tenant, TenantUser
+
+_RLS_ROLE = "rls_test_role"
+
+
+@pytest.fixture(scope="session")
+def _rls_role(django_db_setup, django_db_blocker):
+    """Create a non-superuser role for RLS enforcement (once per session).
+
+    PostgreSQL superusers always bypass RLS, even with FORCE ROW LEVEL
+    SECURITY.  This fixture creates a plain role and grants it full DML
+    access so that ``SET ROLE`` makes the connection subject to RLS.
+    """
+    with django_db_blocker.unblock(), connection.cursor() as cur:
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", [_RLS_ROLE])
+        if cur.fetchone() is None:
+            cur.execute(f"CREATE ROLE {_RLS_ROLE} NOLOGIN")
+        cur.execute(f"GRANT ALL ON ALL TABLES IN SCHEMA public TO {_RLS_ROLE}")
+        cur.execute(f"GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {_RLS_ROLE}")
+
+
+@pytest.fixture
+def enforce_rls(_rls_role, db):
+    """Switch to a non-superuser role so PostgreSQL RLS is enforced.
+
+    Use this fixture (or the autouse version in test_integration/) for any
+    test that verifies database-level row filtering without ``for_user()``.
+    """
+    with connection.cursor() as cur:
+        cur.execute("SELECT usesuper FROM pg_user WHERE usename = current_user")
+        row = cur.fetchone()
+        is_super = row is not None and row[0]
+    if is_super:
+        with connection.cursor() as cur:
+            cur.execute(f"SET ROLE {_RLS_ROLE}")
+    yield
+    if is_super:
+        with connection.cursor() as cur:
+            cur.execute("RESET ROLE")
 
 
 @pytest.fixture
