@@ -1,0 +1,99 @@
+site_name: django-rls-tenants
+site_url: https://dvoraj75.github.io/django-rls-tenants/
+site_description: Database-enforced multitenancy for Django using PostgreSQL Row-Level Security.
+repo_url: https://github.com/dvoraj75/django-rls-tenants
+repo_name: dvoraj75/django-rls-tenants
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - content.code.copy
+    - content.code.annotate
+    - navigation.instant
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - toc.follow
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.snippets
+
+plugins:
+  - search
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          options:
+            show_source: true
+            show_root_heading: true
+            show_symbol_type_heading: true
+            members_order: source
+            docstring_style: google
+            merge_init_into_class: true
+            show_signature_annotations: true
+            separate_signature: true
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation: getting-started/installation.md
+      - Quick Start: getting-started/quickstart.md
+      - Configuration: getting-started/configuration.md
+  - Guides:
+      - Tenant Model: guides/tenant-model.md
+      - Protecting Models: guides/protecting-models.md
+      - User Integration: guides/user-integration.md
+      - Middleware: guides/middleware.md
+      - Context Managers: guides/context-managers.md
+      - Bypass Mode: guides/bypass-mode.md
+      - Testing: guides/testing.md
+      - Management Commands: guides/management-commands.md
+      - Connection Pooling: guides/connection-pooling.md
+  - Advanced:
+      - Architecture: advanced/architecture.md
+      - Migration Guide: advanced/migration-guide.md
+      - Security Model: advanced/security.md
+  - Reference:
+      - API: reference/api.md
+  - Development:
+      - Contributing: development/contributing.md
+      - Changelog: development/changelog.md

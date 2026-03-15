@@ -59,5 +59,8 @@ Thumbs.db
 .pdm-python
 .pdm-build/
 
+# MkDocs build output
+site/
+
 # Project-specific
 .opencode/

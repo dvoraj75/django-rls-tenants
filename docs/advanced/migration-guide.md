@@ -1,0 +1,122 @@
+# Migration Guide
+
+This guide helps you migrate from other Django multitenancy libraries to
+django-rls-tenants.
+
+## From django-tenants
+
+[django-tenants](https://github.com/django-tenants/django-tenants) uses a
+schema-per-tenant approach. Migrating to django-rls-tenants means moving from
+separate schemas to a single schema with RLS policies.
+
+### Key Differences
+
+| Aspect | django-tenants | django-rls-tenants |
+|--------|---------------|-------------------|
+| Isolation | Separate PostgreSQL schemas | RLS policies on shared tables |
+| Tenant routing | `connection.set_tenant()` | GUC variables via middleware |
+| Shared apps | `SHARED_APPS` / `TENANT_APPS` | All apps share one schema |
+| Migrations | Run per-schema | Run once (single schema) |
+| Raw SQL safety | Yes (schema isolation) | Yes (RLS policies) |
+| Database overhead | High (N schemas) | Low (single schema) |
+
+### Migration Steps
+
+1. **Create a tenant FK column** on all tenant-scoped tables:
+
+    ```sql
+    ALTER TABLE myapp_order ADD COLUMN tenant_id INTEGER REFERENCES myapp_tenant(id);
+    UPDATE myapp_order SET tenant_id = <mapped_tenant_id>;
+    ALTER TABLE myapp_order ALTER COLUMN tenant_id SET NOT NULL;
+    ```
+
+2. **Replace model inheritance**: change `TenantMixin` to your own tenant model,
+   and tenant-scoped models to inherit from `RLSProtectedModel`.
+
+3. **Replace middleware**: swap `TenantMainMiddleware` for `RLSTenantMiddleware`.
+
+4. **Replace tenant routing**: replace `connection.set_tenant()` calls with
+   `tenant_context()` or `admin_context()`.
+
+5. **Consolidate schemas** into a single schema (this is the hardest step and is
+   project-specific).
+
+6. **Run migrations** to create RLS policies.
+
+7. **Verify**: run `python manage.py check_rls`.
+
+!!! warning
+    Schema consolidation is a significant data migration and should be planned carefully.
+    Test thoroughly in a staging environment before production.
+
+## From django-multitenant
+
+[django-multitenant](https://github.com/citusdata/django-multitenant) uses ORM-level
+query rewriting. Migrating is simpler because you already use a single schema.
+
+### Key Differences
+
+| Aspect | django-multitenant | django-rls-tenants |
+|--------|-------------------|-------------------|
+| Isolation | ORM query rewriting | RLS policies |
+| Raw SQL safety | No | Yes |
+| Citus support | Yes | No (standard PostgreSQL) |
+| Fail-closed | No | Yes |
+| Manager | `TenantManager` | `RLSManager` |
+
+### Migration Steps
+
+1. **Replace model base class**: change `TenantModel` to `RLSProtectedModel`.
+
+    ```python
+    # Before (django-multitenant)
+    from django_multitenant.models import TenantModel
+
+    class Order(TenantModel):
+        tenant_id = 'account_id'
+        ...
+
+    # After (django-rls-tenants)
+    from django_rls_tenants import RLSProtectedModel
+
+    class Order(RLSProtectedModel):
+        ...
+    ```
+
+2. **Replace manager calls**: change `set_current_tenant()` to context managers.
+
+    ```python
+    # Before
+    from django_multitenant.utils import set_current_tenant
+    set_current_tenant(tenant)
+
+    # After
+    from django_rls_tenants import tenant_context
+    with tenant_context(tenant_id=tenant.pk):
+        ...
+    ```
+
+3. **Replace middleware**: swap the multitenant middleware for `RLSTenantMiddleware`.
+
+4. **Add `TenantUser` properties** to your User model.
+
+5. **Update settings**: replace `MULTI_TENANT` settings with `RLS_TENANTS`.
+
+6. **Run migrations** to create RLS policies.
+
+7. **Verify**: run `python manage.py check_rls`.
+
+## From No Multitenancy
+
+If you are adding multitenancy to an existing single-tenant application:
+
+1. **Create a Tenant model** (see [Tenant Model](../guides/tenant-model.md)).
+2. **Add tenant FK** to all data models that need isolation.
+3. **Populate the FK** with the appropriate tenant ID for existing data.
+4. **Inherit from `RLSProtectedModel`** on those models.
+5. **Implement `TenantUser`** on your User model.
+6. **Add middleware and settings**.
+7. **Run migrations** and verify with `check_rls`.
+
+The most challenging step is populating the tenant FK for existing data. Plan a data
+migration that assigns the correct tenant to each existing record.

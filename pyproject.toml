@@ -47,7 +47,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/dvoraj75/django-rls-tenants"
-Documentation = "https://github.com/dvoraj75/django-rls-tenants#readme"
+Documentation = "https://dvoraj75.github.io/django-rls-tenants/"
 Repository = "https://github.com/dvoraj75/django-rls-tenants"
 Issues = "https://github.com/dvoraj75/django-rls-tenants/issues"
 Changelog = "https://github.com/dvoraj75/django-rls-tenants/blob/main/CHANGELOG.md"
@@ -61,12 +61,19 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "django-stubs[compatible-mypy]>=5.0",
+    "psycopg2-binary>=2.9",
 ]
 test = [
     "pytest>=8.0",
     "pytest-django>=4.9",
     "pytest-cov>=6.0",
     "coverage[toml]>=7.0",
+    "psycopg2-binary>=2.9",
+]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.27",
 ]
 
 # ---------------------------------------------------------------------------
