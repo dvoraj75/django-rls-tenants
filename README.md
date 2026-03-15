@@ -61,6 +61,10 @@ python manage.py check_rls   # verify policies are in place
 
 **[Full tutorial and documentation →](https://dvoraj75.github.io/django-rls-tenants/)**
 
+> **Want to see it in action first?** Try the
+> [demo project](https://github.com/dvoraj75/django-rls-tenants-demo) —
+> zero to "wow" in under 5 minutes.
+
 ## Comparison with Alternatives
 
 | Feature                    | django-rls-tenants | django-tenants  | django-multitenant |
