@@ -13,6 +13,16 @@ Database-enforced multitenancy for Django using PostgreSQL
 Every query -- ORM, raw SQL, `dbshell` -- is filtered by the database itself.
 Missing tenant context returns zero rows, never leaks data.
 
+## Why this library?
+
+Existing Django multitenancy libraries enforce isolation at the application
+level — one missed filter and data leaks across tenants. `django-rls-tenants`
+pushes enforcement to PostgreSQL itself using Row-Level Security. Every query —
+ORM, raw SQL, `dbshell` — is filtered by the database. Missing tenant context
+returns zero rows, never leaked data.
+
+[Learn more about the RLS approach →](https://dvoraj75.github.io/django-rls-tenants/why-rls/)
+
 ## Quick Start
 
 ```bash
@@ -61,6 +71,13 @@ python manage.py check_rls   # verify policies are in place
 | No connection routing      | Yes                | No              | Depends            |
 | Fail-closed on missing ctx | Yes                | N/A             | No                 |
 | Works with any API layer   | Yes                | Yes             | Yes                |
+
+[See the full comparison →](https://dvoraj75.github.io/django-rls-tenants/comparison/)
+
+## Used in Production
+
+Are you using `django-rls-tenants` in production? We'd love to hear about it.
+[Open a discussion →](https://github.com/dvoraj75/django-rls-tenants/discussions)
 
 ## Requirements
 

@@ -74,6 +74,8 @@ plugins:
 
 nav:
   - Home: index.md
+  - Why RLS?: why-rls.md
+  - Comparison: comparison.md
   - Getting Started:
       - Installation: getting-started/installation.md
       - Quick Start: getting-started/quickstart.md
