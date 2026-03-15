@@ -37,16 +37,16 @@ policy. The database itself becomes the trust boundary.
 
 ```
 ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│   Request    │───▶│  Middleware   │───▶│  Set GUCs    │
+│   Request    │───▶│  Middleware  │───▶│  Set GUCs    │
 │              │    │  resolves    │    │  on PG conn  │
 │              │    │  tenant user │    │              │
 └──────────────┘    └──────────────┘    └──────┬───────┘
                                                │
                                                ▼
                                        ┌──────────────┐
-                                       │  PostgreSQL   │
-                                       │  RLS Policy   │
-                                       │  filters rows │
+                                       │  PostgreSQL  │
+                                       │  RLS Policy  │
+                                       │  filters rows│
                                        └──────────────┘
 ```
 

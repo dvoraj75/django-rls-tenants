@@ -6,9 +6,9 @@ django-rls-tenants is organized into two internal layers with a strict import bo
 
 ```
 ┌─────────────────────────────────────────────┐
-│              tenants/ layer                  │
-│  (Django multitenancy: models, middleware,   │
-│   context managers, managers, testing)       │
+│              tenants/ layer                 │
+│  (Django multitenancy: models, middleware,  │
+│   context managers, managers, testing)      │
 │                                             │
 │  Imports from: rls/, django, stdlib         │
 ├─────────────────────────────────────────────┤
@@ -70,7 +70,7 @@ communicating tenant identity from Django to RLS policies:
 Django Application           PostgreSQL
 ─────────────────           ──────────
 
-Middleware reads              set_config('rls.current_tenant', '42')
+Middleware reads             set_config('rls.current_tenant', '42')
 request.user        ──────▶  set_config('rls.is_admin', 'false')
 
 ORM query executes  ──────▶  SELECT * FROM orders
