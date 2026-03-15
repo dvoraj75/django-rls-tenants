@@ -181,6 +181,39 @@ the most common symbols with grouped comments.
 - Ruff relaxations for tests: `S101` (assert), `ARG` (unused fixtures),
   `SLF001` (private access), `PLR2004` (magic values) are all permitted.
 
+## Example Project
+
+The `example/` directory contains a self-contained multi-tenant Django demo app (notes app).
+It showcases `RLSProtectedModel`, `RLSTenantMiddleware`, `TenantUser` protocol, and `admin_context`.
+
+```bash
+cd example/
+docker compose up              # start db + web (runs migrate + seed + runserver)
+docker compose up --build      # rebuild after library or example changes
+docker compose down -v         # stop and destroy database volume
+```
+
+The example has its own `Dockerfile` that installs the library from source (parent directory).
+Build context is the repo root so library code changes are picked up on rebuild.
+
+**Code style for `example/`:** The example is a demo app, not library code. It does **not**
+use `from __future__ import annotations`, strict mypy, or the full ruff rule set. It follows
+standard Django conventions (relative imports within apps, function-based views, no type annotations).
+
+### Example structure
+
+```
+example/
+├── docker-compose.yml   Docker Compose (db + web)
+├── Dockerfile           Installs library from source + example app
+├── manage.py            Django management script
+├── demo/                Project settings, urls, wsgi/asgi
+├── tenants/             Tenant model (shared, not RLS-protected)
+├── accounts/            Custom User with TenantUser protocol
+├── notes/               RLS-protected Note model, views, templates, seed command
+└── docker/              PostgreSQL init (creates non-superuser role for RLS)
+```
+
 ## CI
 
 GitHub Actions runs lint + type-check and a test matrix across
