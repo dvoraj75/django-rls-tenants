@@ -77,7 +77,7 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
                 if guc_value:
                     set_guc(guc_name, guc_value, is_local=conf.USE_LOCAL_SET, using=db_alias)
                 else:
-                    clear_guc(guc_name, using=db_alias)
+                    clear_guc(guc_name, is_local=conf.USE_LOCAL_SET, using=db_alias)
             try:
                 super()._fetch_all()
             finally:

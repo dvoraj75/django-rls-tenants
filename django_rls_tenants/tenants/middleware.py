@@ -81,7 +81,7 @@ class RLSTenantMiddleware(MiddlewareMixin):
                 if guc_value:
                     set_guc(guc_name, guc_value, is_local=conf.USE_LOCAL_SET)
                 else:
-                    clear_guc(guc_name)
+                    clear_guc(guc_name, is_local=conf.USE_LOCAL_SET)
             _mark_gucs_set()
         except Exception:
             logger.exception("Failed to set RLS GUC variables, clearing both to prevent leak")

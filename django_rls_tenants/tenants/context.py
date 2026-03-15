@@ -126,7 +126,7 @@ def admin_context(
     # Clear tenant GUC for admin mode; the admin_bypass clause in the
     # RLS policy handles access independently. Avoids the old "-1"
     # sentinel which could collide with integer PKs or fail UUID casts.
-    clear_guc(conf.GUC_CURRENT_TENANT, using=using)
+    clear_guc(conf.GUC_CURRENT_TENANT, is_local=is_local, using=using)
     try:
         yield
     finally:

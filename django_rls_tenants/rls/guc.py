@@ -86,6 +86,12 @@ def get_guc(name: str, *, using: str = "default") -> str | None:
         return value if value != "" else None
 
 
-def clear_guc(name: str, *, using: str = "default") -> None:
-    """Clear a GUC variable by setting it to an empty string."""
-    set_guc(name, "", using=using)
+def clear_guc(name: str, *, is_local: bool = False, using: str = "default") -> None:
+    """Clear a GUC variable by setting it to an empty string.
+
+    Args:
+        name: Variable name to clear.
+        is_local: If ``True``, use ``SET LOCAL`` (transaction-scoped).
+        using: Database alias. Default: ``"default"``.
+    """
+    set_guc(name, "", is_local=is_local, using=using)
