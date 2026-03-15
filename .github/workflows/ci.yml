@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
   workflow_call:
 
 concurrency:
@@ -22,6 +22,9 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Verify lockfile is up-to-date
+        run: uv lock --check
+
       - name: Install dependencies
         run: uv sync --group dev
 
@@ -37,6 +40,9 @@ jobs:
   test:
     name: Test (Python ${{ matrix.python-version }}, Django ${{ matrix.django-version }})
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     strategy:
       fail-fast: false
       matrix:
@@ -83,6 +89,14 @@ jobs:
 
       - name: Run tests
         run: uv run pytest --cov --cov-report=xml
+
+      - name: Coverage PR comment
+        if: github.event_name == 'pull_request' && matrix.python-version == '3.12' && matrix.django-version == '5.1'
+        uses: orgoro/coverage@v3.2
+        with:
+          coverageFile: coverage.xml
+          token: ${{ secrets.GITHUB_TOKEN }}
+          thresholdAll: 0.9
 
       - name: Upload coverage
         if: matrix.python-version == '3.12' && matrix.django-version == '5.1'
