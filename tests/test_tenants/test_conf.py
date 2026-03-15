@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings as w
+
 import pytest
 from django.test import override_settings
 
@@ -92,3 +94,14 @@ class TestRLSTenantsConfig:
         with override_settings(RLS_TENANTS={"TENANT_MODEL": "x.Y", "USE_LOCAL_SET": True}):
             conf = RLSTenantsConfig()
             assert conf.USE_LOCAL_SET is True
+
+    def test_unknown_key_warns(self):
+        """Unrecognized keys in RLS_TENANTS emit a UserWarning."""
+        with override_settings(
+            RLS_TENANTS={"TENANT_MODEL": "x.Y", "BOGUS_KEY": "val"},
+        ):
+            conf = RLSTenantsConfig()
+            with w.catch_warnings(record=True) as caught:
+                w.simplefilter("always")
+                _ = conf.TENANT_MODEL  # triggers _warn_unknown_keys
+            assert any("BOGUS_KEY" in str(warning.message) for warning in caught)

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from django_rls_tenants.rls.guc import get_guc
-from django_rls_tenants.tenants.middleware import RLSTenantMiddleware
+from django_rls_tenants.rls.guc import get_guc, set_guc
+from django_rls_tenants.tenants.middleware import (
+    RLSTenantMiddleware,
+    _clear_gucs_set_flag,
+    _were_gucs_set,
+)
 
 pytestmark = pytest.mark.django_db
 
@@ -83,3 +87,83 @@ class TestProcessResponse:
         response = MagicMock()
         result = mw.process_response(request, response)
         assert result is response
+
+    def test_skips_clear_when_use_local_set_true(self, tenant_a_user):
+        """process_response skips clearing GUCs when USE_LOCAL_SET=True."""
+        mw = RLSTenantMiddleware(get_response=lambda r: MagicMock())
+        request = _make_request(user=tenant_a_user)
+        mw.process_request(request)
+        assert get_guc("rls.current_tenant") is not None
+
+        with patch("django_rls_tenants.tenants.middleware.rls_tenants_config") as mock_conf:
+            mock_conf.USE_LOCAL_SET = True
+            response = MagicMock()
+            mw.process_response(request, response)
+
+        # GUCs should still be set (SET LOCAL auto-clears at transaction end)
+        assert get_guc("rls.current_tenant") is not None
+
+
+class TestThreadLocalFlags:
+    """Tests for thread-local GUC flag helpers."""
+
+    def test_were_gucs_set_false_by_default(self):
+        """_were_gucs_set() returns False when no flag has been set."""
+        _clear_gucs_set_flag()
+        assert _were_gucs_set() is False
+
+    def test_mark_and_check(self, tenant_a_user):
+        """_mark_gucs_set marks the flag, _were_gucs_set reads it."""
+        mw = RLSTenantMiddleware(get_response=lambda r: MagicMock())
+        _clear_gucs_set_flag()
+        request = _make_request(user=tenant_a_user)
+        mw.process_request(request)
+        assert _were_gucs_set() is True
+
+
+class TestProcessRequestExceptionHandling:
+    """Tests for error handling in process_request."""
+
+    def test_clears_gucs_and_reraises_on_resolve_error(self):
+        """When _resolve_user_guc_vars raises, both GUCs are cleared and error re-raised."""
+        mw = RLSTenantMiddleware(get_response=lambda r: MagicMock())
+        user = MagicMock()
+        user.is_authenticated = True
+        request = _make_request(user=user)
+
+        # Pre-set a GUC to verify cleanup
+        set_guc("rls.is_admin", "true")
+        set_guc("rls.current_tenant", "99")
+
+        with (
+            patch(
+                "django_rls_tenants.tenants.middleware._resolve_user_guc_vars",
+                side_effect=RuntimeError("bad user"),
+            ),
+            pytest.raises(RuntimeError, match="bad user"),
+        ):
+            mw.process_request(request)
+
+        # Both GUCs should have been cleared as safety measure
+        assert get_guc("rls.is_admin") is None
+        assert get_guc("rls.current_tenant") is None
+
+    def test_survives_double_failure_on_cleanup(self):
+        """When both set_guc and cleanup clear_guc fail, the original error propagates."""
+        mw = RLSTenantMiddleware(get_response=lambda r: MagicMock())
+        user = MagicMock()
+        user.is_authenticated = True
+        request = _make_request(user=user)
+
+        with (
+            patch(
+                "django_rls_tenants.tenants.middleware._resolve_user_guc_vars",
+                side_effect=RuntimeError("connection lost"),
+            ),
+            patch(
+                "django_rls_tenants.tenants.middleware.clear_guc",
+                side_effect=RuntimeError("cleanup also failed"),
+            ),
+            pytest.raises(RuntimeError, match="connection lost"),
+        ):
+            mw.process_request(request)

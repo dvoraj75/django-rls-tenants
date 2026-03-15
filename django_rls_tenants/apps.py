@@ -29,8 +29,8 @@ class DjangoRlsTenantsConfig(AppConfig):
         # Only fires when the middleware actually set GUCs (thread-local flag),
         # avoiding 2 redundant DB queries on unauthenticated requests.
         def _clear_rls_on_request_finished(
-            _sender: type,
-            **_kwargs: object,
+            sender: type,  # noqa: ARG001  -- Django signal API
+            **kwargs: object,  # noqa: ARG001  -- Django signal API
         ) -> None:
             from django_rls_tenants.tenants.middleware import (  # noqa: PLC0415
                 _clear_gucs_set_flag,
@@ -53,7 +53,7 @@ class DjangoRlsTenantsConfig(AppConfig):
             finally:
                 _clear_gucs_set_flag()
 
-        request_finished.connect(_clear_rls_on_request_finished)
+        request_finished.connect(_clear_rls_on_request_finished, weak=False)
 
         # Import checks module so @register decorators are activated.
         import django_rls_tenants.tenants.checks  # noqa: PLC0415, F401

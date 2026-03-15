@@ -188,6 +188,8 @@ addopts = [
     "--strict-markers",
     "--strict-config",
     "-ra",
+    "--cov",
+    "--cov-report=term-missing",
 ]
 markers = [
     "integration: end-to-end tests requiring a live PostgreSQL database",
