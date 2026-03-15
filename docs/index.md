@@ -99,6 +99,11 @@ MIDDLEWARE = [
 
 See the full [Quick Start tutorial](getting-started/quickstart.md) for a complete walkthrough.
 
+!!! tip "Try the demo"
+    See django-rls-tenants in action with the
+    [demo project](https://github.com/dvoraj75/django-rls-tenants-demo).
+    Clone, `docker compose up`, and explore tenant isolation in under 5 minutes.
+
 ## License
 
 [MIT](https://github.com/dvoraj75/django-rls-tenants/blob/main/LICENSE)
