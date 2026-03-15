@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from typing import Any
+
+__version__: str = importlib.metadata.version("django-rls-tenants")
 
 __all__ = [
     "RLSConstraint",
@@ -15,6 +18,7 @@ __all__ = [
     "RLSTenantMiddleware",
     "TenantQuerySet",
     "TenantUser",
+    "__version__",
     "admin_context",
     "tenant_context",
     "with_rls_context",
