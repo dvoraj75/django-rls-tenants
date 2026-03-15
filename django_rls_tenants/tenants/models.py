@@ -33,19 +33,20 @@ def _add_tenant_fk(sender: type, **kwargs: Any) -> None:  # noqa: ARG001  -- sig
         return
 
     # Skip if the subclass already defines its own tenant field
-    local_field_names = [f.name for f in sender._meta.local_fields]  # noqa: SLF001
-    if "tenant" not in local_field_names:
-        from django_rls_tenants.tenants.conf import (  # noqa: PLC0415
-            rls_tenants_config,
-        )
+    from django_rls_tenants.tenants.conf import (  # noqa: PLC0415
+        rls_tenants_config,
+    )
 
+    local_field_names = [f.name for f in sender._meta.local_fields]  # noqa: SLF001
+    field_name = rls_tenants_config.TENANT_FK_FIELD
+    if field_name not in local_field_names:
         field: models.ForeignKey[Any, Any] = models.ForeignKey(
             to=rls_tenants_config.TENANT_MODEL,
             on_delete=models.CASCADE,
             blank=False,
             null=False,
         )
-        field.contribute_to_class(sender, rls_tenants_config.TENANT_FK_FIELD)
+        field.contribute_to_class(sender, field_name)
 
 
 class_prepared.connect(_add_tenant_fk)
