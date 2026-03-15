@@ -1,0 +1,25 @@
+{% extends "notes/base.html" %}
+{% block content %}
+    <h2>Log in</h2>
+    {% if form.errors %}
+        <p style="color: #d32f2f;">Invalid username or password.</p>
+    {% endif %}
+    <form method="post">
+        {% csrf_token %}
+        <label for="id_username">Username</label>
+        <input type="text" name="username" id="id_username" autofocus required>
+        <label for="id_password">Password</label>
+        <input type="password" name="password" id="id_password" required>
+        <button type="submit" class="btn">Log in</button>
+    </form>
+    <br>
+    <div style="background: #f5f5f5; padding: 1rem; border-radius: 8px; font-size: 0.875rem;">
+        <strong>Demo accounts:</strong>
+        <table style="width: 100%; margin-top: 0.5rem; border: none; background: transparent;">
+            <tr><td><code>alice</code></td><td><code>demo1234</code></td><td style="color: #757575;">Acme Corp</td></tr>
+            <tr><td><code>bob</code></td><td><code>demo1234</code></td><td style="color: #757575;">Globex Inc</td></tr>
+            <tr><td><code>carol</code></td><td><code>demo1234</code></td><td style="color: #757575;">Initech</td></tr>
+            <tr><td><code>admin</code></td><td><code>admin1234</code></td><td style="color: #757575;">All tenants</td></tr>
+        </table>
+    </div>
+{% endblock %}

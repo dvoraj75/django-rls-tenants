@@ -1,0 +1,13 @@
+{% extends "notes/base.html" %}
+{% block content %}
+    <h2>New Note</h2>
+    <form method="post">
+        {% csrf_token %}
+        <label for="title">Title</label>
+        <input type="text" name="title" id="title" required>
+        <label for="content">Content</label>
+        <textarea name="content" id="content" rows="6"></textarea>
+        <button type="submit" class="btn">Save</button>
+        <a href="{% url 'note_list' %}">Cancel</a>
+    </form>
+{% endblock %}

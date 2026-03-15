@@ -1,0 +1,22 @@
+{% extends "notes/base.html" %}
+{% block content %}
+    <a href="{% url 'note_create' %}" class="btn">+ New Note</a>
+    <br><br>
+    {% for note in notes %}
+        <div class="note">
+            <h3>{{ note.title }}</h3>
+            <p>{{ note.content }}</p>
+            <div class="meta">
+                Created {{ note.created_at|date:"M d, Y H:i" }}
+                <form method="post" action="{% url 'note_delete' note.pk %}" style="display:inline">
+                    {% csrf_token %}
+                    <button type="submit" class="btn btn-danger" style="margin-left:1rem">Delete</button>
+                </form>
+            </div>
+        </div>
+    {% empty %}
+        <div class="empty">
+            <p>No notes yet. Create one!</p>
+        </div>
+    {% endfor %}
+{% endblock %}

@@ -164,6 +164,16 @@ ignore = [
     "I001",     # import order (Django-generated)
     "RUF012",   # mutable class defaults (Django convention)
 ]
+"example/**/*.py" = [
+    "S101",     # assert allowed in demo
+    "S105",     # hardcoded secrets (demo-only)
+    "ARG",      # unused arguments
+    "I001",     # import order (Django demo conventions)
+    "PLC0415",  # imports not at top-level (Django manage.py pattern)
+    "RUF005",   # iterable unpacking vs concatenation
+    "RUF012",   # mutable class defaults (Django convention)
+    "T20",      # print statements (management commands)
+]
 
 [tool.ruff.lint.isort]
 known-first-party = ["django_rls_tenants"]
