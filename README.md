@@ -47,6 +47,7 @@ MIDDLEWARE = [..."django_rls_tenants.RLSTenantMiddleware"]
 
 ```python
 # models.py
+from django.db import models
 from django_rls_tenants import RLSProtectedModel
 
 class Order(RLSProtectedModel):

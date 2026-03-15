@@ -16,7 +16,7 @@ responsibly. **Do not open a public issue.**
    [private security advisory](https://github.com/dvoraj75/django-rls-tenants/security/advisories/new)
    on this repository.
 
-2. **Email**: Send a detailed report to the maintainer listed in `pyproject.toml`.
+2. **Email**: Send a detailed report to <dvoraj75@gmail.com>.
 
 ### What to include
 

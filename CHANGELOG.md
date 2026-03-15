@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Corrected CHANGELOG 1.0.0 entry: replaced non-existent `CONN_MAX_AGE_OVERRIDE`
+  config key with the actual `TENANT_PK_TYPE` key, and clarified that
+  `is_authenticated` is not part of the `TenantUser` protocol.
+- Added missing maintainer email to `pyproject.toml` authors field and updated
+  `SECURITY.md` to reference it directly instead of indirectly.
+- Added missing `from django.db import models` import in README Quick Start example.
+
 - `_add_tenant_fk` signal handler now reads the configured `TENANT_FK_FIELD` value
   instead of hardcoding `"tenant"` when checking for an existing field. Previously,
   a custom `TENANT_FK_FIELD` (e.g., `"organization"`) would cause the handler to
@@ -65,7 +72,7 @@ Initial stable release of django-rls-tenants.
 
 - Single `RLS_TENANTS` settings dict with 6 configuration keys:
   `TENANT_MODEL`, `TENANT_FK_FIELD`, `USER_PARAM_NAME`, `GUC_PREFIX`,
-  `USE_LOCAL_SET`, `CONN_MAX_AGE_OVERRIDE`.
+  `USE_LOCAL_SET`, `TENANT_PK_TYPE`.
 - `RLSTenantsConfig` singleton with lazy property access and unknown-key
   detection (warns on typos).
 - Django system checks: `W001` (GUC prefix mismatch for tenant), `W002`
@@ -75,7 +82,8 @@ Initial stable release of django-rls-tenants.
 #### User Integration
 
 - `TenantUser` runtime-checkable `Protocol` for structural subtyping of user
-  objects. Requires `is_tenant_admin`, `rls_tenant_id`, and `is_authenticated`.
+  objects. Requires `is_tenant_admin` and `rls_tenant_id`. The middleware
+  checks `is_authenticated` separately, but it is not part of the protocol.
 
 #### Bypass Mode
 
