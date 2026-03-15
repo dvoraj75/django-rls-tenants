@@ -184,4 +184,4 @@ the most common symbols with grouped comments.
 ## CI
 
 GitHub Actions runs lint + type-check and a test matrix across
-Python {3.11, 3.12, 3.13} × Django {4.2, 5.0, 5.1} on every push/PR.
+Python {3.11, 3.12, 3.13, 3.14} × Django {4.2, 5.0, 5.1, 5.2, 6.0} on every push/PR.

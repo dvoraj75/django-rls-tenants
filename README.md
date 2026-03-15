@@ -3,7 +3,9 @@
 [![CI](https://github.com/dvoraj75/django-rls-tenants/actions/workflows/ci.yml/badge.svg)](https://github.com/dvoraj75/django-rls-tenants/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/django-rls-tenants)](https://pypi.org/project/django-rls-tenants/)
 [![Python versions](https://img.shields.io/pypi/pyversions/django-rls-tenants)](https://pypi.org/project/django-rls-tenants/)
-[![Django versions](https://img.shields.io/badge/django-4.2%20%7C%205.0%20%7C%205.1-blue)](https://www.djangoproject.com/)
+[![Django versions](https://img.shields.io/badge/django-4.2%20%7C%205.0%20%7C%205.1%20%7C%205.2%20%7C%206.0-blue)](https://www.djangoproject.com/)
+[![Code style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000)](https://docs.astral.sh/ruff/)
+[![Type checked: mypy](https://img.shields.io/badge/type%20checked-mypy-blue)](https://mypy-lang.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 Database-enforced multitenancy for Django using PostgreSQL
