@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
+from django.db import models
 
 from django_rls_tenants.rls.constraints import RLSConstraint
 from django_rls_tenants.tenants.managers import RLSManager
-from django_rls_tenants.tenants.models import RLSProtectedModel
+from django_rls_tenants.tenants.models import RLSProtectedModel, _add_tenant_fk
 from tests.test_app.models import Document, Order, ProtectedUser, Tenant
 
 pytestmark = pytest.mark.django_db
@@ -78,3 +81,42 @@ class TestRLSProtectedModelMeta:
     def test_abstract_model(self):
         """RLSProtectedModel itself is abstract."""
         assert RLSProtectedModel._meta.abstract is True
+
+
+class TestAddTenantFKConfig:
+    """Tests for _add_tenant_fk respecting TENANT_FK_FIELD configuration."""
+
+    def test_respects_custom_tenant_fk_field(self):
+        """_add_tenant_fk uses the configured TENANT_FK_FIELD, not hardcoded 'tenant'.
+
+        When TENANT_FK_FIELD is set to a custom name, the signal handler should
+        check for that name when deciding whether to add the FK.
+        """
+        with patch("django_rls_tenants.tenants.conf.rls_tenants_config") as mock_config:
+            mock_config.TENANT_FK_FIELD = "organization"
+            mock_config.TENANT_MODEL = "test_app.Tenant"
+
+            # Order already has a field named "tenant" but NOT "organization".
+            # With the old hardcoded check, it would skip (because "tenant" IS in
+            # local_field_names). With the fix, it should try to add "organization".
+            # We patch contribute_to_class to verify it's called with the right name.
+            with patch.object(models.ForeignKey, "contribute_to_class") as mock_ctc:
+                _add_tenant_fk(sender=Order)
+                mock_ctc.assert_called_once()
+                _, call_field_name = mock_ctc.call_args[0]
+                assert call_field_name == "organization"
+
+    def test_no_duplicate_when_model_defines_configured_fk(self):
+        """No FK is added when the model already defines a field matching TENANT_FK_FIELD.
+
+        If a user configures TENANT_FK_FIELD='tenant' and their model already
+        has a 'tenant' field (like ProtectedUser), the signal must skip it.
+        """
+        with patch("django_rls_tenants.tenants.conf.rls_tenants_config") as mock_config:
+            mock_config.TENANT_FK_FIELD = "tenant"
+            mock_config.TENANT_MODEL = "test_app.Tenant"
+
+            with patch.object(models.ForeignKey, "contribute_to_class") as mock_ctc:
+                # ProtectedUser already defines "tenant" field
+                _add_tenant_fk(sender=ProtectedUser)
+                mock_ctc.assert_not_called()
