@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `_add_tenant_fk` signal handler now reads the configured `TENANT_FK_FIELD` value
+  instead of hardcoding `"tenant"` when checking for an existing field. Previously,
+  a custom `TENANT_FK_FIELD` (e.g., `"organization"`) would cause the handler to
+  miss existing fields and attempt to add a duplicate FK.
+
 ## [1.0.0] - 2026-03-15
 
 Initial stable release of django-rls-tenants.
