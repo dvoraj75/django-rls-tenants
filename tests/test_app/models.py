@@ -73,6 +73,20 @@ class Document(RLSProtectedModel):
         db_table = "test_document"
 
 
+class OrderItem(RLSProtectedModel):
+    """RLS-protected model with FK to another RLS-protected model.
+
+    Used to test ``select_related()`` tenant propagation across
+    RLS-protected joins.
+    """
+
+    order = models.ForeignKey(Order, on_delete=models.CASCADE)
+    description = models.CharField(max_length=255)
+
+    class Meta(RLSProtectedModel.Meta):
+        db_table = "test_order_item"
+
+
 class ProtectedUser(RLSProtectedModel):
     """RLS-protected user model with extra bypass flags."""
 

@@ -11,7 +11,7 @@ from django.db import connection
 from django_rls_tenants.rls.guc import clear_guc
 from django_rls_tenants.tenants.context import admin_context
 from django_rls_tenants.tenants.state import set_current_tenant_id
-from tests.test_app.models import Document, Order, ProtectedUser, Tenant, TenantUser
+from tests.test_app.models import Document, Order, OrderItem, ProtectedUser, Tenant, TenantUser
 
 _RLS_ROLE = "rls_test_role"
 
@@ -33,10 +33,12 @@ def _clear_gucs_after_test(db):
     for all tests.
     """
     yield
-    set_current_tenant_id(None)
-    for name in _GUC_NAMES_TO_CLEAR:
-        with contextlib.suppress(Exception):
-            clear_guc(name)
+    try:
+        set_current_tenant_id(None)
+    finally:
+        for name in _GUC_NAMES_TO_CLEAR:
+            with contextlib.suppress(Exception):
+                clear_guc(name)
 
 
 @pytest.fixture(scope="session")
@@ -137,6 +139,28 @@ def sample_orders(db, tenant_a, tenant_b):
             tenant=tenant_b,
         )
     return {"a1": order_a1, "a2": order_a2, "b1": order_b1}
+
+
+@pytest.fixture
+def sample_order_items(db, sample_orders):
+    """Create sample order items linked to orders. Requires admin context for RLS."""
+    with admin_context():
+        item_a1 = OrderItem.objects.create(
+            order=sample_orders["a1"],
+            description="Part A1-1",
+            tenant=sample_orders["a1"].tenant,
+        )
+        item_a2 = OrderItem.objects.create(
+            order=sample_orders["a2"],
+            description="Part A2-1",
+            tenant=sample_orders["a2"].tenant,
+        )
+        item_b1 = OrderItem.objects.create(
+            order=sample_orders["b1"],
+            description="Part B1-1",
+            tenant=sample_orders["b1"].tenant,
+        )
+    return {"a1": item_a1, "a2": item_a2, "b1": item_b1}
 
 
 @pytest.fixture

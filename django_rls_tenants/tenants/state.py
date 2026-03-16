@@ -1,4 +1,7 @@
-"""Thread-safe and async-safe tenant state for automatic query scoping.
+"""Tenant state for automatic query scoping.
+
+Relies on Python's ``contextvars.ContextVar`` for thread and async-task
+isolation.
 
 Uses ``contextvars.ContextVar`` to store the current tenant ID so that
 ``RLSManager.get_queryset()`` can automatically add an ORM-level

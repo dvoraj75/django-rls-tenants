@@ -3,6 +3,7 @@
 Detects configuration issues at startup that would otherwise cause
 silent failures at runtime:
 
+- Superuser database connections (RLS is completely bypassed — warning).
 - ``GUC_PREFIX`` mismatch between runtime config and ``RLSConstraint`` defaults.
 - ``USE_LOCAL_SET=True`` without ``ATOMIC_REQUESTS=True``.
 - ``CONN_MAX_AGE > 0`` with ``USE_LOCAL_SET=False`` (connection-pool GUC leak risk).
@@ -10,13 +11,17 @@ silent failures at runtime:
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 from django.core.checks import Warning as CheckWarning
 from django.core.checks import register
+from django.db import connection
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+logger = logging.getLogger("django_rls_tenants")
 
 
 @register("django_rls_tenants")
@@ -26,10 +31,50 @@ def check_rls_config(
 ) -> list[CheckWarning]:
     """Run all RLS configuration checks."""
     errors: list[CheckWarning] = []
+    errors.extend(_check_superuser_connection())
     errors.extend(_check_guc_prefix_mismatch())
     errors.extend(_check_use_local_set_requires_atomic())
     errors.extend(_check_conn_max_age_with_session_gucs())
     return errors
+
+
+def _check_superuser_connection() -> list[CheckWarning]:
+    """Warn if the default database connection uses a PostgreSQL superuser.
+
+    PostgreSQL superusers bypass ALL Row-Level Security policies, even
+    with ``FORCE ROW LEVEL SECURITY``. If the Django application connects
+    as a superuser, tenant isolation is completely disabled -- every query
+    returns all rows regardless of GUC settings.
+    """
+    warnings: list[CheckWarning] = []
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT usesuper FROM pg_user WHERE usename = current_user")
+            row = cursor.fetchone()
+            if row is not None and row[0]:
+                warnings.append(
+                    CheckWarning(
+                        "The default database connection uses a PostgreSQL "
+                        "superuser. Superusers bypass ALL Row-Level Security "
+                        "policies, completely disabling tenant isolation.",
+                        hint=(
+                            "Create a non-superuser role for the Django "
+                            "application and set it in DATABASES['default']. "
+                            "Example: CREATE ROLE app LOGIN PASSWORD 'secret'; "
+                            "GRANT ALL ON ALL TABLES IN SCHEMA public TO app;"
+                        ),
+                        id="django_rls_tenants.W005",
+                    )
+                )
+    except Exception:
+        # Database may not be available at check time (e.g., during
+        # collectstatic or other commands that don't need a DB).
+        # Skip the check silently -- it will be caught at runtime.
+        logger.debug(
+            "Could not check superuser status (database may be unavailable).",
+            exc_info=True,
+        )
+    return warnings
 
 
 def _check_guc_prefix_mismatch() -> list[CheckWarning]:
@@ -134,7 +179,8 @@ def _check_conn_max_age_with_session_gucs() -> list[CheckWarning]:
     databases = getattr(settings, "DATABASES", {})
     default_db = databases.get("default", {})
     conn_max_age = default_db.get("CONN_MAX_AGE", 0)
-    if conn_max_age and conn_max_age > 0:
+    # None means "keep connections forever" -- the most dangerous value.
+    if conn_max_age is None or (isinstance(conn_max_age, (int, float)) and conn_max_age > 0):
         warnings.append(
             CheckWarning(
                 f"CONN_MAX_AGE={conn_max_age} with USE_LOCAL_SET=False "

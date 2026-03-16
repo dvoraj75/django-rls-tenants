@@ -53,9 +53,17 @@ def _resolve_user_guc_vars(
             conf.GUC_IS_ADMIN: "true",
             conf.GUC_CURRENT_TENANT: "",
         }
+    tenant_id = user.rls_tenant_id
+    if tenant_id is None:
+        msg = (
+            f"Non-admin user has rls_tenant_id=None. "
+            f"Assign the user to a tenant or set is_tenant_admin=True. "
+            f"User type: {type(user).__name__}"
+        )
+        raise ValueError(msg)
     return {
         conf.GUC_IS_ADMIN: "false",
-        conf.GUC_CURRENT_TENANT: str(user.rls_tenant_id),
+        conf.GUC_CURRENT_TENANT: str(tenant_id),
     }
 
 
@@ -89,14 +97,14 @@ def tenant_context(
         prev_tenant = get_guc(conf.GUC_CURRENT_TENANT, using=using)
 
     token = set_current_tenant_id(tenant_id)
-    set_guc(conf.GUC_IS_ADMIN, "false", is_local=is_local, using=using)
-    set_guc(
-        conf.GUC_CURRENT_TENANT,
-        str(tenant_id),
-        is_local=is_local,
-        using=using,
-    )
     try:
+        set_guc(conf.GUC_IS_ADMIN, "false", is_local=is_local, using=using)
+        set_guc(
+            conf.GUC_CURRENT_TENANT,
+            str(tenant_id),
+            is_local=is_local,
+            using=using,
+        )
         yield
     finally:
         reset_current_tenant_id(token)
@@ -126,12 +134,12 @@ def admin_context(
         prev_tenant = get_guc(conf.GUC_CURRENT_TENANT, using=using)
 
     token = set_current_tenant_id(None)
-    set_guc(conf.GUC_IS_ADMIN, "true", is_local=is_local, using=using)
-    # Clear tenant GUC for admin mode; the admin_bypass clause in the
-    # RLS policy handles access independently. Avoids the old "-1"
-    # sentinel which could collide with integer PKs or fail UUID casts.
-    clear_guc(conf.GUC_CURRENT_TENANT, is_local=is_local, using=using)
     try:
+        set_guc(conf.GUC_IS_ADMIN, "true", is_local=is_local, using=using)
+        # Clear tenant GUC for admin mode; the admin_bypass clause in the
+        # RLS policy handles access independently. Avoids the old "-1"
+        # sentinel which could collide with integer PKs or fail UUID casts.
+        clear_guc(conf.GUC_CURRENT_TENANT, is_local=is_local, using=using)
         yield
     finally:
         reset_current_tenant_id(token)
@@ -221,8 +229,14 @@ def with_rls_context(
                 ctx = admin_context()
             elif as_user is not None:
                 tenant_id = as_user.rls_tenant_id
-                # tenant_context validates None at runtime; narrow type for mypy
-                ctx = tenant_context(tenant_id)  # type: ignore[arg-type]
+                if tenant_id is None:
+                    msg = (
+                        f"Non-admin user passed to {fn.__qualname__} has "
+                        f"rls_tenant_id=None. Assign the user to a tenant "
+                        f"or set is_tenant_admin=True."
+                    )
+                    raise ValueError(msg)
+                ctx = tenant_context(tenant_id)
             else:
                 logger.warning(
                     "with_rls_context: %s is None in call to %s, no RLS context set (fail-closed)",

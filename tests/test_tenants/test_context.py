@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+from unittest.mock import MagicMock
 
 import pytest
 
 from django_rls_tenants.rls.guc import get_guc, set_guc
 from django_rls_tenants.tenants.context import (
+    _resolve_user_guc_vars,
     admin_context,
     tenant_context,
     with_rls_context,
@@ -177,6 +179,39 @@ class TestNesting:
         assert get_current_tenant_id() is None
 
 
+class TestResolveUserGucVars:
+    """Tests for _resolve_user_guc_vars()."""
+
+    def test_admin_user_returns_admin_gucs(self, admin_user):
+        """Admin user returns is_admin=true and empty tenant."""
+        result = _resolve_user_guc_vars(admin_user)
+        assert result["rls.is_admin"] == "true"
+        assert result["rls.current_tenant"] == ""
+
+    def test_tenant_user_returns_tenant_gucs(self, tenant_a_user):
+        """Tenant user returns is_admin=false and tenant ID string."""
+        result = _resolve_user_guc_vars(tenant_a_user)
+        assert result["rls.is_admin"] == "false"
+        assert result["rls.current_tenant"] == str(tenant_a_user.rls_tenant_id)
+
+    def test_non_admin_with_none_tenant_id_raises(self):
+        """Non-admin user with rls_tenant_id=None raises ValueError."""
+        user = MagicMock()
+        user.is_tenant_admin = False
+        user.rls_tenant_id = None
+        with pytest.raises(ValueError, match="rls_tenant_id=None"):
+            _resolve_user_guc_vars(user)
+
+    def test_admin_with_none_tenant_id_ok(self):
+        """Admin user with rls_tenant_id=None is valid (admin bypasses RLS)."""
+        user = MagicMock()
+        user.is_tenant_admin = True
+        user.rls_tenant_id = None
+        result = _resolve_user_guc_vars(user)
+        assert result["rls.is_admin"] == "true"
+        assert result["rls.current_tenant"] == ""
+
+
 class TestWithRlsContext:
     """Tests for the @with_rls_context decorator."""
 
@@ -252,6 +287,19 @@ class TestWithRlsContext:
         my_func(as_user=tenant_a_user)
         assert get_guc("rls.current_tenant") is None
         assert get_guc("rls.is_admin") is None
+
+    def test_non_admin_with_none_tenant_id_raises(self):
+        """Decorator raises ValueError for non-admin user with rls_tenant_id=None."""
+        user = MagicMock()
+        user.is_tenant_admin = False
+        user.rls_tenant_id = None
+
+        @with_rls_context
+        def my_func(as_user):
+            return "should not reach"
+
+        with pytest.raises(ValueError, match="rls_tenant_id=None"):
+            my_func(as_user=user)
 
 
 class TestIsLocalMode:
