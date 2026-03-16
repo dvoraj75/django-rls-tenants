@@ -95,6 +95,55 @@ class TestCreateSQL:
         sql = _get_create_sql(c)
         assert "organization_id" in sql
 
+    def test_uses_case_when_structure(self):
+        """Policy uses CASE WHEN for index-friendly constant folding."""
+        c = RLSConstraint(field="tenant", name="test_rls")
+        sql = _get_create_sql(c)
+        assert "CASE WHEN" in sql
+        assert "THEN true" in sql
+        assert "ELSE tenant_id" in sql
+        assert "END" in sql
+
+    def test_no_top_level_or_in_policy_predicate(self):
+        """USING/WITH CHECK clauses have no top-level OR (it's inside CASE WHEN)."""
+        c = RLSConstraint(field="tenant", name="test_rls")
+        sql = _get_create_sql(c)
+        # Split out the USING and WITH CHECK clause contents
+        parts = sql.split("WITH CHECK")
+        using_part = parts[0].split("USING")[1]
+        check_part = parts[1]
+        # The OR should NOT appear at the top level of USING or WITH CHECK.
+        # It may appear inside the CASE WHEN condition (for extra bypass flags),
+        # but the basic case has no OR at all.
+        # Verify the old pattern "tenant_match OR admin_bypass" is gone.
+        assert "OR coalesce" not in using_part
+        assert "OR coalesce" not in check_part
+
+    def test_no_redundant_coalesce_null(self):
+        """Policy does not contain the redundant coalesce(..., NULL) wrapper."""
+        c = RLSConstraint(field="tenant", name="test_rls")
+        sql = _get_create_sql(c)
+        assert "coalesce" not in sql.lower()
+
+    def test_extra_bypass_flags_use_case_when_with_or(self):
+        """Extra bypass flags are OR'd inside the CASE WHEN condition."""
+        c = RLSConstraint(
+            field="tenant",
+            name="test_rls",
+            extra_bypass_flags=["rls.is_login_request", "rls.is_preauth_request"],
+        )
+        sql = _get_create_sql(c)
+        # Both flags should appear in the CASE WHEN condition (USING only)
+        parts = sql.split("WITH CHECK")
+        using_part = parts[0]
+        check_part = parts[1]
+        assert "rls.is_login_request" in using_part
+        assert "rls.is_preauth_request" in using_part
+        assert "rls.is_login_request" not in check_part
+        assert "rls.is_preauth_request" not in check_part
+        # The CASE WHEN in USING should contain OR for the bypass flags
+        assert "CASE WHEN" in using_part
+
 
 class TestRemoveSQL:
     """Tests for RLSConstraint.remove_sql()."""

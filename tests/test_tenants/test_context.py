@@ -12,6 +12,7 @@ from django_rls_tenants.tenants.context import (
     tenant_context,
     with_rls_context,
 )
+from django_rls_tenants.tenants.state import get_current_tenant_id
 
 pytestmark = pytest.mark.django_db
 
@@ -53,6 +54,28 @@ class TestTenantContext:
         with tenant_context("abc-123"):
             assert get_guc("rls.current_tenant") == "abc-123"
 
+    def test_sets_tenant_state(self, tenant_a):
+        """Sets ContextVar tenant state for auto-scoping."""
+        assert get_current_tenant_id() is None
+        with tenant_context(tenant_a.pk):
+            assert get_current_tenant_id() == tenant_a.pk
+        assert get_current_tenant_id() is None
+
+    def test_restores_state_on_exit(self, tenant_a):
+        """ContextVar state is restored on exit even after nesting."""
+        with tenant_context(1):
+            assert get_current_tenant_id() == 1
+            with tenant_context(tenant_a.pk):
+                assert get_current_tenant_id() == tenant_a.pk
+            assert get_current_tenant_id() == 1
+        assert get_current_tenant_id() is None
+
+    def test_state_cleared_on_exception(self, tenant_a):
+        """ContextVar state is restored when an exception occurs."""
+        with pytest.raises(RuntimeError, match="boom"), tenant_context(tenant_a.pk):
+            raise RuntimeError("boom")
+        assert get_current_tenant_id() is None
+
 
 class TestAdminContext:
     """Tests for admin_context()."""
@@ -79,6 +102,21 @@ class TestAdminContext:
             assert get_guc("rls.is_admin") == "true"
         assert get_guc("rls.is_admin") == "false"
         assert get_guc("rls.current_tenant") == str(tenant_a.pk)
+
+    def test_clears_tenant_state(self):
+        """Admin context clears ContextVar tenant state (no auto-scope filter)."""
+        assert get_current_tenant_id() is None
+        with admin_context():
+            assert get_current_tenant_id() is None
+        assert get_current_tenant_id() is None
+
+    def test_clears_state_inside_tenant(self, tenant_a):
+        """Admin context inside tenant context clears and restores state."""
+        with tenant_context(tenant_a.pk):
+            assert get_current_tenant_id() == tenant_a.pk
+            with admin_context():
+                assert get_current_tenant_id() is None
+            assert get_current_tenant_id() == tenant_a.pk
 
 
 class TestNesting:
@@ -110,6 +148,33 @@ class TestNesting:
             raise RuntimeError("boom")
         assert get_guc("rls.is_admin") is None
         assert get_guc("rls.current_tenant") is None
+
+    def test_state_nesting_admin_inside_tenant(self, tenant_a):
+        """ContextVar state tracks nesting of admin inside tenant."""
+        with tenant_context(tenant_a.pk):
+            assert get_current_tenant_id() == tenant_a.pk
+            with admin_context():
+                assert get_current_tenant_id() is None
+            assert get_current_tenant_id() == tenant_a.pk
+        assert get_current_tenant_id() is None
+
+    def test_state_nesting_tenant_inside_admin(self, tenant_a):
+        """ContextVar state tracks nesting of tenant inside admin."""
+        with admin_context():
+            assert get_current_tenant_id() is None
+            with tenant_context(tenant_a.pk):
+                assert get_current_tenant_id() == tenant_a.pk
+            assert get_current_tenant_id() is None
+        assert get_current_tenant_id() is None
+
+    def test_state_nesting_tenant_inside_tenant(self, tenant_a, tenant_b):
+        """ContextVar state tracks nesting of two different tenant contexts."""
+        with tenant_context(tenant_a.pk):
+            assert get_current_tenant_id() == tenant_a.pk
+            with tenant_context(tenant_b.pk):
+                assert get_current_tenant_id() == tenant_b.pk
+            assert get_current_tenant_id() == tenant_a.pk
+        assert get_current_tenant_id() is None
 
 
 class TestWithRlsContext:

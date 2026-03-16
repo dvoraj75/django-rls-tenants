@@ -37,16 +37,18 @@ ALTER TABLE "myapp_order" FORCE ROW LEVEL SECURITY;
 CREATE POLICY "myapp_order_tenant_isolation_policy"
 ON "myapp_order"
 USING (
-    tenant_id = coalesce(
-        nullif(current_setting('rls.current_tenant', true), '')::int, NULL
-    )
-    OR coalesce(current_setting('rls.is_admin', true) = 'true', false)
+    CASE WHEN current_setting('rls.is_admin', true) = 'true'
+         THEN true
+         ELSE tenant_id = nullif(
+             current_setting('rls.current_tenant', true), '')::int
+    END
 )
 WITH CHECK (
-    tenant_id = coalesce(
-        nullif(current_setting('rls.current_tenant', true), '')::int, NULL
-    )
-    OR coalesce(current_setting('rls.is_admin', true) = 'true', false)
+    CASE WHEN current_setting('rls.is_admin', true) = 'true'
+         THEN true
+         ELSE tenant_id = nullif(
+             current_setting('rls.current_tenant', true), '')::int
+    END
 );
 ```
 
@@ -88,29 +90,63 @@ class User(AbstractUser, RLSProtectedModel):
     for the auto-detection to work. If you name it differently, the handler will add
     a duplicate FK.
 
-## Using for_user()
+## Automatic Query Scoping
 
-The `RLSManager` provides `for_user()` to scope queries to a specific user's tenant:
+When a tenant context is active (via `tenant_context()`, `admin_context()`, or
+`RLSTenantMiddleware`), `RLSManager` **automatically** adds `WHERE tenant_id = X`
+to every query. No extra calls are needed:
 
 ```python
-# In a view or service function:
+from django_rls_tenants import tenant_context, admin_context
+
+# Queries are automatically scoped -- no for_user() needed
+with tenant_context(tenant_id=42):
+    orders = Order.objects.all()           # WHERE tenant_id = 42
+    active = Order.objects.filter(active=True)  # WHERE tenant_id = 42 AND active
+
+# Admin context -- no filter (sees all rows)
+with admin_context():
+    all_orders = Order.objects.all()       # no tenant filter
+```
+
+In views with `RLSTenantMiddleware`, this happens transparently:
+
+```python
+def list_orders(request):
+    # Middleware already set the context -- queries are auto-scoped
+    orders = Order.objects.filter(is_active=True)
+    return render(request, "orders/list.html", {"orders": orders})
+```
+
+**Why this matters:** PostgreSQL's `current_setting()` function used in RLS policies
+is not leakproof, so the planner cannot push the RLS predicate into index scans.
+The automatic ORM-level `WHERE tenant_id = X` filter enables composite indexes,
+eliminating sequential scan penalties at scale.
+
+## Using for_user()
+
+`for_user()` is still available and works as before. It scopes queries to a specific
+user's tenant and sets GUC variables at query evaluation time:
+
+```python
+# Explicit scoping (still works, useful outside context managers)
 def list_orders(request):
     orders = Order.objects.for_user(request.user)
     return render(request, "orders/list.html", {"orders": orders})
 ```
 
-For admin users, `for_user()` returns all rows (RLS admin bypass is set at evaluation
-time). For tenant users, it applies both a Django ORM filter (defense-in-depth) and
-sets the GUC variable at query evaluation time.
+If both auto-scoping and `for_user()` are active simultaneously, the query gets two
+identical `WHERE tenant_id = X` clauses. PostgreSQL deduplicates these -- no performance
+impact, correct results.
 
 ## Querying with Context Managers
 
-Alternatively, use context managers to set the RLS context for any code block:
+Context managers set the RLS context for any code block:
 
 ```python
 from django_rls_tenants import tenant_context, admin_context
 
-# As a specific tenant
+# As a specific tenant (queries auto-scoped)
 with tenant_context(tenant_id=42):
     orders = Order.objects.all()  # only tenant 42's orders
 

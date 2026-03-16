@@ -61,6 +61,11 @@ def test_tenant_isolation():
 | `tenant_id` | `int \| str` | *(required)* | Tenant PK to scope to. |
 | `using`     | `str`       | `"default"` | Database alias. |
 
+!!! info "Auto-scoping is active"
+    Inside an `rls_as_tenant` block, `RLSManager.get_queryset()` automatically adds
+    `WHERE tenant_id = X` to all queries. This means `Order.objects.all()` returns
+    only the scoped tenant's rows at both ORM and RLS levels.
+
 ## Assertion Functions
 
 ### assert_rls_enabled

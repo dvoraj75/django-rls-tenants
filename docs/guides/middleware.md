@@ -34,15 +34,18 @@ MIDDLEWARE = [
 3. If **authenticated**: reads the `TenantUser` protocol properties:
     - `is_tenant_admin`: if `True`, sets `rls.is_admin = 'true'` and clears `rls.current_tenant`.
     - `rls_tenant_id`: if not admin, sets `rls.current_tenant = str(tenant_id)` and `rls.is_admin = 'false'`.
-4. Marks a thread-local flag that GUCs were set (used by the safety-net signal handler).
+4. Sets the internal `ContextVar` state for automatic query scoping (tenant users get
+   auto-scoped queries; admin users and unauthenticated requests do not).
+5. Marks a thread-local flag that GUCs were set (used by the safety-net signal handler).
 
 ### Response Phase (`process_response`)
 
-1. If `USE_LOCAL_SET` is `False` (default): clears both GUC variables to prevent
+1. Clears the `ContextVar` auto-scope state to prevent cross-request leaks.
+2. If `USE_LOCAL_SET` is `False` (default): clears both GUC variables to prevent
    cross-request leaks on persistent connections.
-2. If `USE_LOCAL_SET` is `True`: GUCs are automatically cleared at transaction end
+3. If `USE_LOCAL_SET` is `True`: GUCs are automatically cleared at transaction end
    (by PostgreSQL), so explicit cleanup is skipped.
-3. Clears the thread-local GUC flag.
+4. Clears the thread-local GUC flag.
 
 ### Error Handling
 
@@ -68,17 +71,20 @@ RLSTenantMiddleware.process_request()
     ├── user.is_tenant_admin == True
     │   └── SET rls.is_admin = 'true'
     │       CLEAR rls.current_tenant
+    │       SET auto-scope state = None (no filter)
     │
     └── user.is_tenant_admin == False
         └── SET rls.current_tenant = str(tenant_id)
             SET rls.is_admin = 'false'
+            SET auto-scope state = tenant_id
     │
     ▼
-View executes (all queries filtered by RLS)
+View executes (queries auto-scoped + filtered by RLS)
     │
     ▼
 RLSTenantMiddleware.process_response()
     │
+    ├── CLEAR auto-scope state
     ├── USE_LOCAL_SET == False → CLEAR both GUCs
     └── USE_LOCAL_SET == True  → no-op (transaction handles cleanup)
 ```

@@ -10,6 +10,7 @@ from django.db import connection
 
 from django_rls_tenants.rls.guc import clear_guc
 from django_rls_tenants.tenants.context import admin_context
+from django_rls_tenants.tenants.state import set_current_tenant_id
 from tests.test_app.models import Document, Order, ProtectedUser, Tenant, TenantUser
 
 _RLS_ROLE = "rls_test_role"
@@ -25,12 +26,14 @@ _GUC_NAMES_TO_CLEAR = (
 
 @pytest.fixture(autouse=True)
 def _clear_gucs_after_test(db):
-    """Clear known GUC variables after each test.
+    """Clear known GUC variables and auto-scope state after each test.
 
-    Prevents GUC state from leaking between tests when a test fails
-    before reaching manual cleanup. Runs automatically for all tests.
+    Prevents GUC and ContextVar state from leaking between tests when
+    a test fails before reaching manual cleanup. Runs automatically
+    for all tests.
     """
     yield
+    set_current_tenant_id(None)
     for name in _GUC_NAMES_TO_CLEAR:
         with contextlib.suppress(Exception):
             clear_guc(name)

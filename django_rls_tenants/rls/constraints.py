@@ -141,19 +141,21 @@ class RLSConstraint(BaseConstraint):
         policy_name = f"{table}_tenant_isolation_policy"
 
         tenant_match = (
-            f"{self.field}_id = coalesce("
-            f"nullif(current_setting('{self.guc_tenant_var}', true), '')"
-            f"::{self.tenant_pk_type}, NULL)"
+            f"{self.field}_id = nullif("
+            f"current_setting('{self.guc_tenant_var}', true), '')"
+            f"::{self.tenant_pk_type}"
         )
-        admin_bypass = f"coalesce(current_setting('{self.guc_admin_var}', true) = 'true', false)"
+        admin_check = f"current_setting('{self.guc_admin_var}', true) = 'true'"
 
-        # Extra bypass flags apply to USING (SELECT) only, NOT WITH CHECK (INSERT/UPDATE).
-        extra_using_clauses = ""
-        for flag in self.extra_bypass_flags:
-            extra_using_clauses += (
-                "\n                                OR coalesce("
-                f"current_setting('{flag}', true) = 'true', false)"
-            )
+        # Build bypass conditions for CASE WHEN: admin is always first,
+        # extra bypass flags are appended (USING only, NOT WITH CHECK).
+        bypass_conditions_using = [admin_check]
+        bypass_conditions_using.extend(
+            f"current_setting('{flag}', true) = 'true'" for flag in self.extra_bypass_flags
+        )
+
+        bypass_clause_using = "\n                              OR ".join(bypass_conditions_using)
+        bypass_clause_check = admin_check  # only admin in WITH CHECK
 
         # Safety: all interpolated values come from model._meta (developer-defined)
         # and constructor args, not from user input. SQL injection is not possible.
@@ -174,12 +176,16 @@ class RLSConstraint(BaseConstraint):
                             CREATE POLICY "{policy_name}"
                             ON "{table}"
                             USING (
-                                {tenant_match}
-                                OR {admin_bypass}{extra_using_clauses}
+                                CASE WHEN {bypass_clause_using}
+                                     THEN true
+                                     ELSE {tenant_match}
+                                END
                             )
                             WITH CHECK (
-                                {tenant_match}
-                                OR {admin_bypass}
+                                CASE WHEN {bypass_clause_check}
+                                     THEN true
+                                     ELSE {tenant_match}
+                                END
                             );
                         $BODY$;
                     END IF;

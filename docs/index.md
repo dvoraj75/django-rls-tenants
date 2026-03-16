@@ -26,6 +26,7 @@ policy. The database itself becomes the trust boundary.
 ## Key Features
 
 - **Database-enforced isolation** -- RLS policies apply to every query, not just ORM calls.
+- **Automatic query scoping** -- queries are filtered at both ORM and database levels for defense-in-depth.
 - **Fail-closed by default** -- missing tenant context returns zero rows, never leaks data.
 - **Single schema, single database** -- no schema-per-tenant overhead.
 - **API-agnostic** -- works with Django REST Framework, GraphQL, async views, management commands.
@@ -52,8 +53,9 @@ policy. The database itself becomes the trust boundary.
 
 1. **Middleware** reads `request.user` and extracts tenant identity via the `TenantUser` protocol.
 2. **GUC variables** (`rls.current_tenant`, `rls.is_admin`) are set on the PostgreSQL connection.
-3. **RLS policies** (created automatically via Django migrations) filter every query at the database level.
-4. **Fail-closed**: if no GUC is set, the policy returns zero rows -- no data leak is possible.
+3. **Auto-scoping** adds `WHERE tenant_id = X` at the ORM level, enabling composite index usage.
+4. **RLS policies** (created automatically via Django migrations) filter every query at the database level as a safety net.
+5. **Fail-closed**: if no GUC is set, the policy returns zero rows -- no data leak is possible.
 
 ## Comparison with Alternatives
 

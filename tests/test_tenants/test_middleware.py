@@ -12,6 +12,7 @@ from django_rls_tenants.tenants.middleware import (
     _clear_gucs_set_flag,
     _were_gucs_set,
 )
+from django_rls_tenants.tenants.state import get_current_tenant_id
 
 pytestmark = pytest.mark.django_db
 
@@ -121,11 +122,64 @@ class TestThreadLocalFlags:
         assert _were_gucs_set() is True
 
 
+class TestAutoScopeState:
+    """Tests for ContextVar tenant state management in middleware."""
+
+    def test_sets_state_for_tenant_user(self, tenant_a_user):
+        """Middleware sets ContextVar state for tenant user."""
+        mw = RLSTenantMiddleware(get_response=lambda r: MagicMock())
+        request = _make_request(user=tenant_a_user)
+        mw.process_request(request)
+        assert get_current_tenant_id() == str(tenant_a_user.rls_tenant_id)
+
+    def test_clears_state_for_admin_user(self, admin_user):
+        """Middleware sets ContextVar state to None for admin user."""
+        mw = RLSTenantMiddleware(get_response=lambda r: MagicMock())
+        request = _make_request(user=admin_user)
+        mw.process_request(request)
+        assert get_current_tenant_id() is None
+
+    def test_no_state_for_unauthenticated(self):
+        """Middleware does not set ContextVar state for unauthenticated request."""
+        mw = RLSTenantMiddleware(get_response=lambda r: MagicMock())
+        user = MagicMock()
+        user.is_authenticated = False
+        request = _make_request(user=user)
+        mw.process_request(request)
+        assert get_current_tenant_id() is None
+
+    def test_process_response_clears_state(self, tenant_a_user):
+        """process_response clears ContextVar state."""
+        mw = RLSTenantMiddleware(get_response=lambda r: MagicMock())
+        request = _make_request(user=tenant_a_user)
+        mw.process_request(request)
+        assert get_current_tenant_id() is not None
+        response = MagicMock()
+        mw.process_response(request, response)
+        assert get_current_tenant_id() is None
+
+    def test_full_request_response_cycle(self, tenant_a_user):
+        """Full request/response cycle sets and clears ContextVar state."""
+        mw = RLSTenantMiddleware(get_response=lambda r: MagicMock())
+        request = _make_request(user=tenant_a_user)
+
+        # Before request
+        assert get_current_tenant_id() is None
+
+        # After process_request
+        mw.process_request(request)
+        assert get_current_tenant_id() == str(tenant_a_user.rls_tenant_id)
+
+        # After process_response
+        mw.process_response(request, MagicMock())
+        assert get_current_tenant_id() is None
+
+
 class TestProcessRequestExceptionHandling:
     """Tests for error handling in process_request."""
 
     def test_clears_gucs_and_reraises_on_resolve_error(self):
-        """When _resolve_user_guc_vars raises, both GUCs are cleared and error re-raised."""
+        """When _resolve_user_guc_vars raises, both GUCs and state are cleared."""
         mw = RLSTenantMiddleware(get_response=lambda r: MagicMock())
         user = MagicMock()
         user.is_authenticated = True
@@ -147,6 +201,8 @@ class TestProcessRequestExceptionHandling:
         # Both GUCs should have been cleared as safety measure
         assert get_guc("rls.is_admin") is None
         assert get_guc("rls.current_tenant") is None
+        # ContextVar state should also be cleared
+        assert get_current_tenant_id() is None
 
     def test_survives_double_failure_on_cleanup(self):
         """When both set_guc and cleanup clear_guc fail, the original error propagates."""

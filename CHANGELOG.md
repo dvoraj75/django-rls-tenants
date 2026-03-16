@@ -14,6 +14,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a custom `TENANT_FK_FIELD` (e.g., `"organization"`) would cause the handler to
   miss existing fields and attempt to add a duplicate FK.
 
+### Added
+
+- `get_current_tenant_id()` / `set_current_tenant_id()` functions for
+  custom middleware and management commands that need direct access to
+  the auto-scope state.
+
+### Changed
+
+- **Automatic query scoping**: `RLSManager.get_queryset()` now adds
+  `WHERE tenant_id = X` automatically when a tenant context is active
+  (via `tenant_context()`, `admin_context()`, or `RLSTenantMiddleware`).
+  This enables PostgreSQL to use composite indexes, eliminating the
+  sequential scan penalty of RLS `current_setting()` calls. No code
+  changes required -- activates automatically. `for_user()` continues
+  to work as before.
+- **RLS policy rewrite**: `RLSConstraint` now generates `CASE WHEN`
+  policies instead of `OR`-based policies. The admin check short-circuits
+  before evaluating the tenant match. Existing policies are updated on
+  the next migration.
+- `TenantQuerySet.select_related()` now auto-propagates tenant filters
+  to joined RLS-protected tables when a tenant context is active.
+
 ## [1.0.0] - 2026-03-15
 
 Initial stable release of django-rls-tenants.

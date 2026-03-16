@@ -38,7 +38,9 @@ class Order(RLSProtectedModel):
 `RLSProtectedModel` automatically:
 
 - Adds a `tenant` ForeignKey pointing to your tenant model.
-- Sets `RLSManager` as the default manager (with `for_user()` support).
+- Sets `RLSManager` as the default manager, which automatically scopes queries
+  to the current tenant when a context is active (via middleware or `tenant_context()`).
+  Also provides `for_user()` for explicit scoping.
 - Includes an `RLSConstraint` that generates the RLS policy during migrations.
 
 ## 3. Implement the TenantUser Protocol
@@ -108,6 +110,11 @@ MIDDLEWARE = [
 !!! important
     `RLSTenantMiddleware` must come **after** `AuthenticationMiddleware` because it
     reads `request.user` to determine the tenant context.
+
+The middleware automatically scopes all queries on RLS-protected models. In your
+views, `Order.objects.all()` returns only the current tenant's rows -- no
+`for_user()` call needed. The database-level RLS policy acts as a safety net on
+top of the ORM-level filter.
 
 ## 6. Run Migrations
 

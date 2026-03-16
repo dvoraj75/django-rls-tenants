@@ -10,11 +10,13 @@ returns zero rows.** This is the fail-closed default.
 
 ```sql
 -- When rls.current_tenant is empty or unset:
-tenant_id = coalesce(
-    nullif(current_setting('rls.current_tenant', true), '')::int,
-    NULL
-)
--- Evaluates to: tenant_id = NULL → always false → zero rows
+CASE WHEN current_setting('rls.is_admin', true) = 'true'
+     THEN true
+     ELSE tenant_id = nullif(
+         current_setting('rls.current_tenant', true), '')::int
+END
+-- Admin not set → ELSE branch → nullif('', '') → NULL
+-- tenant_id = NULL → always false → zero rows
 ```
 
 This means:

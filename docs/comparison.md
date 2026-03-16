@@ -8,6 +8,7 @@
 | Raw SQL safety | Filtered by DB automatically | Must use correct schema search_path | Not enforced |
 | dbshell safety | Filtered by DB automatically | Must set search_path manually | Not enforced |
 | Migration complexity | Single schema, standard migrations | One migration per tenant schema | Single schema, standard migrations |
+| Auto query scoping | Yes (ORM + RLS dual layer) | Yes (schema isolation) | Yes (ORM rewriting only) |
 | Scaling (1000+ tenants) | Single schema, no overhead | One PG schema per tenant (catalog bloat) | Depends on Citus setup |
 | PostgreSQL required | Yes | Yes | Yes (Citus extension) |
 | Django version support | 4.2 — 6.0 | 4.0+ | 3.2+ |
@@ -74,6 +75,8 @@
 
 - **Database-enforced**: the filter is in PostgreSQL, not in Python.
   Raw SQL, `dbshell`, and migrations are all subject to the policy.
+- **Dual-layer filtering**: ORM-level `WHERE` enables composite indexes, while
+  RLS provides a database-level safety net.
 - **Fail-closed**: missing tenant context = zero rows, not all rows.
 - **Single schema**: standard Django migrations run once, not once per tenant.
 - **No catalog bloat**: 1000 tenants ≈ same DB footprint as 1 tenant.

@@ -15,6 +15,7 @@ from django.utils.deprecation import MiddlewareMixin
 from django_rls_tenants.rls.guc import clear_guc, set_guc
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import _resolve_user_guc_vars
+from django_rls_tenants.tenants.state import set_current_tenant_id
 
 if TYPE_CHECKING:
     from django.http import HttpRequest, HttpResponse
@@ -82,9 +83,17 @@ class RLSTenantMiddleware(MiddlewareMixin):
                     set_guc(guc_name, guc_value, is_local=conf.USE_LOCAL_SET)
                 else:
                     clear_guc(guc_name, is_local=conf.USE_LOCAL_SET)
+
+            # Set auto-scope state for RLSManager.get_queryset()
+            tenant_value = guc_vars.get(conf.GUC_CURRENT_TENANT, "")
+            if tenant_value:
+                set_current_tenant_id(tenant_value)
+            else:
+                set_current_tenant_id(None)
             _mark_gucs_set()
         except Exception:
             logger.exception("Failed to set RLS GUC variables, clearing both to prevent leak")
+            set_current_tenant_id(None)
             try:
                 clear_guc(conf.GUC_IS_ADMIN)
                 clear_guc(conf.GUC_CURRENT_TENANT)
@@ -97,7 +106,8 @@ class RLSTenantMiddleware(MiddlewareMixin):
         request: HttpRequest,  # noqa: ARG002  -- required by MiddlewareMixin
         response: HttpResponse,
     ) -> HttpResponse:
-        """Clear GUC variables to prevent cross-request leaks."""
+        """Clear GUC variables and auto-scope state to prevent cross-request leaks."""
+        set_current_tenant_id(None)
         conf = rls_tenants_config
         if not conf.USE_LOCAL_SET:
             clear_guc(conf.GUC_IS_ADMIN)
