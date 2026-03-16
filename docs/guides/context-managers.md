@@ -27,7 +27,9 @@ with tenant_context(tenant_id=42):
 **Behavior:**
 
 - Sets `rls.is_admin = 'false'` and `rls.current_tenant = str(tenant_id)`.
-- Saves and restores previous GUC values on exit (supports nesting).
+- Sets the internal `ContextVar` state so `RLSManager.get_queryset()` automatically
+  adds `WHERE tenant_id = X` to all queries (auto-scoping).
+- Saves and restores previous GUC values and state on exit (supports nesting).
 - Raises `ValueError` if `tenant_id` is `None`.
 
 ```python
@@ -58,7 +60,9 @@ with admin_context():
 **Behavior:**
 
 - Sets `rls.is_admin = 'true'` and clears `rls.current_tenant`.
-- Saves and restores previous GUC values on exit (supports nesting).
+- Clears the internal `ContextVar` state so `RLSManager.get_queryset()` does not
+  add any tenant filter (admin sees all rows).
+- Saves and restores previous GUC values and state on exit (supports nesting).
 
 ## Nesting
 

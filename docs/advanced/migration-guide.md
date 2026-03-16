@@ -120,3 +120,55 @@ If you are adding multitenancy to an existing single-tenant application:
 
 The most challenging step is populating the tenant FK for existing data. Plan a data
 migration that assigns the correct tenant to each existing record.
+
+## Upgrading django-rls-tenants
+
+### From 1.0.0 to Unreleased
+
+This release has **no breaking changes**. All existing code continues to work without
+modification.
+
+#### What Changed
+
+1. **RLS policy SQL**: `RLSConstraint` now generates `CASE WHEN` policies instead of
+   `OR`-based policies. The admin check short-circuits before evaluating the tenant
+   match, improving per-row evaluation efficiency.
+
+2. **Automatic query scoping**: `RLSManager.get_queryset()` now adds
+   `WHERE tenant_id = X` automatically when a tenant context is active (via
+   `tenant_context()`, `admin_context()`, or `RLSTenantMiddleware`). This enables
+   composite indexes and eliminates sequential scan penalties at scale.
+
+3. **New public API**: `get_current_tenant_id()` and `set_current_tenant_id()` are
+   available for custom middleware and management commands that need direct access to
+   the auto-scope state.
+
+#### Upgrade Steps
+
+1. **Update the package**:
+
+    ```bash
+    pip install --upgrade django-rls-tenants
+    ```
+
+2. **Generate a new migration** to update the RLS policy SQL:
+
+    ```bash
+    python manage.py makemigrations
+    python manage.py migrate
+    ```
+
+    This replaces the `OR`-based policy with the `CASE WHEN` structure. The migration
+    is safe to run on a live database -- it drops and recreates the policy in a single
+    DDL statement.
+
+3. **Verify**: run `python manage.py check_rls`.
+
+#### Behavioral Notes
+
+- `for_user()` continues to work exactly as before.
+- Auto-scoping activates automatically -- no code changes required. If both
+  auto-scoping and `for_user()` are active simultaneously, PostgreSQL deduplicates
+  the identical `WHERE` clauses.
+- `TenantQuerySet.select_related()` now auto-propagates tenant filters to joined
+  RLS-protected tables when a tenant context is active.
