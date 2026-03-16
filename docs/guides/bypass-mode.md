@@ -50,13 +50,15 @@ class ProtectedUser(RLSProtectedModel):
 
 | Behavior | Admin bypass | Extra bypass flags |
 |----------|-------------|-------------------|
-| Added to `USING` clause (SELECT/UPDATE/DELETE) | Yes | Yes |
-| Added to `WITH CHECK` clause (INSERT/UPDATE) | Yes | **No** |
+| In `CASE WHEN` condition (`USING` clause) | Yes | Yes |
+| In `CASE WHEN` condition (`WITH CHECK` clause) | Yes | **No** |
 | Allows reading all rows | Yes | Yes |
 | Allows inserting/updating without tenant | Yes | **No** |
 
-Extra bypass flags are intentionally read-only. This prevents accidental writes
-without proper tenant context.
+The RLS policy uses a `CASE WHEN` structure where bypass conditions are checked
+first. If any bypass condition is true, the tenant match is skipped entirely.
+Extra bypass flags appear only in the `USING` clause, so they enable read access
+(SELECT/UPDATE/DELETE) but not writes without a valid tenant context.
 
 ### Setting Bypass Flags
 

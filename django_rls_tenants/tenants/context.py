@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from django_rls_tenants.rls.guc import clear_guc, get_guc, set_guc
 from django_rls_tenants.tenants.conf import rls_tenants_config
+from django_rls_tenants.tenants.state import reset_current_tenant_id, set_current_tenant_id
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -87,6 +88,7 @@ def tenant_context(
         prev_admin = get_guc(conf.GUC_IS_ADMIN, using=using)
         prev_tenant = get_guc(conf.GUC_CURRENT_TENANT, using=using)
 
+    token = set_current_tenant_id(tenant_id)
     set_guc(conf.GUC_IS_ADMIN, "false", is_local=is_local, using=using)
     set_guc(
         conf.GUC_CURRENT_TENANT,
@@ -97,6 +99,7 @@ def tenant_context(
     try:
         yield
     finally:
+        reset_current_tenant_id(token)
         if not is_local:
             _restore_guc(conf.GUC_IS_ADMIN, prev_admin, using=using)
             _restore_guc(conf.GUC_CURRENT_TENANT, prev_tenant, using=using)
@@ -122,6 +125,7 @@ def admin_context(
         prev_admin = get_guc(conf.GUC_IS_ADMIN, using=using)
         prev_tenant = get_guc(conf.GUC_CURRENT_TENANT, using=using)
 
+    token = set_current_tenant_id(None)
     set_guc(conf.GUC_IS_ADMIN, "true", is_local=is_local, using=using)
     # Clear tenant GUC for admin mode; the admin_bypass clause in the
     # RLS policy handles access independently. Avoids the old "-1"
@@ -130,6 +134,7 @@ def admin_context(
     try:
         yield
     finally:
+        reset_current_tenant_id(token)
         if not is_local:
             _restore_guc(conf.GUC_IS_ADMIN, prev_admin, using=using)
             _restore_guc(conf.GUC_CURRENT_TENANT, prev_tenant, using=using)

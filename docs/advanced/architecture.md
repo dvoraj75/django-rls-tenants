@@ -97,28 +97,30 @@ ALTER TABLE "myapp_order" FORCE ROW LEVEL SECURITY;
 CREATE POLICY "myapp_order_tenant_isolation_policy"
 ON "myapp_order"
 USING (
-    -- Row matches current tenant
-    tenant_id = coalesce(
-        nullif(current_setting('rls.current_tenant', true), '')::int, NULL
-    )
-    -- OR admin bypass
-    OR coalesce(current_setting('rls.is_admin', true) = 'true', false)
+    CASE WHEN current_setting('rls.is_admin', true) = 'true'
+         THEN true
+         ELSE tenant_id = nullif(
+             current_setting('rls.current_tenant', true), '')::int
+    END
 )
 WITH CHECK (
-    -- Same conditions for INSERT/UPDATE
-    tenant_id = coalesce(
-        nullif(current_setting('rls.current_tenant', true), '')::int, NULL
-    )
-    OR coalesce(current_setting('rls.is_admin', true) = 'true', false)
+    CASE WHEN current_setting('rls.is_admin', true) = 'true'
+         THEN true
+         ELSE tenant_id = nullif(
+             current_setting('rls.current_tenant', true), '')::int
+    END
 );
 ```
 
 Key design decisions in the policy:
 
+- **`CASE WHEN ... THEN true ELSE ...`**: the `CASE` structure short-circuits
+  evaluation. For admin queries the tenant check is skipped entirely. For normal
+  tenant queries the expression reduces to a simple `tenant_id = <value>` equality.
 - **`current_setting(..., true)`**: the `true` parameter returns empty string instead
   of raising an error when the GUC is not set. This enables fail-closed behavior.
-- **`nullif(..., '')`**: converts empty string to `NULL`, so `coalesce` returns `NULL`,
-  making the `tenant_id = NULL` comparison false (no rows match).
+- **`nullif(..., '')`**: converts empty string to `NULL`, making the
+  `tenant_id = NULL` comparison false (no rows match -- fail-closed).
 - **`::int` cast**: ensures type safety. The cast type is configurable via `TENANT_PK_TYPE`.
 - **`FORCE ROW LEVEL SECURITY`**: ensures RLS applies even to the table owner,
   preventing accidental bypass through superuser connections.

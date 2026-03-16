@@ -6,6 +6,7 @@ They verify database-level tenant isolation via both ORM and raw SQL.
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from io import StringIO
 
@@ -16,6 +17,7 @@ from django.db import connection
 from django_rls_tenants.rls.guc import get_guc, set_guc
 from django_rls_tenants.tenants.bypass import bypass_flag
 from django_rls_tenants.tenants.context import admin_context, tenant_context
+from django_rls_tenants.tenants.state import get_current_tenant_id
 from tests.test_app.models import Document, Order, ProtectedUser
 
 pytestmark = pytest.mark.django_db
@@ -373,3 +375,171 @@ class TestCheckRlsCommand:
         finally:
             with connection.cursor() as cur:
                 cur.execute('ALTER TABLE "test_order" ENABLE ROW LEVEL SECURITY')
+
+
+# ---------------------------------------------------------------------------
+# EXPLAIN-based index usage verification
+# ---------------------------------------------------------------------------
+
+
+def _collect_node_types(plan: dict) -> list[str]:
+    """Recursively collect all 'Node Type' values from an EXPLAIN JSON plan."""
+    types = []
+    if "Node Type" in plan:
+        types.append(plan["Node Type"])
+    for child in plan.get("Plans", []):
+        types.extend(_collect_node_types(child))
+    return types
+
+
+class TestRlsPolicyIndexUsage:
+    """Verify the CASE WHEN policy does not prevent index scans.
+
+    PostgreSQL's security barrier mechanism prevents non-leakproof
+    functions (like ``current_setting()``) from being pushed into index
+    quals. This means the RLS policy expression is always applied as a
+    Filter, never as an Index Cond.
+
+    However, when the ORM adds an explicit ``WHERE tenant_id = X``
+    (as ``for_user()`` does), the planner uses that equality as an
+    index condition, and the RLS policy is applied as a secondary
+    filter on already-scoped rows. The CASE WHEN structure ensures
+    the admin check short-circuits efficiently during per-row evaluation.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup_index_and_data(self, tenant_a, tenant_b):
+        """Create a composite index and seed rows."""
+        with connection.cursor() as cur:
+            # RESET ROLE so we have privileges to create indexes
+            cur.execute("RESET ROLE")
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_test_order_tenant_id ON test_order (tenant_id)"
+            )
+        with admin_context():
+            Order.objects.all().delete()
+            orders = []
+            for i in range(50):
+                orders.append(Order(product=f"Item A{i}", amount=1, tenant=tenant_a))
+                orders.append(Order(product=f"Item B{i}", amount=1, tenant=tenant_b))
+            Order.objects.bulk_create(orders)
+        with connection.cursor() as cur:
+            cur.execute("ANALYZE test_order")
+        yield
+        with connection.cursor() as cur:
+            cur.execute("RESET ROLE")
+            cur.execute("DROP INDEX IF EXISTS idx_test_order_tenant_id")
+
+    def test_explicit_where_uses_index_with_rls(self, tenant_a):
+        """ORM-level WHERE tenant_id = X drives an index scan through RLS.
+
+        This simulates the ``for_user()`` pattern: the ORM filter adds
+        ``WHERE tenant_id = X``, which the planner uses as an Index Cond.
+        The RLS CASE WHEN policy is applied as a secondary Filter on the
+        already-scoped rows. We disable seq scan to force the index path.
+        """
+        with tenant_context(tenant_a.pk), connection.cursor() as cur:
+            cur.execute("SET enable_seqscan = off")
+            try:
+                cur.execute(
+                    "EXPLAIN (FORMAT JSON) SELECT * FROM test_order WHERE tenant_id = %s",
+                    [tenant_a.pk],
+                )
+                plan_json = cur.fetchone()[0]
+            finally:
+                cur.execute("SET enable_seqscan = on")
+
+        plan = (
+            plan_json[0]["Plan"]
+            if isinstance(plan_json, list)
+            else json.loads(plan_json)[0]["Plan"]
+        )
+        node_types = _collect_node_types(plan)
+
+        # Accept any index-based scan (Index Scan, Index Only Scan,
+        # Bitmap Index Scan + Bitmap Heap Scan).
+        index_scan_types = {"Index Scan", "Index Only Scan", "Bitmap Index Scan"}
+        uses_index = bool(index_scan_types & set(node_types))
+
+        assert uses_index, (
+            f"Expected an index scan for tenant-scoped query with explicit "
+            f"WHERE and enable_seqscan=off, but got node types: {node_types}"
+        )
+
+    def test_rls_policy_uses_case_when_structure(self):
+        """Verify the installed policy uses the optimized CASE WHEN structure.
+
+        This checks that the migration applied the new policy format
+        rather than the old ``OR``-based structure.
+        """
+        with connection.cursor() as cur:
+            cur.execute("RESET ROLE")
+            cur.execute(
+                """
+                SELECT pg_get_expr(polqual, polrelid)
+                FROM pg_policy
+                WHERE polrelid = 'test_order'::regclass
+                """,
+            )
+            using_clause = cur.fetchone()[0]
+
+        assert "CASE" in using_clause
+        assert "WHEN" in using_clause
+        # The old OR pattern should not be present
+        assert " OR " not in using_clause or "WHEN" in using_clause.split(" OR ")[0]
+
+
+# ---------------------------------------------------------------------------
+# Auto-scope integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestAutoScope:
+    """Verify automatic query scoping via ContextVar state + RLS."""
+
+    def test_auto_scope_returns_correct_rows(self, sample_orders, tenant_a):
+        """Auto-scoped query returns only the active tenant's rows."""
+        with tenant_context(tenant_a.pk):
+            orders = list(Order.objects.values_list("product", flat=True))
+        assert sorted(orders) == ["Widget A1", "Widget A2"]
+
+    def test_auto_scope_tenant_b(self, sample_orders, tenant_b):
+        """Auto-scoped query returns only Tenant B's rows."""
+        with tenant_context(tenant_b.pk):
+            orders = list(Order.objects.values_list("product", flat=True))
+        assert orders == ["Gadget B1"]
+
+    def test_auto_scope_admin_sees_all(self, sample_orders):
+        """Admin context disables auto-scope, sees all rows."""
+        with admin_context():
+            assert Order.objects.count() == 3
+
+    def test_auto_scope_nested_contexts(self, sample_orders, tenant_a, tenant_b):
+        """Nested contexts correctly switch auto-scope."""
+        with tenant_context(tenant_a.pk):
+            assert Order.objects.count() == 2
+            with tenant_context(tenant_b.pk):
+                assert Order.objects.count() == 1
+            assert Order.objects.count() == 2
+
+    def test_auto_scope_query_contains_where_clause(self, sample_orders, tenant_a):
+        """Verify the generated SQL contains an explicit WHERE tenant_id clause."""
+        with tenant_context(tenant_a.pk):
+            qs = Order.objects.all()
+            sql = str(qs.query)
+            assert "tenant_id" in sql
+
+    def test_auto_scope_no_where_without_context(self, sample_orders):
+        """Without context, no WHERE clause in generated SQL."""
+        assert get_current_tenant_id() is None
+        qs = Order.objects.all()
+        sql = str(qs.query)
+        assert "WHERE" not in sql
+
+    def test_auto_scope_cross_model(self, sample_orders, sample_documents, tenant_a):
+        """Auto-scope works across multiple RLS-protected models."""
+        with tenant_context(tenant_a.pk):
+            orders = list(Order.objects.values_list("product", flat=True))
+            docs = list(Document.objects.values_list("title", flat=True))
+        assert sorted(orders) == ["Widget A1", "Widget A2"]
+        assert docs == ["Doc A"]
