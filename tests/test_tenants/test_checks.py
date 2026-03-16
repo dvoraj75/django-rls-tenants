@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from django.core.checks import Warning as CheckWarning
@@ -11,6 +11,7 @@ from django.test import override_settings
 from django_rls_tenants.tenants.checks import (
     _check_conn_max_age_with_session_gucs,
     _check_guc_prefix_mismatch,
+    _check_superuser_connection,
     _check_use_local_set_requires_atomic,
     check_rls_config,
 )
@@ -26,9 +27,11 @@ class TestCheckRlsConfig:
     """Tests for the top-level check_rls_config orchestrator."""
 
     def test_no_warnings_with_default_config(self):
-        """Default test config produces no warnings."""
+        """Default test config produces no warnings (excluding superuser check)."""
         warnings = check_rls_config()
-        assert warnings == []
+        # Filter out W005 since test DB may run as superuser
+        non_superuser_warnings = [w for w in warnings if w.id != "django_rls_tenants.W005"]
+        assert non_superuser_warnings == []
 
 
 class TestCheckGucPrefixMismatch:
@@ -217,3 +220,83 @@ class TestCheckConnMaxAgeWithSessionGucs:
         ):
             warnings = _check_conn_max_age_with_session_gucs()
         assert "300" in warnings[0].msg
+
+    def test_w004_conn_max_age_none_means_infinite(self):
+        """W004 fires when CONN_MAX_AGE=None (keep connections forever)."""
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "USE_LOCAL_SET": False,
+                },
+                DATABASES={
+                    "default": {
+                        "ENGINE": "django.db.backends.postgresql",
+                        "NAME": "test",
+                        "CONN_MAX_AGE": None,
+                    },
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_conn_max_age_with_session_gucs()
+        ids = [w.id for w in warnings]
+        assert "django_rls_tenants.W004" in ids
+
+
+class TestCheckSuperuserConnection:
+    """Tests for _check_superuser_connection."""
+
+    def test_w005_when_superuser(self):
+        """W005 fires when connected as a PostgreSQL superuser."""
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = (True,)
+        mock_cursor.__enter__ = lambda self: self
+        mock_cursor.__exit__ = MagicMock(return_value=False)
+
+        with patch(
+            "django_rls_tenants.tenants.checks.connection",
+        ) as mock_conn:
+            mock_conn.cursor.return_value = mock_cursor
+            warnings = _check_superuser_connection()
+        ids = [w.id for w in warnings]
+        assert "django_rls_tenants.W005" in ids
+        assert "superuser" in warnings[0].msg.lower()
+        assert isinstance(warnings[0], CheckWarning)
+
+    def test_no_warning_when_not_superuser(self):
+        """No W005 when connected as a regular user."""
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = (False,)
+        mock_cursor.__enter__ = lambda self: self
+        mock_cursor.__exit__ = MagicMock(return_value=False)
+
+        with patch(
+            "django_rls_tenants.tenants.checks.connection",
+        ) as mock_conn:
+            mock_conn.cursor.return_value = mock_cursor
+            warnings = _check_superuser_connection()
+        assert warnings == []
+
+    def test_no_warning_when_db_unavailable(self):
+        """No W005 when the database is unavailable (graceful fallback)."""
+        with patch(
+            "django_rls_tenants.tenants.checks.connection",
+        ) as mock_conn:
+            mock_conn.cursor.side_effect = Exception("connection refused")
+            warnings = _check_superuser_connection()
+        assert warnings == []
+
+    def test_no_warning_when_user_not_in_pg_user(self):
+        """No W005 when current_user is not found in pg_user (e.g., role-based)."""
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = None
+        mock_cursor.__enter__ = lambda self: self
+        mock_cursor.__exit__ = MagicMock(return_value=False)
+
+        with patch(
+            "django_rls_tenants.tenants.checks.connection",
+        ) as mock_conn:
+            mock_conn.cursor.return_value = mock_cursor
+            warnings = _check_superuser_connection()
+        assert warnings == []

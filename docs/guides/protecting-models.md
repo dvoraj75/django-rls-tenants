@@ -136,8 +136,8 @@ def list_orders(request):
 ```
 
 If both auto-scoping and `for_user()` are active simultaneously, the query gets two
-identical `WHERE tenant_id = X` clauses. PostgreSQL deduplicates these -- no performance
-impact, correct results.
+redundant `WHERE tenant_id = X` clauses. This is by design for defense-in-depth; the
+cost of the double equality check per row is negligible.
 
 ## Querying with Context Managers
 

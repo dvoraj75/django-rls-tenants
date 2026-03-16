@@ -130,7 +130,7 @@ class TestAutoScopeState:
         mw = RLSTenantMiddleware(get_response=lambda r: MagicMock())
         request = _make_request(user=tenant_a_user)
         mw.process_request(request)
-        assert get_current_tenant_id() == str(tenant_a_user.rls_tenant_id)
+        assert get_current_tenant_id() == tenant_a_user.rls_tenant_id
 
     def test_clears_state_for_admin_user(self, admin_user):
         """Middleware sets ContextVar state to None for admin user."""
@@ -168,7 +168,7 @@ class TestAutoScopeState:
 
         # After process_request
         mw.process_request(request)
-        assert get_current_tenant_id() == str(tenant_a_user.rls_tenant_id)
+        assert get_current_tenant_id() == tenant_a_user.rls_tenant_id
 
         # After process_response
         mw.process_response(request, MagicMock())
