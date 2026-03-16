@@ -16,9 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `get_current_tenant_id()` / `set_current_tenant_id()` functions for
-  custom middleware and management commands that need direct access to
-  the auto-scope state.
+- `get_current_tenant_id()` / `set_current_tenant_id()` /
+  `reset_current_tenant_id()` functions for custom middleware and
+  management commands that need direct access to the auto-scope state.
+  Use the token returned by `set_current_tenant_id()` with
+  `reset_current_tenant_id(token)` to safely restore the previous value.
 
 ### Changed
 
@@ -30,9 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changes required -- activates automatically. `for_user()` continues
   to work as before.
 - **RLS policy rewrite**: `RLSConstraint` now generates `CASE WHEN`
-  policies instead of `OR`-based policies. The admin check short-circuits
-  before evaluating the tenant match. Existing policies are updated on
-  the next migration.
+  policies instead of `OR`-based policies, improving readability and
+  clarifying the evaluation structure. Existing policies are updated on
+  the next migration. (Note: the primary performance improvement comes
+  from auto-scoping above, which enables index usage. The `CASE WHEN`
+  rewrite is a clarity improvement, not a performance optimization.)
 - `TenantQuerySet.select_related()` now auto-propagates tenant filters
   to joined RLS-protected tables when a tenant context is active.
 

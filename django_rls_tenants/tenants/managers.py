@@ -10,6 +10,16 @@ the queryset automatically adds ``WHERE tenant_id = X`` to every query.
 For joins via ``select_related()``, tenant filters are also propagated
 to joined RLS-protected tables, enabling PostgreSQL to use composite
 indexes on both sides of the join.
+
+.. note:: **``for_user()`` GUC limitation**
+
+    The ``for_user()`` mechanism only sets GUC variables during
+    ``_fetch_all()`` (iteration). Methods that bypass ``_fetch_all``
+    (``count()``, ``exists()``, ``aggregate()``, ``update()``,
+    ``delete()``, ``iterator()``) do **not** trigger GUC setting.
+    For non-middleware entry points (Celery tasks, management commands),
+    prefer ``tenant_context()`` or ``admin_context()`` which set GUCs
+    at the connection level for the entire block.
 """
 
 from __future__ import annotations
@@ -18,6 +28,7 @@ import logging
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
+from django.core.exceptions import FieldDoesNotExist
 from django.db import models
 
 from django_rls_tenants.rls.guc import clear_guc, set_guc
@@ -56,10 +67,22 @@ def _rls_model_cache() -> frozenset[type[models.Model]]:
 
     Called lazily after Django's app registry is ready. The result is
     cached for the lifetime of the process (model set doesn't change).
+
+    Raises:
+        RuntimeError: If called before ``django.apps`` is fully ready,
+            to prevent caching an incomplete model set.
     """
     from django.apps import apps  # noqa: PLC0415  -- lazy import avoids circular
 
     from django_rls_tenants.rls.constraints import RLSConstraint  # noqa: PLC0415
+
+    if not apps.ready:
+        msg = (
+            "_rls_model_cache() called before Django apps are ready. "
+            "This would cache an incomplete model set. Ensure all apps "
+            "are loaded before accessing RLS-protected querysets."
+        )
+        raise RuntimeError(msg)
 
     protected: set[type[models.Model]] = set()
     for model in apps.get_models():
@@ -78,6 +101,24 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
     ``select_related()`` automatically adds ``WHERE related.tenant_id = X``
     for joined RLS-protected tables, enabling index usage on both sides
     of the join.
+
+    .. warning:: **Limitation of ``for_user()`` GUC management**
+
+        GUC variables are only set during ``_fetch_all()`` (iteration).
+        QuerySet methods that bypass ``_fetch_all()`` — such as
+        ``count()``, ``exists()``, ``aggregate()``, ``update()``,
+        ``delete()``, and ``iterator()`` — will **not** have GUC
+        variables set by ``for_user()``.
+
+        For non-admin users this is safe because ``for_user()`` also
+        adds a Django ORM ``WHERE tenant_id = X`` filter. For **admin
+        users** (``is_tenant_admin=True``), no ORM filter is applied,
+        so these methods run against whatever GUC state the connection
+        already has.
+
+        For non-middleware contexts (Celery tasks, management commands),
+        use ``tenant_context()`` or ``admin_context()`` instead, which
+        set GUCs at the connection level for the entire block.
     """
 
     _rls_user: TenantUser | None
@@ -94,6 +135,16 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
 
         The queryset remains lazy and chainable. GUC variables are set
         when the queryset is evaluated, not when ``for_user()`` is called.
+
+        .. warning::
+
+            GUC variables are only set during iteration (``_fetch_all``).
+            Methods like ``count()``, ``exists()``, ``aggregate()``,
+            ``update()``, ``delete()``, and ``iterator()`` bypass
+            ``_fetch_all`` and will **not** have GUC variables set.
+            For admin users this means those methods run without GUC
+            protection. Use ``tenant_context()`` or ``admin_context()``
+            for full coverage in non-middleware contexts.
 
         Args:
             as_user: User object satisfying the ``TenantUser`` protocol.
@@ -119,10 +170,21 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
 
         Falls back to ``super().select_related()`` when no tenant scope
         is active or when called with no arguments (select-all mode).
+
+        Handles ``select_related(False)`` (Django 5.x) and
+        ``select_related(None)`` (Django 6.0+) for clearing without
+        adding tenant filters.
         """
-        qs: TenantQuerySet = super().select_related(*fields)
+        # Django 5.x uses False, Django 6.0+ uses None to clear
+        # select_related. Normalize to None before calling super() to
+        # avoid AttributeError: 'bool' object has no attribute 'split'.
+        if fields in ((False,), (None,)):
+            return super().select_related(None)
+        if not fields:
+            return super().select_related()
         tenant_id = self._get_active_tenant_id()
-        if tenant_id is None or not fields:
+        qs: TenantQuerySet = super().select_related(*fields)
+        if tenant_id is None:
             return qs
         conf = rls_tenants_config
         fk_field_id = f"{conf.TENANT_FK_FIELD}_id"
@@ -170,13 +232,12 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
             user = self._rls_user
             ctx_tenant_id = None if user.is_tenant_admin else user.rls_tenant_id
             token = set_current_tenant_id(ctx_tenant_id)
-
-            for guc_name, guc_value in guc_vars.items():
-                if guc_value:
-                    set_guc(guc_name, guc_value, is_local=conf.USE_LOCAL_SET, using=db_alias)
-                else:
-                    clear_guc(guc_name, is_local=conf.USE_LOCAL_SET, using=db_alias)
             try:
+                for guc_name, guc_value in guc_vars.items():
+                    if guc_value:
+                        set_guc(guc_name, guc_value, is_local=conf.USE_LOCAL_SET, using=db_alias)
+                    else:
+                        clear_guc(guc_name, is_local=conf.USE_LOCAL_SET, using=db_alias)
                 super()._fetch_all()
             finally:
                 reset_current_tenant_id(token)
@@ -208,7 +269,7 @@ def _resolve_related_model(
     for part in field_path.split("__"):
         try:
             field = current._meta.get_field(part)  # noqa: SLF001
-        except Exception:
+        except FieldDoesNotExist:
             return None
         related = getattr(field, "related_model", None)
         if related is None or isinstance(related, str):

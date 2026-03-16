@@ -40,6 +40,11 @@ class DjangoRlsTenantsConfig(AppConfig):
             if not _were_gucs_set():
                 return
             try:
+                from django_rls_tenants.tenants.state import (  # noqa: PLC0415
+                    set_current_tenant_id,
+                )
+
+                set_current_tenant_id(None)
                 conf = rls_tenants_config
                 if not conf.USE_LOCAL_SET:
                     clear_guc(conf.GUC_IS_ADMIN)

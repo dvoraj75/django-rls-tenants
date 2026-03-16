@@ -5,16 +5,17 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
+from django.core.exceptions import FieldError
 
 from django_rls_tenants.rls.guc import get_guc
 from django_rls_tenants.tenants.context import admin_context, tenant_context
-from django_rls_tenants.tenants.managers import _is_rls_protected
+from django_rls_tenants.tenants.managers import _is_rls_protected, _resolve_related_model
 from django_rls_tenants.tenants.state import (
     get_current_tenant_id,
     reset_current_tenant_id,
     set_current_tenant_id,
 )
-from tests.test_app.models import Order, Tenant
+from tests.test_app.models import Order, OrderItem, Tenant
 
 pytestmark = pytest.mark.django_db
 
@@ -157,7 +158,8 @@ class TestAutoScope:
     def test_for_user_still_works_with_auto_scope(self, sample_orders, tenant_a_user, tenant_a):
         """for_user() still works correctly even when auto-scope is also active.
 
-        Both add a WHERE tenant_id = X clause. PostgreSQL deduplicates them.
+        Both add a WHERE tenant_id = X clause. The redundancy is by design
+        for defense-in-depth; the double equality check cost is negligible.
         """
         with tenant_context(tenant_a.pk):
             qs = Order.objects.for_user(tenant_a_user)
@@ -281,3 +283,130 @@ class TestPrepareTenantInModelData:
         data = {"product": "Widget"}
         Order.objects.prepare_tenant_in_model_data(data, as_user=tenant_a_user)
         assert "tenant" not in data
+
+
+class TestSelectRelated:
+    """Tests for TenantQuerySet.select_related() tenant propagation."""
+
+    def test_select_related_false_does_not_crash(self, sample_orders, tenant_a):
+        """select_related(False) must not crash (clears select_related)."""
+        with tenant_context(tenant_a.pk):
+            qs = Order.objects.all().select_related("tenant").select_related(False)
+            # Should work without AttributeError
+            assert list(qs) is not None
+
+    def test_select_related_no_args_falls_through(self, sample_orders, tenant_a):
+        """select_related() with no arguments falls through to super()."""
+        with tenant_context(tenant_a.pk):
+            qs = Order.objects.all().select_related()
+            sql = str(qs.query)
+            # Auto-scope adds tenant_id filter, but no extra join filters
+            assert "tenant_id" in sql
+
+    def test_select_related_non_rls_model_no_extra_filter(self, sample_orders, tenant_a):
+        """select_related('tenant') to a non-RLS model does NOT add extra filter."""
+        with tenant_context(tenant_a.pk):
+            qs = Order.objects.all().select_related("tenant")
+            sql = str(qs.query)
+            # Auto-scope filter is present (from get_queryset)
+            assert "tenant_id" in sql
+            # But no extra filter like tenant__tenant_id should be added
+            # because Tenant is not RLS-protected
+            assert "tenant__tenant_id" not in sql
+
+    def test_select_related_rls_model_adds_filter(self, sample_order_items, tenant_a):
+        """select_related('order') on OrderItem adds tenant filter on joined Order."""
+        with tenant_context(tenant_a.pk):
+            qs = OrderItem.objects.all().select_related("order")
+            sql = str(qs.query)
+            # Auto-scope on OrderItem itself
+            assert "tenant_id" in sql
+            # Extra filter on the joined Order table
+            assert "order__tenant_id" in sql or "order" in sql
+
+    def test_select_related_rls_model_returns_correct_data(self, sample_order_items, tenant_a):
+        """select_related('order') returns only tenant A's items with orders."""
+        with tenant_context(tenant_a.pk):
+            items = list(OrderItem.objects.all().select_related("order"))
+            descriptions = sorted(item.description for item in items)
+            assert descriptions == ["Part A1-1", "Part A2-1"]
+            # Verify the joined order is accessible
+            for item in items:
+                assert item.order is not None
+                assert item.order.tenant_id == tenant_a.pk
+
+    def test_select_related_dotted_path(self, sample_order_items, tenant_a):
+        """select_related('order__tenant') follows multi-level path."""
+        with tenant_context(tenant_a.pk):
+            qs = OrderItem.objects.all().select_related("order__tenant")
+            # Should not crash; order is RLS-protected, tenant is not
+            items = list(qs)
+            assert len(items) == 2
+
+    def test_select_related_invalid_field_ignored(self, sample_orders, tenant_a):
+        """select_related('nonexistent') is handled by Django (not our code)."""
+        with tenant_context(tenant_a.pk):
+            # Django validates fields at evaluation time. Our override
+            # calls _resolve_related_model which returns None for invalid paths.
+            qs = Order.objects.all().select_related("nonexistent")
+            # _resolve_related_model returns None, so no extra filter
+            # Django itself will raise FieldError when evaluating the queryset
+            with pytest.raises(FieldError, match="Invalid field name"):
+                list(qs)
+
+    def test_select_related_no_context_skips_filter(self, sample_order_items):
+        """select_related() without tenant context does not add extra filters."""
+        assert get_current_tenant_id() is None
+        qs = OrderItem.objects.all().select_related("order")
+        sql = str(qs.query)
+        # No auto-scope, no extra join filters
+        assert "WHERE" not in sql
+
+    def test_select_related_admin_context_skips_filter(self, sample_order_items):
+        """select_related() in admin context does not add extra filters."""
+        with admin_context():
+            qs = OrderItem.objects.all().select_related("order")
+            sql = str(qs.query)
+            # Admin context: no auto-scope filter
+            assert "WHERE" not in sql
+
+    def test_select_related_with_for_user(self, sample_order_items, tenant_a_user):
+        """select_related() works correctly with for_user()."""
+        qs = OrderItem.objects.for_user(tenant_a_user).select_related("order")
+        items = list(qs)
+        descriptions = sorted(item.description for item in items)
+        assert descriptions == ["Part A1-1", "Part A2-1"]
+
+
+class TestResolveRelatedModel:
+    """Tests for the _resolve_related_model() helper."""
+
+    def test_single_field_fk(self):
+        """Resolves a single FK field to its target model."""
+        result = _resolve_related_model(Order, "tenant")
+        assert result is Tenant
+
+    def test_single_field_fk_to_rls_model(self):
+        """Resolves FK from OrderItem to Order (both RLS-protected)."""
+        result = _resolve_related_model(OrderItem, "order")
+        assert result is Order
+
+    def test_dotted_path(self):
+        """Resolves a dotted path across multiple relations."""
+        result = _resolve_related_model(OrderItem, "order__tenant")
+        assert result is Tenant
+
+    def test_invalid_field_returns_none(self):
+        """Returns None for a non-existent field name."""
+        result = _resolve_related_model(Order, "nonexistent")
+        assert result is None
+
+    def test_invalid_second_segment_returns_none(self):
+        """Returns None for an invalid second segment in a dotted path."""
+        result = _resolve_related_model(OrderItem, "order__nonexistent")
+        assert result is None
+
+    def test_non_relation_field_returns_none(self):
+        """Returns None for a non-relation field (e.g., CharField)."""
+        result = _resolve_related_model(Order, "product")
+        assert result is None

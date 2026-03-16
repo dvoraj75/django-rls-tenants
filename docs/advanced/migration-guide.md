@@ -131,8 +131,9 @@ modification.
 #### What Changed
 
 1. **RLS policy SQL**: `RLSConstraint` now generates `CASE WHEN` policies instead of
-   `OR`-based policies. The admin check short-circuits before evaluating the tenant
-   match, improving per-row evaluation efficiency.
+   `OR`-based policies, improving readability and clarifying the evaluation structure.
+   (The primary performance improvement comes from auto-scoping below, which enables
+   composite index usage.)
 
 2. **Automatic query scoping**: `RLSManager.get_queryset()` now adds
    `WHERE tenant_id = X` automatically when a tenant context is active (via
@@ -168,7 +169,8 @@ modification.
 
 - `for_user()` continues to work exactly as before.
 - Auto-scoping activates automatically -- no code changes required. If both
-  auto-scoping and `for_user()` are active simultaneously, PostgreSQL deduplicates
-  the identical `WHERE` clauses.
+  auto-scoping and `for_user()` are active simultaneously, the query gets two
+  redundant `WHERE tenant_id = X` clauses. This is by design for defense-in-depth;
+  the cost of the double equality check per row is negligible.
 - `TenantQuerySet.select_related()` now auto-propagates tenant filters to joined
   RLS-protected tables when a tenant context is active.
