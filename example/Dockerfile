@@ -9,7 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install the library from local source
 COPY pyproject.toml README.md /lib/
 COPY django_rls_tenants/ /lib/django_rls_tenants/
-RUN pip install --no-cache-dir /lib/ psycopg2-binary "django>=5.1,<5.2"
+RUN pip install --no-cache-dir /lib/ psycopg2-binary "django>=5.1,<5.2" \
+    pytest pytest-django
 
 # Copy the example project
 COPY example/ /app/

@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 from django.core.exceptions import FieldDoesNotExist
 from django.db import models
+from django.db.models import Q
 
 from django_rls_tenants.rls.guc import clear_guc, set_guc
 from django_rls_tenants.tenants.conf import rls_tenants_config
@@ -191,7 +192,18 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         for field_path in fields:
             related_model = _resolve_related_model(self.model, field_path)
             if related_model is not None and _is_rls_protected(related_model):
-                qs = qs.filter(**{f"{field_path}__{fk_field_id}": tenant_id})
+                tenant_filter = Q(**{f"{field_path}__{fk_field_id}": tenant_id})
+                # For nullable FKs, preserve LEFT OUTER JOIN semantics:
+                # include rows where the FK is NULL (no related object).
+                # Without this, .filter() forces an INNER JOIN which
+                # silently drops rows with NULL FKs.
+                try:
+                    fk_field = self.model._meta.get_field(field_path)  # noqa: SLF001
+                    if getattr(fk_field, "null", False):
+                        tenant_filter = tenant_filter | Q(**{f"{field_path}__isnull": True})
+                except FieldDoesNotExist:
+                    pass
+                qs = qs.filter(tenant_filter)
         return qs
 
     def _get_active_tenant_id(self) -> int | str | None:

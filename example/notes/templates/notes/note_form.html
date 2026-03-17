@@ -5,6 +5,13 @@
         {% csrf_token %}
         <label for="title">Title</label>
         <input type="text" name="title" id="title" required>
+        <label for="category">Category</label>
+        <select name="category" id="category">
+            <option value="">-- No category --</option>
+            {% for cat in categories %}
+                <option value="{{ cat.pk }}">{{ cat.name }}</option>
+            {% endfor %}
+        </select>
         <label for="content">Content</label>
         <textarea name="content" id="content" rows="6"></textarea>
         <button type="submit" class="btn">Save</button>

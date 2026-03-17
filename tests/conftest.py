@@ -11,7 +11,15 @@ from django.db import connection
 from django_rls_tenants.rls.guc import clear_guc
 from django_rls_tenants.tenants.context import admin_context
 from django_rls_tenants.tenants.state import set_current_tenant_id
-from tests.test_app.models import Document, Order, OrderItem, ProtectedUser, Tenant, TenantUser
+from tests.test_app.models import (
+    Document,
+    Order,
+    OrderItem,
+    OrderNote,
+    ProtectedUser,
+    Tenant,
+    TenantUser,
+)
 
 _RLS_ROLE = "rls_test_role"
 
@@ -161,6 +169,36 @@ def sample_order_items(db, sample_orders):
             tenant=sample_orders["b1"].tenant,
         )
     return {"a1": item_a1, "a2": item_a2, "b1": item_b1}
+
+
+@pytest.fixture
+def sample_order_notes(db, sample_orders, tenant_a, tenant_b):
+    """Create order notes with mix of linked and NULL order FKs.
+
+    Tenant A gets one note linked to an order and one with no order (NULL FK).
+    Tenant B gets one note linked to an order.
+    """
+    with admin_context():
+        note_a_linked = OrderNote.objects.create(
+            order=sample_orders["a1"],
+            body="Linked to order A1",
+            tenant=tenant_a,
+        )
+        note_a_orphan = OrderNote.objects.create(
+            order=None,
+            body="No order (orphan)",
+            tenant=tenant_a,
+        )
+        note_b_linked = OrderNote.objects.create(
+            order=sample_orders["b1"],
+            body="Linked to order B1",
+            tenant=tenant_b,
+        )
+    return {
+        "a_linked": note_a_linked,
+        "a_orphan": note_a_orphan,
+        "b_linked": note_b_linked,
+    }
 
 
 @pytest.fixture

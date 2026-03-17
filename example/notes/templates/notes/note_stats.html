@@ -1,0 +1,31 @@
+{% extends "notes/base.html" %}
+{% block content %}
+    <h2>Note Statistics</h2>
+    <p>
+        This page is rendered using a service function decorated with
+        <code>@with_rls_context</code>, which automatically sets the RLS
+        context based on the <code>as_user</code> argument.
+    </p>
+
+    <div class="note">
+        <h3>Total notes: {{ stats.total }}</h3>
+    </div>
+
+    {% if stats.by_category %}
+        <h3>By Category</h3>
+        {% for name, count in stats.by_category %}
+            <div class="note" style="padding:0.5rem 1rem">
+                <strong>{{ name }}</strong>: {{ count }} note{{ count|pluralize }}
+            </div>
+        {% endfor %}
+    {% endif %}
+
+    {% if stats.uncategorized %}
+        <div class="note" style="padding:0.5rem 1rem">
+            <strong>Uncategorized</strong>: {{ stats.uncategorized }} note{{ stats.uncategorized|pluralize }}
+        </div>
+    {% endif %}
+
+    <br>
+    <a href="{% url 'note_list' %}" class="btn">Back to Notes</a>
+{% endblock %}
