@@ -36,7 +36,7 @@ MIDDLEWARE = [
     - `rls_tenant_id`: if not admin, sets `rls.current_tenant = str(tenant_id)` and `rls.is_admin = 'false'`.
 4. Sets the internal `ContextVar` state for automatic query scoping (tenant users get
    auto-scoped queries; admin users and unauthenticated requests do not).
-5. Marks a thread-local flag that GUCs were set (used by the safety-net signal handler).
+5. Marks a `ContextVar` flag that GUCs were set (used by the safety-net signal handler).
 
 ### Response Phase (`process_response`)
 
@@ -45,15 +45,27 @@ MIDDLEWARE = [
    cross-request leaks on persistent connections.
 3. If `USE_LOCAL_SET` is `True`: GUCs are automatically cleared at transaction end
    (by PostgreSQL), so explicit cleanup is skipped.
-4. Clears the thread-local GUC flag.
+4. Clears the `ContextVar` GUC flag.
+
+### Exception Phase (`process_exception`)
+
+If a view raises an unhandled exception, `process_response` may not run (depending
+on middleware ordering). The `process_exception` handler ensures cleanup still happens:
+
+1. Resets the `ContextVar` auto-scope state (via the saved token or fallback to `None`).
+2. Clears GUC variables (same logic as `process_response`).
+
+This prevents `ContextVar` leaks that could affect subsequent requests on the same
+thread (WSGI) or async task (ASGI).
 
 ### Error Handling
 
-If setting a GUC fails (e.g., broken database connection):
+If setting a GUC fails during `process_request` (e.g., broken database connection):
 
-1. Both GUCs are cleared on a best-effort basis.
-2. The exception is re-raised (Django returns a 500 response).
-3. This prevents partial GUC state from leaking to the next request.
+1. The `ContextVar` state is reset to `None`.
+2. Both GUCs are cleared on a best-effort basis.
+3. The exception is re-raised (Django returns a 500 response).
+4. This prevents partial GUC state from leaking to the next request.
 
 ## Request Lifecycle Diagram
 
@@ -82,9 +94,9 @@ RLSTenantMiddleware.process_request()
 View executes (queries auto-scoped + filtered by RLS)
     │
     ▼
-RLSTenantMiddleware.process_response()
+RLSTenantMiddleware.process_response()  (or process_exception on error)
     │
-    ├── CLEAR auto-scope state
+    ├── RESET auto-scope ContextVar (via saved token)
     ├── USE_LOCAL_SET == False → CLEAR both GUCs
     └── USE_LOCAL_SET == True  → no-op (transaction handles cleanup)
 ```

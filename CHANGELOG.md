@@ -7,12 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- `_add_tenant_fk` signal handler now reads the configured `TENANT_FK_FIELD` value
-  instead of hardcoding `"tenant"` when checking for an existing field. Previously,
-  a custom `TENANT_FK_FIELD` (e.g., `"organization"`) would cause the handler to
-  miss existing fields and attempt to add a duplicate FK.
+## [1.1.0] - 2026-03-17
 
 ### Added
 
@@ -21,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   management commands that need direct access to the auto-scope state.
   Use the token returned by `set_current_tenant_id()` with
   `reset_current_tenant_id(token)` to safely restore the previous value.
+- `W005` system check that warns when the default database connection
+  uses a PostgreSQL superuser. Superusers bypass all RLS policies,
+  completely disabling tenant isolation.
 
 ### Changed
 
@@ -39,6 +37,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rewrite is a clarity improvement, not a performance optimization.)
 - `TenantQuerySet.select_related()` now auto-propagates tenant filters
   to joined RLS-protected tables when a tenant context is active.
+- Middleware GUC-set tracking now uses `ContextVar` instead of
+  `threading.local`, ensuring proper isolation in ASGI (async)
+  deployments where multiple coroutines share a single thread.
+- Middleware adds `process_exception()` handler that cleans up both
+  `ContextVar` state and GUCs when an unhandled view exception prevents
+  `process_response` from running.
+- `request_finished` safety-net signal handler now also resets the
+  `ContextVar` auto-scope state, not just the GUC variables.
+- `_resolve_user_guc_vars()` now raises `ValueError` for non-admin
+  users with `rls_tenant_id=None` instead of stringifying `None`. This
+  catches user-model misconfigurations at middleware/context-manager
+  time rather than producing a silent mismatch at the database level.
+- `@with_rls_context` now validates `rls_tenant_id` before entering the
+  tenant context (fail-fast), providing a clear error message that
+  includes the function name.
+
+### Fixed
+
+- `_add_tenant_fk` signal handler now reads the configured `TENANT_FK_FIELD` value
+  instead of hardcoding `"tenant"` when checking for an existing field. Previously,
+  a custom `TENANT_FK_FIELD` (e.g., `"organization"`) would cause the handler to
+  miss existing fields and attempt to add a duplicate FK.
+- `W004` system check now correctly detects `CONN_MAX_AGE=None` (Django's
+  "keep connections forever" sentinel). Previously, only positive integer
+  values were flagged; `None` silently passed the check despite being the
+  most dangerous value for GUC leak risk.
 
 ## [1.0.0] - 2026-03-15
 
@@ -91,7 +115,7 @@ Initial stable release of django-rls-tenants.
 
 - Single `RLS_TENANTS` settings dict with 6 configuration keys:
   `TENANT_MODEL`, `TENANT_FK_FIELD`, `USER_PARAM_NAME`, `GUC_PREFIX`,
-  `USE_LOCAL_SET`, `CONN_MAX_AGE_OVERRIDE`.
+  `TENANT_PK_TYPE`, `USE_LOCAL_SET`.
 - `RLSTenantsConfig` singleton with lazy property access and unknown-key
   detection (warns on typos).
 - Django system checks: `W001` (GUC prefix mismatch for tenant), `W002`
@@ -101,7 +125,7 @@ Initial stable release of django-rls-tenants.
 #### User Integration
 
 - `TenantUser` runtime-checkable `Protocol` for structural subtyping of user
-  objects. Requires `is_tenant_admin`, `rls_tenant_id`, and `is_authenticated`.
+  objects. Requires `is_tenant_admin` and `rls_tenant_id` properties.
 
 #### Bypass Mode
 
@@ -146,5 +170,6 @@ Initial stable release of django-rls-tenants.
   and manager `_fetch_all` could clear GUCs with session scope while setting
   them with transaction scope, causing mismatched lifetimes.
 
-[Unreleased]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/dvoraj75/django-rls-tenants/releases/tag/v1.0.0

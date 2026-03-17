@@ -4,9 +4,9 @@ A multi-tenant notes application demonstrating
 **[django-rls-tenants](https://github.com/dvoraj75/django-rls-tenants)** --
 database-enforced tenant isolation using PostgreSQL Row-Level Security (RLS).
 
-> The view code uses `Note.objects.all()` with **zero** `.filter()` calls --
-> PostgreSQL RLS policies handle tenant isolation automatically at the database
-> level.
+> The view code uses `Note.objects.select_related("category").all()` with
+> **zero** `.filter()` calls -- PostgreSQL RLS policies and automatic query
+> scoping handle tenant isolation at both the ORM and database level.
 
 ## Requirements
 
@@ -22,22 +22,31 @@ docker compose up
 
 Open **<http://localhost:8000>** and log in with any demo account:
 
-| User                | Password    | Tenant     | Sees              |
-| ------------------- | ----------- | ---------- | ----------------- |
-| `alice@acme.com`    | `demo1234`  | Acme Corp  | Only Acme notes   |
-| `bob@globex.com`    | `demo1234`  | Globex Inc | Only Globex notes |
-| `carol@initech.com` | `demo1234`  | Initech    | Only Initech notes|
-| `admin@example.com` | `admin1234` | _(admin)_  | **All notes**     |
+| Username | Password    | Tenant     | Sees              |
+| -------- | ----------- | ---------- | ----------------- |
+| `alice`  | `demo1234`  | Acme Corp  | Only Acme notes   |
+| `bob`    | `demo1234`  | Globex Inc | Only Globex notes |
+| `carol`  | `demo1234`  | Initech    | Only Initech notes|
+| `admin`  | `admin1234` | _(admin)_  | **All notes**     |
 
 ## What to Try
 
-1. **Tenant isolation** -- Log in as Alice, see only Acme notes. Switch to Bob
-   and see only Globex notes. No `.filter()` in the view -- RLS does it all.
+1. **Tenant isolation** -- Log in as Alice, see only Acme notes and categories.
+   Switch to Bob and see only Globex data. No `.filter()` in the view -- RLS
+   does it all.
 
 2. **Admin bypass** -- Log in as `admin@example.com` and see every note across
    all tenants.
 
-3. **Database-level proof** -- Open a raw database shell and verify RLS is
+3. **Categories with `select_related()`** -- Notes display their category inline.
+   The view uses `Note.objects.select_related("category")`, and the tenant filter
+   automatically propagates to the joined `Category` table.
+
+4. **Statistics page** -- Click "Stats" to see per-category note counts. This
+   page is powered by a service function decorated with `@with_rls_context`,
+   demonstrating automatic RLS context from function arguments.
+
+5. **Database-level proof** -- Open a raw database shell and verify RLS is
    active:
    ```bash
    docker compose exec web python manage.py dbshell
@@ -48,25 +57,43 @@ Open **<http://localhost:8000>** and log in with any demo account:
    -- -> 0
    ```
 
-4. **Django admin** -- Visit <http://localhost:8000/admin/>
+6. **RLS policy verification** -- The `check_rls` management command verifies
+   all RLS policies are correctly applied:
+   ```bash
+   docker compose exec web python manage.py check_rls
+   ```
+
+7. **Django admin** -- Visit <http://localhost:8000/admin/>
    (`admin@example.com` / `admin1234`).
+
+## Library Features Demonstrated
+
+| Feature | Where |
+| ------- | ----- |
+| `RLSProtectedModel` | `notes/models.py` -- `Note` and `Category` |
+| `RLSTenantMiddleware` | `demo/settings.py` -- automatic per-request RLS context |
+| `TenantUser` protocol | `accounts/models.py` -- `rls_tenant_id` + `is_tenant_admin` |
+| Auto-scoping (zero `.filter()`) | `notes/views.py` -- `Note.objects.all()` returns only tenant data |
+| `select_related()` propagation | `notes/views.py` -- tenant filter auto-propagates to joined `Category` |
+| `@with_rls_context` decorator | `notes/services.py` -- `get_note_stats(as_user=...)` |
+| `admin_context()` | `seed_demo.py` -- bulk data creation bypassing RLS |
+| `tenant_context()` | `seed_demo.py` -- programmatic tenant scoping for verification |
+| `check_rls` command | `docker-compose.yml` -- runs after migrations |
+| Testing utilities | `tests/test_rls.py` -- `rls_bypass`, `rls_as_tenant`, assert helpers |
 
 ## How It Works
 
 ```
 Request
   -> Django AuthenticationMiddleware (sets request.user)
-  -> RLSTenantMiddleware (SETs PostgreSQL session variable from user.rls_tenant_id)
-  -> View calls Note.objects.all()
-  -> PostgreSQL RLS policy filters rows by tenant_id automatically
+  -> RLSTenantMiddleware:
+       1. Sets PostgreSQL GUC variables (rls.current_tenant, rls.is_admin)
+       2. Sets ContextVar for automatic ORM query scoping
+  -> View calls Note.objects.select_related("category").all()
+       1. RLSManager auto-adds WHERE tenant_id = X (from ContextVar)
+       2. select_related() propagates tenant filter to Category join
+  -> PostgreSQL RLS policy provides defense-in-depth at database level
 ```
-
-| File                  | Role                                                        |
-| --------------------- | ----------------------------------------------------------- |
-| `tenants/models.py`   | Plain Django model for tenants (shared, not RLS-protected)  |
-| `accounts/models.py`  | Custom `User` implementing the `TenantUser` protocol        |
-| `notes/models.py`     | `Note` inherits `RLSProtectedModel` -- that's it            |
-| `demo/settings.py`    | `RLS_TENANTS` config and `RLSTenantMiddleware` registration |
 
 ## Project Structure
 
@@ -78,8 +105,26 @@ example/
 ├── demo/                Django project: settings, urls, wsgi/asgi
 ├── tenants/             Tenant model (shared, not RLS-protected)
 ├── accounts/            Custom User model with tenant FK + TenantUser protocol
-├── notes/               RLS-protected Note model, views, templates, seed command
-└── docker/              PostgreSQL init script (creates non-superuser role)
+├── notes/               RLS-protected Note + Category models, views, services,
+│                        templates, admin, seed command
+└── tests/               Example tests using django-rls-tenants testing utilities
+    ├── conftest.py      Fixtures using rls_bypass for test data setup
+    └── test_rls.py      RLS policy verification and tenant isolation tests
+```
+
+## Running Tests
+
+The example includes tests that demonstrate the library's testing utilities.
+These require a running PostgreSQL instance:
+
+```bash
+# With Docker (exec into the running container):
+docker compose exec web python -m pytest tests/ -v
+
+# Or locally (with PostgreSQL running):
+cd example/
+pip install pytest pytest-django
+python -m pytest tests/ -v
 ```
 
 ## Local Development (without Docker)
@@ -96,18 +141,22 @@ pip install -e ..
 pip install psycopg2-binary
 
 # Configure database (PostgreSQL required -- SQLite will not work)
-export POSTGRES_DB=demo POSTGRES_USER=demo POSTGRES_PASSWORD=demo
+# IMPORTANT: Use a non-superuser role -- superusers bypass RLS entirely.
+# See docker/init-db.sql for the recommended role setup.
+export POSTGRES_DB=demo POSTGRES_USER=app POSTGRES_PASSWORD=app
 export POSTGRES_HOST=localhost POSTGRES_PORT=5432
 
-# Run migrations, seed data, and start the server
+# Run migrations, verify policies, seed data, and start the server
 python manage.py makemigrations
 python manage.py migrate
+python manage.py check_rls
 python manage.py seed_demo --no-input
 python manage.py runserver
 ```
 
 > **Important:** The PostgreSQL user must **not** be a superuser -- superusers
-> bypass RLS entirely. See `docker/init-db.sql` for the recommended role setup.
+> bypass RLS entirely. If running PostgreSQL locally (without Docker), create a
+> non-superuser role as shown in `docker/init-db.sql`.
 
 ## Learn More
 

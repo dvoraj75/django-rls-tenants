@@ -123,7 +123,7 @@ migration that assigns the correct tenant to each existing record.
 
 ## Upgrading django-rls-tenants
 
-### From 1.0.0 to Unreleased
+### From 1.0.0 to 1.1.0
 
 This release has **no breaking changes**. All existing code continues to work without
 modification.
@@ -140,9 +140,9 @@ modification.
    `tenant_context()`, `admin_context()`, or `RLSTenantMiddleware`). This enables
    composite indexes and eliminates sequential scan penalties at scale.
 
-3. **New public API**: `get_current_tenant_id()` and `set_current_tenant_id()` are
-   available for custom middleware and management commands that need direct access to
-   the auto-scope state.
+3. **New public API**: `get_current_tenant_id()`, `set_current_tenant_id()`, and
+    `reset_current_tenant_id()` are available for custom middleware and management
+    commands that need direct access to the auto-scope state.
 
 #### Upgrade Steps
 
