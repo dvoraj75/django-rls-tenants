@@ -87,6 +87,20 @@ class OrderItem(RLSProtectedModel):
         db_table = "test_order_item"
 
 
+class OrderNote(RLSProtectedModel):
+    """RLS-protected model with a *nullable* FK to another RLS-protected model.
+
+    Used to test ``select_related()`` tenant propagation preserves
+    rows where the nullable FK is ``NULL`` (LEFT OUTER JOIN semantics).
+    """
+
+    order = models.ForeignKey(Order, on_delete=models.SET_NULL, null=True, blank=True)
+    body = models.CharField(max_length=255)
+
+    class Meta(RLSProtectedModel.Meta):
+        db_table = "test_order_note"
+
+
 class ProtectedUser(RLSProtectedModel):
     """RLS-protected user model with extra bypass flags."""
 

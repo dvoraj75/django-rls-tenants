@@ -7,7 +7,7 @@ build-backend = "hatchling.build"
 # ---------------------------------------------------------------------------
 [project]
 name = "django-rls-tenants"
-version = "1.0.0"
+version = "1.1.0"
 description = "Database-enforced multitenancy for Django using PostgreSQL Row-Level Security."
 readme = "README.md"
 license = "MIT"

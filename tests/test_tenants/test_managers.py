@@ -15,7 +15,7 @@ from django_rls_tenants.tenants.state import (
     reset_current_tenant_id,
     set_current_tenant_id,
 )
-from tests.test_app.models import Order, OrderItem, Tenant
+from tests.test_app.models import Order, OrderItem, OrderNote, Tenant
 
 pytestmark = pytest.mark.django_db
 
@@ -376,6 +376,40 @@ class TestSelectRelated:
         items = list(qs)
         descriptions = sorted(item.description for item in items)
         assert descriptions == ["Part A1-1", "Part A2-1"]
+
+    def test_select_related_nullable_fk_preserves_null_rows(self, sample_order_notes, tenant_a):
+        """select_related() on nullable FK preserves rows where FK is NULL."""
+        with tenant_context(tenant_a.pk):
+            notes = list(OrderNote.objects.select_related("order"))
+            bodies = sorted(n.body for n in notes)
+            assert bodies == ["Linked to order A1", "No order (orphan)"]
+
+    def test_select_related_nullable_fk_linked_row_has_order(self, sample_order_notes, tenant_a):
+        """select_related() on nullable FK still resolves non-NULL FKs."""
+        with tenant_context(tenant_a.pk):
+            notes = list(OrderNote.objects.select_related("order"))
+            linked = [n for n in notes if n.order is not None]
+            assert len(linked) == 1
+            assert linked[0].order.tenant_id == tenant_a.pk
+
+    def test_select_related_nullable_fk_orphan_row_has_none(self, sample_order_notes, tenant_a):
+        """select_related() on nullable FK returns None for NULL FK rows."""
+        with tenant_context(tenant_a.pk):
+            notes = list(OrderNote.objects.select_related("order"))
+            orphans = [n for n in notes if n.order is None]
+            assert len(orphans) == 1
+            assert orphans[0].body == "No order (orphan)"
+
+    def test_select_related_nullable_fk_isolation(self, sample_order_notes, tenant_a, tenant_b):
+        """select_related() on nullable FK still isolates tenants."""
+        with tenant_context(tenant_a.pk):
+            a_notes = list(OrderNote.objects.select_related("order"))
+            assert len(a_notes) == 2
+
+        with tenant_context(tenant_b.pk):
+            b_notes = list(OrderNote.objects.select_related("order"))
+            assert len(b_notes) == 1
+            assert b_notes[0].body == "Linked to order B1"
 
 
 class TestResolveRelatedModel:

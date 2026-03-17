@@ -48,7 +48,8 @@ The upper layer builds Django multitenancy on top of `rls/`:
 | `tenants/bypass.py` | `set_bypass_flag()`, `clear_bypass_flag()`, `bypass_flag()` |
 | `tenants/testing.py` | Test helpers: `rls_bypass`, `rls_as_tenant`, assertion functions |
 | `tenants/types.py` | `TenantUser` protocol |
-| `tenants/checks.py` | Django system checks (W001--W004) |
+| `tenants/state.py` | `get_current_tenant_id()`, `set_current_tenant_id()`, `reset_current_tenant_id()` -- `ContextVar`-based tenant state for auto-scoping |
+| `tenants/checks.py` | Django system checks (W001--W005) |
 
 ### Import Boundary
 

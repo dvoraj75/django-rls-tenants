@@ -1,10 +1,17 @@
 {% extends "notes/base.html" %}
 {% block content %}
-    <a href="{% url 'note_create' %}" class="btn">+ New Note</a>
-    <br><br>
+    <div style="display:flex;gap:1rem;margin-bottom:1.5rem">
+        {% if user.tenant %}
+            <a href="{% url 'note_create' %}" class="btn">+ New Note</a>
+        {% endif %}
+        <a href="{% url 'note_stats' %}" class="btn" style="background:#1565c0">Stats</a>
+    </div>
     {% for note in notes %}
         <div class="note">
             <h3>{{ note.title }}</h3>
+            {% if note.category %}
+                <span class="category-badge">{{ note.category.name }}</span>
+            {% endif %}
             <p>{{ note.content }}</p>
             <div class="meta">
                 Created {{ note.created_at|date:"M d, Y H:i" }}
