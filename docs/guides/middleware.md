@@ -34,15 +34,18 @@ MIDDLEWARE = [
 3. If **authenticated**: reads the `TenantUser` protocol properties:
     - `is_tenant_admin`: if `True`, sets `rls.is_admin = 'true'` and clears `rls.current_tenant`.
     - `rls_tenant_id`: if not admin, sets `rls.current_tenant = str(tenant_id)` and `rls.is_admin = 'false'`.
-4. Sets the internal `ContextVar` state for automatic query scoping (tenant users get
+4. Sets GUCs on **all database aliases** listed in `RLS_TENANTS["DATABASES"]` (default:
+   `["default"]`). If setting GUCs on one alias fails, all previously-set aliases are
+   cleaned up before the exception propagates.
+5. Sets the internal `ContextVar` state for automatic query scoping (tenant users get
    auto-scoped queries; admin users and unauthenticated requests do not).
-5. Marks a `ContextVar` flag that GUCs were set (used by the safety-net signal handler).
+6. Marks a `ContextVar` flag that GUCs were set (used by the safety-net signal handler).
 
 ### Response Phase (`process_response`)
 
 1. Clears the `ContextVar` auto-scope state to prevent cross-request leaks.
-2. If `USE_LOCAL_SET` is `False` (default): clears both GUC variables to prevent
-   cross-request leaks on persistent connections.
+2. If `USE_LOCAL_SET` is `False` (default): clears both GUC variables on **all
+   configured database aliases** to prevent cross-request leaks on persistent connections.
 3. If `USE_LOCAL_SET` is `True`: GUCs are automatically cleared at transaction end
    (by PostgreSQL), so explicit cleanup is skipped.
 4. Clears the `ContextVar` GUC flag.
@@ -100,6 +103,26 @@ RLSTenantMiddleware.process_response()  (or process_exception on error)
     ├── USE_LOCAL_SET == False → CLEAR both GUCs
     └── USE_LOCAL_SET == True  → no-op (transaction handles cleanup)
 ```
+
+## Multi-Database Support
+
+By default, the middleware sets GUCs only on the `default` database connection.
+In multi-database setups (read replicas, analytics databases), configure all
+aliases that serve RLS-protected queries:
+
+```python title="settings.py"
+RLS_TENANTS = {
+    "TENANT_MODEL": "myapp.Tenant",
+    "DATABASES": ["default", "replica"],
+}
+```
+
+The middleware sets GUCs on all configured aliases during `process_request` and
+clears them during `process_response`. A `connection_created` signal handler
+also sets GUCs on lazily-created connections that don't exist when the middleware
+runs (e.g., a replica connection opened by a database router mid-request).
+
+See [Configuration](../getting-started/configuration.md#databases) for details.
 
 ## Safety Net
 

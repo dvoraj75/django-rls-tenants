@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Custom exception hierarchy in `django_rls_tenants.exceptions`: `RLSTenantError`
   (base), `NoTenantContextError`, `RLSConfigurationError`. All importable from
   the top-level `django_rls_tenants` package. (#12)
+- `DATABASES` configuration option for multi-database GUC support. The middleware
+  now sets GUCs on all configured database aliases, not just `default`. Default:
+  `["default"]` (backward compatible). (#9)
+- `connection_created` signal handler that sets GUCs on lazily created database
+  connections mid-request (e.g., replica connections opened by a database router).
+- `check_rls --database` flag for verifying RLS on non-default databases.
+- System checks `W006` (invalid database alias in `DATABASES`) and `W007`
+  (`USE_LOCAL_SET=True` without `ATOMIC_REQUESTS` on configured databases).
 
 ### Changed
 

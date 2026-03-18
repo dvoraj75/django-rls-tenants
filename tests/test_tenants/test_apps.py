@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 from django.core.signals import request_finished
 from django.db import close_old_connections, connection
+from django.db.backends.signals import connection_created
 from django.test import override_settings
 
 from django_rls_tenants.rls.guc import get_guc, set_guc
@@ -14,8 +15,12 @@ from django_rls_tenants.tenants.middleware import (
     _mark_gucs_set,
     _were_gucs_set,
 )
+from django_rls_tenants.tenants.state import set_current_tenant_id
 
 pytestmark = pytest.mark.django_db
+
+# Patch target for the module-level singleton.
+_CONF_PATCH = "django_rls_tenants.tenants.conf.rls_tenants_config"
 
 
 @pytest.fixture(autouse=True)
@@ -125,3 +130,98 @@ class TestRequestFinishedSafetyNet:
         assert _were_gucs_set() is False
         # Reconnect for subsequent tests / cleanup
         connection.close()
+
+    def test_safety_net_clears_gucs_on_all_databases(self):
+        """Safety-net handler clears GUCs on all configured DATABASES aliases.
+
+        Tests actual GUC effects since the handler uses closure-captured
+        references that cannot be patched via module-level mocking.
+        """
+        set_guc("rls.is_admin", "true")
+        set_guc("rls.current_tenant", "42")
+        _mark_gucs_set()
+
+        # The handler reads DATABASES from conf; default config is ["default"]
+        request_finished.send(sender=self.__class__)
+
+        # Verify GUCs were cleared on the default database
+        assert get_guc("rls.is_admin") is None
+        assert get_guc("rls.current_tenant") is None
+        assert _were_gucs_set() is False
+
+
+@pytest.mark.django_db(transaction=True)
+class TestConnectionCreatedSignalHandler:
+    """Tests for the connection_created signal handler logic.
+
+    Uses ``transaction=True`` because these tests close and reopen the
+    database connection, which breaks Django's test transaction wrapper.
+
+    The handler is a closure inside ``AppConfig.ready()``. We test it
+    by forcing a real database reconnection (closing the underlying
+    psycopg2 connection and resetting Django's wrapper) so that
+    ``connection_created`` fires with ContextVar state active.
+    """
+
+    def test_handler_is_connected(self):
+        """Verify the connection_created signal has our handler connected."""
+        # At least one receiver should be registered (our handler)
+        assert len(connection_created.receivers) >= 1
+
+    def test_tenant_context_sets_gucs_on_new_connection(self):
+        """When a new connection opens mid-request, GUCs are set from ContextVar."""
+        set_current_tenant_id(42)
+        _mark_gucs_set()
+        try:
+            # Force Django to create a new connection by resetting the wrapper.
+            connection.ensure_connection()
+            connection.connection.close()
+            connection.connection = None
+
+            # cursor() triggers reconnection -> connection_created signal
+            with connection.cursor() as cur:
+                cur.execute("SELECT current_setting('rls.current_tenant', true)")
+                result = cur.fetchone()
+
+            assert result is not None
+            assert result[0] == "42"
+        finally:
+            set_current_tenant_id(None)
+            _clear_gucs_set_flag()
+
+    def test_admin_context_sets_gucs_on_new_connection(self):
+        """Admin context (tenant_id=None) sets admin GUCs on new connections."""
+        set_current_tenant_id(None)
+        _mark_gucs_set()
+        try:
+            connection.ensure_connection()
+            connection.connection.close()
+            connection.connection = None
+
+            with connection.cursor() as cur:
+                cur.execute("SELECT current_setting('rls.is_admin', true)")
+                result = cur.fetchone()
+
+            assert result is not None
+            assert result[0] == "true"
+        finally:
+            set_current_tenant_id(None)
+            _clear_gucs_set_flag()
+
+    def test_no_context_skips_guc_setting(self):
+        """Without active context, handler does nothing on new connections."""
+        _clear_gucs_set_flag()
+        set_current_tenant_id(None)
+
+        connection.ensure_connection()
+        connection.connection.close()
+        connection.connection = None
+
+        with connection.cursor() as cur:
+            cur.execute("SELECT current_setting('rls.current_tenant', true)")
+            result = cur.fetchone()
+
+        # On a fresh connection with no GUC context, current_setting returns
+        # None or empty string depending on PostgreSQL version.
+        assert result is not None
+        assert result[0] in (None, "")

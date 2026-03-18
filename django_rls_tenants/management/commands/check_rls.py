@@ -2,6 +2,7 @@
 
 Verifies that all RLSProtectedModel subclasses have the expected
 RLS policies applied in the database. Reports missing or stale policies.
+Supports checking non-default database aliases via ``--database``.
 """
 
 from __future__ import annotations
@@ -9,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from django.core.management.base import BaseCommand
-from django.db import connection
+from django.db import connections
 
 
 def _collect_rls_tables() -> dict[str, str]:
@@ -31,8 +32,17 @@ class Command(BaseCommand):
 
     help = "Verify that RLS policies exist and are enabled on all RLS-protected tables."
 
+    def add_arguments(self, parser: Any) -> None:
+        """Add command-line arguments."""
+        parser.add_argument(
+            "--database",
+            default="default",
+            help="Database alias to check RLS status on. Default: 'default'.",
+        )
+
     def handle(self, *args: Any, **options: Any) -> None:  # noqa: ARG002
         """Check each RLSProtectedModel subclass."""
+        db_alias: str = options["database"]
         table_to_model = _collect_rls_tables()
         if not table_to_model:
             self.stdout.write("No RLS-protected models found.")
@@ -41,8 +51,8 @@ class Command(BaseCommand):
         tables = list(table_to_model.keys())
         errors: list[str] = []
 
-        self._check_rls_status(tables, table_to_model, errors)
-        self._check_policies(tables, table_to_model, errors)
+        self._check_rls_status(tables, table_to_model, errors, db_alias=db_alias)
+        self._check_policies(tables, table_to_model, errors, db_alias=db_alias)
 
         if errors:
             self.stderr.write(self.style.ERROR(f"\nFound {len(errors)} issue(s):"))
@@ -59,9 +69,12 @@ class Command(BaseCommand):
         tables: list[str],
         table_to_model: dict[str, str],
         errors: list[str],
+        *,
+        db_alias: str = "default",
     ) -> None:
         """Batch-check ``relrowsecurity`` / ``relforcerowsecurity`` via ``pg_class``."""
-        with connection.cursor() as cursor:
+        conn = connections[db_alias]
+        with conn.cursor() as cursor:
             placeholders = ", ".join(["%s"] * len(tables))
             cursor.execute(
                 f"SELECT relname, relrowsecurity, relforcerowsecurity "
@@ -85,9 +98,12 @@ class Command(BaseCommand):
         tables: list[str],
         table_to_model: dict[str, str],
         errors: list[str],
+        *,
+        db_alias: str = "default",
     ) -> None:
         """Batch-check RLS policies via ``pg_policies``."""
-        with connection.cursor() as cursor:
+        conn = connections[db_alias]
+        with conn.cursor() as cursor:
             placeholders = ", ".join(["%s"] * len(tables))
             cursor.execute(
                 f"SELECT tablename, policyname "
