@@ -16,12 +16,13 @@ from django_rls_tenants.exceptions import RLSConfigurationError
 # All recognized keys in the RLS_TENANTS configuration dict.
 _KNOWN_KEYS = frozenset(
     {
-        "TENANT_MODEL",
+        "DATABASES",
         "GUC_PREFIX",
         "TENANT_FK_FIELD",
-        "USER_PARAM_NAME",
+        "TENANT_MODEL",
         "TENANT_PK_TYPE",
         "USE_LOCAL_SET",
+        "USER_PARAM_NAME",
     }
 )
 
@@ -32,12 +33,13 @@ class RLSTenantsConfig:
     All settings live under a single dict::
 
         RLS_TENANTS = {
-            "TENANT_MODEL": "myapp.Tenant",  # Required
-            "GUC_PREFIX": "rls",             # Default: "rls"
-            "TENANT_FK_FIELD": "tenant",     # Default: "tenant"
-            "USER_PARAM_NAME": "as_user",    # Default: "as_user"
-            "TENANT_PK_TYPE": "int",         # Default: "int"
-            "USE_LOCAL_SET": False,           # Default: False
+            "TENANT_MODEL": "myapp.Tenant",       # Required
+            "DATABASES": ["default"],              # Default: ["default"]
+            "GUC_PREFIX": "rls",                   # Default: "rls"
+            "TENANT_FK_FIELD": "tenant",           # Default: "tenant"
+            "USER_PARAM_NAME": "as_user",          # Default: "as_user"
+            "TENANT_PK_TYPE": "int",               # Default: "int"
+            "USE_LOCAL_SET": False,                 # Default: False
         }
     """
 
@@ -80,6 +82,19 @@ class RLSTenantsConfig:
     def USE_LOCAL_SET(self) -> bool:
         """Use ``SET LOCAL`` instead of ``set_config``. Default: ``False``."""
         return self._get("USE_LOCAL_SET", default=False)  # type: ignore[no-any-return]
+
+    @property
+    def DATABASES(self) -> list[str]:
+        """Database aliases to set GUCs on. Default: ``["default"]``.
+
+        In multi-database setups (e.g., read replicas), add all aliases
+        that serve RLS-protected queries::
+
+            RLS_TENANTS = {
+                "DATABASES": ["default", "replica"],
+            }
+        """
+        return self._get("DATABASES", ["default"])  # type: ignore[no-any-return]
 
     def __init__(self) -> None:
         self._config_cache: dict[str, Any] | None = None
