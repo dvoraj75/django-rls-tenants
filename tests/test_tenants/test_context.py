@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.guc import get_guc, set_guc
 from django_rls_tenants.tenants.context import (
     _resolve_user_guc_vars,
@@ -45,9 +46,9 @@ class TestTenantContext:
         assert get_guc("rls.is_admin") == "true"
         assert get_guc("rls.current_tenant") == "999"
 
-    def test_none_raises_valueerror(self):
-        """tenant_context(None) raises ValueError."""
-        with pytest.raises(ValueError, match="tenant_id cannot be None"):  # noqa: SIM117
+    def test_none_raises_no_tenant_context_error(self):
+        """tenant_context(None) raises NoTenantContextError."""
+        with pytest.raises(NoTenantContextError, match="tenant_id cannot be None"):  # noqa: SIM117
             with tenant_context(None):
                 pass
 
@@ -195,11 +196,11 @@ class TestResolveUserGucVars:
         assert result["rls.current_tenant"] == str(tenant_a_user.rls_tenant_id)
 
     def test_non_admin_with_none_tenant_id_raises(self):
-        """Non-admin user with rls_tenant_id=None raises ValueError."""
+        """Non-admin user with rls_tenant_id=None raises NoTenantContextError."""
         user = MagicMock()
         user.is_tenant_admin = False
         user.rls_tenant_id = None
-        with pytest.raises(ValueError, match="rls_tenant_id=None"):
+        with pytest.raises(NoTenantContextError, match="rls_tenant_id=None"):
             _resolve_user_guc_vars(user)
 
     def test_admin_with_none_tenant_id_ok(self):
@@ -289,7 +290,7 @@ class TestWithRlsContext:
         assert get_guc("rls.is_admin") is None
 
     def test_non_admin_with_none_tenant_id_raises(self):
-        """Decorator raises ValueError for non-admin user with rls_tenant_id=None."""
+        """Decorator raises NoTenantContextError for non-admin user with rls_tenant_id=None."""
         user = MagicMock()
         user.is_tenant_admin = False
         user.rls_tenant_id = None
@@ -298,7 +299,7 @@ class TestWithRlsContext:
         def my_func(as_user):
             return "should not reach"
 
-        with pytest.raises(ValueError, match="rls_tenant_id=None"):
+        with pytest.raises(NoTenantContextError, match="rls_tenant_id=None"):
             my_func(as_user=user)
 
 

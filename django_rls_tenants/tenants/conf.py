@@ -11,6 +11,8 @@ from typing import Any
 
 from django.conf import settings
 
+from django_rls_tenants.exceptions import RLSConfigurationError
+
 # All recognized keys in the RLS_TENANTS configuration dict.
 _KNOWN_KEYS = frozenset(
     {
@@ -91,7 +93,7 @@ class RLSTenantsConfig:
         On first access, warns about any unrecognized keys (likely typos).
 
         Raises:
-            ValueError: If ``key`` is required (no default) and missing.
+            RLSConfigurationError: If ``key`` is required (no default) and missing.
         """
         cached = self._config_cache
         if cached is None:
@@ -105,7 +107,7 @@ class RLSTenantsConfig:
                 f"Add it to your Django settings: "
                 f"RLS_TENANTS = {{'{key}': ...}}"
             )
-            raise ValueError(msg)
+            raise RLSConfigurationError(msg)
         return value
 
     def _warn_unknown_keys(self, config: dict[str, Any]) -> None:

@@ -8,9 +8,12 @@ The most common symbols are available directly from `django_rls_tenants`:
 
 ```python
 from django_rls_tenants import (
+    NoTenantContextError,
+    RLSConfigurationError,
     RLSConstraint,
     RLSManager,
     RLSProtectedModel,
+    RLSTenantError,
     RLSTenantMiddleware,
     TenantQuerySet,
     TenantUser,
@@ -22,6 +25,19 @@ from django_rls_tenants import (
     with_rls_context,
 )
 ```
+
+---
+
+## Exceptions
+
+Custom exception hierarchy for precise error handling. All exceptions live in
+`django_rls_tenants.exceptions` and are re-exported from the top-level package.
+
+::: django_rls_tenants.exceptions.RLSTenantError
+
+::: django_rls_tenants.exceptions.NoTenantContextError
+
+::: django_rls_tenants.exceptions.RLSConfigurationError
 
 ---
 

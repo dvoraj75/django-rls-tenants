@@ -12,9 +12,12 @@ if TYPE_CHECKING:
 __version__: str = importlib.metadata.version("django-rls-tenants")
 
 __all__ = [
+    "NoTenantContextError",
+    "RLSConfigurationError",
     "RLSConstraint",
     "RLSManager",
     "RLSProtectedModel",
+    "RLSTenantError",
     "RLSTenantMiddleware",
     "TenantQuerySet",
     "TenantUser",
@@ -28,9 +31,12 @@ __all__ = [
 ]
 
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
+    "NoTenantContextError": ("django_rls_tenants.exceptions", "NoTenantContextError"),
+    "RLSConfigurationError": ("django_rls_tenants.exceptions", "RLSConfigurationError"),
     "RLSConstraint": ("django_rls_tenants.rls.constraints", "RLSConstraint"),
     "RLSManager": ("django_rls_tenants.tenants.managers", "RLSManager"),
     "RLSProtectedModel": ("django_rls_tenants.tenants.models", "RLSProtectedModel"),
+    "RLSTenantError": ("django_rls_tenants.exceptions", "RLSTenantError"),
     "RLSTenantMiddleware": ("django_rls_tenants.tenants.middleware", "RLSTenantMiddleware"),
     "TenantQuerySet": ("django_rls_tenants.tenants.managers", "TenantQuerySet"),
     "TenantUser": ("django_rls_tenants.tenants.types", "TenantUser"),

@@ -7,6 +7,7 @@ import warnings as w
 import pytest
 from django.test import override_settings
 
+from django_rls_tenants.exceptions import RLSConfigurationError
 from django_rls_tenants.tenants.conf import RLSTenantsConfig
 
 
@@ -19,21 +20,21 @@ class TestRLSTenantsConfig:
         assert conf.TENANT_MODEL == "test_app.Tenant"
 
     def test_missing_tenant_model_raises(self):
-        """Missing TENANT_MODEL raises ValueError with helpful message."""
+        """Missing TENANT_MODEL raises RLSConfigurationError with helpful message."""
         with override_settings(RLS_TENANTS={}):
             conf = RLSTenantsConfig()
-            with pytest.raises(ValueError, match="TENANT_MODEL"):
+            with pytest.raises(RLSConfigurationError, match="TENANT_MODEL"):
                 _ = conf.TENANT_MODEL
 
     def test_missing_rls_tenants_setting_raises(self):
-        """No RLS_TENANTS setting at all raises ValueError."""
+        """No RLS_TENANTS setting at all raises RLSConfigurationError."""
         with override_settings():
             from django.conf import settings  # noqa: PLC0415  -- must be inside override_settings
 
             if hasattr(settings, "RLS_TENANTS"):
                 delattr(settings, "RLS_TENANTS")
             conf = RLSTenantsConfig()
-            with pytest.raises(ValueError, match="TENANT_MODEL"):
+            with pytest.raises(RLSConfigurationError, match="TENANT_MODEL"):
                 _ = conf.TENANT_MODEL
 
     def test_guc_prefix_default(self):

@@ -13,6 +13,7 @@ import logging
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
+from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.guc import clear_guc, get_guc, set_guc
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.state import reset_current_tenant_id, set_current_tenant_id
@@ -60,7 +61,7 @@ def _resolve_user_guc_vars(
             f"Assign the user to a tenant or set is_tenant_admin=True. "
             f"User type: {type(user).__name__}"
         )
-        raise ValueError(msg)
+        raise NoTenantContextError(msg)
     return {
         conf.GUC_IS_ADMIN: "false",
         conf.GUC_CURRENT_TENANT: str(tenant_id),
@@ -80,11 +81,11 @@ def tenant_context(
         using: Database alias. Default: ``"default"``.
 
     Raises:
-        ValueError: If ``tenant_id`` is ``None``.
+        NoTenantContextError: If ``tenant_id`` is ``None``.
     """
     if tenant_id is None:
         msg = "tenant_id cannot be None. For admin access, use admin_context() instead."
-        raise ValueError(msg)
+        raise NoTenantContextError(msg)
 
     conf = rls_tenants_config
     is_local = conf.USE_LOCAL_SET
@@ -235,7 +236,7 @@ def with_rls_context(
                         f"rls_tenant_id=None. Assign the user to a tenant "
                         f"or set is_tenant_admin=True."
                     )
-                    raise ValueError(msg)
+                    raise NoTenantContextError(msg)
                 ctx = tenant_context(tenant_id)
             else:
                 logger.warning(
