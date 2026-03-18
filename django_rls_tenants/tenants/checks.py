@@ -7,6 +7,8 @@ silent failures at runtime:
 - ``GUC_PREFIX`` mismatch between runtime config and ``RLSConstraint`` defaults.
 - ``USE_LOCAL_SET=True`` without ``ATOMIC_REQUESTS=True``.
 - ``CONN_MAX_AGE > 0`` with ``USE_LOCAL_SET=False`` (connection-pool GUC leak risk).
+- ``DATABASES`` contains aliases not in ``settings.DATABASES``.
+- ``USE_LOCAL_SET=True`` without ``ATOMIC_REQUESTS`` on configured databases.
 """
 
 from __future__ import annotations
@@ -35,6 +37,8 @@ def check_rls_config(
     errors.extend(_check_guc_prefix_mismatch())
     errors.extend(_check_use_local_set_requires_atomic())
     errors.extend(_check_conn_max_age_with_session_gucs())
+    errors.extend(_check_databases_alias_exists())
+    errors.extend(_check_databases_atomic_requests())
     return errors
 
 
@@ -165,8 +169,9 @@ def _check_use_local_set_requires_atomic() -> list[CheckWarning]:
 def _check_conn_max_age_with_session_gucs() -> list[CheckWarning]:
     """Warn if ``CONN_MAX_AGE > 0`` with ``USE_LOCAL_SET=False``.
 
-    Persistent connections with session-scoped GUCs risk stale tenant
-    context leaking between requests if cleanup fails.
+    Checks all aliases in ``RLS_TENANTS["DATABASES"]``. Persistent
+    connections with session-scoped GUCs risk stale tenant context
+    leaking between requests if cleanup fails.
     """
     from django.conf import settings  # noqa: PLC0415
 
@@ -176,19 +181,82 @@ def _check_conn_max_age_with_session_gucs() -> list[CheckWarning]:
     if rls_tenants_config.USE_LOCAL_SET:
         return warnings
 
-    databases = getattr(settings, "DATABASES", {})
-    default_db = databases.get("default", {})
-    conn_max_age = default_db.get("CONN_MAX_AGE", 0)
-    # None means "keep connections forever" -- the most dangerous value.
-    if conn_max_age is None or (isinstance(conn_max_age, (int, float)) and conn_max_age > 0):
-        warnings.append(
-            CheckWarning(
-                f"CONN_MAX_AGE={conn_max_age} with USE_LOCAL_SET=False "
-                f"risks GUC state leaking between requests on persistent "
-                f"connections. Consider USE_LOCAL_SET=True with "
-                f"ATOMIC_REQUESTS=True for safer connection pooling.",
-                hint="Set USE_LOCAL_SET=True and ATOMIC_REQUESTS=True.",
-                id="django_rls_tenants.W004",
+    django_databases = getattr(settings, "DATABASES", {})
+    for alias in rls_tenants_config.DATABASES:
+        db_config = django_databases.get(alias, {})
+        conn_max_age = db_config.get("CONN_MAX_AGE", 0)
+        # None means "keep connections forever" -- the most dangerous value.
+        if conn_max_age is None or (isinstance(conn_max_age, (int, float)) and conn_max_age > 0):
+            warnings.append(
+                CheckWarning(
+                    f"DATABASES[{alias!r}] has CONN_MAX_AGE={conn_max_age} "
+                    f"with USE_LOCAL_SET=False. This risks GUC state leaking "
+                    f"between requests on persistent connections. Consider "
+                    f"USE_LOCAL_SET=True with ATOMIC_REQUESTS=True for safer "
+                    f"connection pooling.",
+                    hint=f"Set USE_LOCAL_SET=True and ATOMIC_REQUESTS=True, "
+                    f"or set DATABASES[{alias!r}]['CONN_MAX_AGE'] = 0.",
+                    id="django_rls_tenants.W004",
+                )
             )
+    return warnings
+
+
+def _check_databases_alias_exists() -> list[CheckWarning]:
+    """Warn if ``DATABASES`` contains an alias not in ``settings.DATABASES``.
+
+    Catches typos like ``"replca"`` instead of ``"replica"`` that would
+    cause ``set_guc`` to fail at runtime when the middleware tries to
+    open a connection to a non-existent database alias.
+    """
+    from django.conf import settings  # noqa: PLC0415
+
+    from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
+
+    django_databases = set(getattr(settings, "DATABASES", {}).keys())
+    return [
+        CheckWarning(
+            f"RLS_TENANTS['DATABASES'] contains {alias!r} which is "
+            f"not defined in settings.DATABASES. The middleware will "
+            f"fail at runtime when trying to set GUCs on this alias.",
+            hint=(
+                f"Check for typos. Defined database aliases: "
+                f"{', '.join(sorted(django_databases))}."
+            ),
+            id="django_rls_tenants.W006",
         )
+        for alias in rls_tenants_config.DATABASES
+        if alias not in django_databases
+    ]
+
+
+def _check_databases_atomic_requests() -> list[CheckWarning]:
+    """Warn if ``USE_LOCAL_SET=True`` but ``ATOMIC_REQUESTS`` is not enabled.
+
+    Checks all aliases in ``RLS_TENANTS["DATABASES"]``, not just
+    ``default``. ``SET LOCAL`` requires an active transaction on each
+    database.
+    """
+    from django.conf import settings  # noqa: PLC0415
+
+    from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
+
+    warnings: list[CheckWarning] = []
+    if not rls_tenants_config.USE_LOCAL_SET:
+        return warnings
+
+    django_databases = getattr(settings, "DATABASES", {})
+    for alias in rls_tenants_config.DATABASES:
+        db_config = django_databases.get(alias, {})
+        if not db_config.get("ATOMIC_REQUESTS", False):
+            warnings.append(
+                CheckWarning(
+                    f"USE_LOCAL_SET=True but DATABASES[{alias!r}] does not "
+                    f"have ATOMIC_REQUESTS=True. SET LOCAL requires an active "
+                    f"transaction. The middleware will crash at runtime when "
+                    f"setting GUCs on {alias!r}.",
+                    hint=f"Set DATABASES[{alias!r}]['ATOMIC_REQUESTS'] = True.",
+                    id="django_rls_tenants.W007",
+                )
+            )
     return warnings

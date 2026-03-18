@@ -10,6 +10,8 @@ from django.test import override_settings
 
 from django_rls_tenants.tenants.checks import (
     _check_conn_max_age_with_session_gucs,
+    _check_databases_alias_exists,
+    _check_databases_atomic_requests,
     _check_guc_prefix_mismatch,
     _check_superuser_connection,
     _check_use_local_set_requires_atomic,
@@ -220,6 +222,7 @@ class TestCheckConnMaxAgeWithSessionGucs:
         ):
             warnings = _check_conn_max_age_with_session_gucs()
         assert "300" in warnings[0].msg
+        assert "default" in warnings[0].msg
 
     def test_w004_conn_max_age_none_means_infinite(self):
         """W004 fires when CONN_MAX_AGE=None (keep connections forever)."""
@@ -242,6 +245,35 @@ class TestCheckConnMaxAgeWithSessionGucs:
             warnings = _check_conn_max_age_with_session_gucs()
         ids = [w.id for w in warnings]
         assert "django_rls_tenants.W004" in ids
+
+    def test_w004_checks_all_configured_databases(self):
+        """W004 fires for each alias with CONN_MAX_AGE > 0."""
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "USE_LOCAL_SET": False,
+                    "DATABASES": ["default", "replica"],
+                },
+                DATABASES={
+                    "default": {
+                        "ENGINE": "django.db.backends.postgresql",
+                        "NAME": "test",
+                        "CONN_MAX_AGE": 0,
+                    },
+                    "replica": {
+                        "ENGINE": "django.db.backends.postgresql",
+                        "NAME": "test_replica",
+                        "CONN_MAX_AGE": 600,
+                    },
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_conn_max_age_with_session_gucs()
+        assert len(warnings) == 1
+        assert "replica" in warnings[0].msg
+        assert "600" in warnings[0].msg
 
 
 class TestCheckSuperuserConnection:
@@ -300,3 +332,189 @@ class TestCheckSuperuserConnection:
             mock_conn.cursor.return_value = mock_cursor
             warnings = _check_superuser_connection()
         assert warnings == []
+
+
+class TestCheckDatabasesAliasExists:
+    """Tests for _check_databases_alias_exists."""
+
+    def test_no_warning_when_default_only(self):
+        """No W006 when DATABASES contains only 'default'."""
+        warnings = _check_databases_alias_exists()
+        assert warnings == []
+
+    def test_w006_invalid_alias(self):
+        """W006 fires when DATABASES contains an alias not in settings.DATABASES."""
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "DATABASES": ["default", "replca"],
+                },
+                DATABASES={
+                    "default": {
+                        "ENGINE": "django.db.backends.postgresql",
+                        "NAME": "test",
+                    },
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_databases_alias_exists()
+        ids = [w.id for w in warnings]
+        assert "django_rls_tenants.W006" in ids
+
+    def test_w006_message_includes_alias(self):
+        """W006 message includes the invalid alias name."""
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "DATABASES": ["default", "replca"],
+                },
+                DATABASES={
+                    "default": {
+                        "ENGINE": "django.db.backends.postgresql",
+                        "NAME": "test",
+                    },
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_databases_alias_exists()
+        assert "replca" in warnings[0].msg
+
+    def test_no_warning_when_all_aliases_valid(self):
+        """No W006 when all DATABASES aliases exist in settings.DATABASES."""
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "DATABASES": ["default", "replica"],
+                },
+                DATABASES={
+                    "default": {
+                        "ENGINE": "django.db.backends.postgresql",
+                        "NAME": "test",
+                    },
+                    "replica": {
+                        "ENGINE": "django.db.backends.postgresql",
+                        "NAME": "test_replica",
+                    },
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_databases_alias_exists()
+        assert warnings == []
+
+    def test_warnings_are_check_warning_instances(self):
+        """Returned items are Django CheckWarning instances."""
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "DATABASES": ["default", "nonexistent"],
+                },
+                DATABASES={
+                    "default": {
+                        "ENGINE": "django.db.backends.postgresql",
+                        "NAME": "test",
+                    },
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_databases_alias_exists()
+        assert all(isinstance(w, CheckWarning) for w in warnings)
+
+
+class TestCheckDatabasesAtomicRequests:
+    """Tests for _check_databases_atomic_requests."""
+
+    def test_no_warning_when_use_local_set_false(self):
+        """No W007 when USE_LOCAL_SET=False (default)."""
+        warnings = _check_databases_atomic_requests()
+        assert warnings == []
+
+    def test_w007_use_local_set_without_atomic_on_alias(self):
+        """W007 fires when USE_LOCAL_SET=True but an alias lacks ATOMIC_REQUESTS."""
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "USE_LOCAL_SET": True,
+                    "DATABASES": ["default", "replica"],
+                },
+                DATABASES={
+                    "default": {
+                        "ENGINE": "django.db.backends.postgresql",
+                        "NAME": "test",
+                        "ATOMIC_REQUESTS": True,
+                    },
+                    "replica": {
+                        "ENGINE": "django.db.backends.postgresql",
+                        "NAME": "test_replica",
+                    },
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_databases_atomic_requests()
+        ids = [w.id for w in warnings]
+        assert "django_rls_tenants.W007" in ids
+        # Only replica should trigger the warning
+        assert len(warnings) == 1
+        assert "replica" in warnings[0].msg
+
+    def test_no_warning_when_all_aliases_have_atomic(self):
+        """No W007 when all DATABASES aliases have ATOMIC_REQUESTS=True."""
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "USE_LOCAL_SET": True,
+                    "DATABASES": ["default", "replica"],
+                },
+                DATABASES={
+                    "default": {
+                        "ENGINE": "django.db.backends.postgresql",
+                        "NAME": "test",
+                        "ATOMIC_REQUESTS": True,
+                    },
+                    "replica": {
+                        "ENGINE": "django.db.backends.postgresql",
+                        "NAME": "test_replica",
+                        "ATOMIC_REQUESTS": True,
+                    },
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_databases_atomic_requests()
+        assert warnings == []
+
+    def test_w007_multiple_aliases_without_atomic(self):
+        """W007 fires for each alias missing ATOMIC_REQUESTS."""
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "USE_LOCAL_SET": True,
+                    "DATABASES": ["default", "replica"],
+                },
+                DATABASES={
+                    "default": {
+                        "ENGINE": "django.db.backends.postgresql",
+                        "NAME": "test",
+                    },
+                    "replica": {
+                        "ENGINE": "django.db.backends.postgresql",
+                        "NAME": "test_replica",
+                    },
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_databases_atomic_requests()
+        ids = [w.id for w in warnings]
+        assert ids.count("django_rls_tenants.W007") == 2

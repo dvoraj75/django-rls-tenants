@@ -8,6 +8,7 @@ settings module.
 ```python title="settings.py"
 RLS_TENANTS = {
     "TENANT_MODEL": "myapp.Tenant",
+    "DATABASES": ["default"],
     "TENANT_FK_FIELD": "tenant",
     "GUC_PREFIX": "rls",
     "USER_PARAM_NAME": "as_user",
@@ -33,6 +34,31 @@ RLS_TENANTS = {
     "TENANT_MODEL": "organizations.Organization",
 }
 ```
+
+### `DATABASES`
+
+| | |
+|---|---|
+| **Type** | `list[str]` |
+| **Default** | `["default"]` |
+
+Database aliases to set GUC variables on. In multi-database setups (e.g., read replicas),
+add all aliases that serve RLS-protected queries.
+
+```python
+RLS_TENANTS = {
+    "TENANT_MODEL": "myapp.Tenant",
+    "DATABASES": ["default", "replica"],
+}
+```
+
+The middleware sets GUCs on all configured aliases during each request. A
+`connection_created` signal handler also sets GUCs on lazily-created connections
+that don't exist when the middleware runs.
+
+!!! warning
+    Each alias must exist in Django's `DATABASES` setting. A typo (e.g., `"replca"`)
+    will trigger system check `W006` at startup and cause runtime errors.
 
 ### `TENANT_FK_FIELD`
 
@@ -170,8 +196,11 @@ django-rls-tenants registers Django system checks that warn about common misconf
 |-------|----------|-------------|
 | `W001` | Warning | `RLSConstraint.guc_tenant_var` doesn't match `GUC_PREFIX`-derived name |
 | `W002` | Warning | `RLSConstraint.guc_admin_var` doesn't match `GUC_PREFIX`-derived name |
-| `W003` | Warning | `USE_LOCAL_SET=True` without `ATOMIC_REQUESTS=True` |
+| `W003` | Warning | `USE_LOCAL_SET=True` without `ATOMIC_REQUESTS=True` on `default` |
 | `W004` | Warning | `CONN_MAX_AGE > 0` with `USE_LOCAL_SET=False` (session GUCs may leak) |
+| `W005` | Warning | Database connection uses a PostgreSQL superuser (RLS bypassed) |
+| `W006` | Warning | `DATABASES` contains an alias not defined in `settings.DATABASES` |
+| `W007` | Warning | `USE_LOCAL_SET=True` without `ATOMIC_REQUESTS` on a configured alias |
 
 Run `python manage.py check` to see any warnings.
 

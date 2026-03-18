@@ -96,6 +96,20 @@ class TestRLSTenantsConfig:
             conf = RLSTenantsConfig()
             assert conf.USE_LOCAL_SET is True
 
+    def test_databases_default(self):
+        """DATABASES defaults to ["default"]."""
+        with override_settings(RLS_TENANTS={"TENANT_MODEL": "x.Y"}):
+            conf = RLSTenantsConfig()
+            assert conf.DATABASES == ["default"]
+
+    def test_databases_custom(self):
+        """DATABASES reads custom value."""
+        with override_settings(
+            RLS_TENANTS={"TENANT_MODEL": "x.Y", "DATABASES": ["default", "replica"]},
+        ):
+            conf = RLSTenantsConfig()
+            assert conf.DATABASES == ["default", "replica"]
+
     def test_unknown_key_warns(self):
         """Unrecognized keys in RLS_TENANTS emit a UserWarning."""
         with override_settings(
