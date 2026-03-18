@@ -6,6 +6,11 @@ and testing utilities.
 
 from __future__ import annotations
 
+from django_rls_tenants.exceptions import (
+    NoTenantContextError,
+    RLSConfigurationError,
+    RLSTenantError,
+)
 from django_rls_tenants.tenants.bypass import (
     bypass_flag,
     clear_bypass_flag,
@@ -27,8 +32,11 @@ from django_rls_tenants.tenants.state import (
 from django_rls_tenants.tenants.types import TenantUser
 
 __all__ = [
+    "NoTenantContextError",
+    "RLSConfigurationError",
     "RLSManager",
     "RLSProtectedModel",
+    "RLSTenantError",
     "TenantQuerySet",
     "TenantUser",
     "admin_context",
