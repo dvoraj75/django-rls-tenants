@@ -30,11 +30,13 @@ with tenant_context(tenant_id=42):
 - Sets the internal `ContextVar` state so `RLSManager.get_queryset()` automatically
   adds `WHERE tenant_id = X` to all queries (auto-scoping).
 - Saves and restores previous GUC values and state on exit (supports nesting).
-- Raises `ValueError` if `tenant_id` is `None`.
+- Raises `NoTenantContextError` if `tenant_id` is `None`.
 
 ```python
-# ValueError: use admin_context() for admin access
-with tenant_context(tenant_id=None):  # raises ValueError
+from django_rls_tenants import NoTenantContextError
+
+# NoTenantContextError: use admin_context() for admin access
+with tenant_context(tenant_id=None):  # raises NoTenantContextError
     ...
 ```
 

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Custom exception hierarchy in `django_rls_tenants.exceptions`: `RLSTenantError`
+  (base), `NoTenantContextError`, `RLSConfigurationError`. All importable from
+  the top-level `django_rls_tenants` package. (#12)
+
+### Changed
+
+- `tenant_context()` and `_resolve_user_guc_vars()` now raise
+  `NoTenantContextError` instead of `ValueError` when a non-admin user has
+  `rls_tenant_id=None` or when `tenant_id` is `None`.
+- `@with_rls_context` decorator now raises `NoTenantContextError` instead of
+  `ValueError` when a non-admin user has `rls_tenant_id=None`.
+- `RLSTenantsConfig._get()` now raises `RLSConfigurationError` instead of
+  `ValueError` when a required config key (e.g., `TENANT_MODEL`) is missing.
+
 ## [1.1.0] - 2026-03-17
 
 ### Added

@@ -144,8 +144,17 @@ def set_guc(name: str, value: str, *, is_local: bool = False) -> None:
 
 ### Error Handling
 
-- Use **stdlib exceptions** — `ValueError` for bad arguments, `RuntimeError` for
-  incorrect usage context. No custom exception classes.
+- **Custom exceptions** live in `django_rls_tenants/exceptions.py` (package root,
+  usable by both `rls/` and `tenants/` layers):
+  - `RLSTenantError(Exception)` — base for all library errors.
+  - `NoTenantContextError(RLSTenantError)` — missing tenant context (e.g.,
+    `tenant_context(None)`, non-admin with `rls_tenant_id=None`).
+  - `RLSConfigurationError(RLSTenantError)` — invalid/missing config (e.g.,
+    missing `TENANT_MODEL`).
+- The **`rls/` layer** still uses stdlib exceptions (`ValueError` for input
+  validation / SQL injection guards, `RuntimeError` for misuse like SET LOCAL
+  outside a transaction). This keeps the generic layer free of tenant-specific
+  concerns.
 - Error messages must be **descriptive f-strings** explaining both the problem and
   how to fix it (`TRY003` is intentionally ignored).
 - **Logging:** `logger = logging.getLogger("django_rls_tenants")`. Use `%s` format
