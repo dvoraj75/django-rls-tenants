@@ -44,6 +44,23 @@ def _were_gucs_set() -> bool:
     return _gucs_set_var.get()
 
 
+def _clear_gucs_on_all_databases(conf: Any) -> None:
+    """Best-effort clear of GUCs on all configured database aliases.
+
+    Used during error handling to prevent partial GUC state from
+    leaking. Silently ignores failures on individual aliases.
+
+    Args:
+        conf: ``RLSTenantsConfig`` instance.
+    """
+    for db_alias in conf.DATABASES:
+        try:
+            clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
+            clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
+        except Exception:  # noqa: S110  -- best-effort cleanup, connection may be dead
+            pass
+
+
 class RLSTenantMiddleware(MiddlewareMixin):
     """Set RLS context for each authenticated request.
 
@@ -65,11 +82,11 @@ class RLSTenantMiddleware(MiddlewareMixin):
     """
 
     def process_request(self, request: HttpRequest) -> None:
-        """Set GUC variables based on the authenticated user.
+        """Set GUC variables on all configured databases.
 
-        If the first ``set_guc`` succeeds but the second fails (e.g.,
-        broken connection), both GUCs are cleared to prevent partial
-        state from leaking tenant context.
+        Iterates over ``RLS_TENANTS["DATABASES"]`` and sets GUCs on each
+        alias. If setting GUCs on one database fails, clears all GUCs on
+        databases that were already set, then re-raises.
         """
         if not hasattr(request, "user") or not request.user.is_authenticated:
             return
@@ -79,11 +96,7 @@ class RLSTenantMiddleware(MiddlewareMixin):
 
         try:
             guc_vars = _resolve_user_guc_vars(user, conf)
-            for guc_name, guc_value in guc_vars.items():
-                if guc_value:
-                    set_guc(guc_name, guc_value, is_local=conf.USE_LOCAL_SET)
-                else:
-                    clear_guc(guc_name, is_local=conf.USE_LOCAL_SET)
+            self._set_gucs_on_all_databases(guc_vars, conf)
 
             # Set auto-scope state for RLSManager.get_queryset().
             # Use the original tenant ID from the user (preserving type)
@@ -96,13 +109,9 @@ class RLSTenantMiddleware(MiddlewareMixin):
             setattr(request, "_rls_tenant_token", token)  # noqa: B010  -- dynamic attr on HttpRequest
             _mark_gucs_set()
         except Exception:
-            logger.exception("Failed to set RLS GUC variables, clearing both to prevent leak")
+            logger.exception("Failed to set RLS GUC variables, clearing to prevent leak")
             set_current_tenant_id(None)
-            try:
-                clear_guc(conf.GUC_IS_ADMIN)
-                clear_guc(conf.GUC_CURRENT_TENANT)
-            except Exception:  # noqa: S110  -- best-effort cleanup, connection may be dead
-                pass
+            _clear_gucs_on_all_databases(conf)
             raise
 
     def process_response(
@@ -128,11 +137,47 @@ class RLSTenantMiddleware(MiddlewareMixin):
         self._cleanup_rls_state(request)
 
     @staticmethod
+    def _set_gucs_on_all_databases(guc_vars: dict[str, str], conf: Any) -> None:
+        """Set GUC variables on all configured database aliases.
+
+        If setting GUCs on one database fails, clears all GUCs on
+        databases that were already set, then re-raises.
+
+        Args:
+            guc_vars: Mapping of GUC names to values.
+            conf: ``RLSTenantsConfig`` instance.
+        """
+        completed_aliases: list[str] = []
+        try:
+            for db_alias in conf.DATABASES:
+                for guc_name, guc_value in guc_vars.items():
+                    if guc_value:
+                        set_guc(
+                            guc_name,
+                            guc_value,
+                            is_local=conf.USE_LOCAL_SET,
+                            using=db_alias,
+                        )
+                    else:
+                        clear_guc(guc_name, is_local=conf.USE_LOCAL_SET, using=db_alias)
+                completed_aliases.append(db_alias)
+        except Exception:
+            # Rollback GUCs on databases that were already set.
+            for done_alias in completed_aliases:
+                try:
+                    clear_guc(conf.GUC_IS_ADMIN, using=done_alias)
+                    clear_guc(conf.GUC_CURRENT_TENANT, using=done_alias)
+                except Exception:  # noqa: S110  -- best-effort cleanup
+                    pass
+            raise
+
+    @staticmethod
     def _cleanup_rls_state(request: HttpRequest) -> None:
         """Reset ContextVar (via token if available) and clear GUCs.
 
-        Skips database round-trips for requests where GUCs were never
-        set (e.g., unauthenticated requests, health checks).
+        Clears GUCs on all configured database aliases. Skips database
+        round-trips for requests where GUCs were never set (e.g.,
+        unauthenticated requests, health checks).
 
         Args:
             request: The Django HTTP request being finalised.
@@ -148,6 +193,7 @@ class RLSTenantMiddleware(MiddlewareMixin):
             return
         conf = rls_tenants_config
         if not conf.USE_LOCAL_SET:
-            clear_guc(conf.GUC_IS_ADMIN)
-            clear_guc(conf.GUC_CURRENT_TENANT)
+            for db_alias in conf.DATABASES:
+                clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
+                clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
         _clear_gucs_set_flag()

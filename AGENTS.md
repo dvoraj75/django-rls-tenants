@@ -64,6 +64,16 @@ The library has two internal layers with a strict import boundary:
 
 This boundary is enforced by `tests/test_layering.py`. Never import from `tenants/` in `rls/`.
 
+### Multi-Database Support
+
+The middleware sets GUC variables on all database aliases listed in
+`RLS_TENANTS["DATABASES"]` (default: `["default"]`). A `connection_created`
+signal handler in `apps.py` also sets GUCs on lazily-created connections.
+The safety-net `request_finished` handler clears GUCs on all configured aliases.
+
+When modifying middleware or GUC-related code, ensure all database iteration
+uses `conf.DATABASES` rather than hardcoding `"default"`.
+
 ## Code Style
 
 ### General Formatting

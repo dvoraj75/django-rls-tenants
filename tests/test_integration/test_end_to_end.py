@@ -376,6 +376,21 @@ class TestCheckRlsCommand:
             with connection.cursor() as cur:
                 cur.execute('ALTER TABLE "test_order" ENABLE ROW LEVEL SECURITY')
 
+    def test_database_flag_default(self):
+        """--database flag defaults to 'default' and works correctly."""
+        out = StringIO()
+        call_command("check_rls", "--database", "default", stdout=out)
+        output = out.getvalue()
+        assert "verified" in output.lower()
+
+    def test_database_flag_accepts_alias(self):
+        """--database flag accepts a database alias."""
+        # Using the default alias should work; test the flag is accepted
+        out = StringIO()
+        call_command("check_rls", database="default", stdout=out)
+        output = out.getvalue()
+        assert "verified" in output.lower()
+
 
 # ---------------------------------------------------------------------------
 # EXPLAIN-based index usage verification

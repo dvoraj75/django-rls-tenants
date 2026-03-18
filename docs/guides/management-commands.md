@@ -9,6 +9,7 @@ have the expected RLS policies applied in the database.
 
 ```bash
 python manage.py check_rls
+python manage.py check_rls --database replica  # check a specific database
 ```
 
 ### Successful Output
@@ -55,6 +56,12 @@ The command performs two batched queries against PostgreSQL system catalogs:
 - name: Verify RLS policies
   run: python manage.py check_rls
 ```
+
+### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--database` | `default` | Database alias to check RLS status on |
 
 ### Limitations
 
