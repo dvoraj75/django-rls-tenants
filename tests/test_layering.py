@@ -62,6 +62,27 @@ class TestLazyImports:
         assert admin_context is ctx_mod.admin_context
         assert tenant_context is ctx_mod.tenant_context
 
+    def test_exceptions(self):
+        """Exception classes are importable from the top-level package."""
+        from django_rls_tenants import (  # noqa: PLC0415
+            NoTenantContextError,
+            RLSConfigurationError,
+            RLSTenantError,
+        )
+        from django_rls_tenants.exceptions import (  # noqa: PLC0415
+            NoTenantContextError as DirectNoCtx,
+        )
+        from django_rls_tenants.exceptions import (  # noqa: PLC0415
+            RLSConfigurationError as DirectCfgErr,
+        )
+        from django_rls_tenants.exceptions import (  # noqa: PLC0415
+            RLSTenantError as DirectBase,
+        )
+
+        assert NoTenantContextError is DirectNoCtx
+        assert RLSConfigurationError is DirectCfgErr
+        assert RLSTenantError is DirectBase
+
     def test_invalid_attribute_raises(self):
         """Accessing an undefined attribute raises AttributeError."""
         import django_rls_tenants  # noqa: PLC0415

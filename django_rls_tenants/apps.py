@@ -64,5 +64,7 @@ class DjangoRlsTenantsConfig(AppConfig):
         import django_rls_tenants.tenants.checks  # noqa: PLC0415, F401
 
         # Validate configuration at startup
-        with contextlib.suppress(ValueError):
+        from django_rls_tenants.exceptions import RLSConfigurationError  # noqa: PLC0415
+
+        with contextlib.suppress(RLSConfigurationError):
             _ = rls_tenants_config.TENANT_MODEL
