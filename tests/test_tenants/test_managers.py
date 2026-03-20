@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from unittest.mock import MagicMock
 
 import pytest
 from django.core.exceptions import FieldError
+from django.db.models import Sum
+from django.test import override_settings
 
+from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.guc import get_guc
+from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import admin_context, tenant_context
 from django_rls_tenants.tenants.managers import _is_rls_protected, _resolve_related_model
+from django_rls_tenants.tenants.middleware import RLSTenantMiddleware
 from django_rls_tenants.tenants.state import (
     get_current_tenant_id,
+    get_rls_context_active,
     reset_current_tenant_id,
     set_current_tenant_id,
 )
@@ -444,3 +451,244 @@ class TestResolveRelatedModel:
         """Returns None for a non-relation field (e.g., CharField)."""
         result = _resolve_related_model(Order, "product")
         assert result is None
+
+
+# ---- Strict mode tests ----
+
+
+def _strict_settings():
+    """Return override_settings context for STRICT_MODE=True."""
+    return override_settings(
+        RLS_TENANTS={
+            "TENANT_MODEL": "test_app.Tenant",
+            "STRICT_MODE": True,
+        },
+    )
+
+
+@pytest.fixture
+def _strict_mode():
+    """Enable strict mode and reset config cache for the test."""
+    with _strict_settings():
+        rls_tenants_config._config_cache = None
+        rls_tenants_config._unknown_keys_checked = False
+        try:
+            yield
+        finally:
+            rls_tenants_config._config_cache = None
+            rls_tenants_config._unknown_keys_checked = False
+
+
+class TestStrictModeDisabled:
+    """Tests that strict mode off (default) preserves existing behavior."""
+
+    def test_no_context_returns_empty(self, sample_orders):
+        """Without context and strict mode off, queries return empty (fail-closed)."""
+        assert get_current_tenant_id() is None
+        qs = Order.objects.all()
+        # No strict mode error; just returns all rows (superuser test DB)
+        # or empty (if RLS enforced). The key point: no exception.
+        list(qs)
+
+
+class TestStrictModeRaises:
+    """Tests that strict mode raises NoTenantContextError on evaluation."""
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_fetch_all_raises(self, sample_orders):
+        """list(qs) raises NoTenantContextError without context."""
+        qs = Order.objects.all()
+        with pytest.raises(NoTenantContextError, match="strict mode"):
+            list(qs)
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_count_raises(self, sample_orders):
+        """qs.count() raises NoTenantContextError without context."""
+        qs = Order.objects.all()
+        with pytest.raises(NoTenantContextError, match="strict mode"):
+            qs.count()
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_exists_raises(self, sample_orders):
+        """qs.exists() raises NoTenantContextError without context."""
+        qs = Order.objects.all()
+        with pytest.raises(NoTenantContextError, match="strict mode"):
+            qs.exists()
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_aggregate_raises(self, sample_orders):
+        """qs.aggregate() raises NoTenantContextError without context."""
+        qs = Order.objects.all()
+        with pytest.raises(NoTenantContextError, match="strict mode"):
+            qs.aggregate(total=Sum("amount"))
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_update_raises(self, sample_orders):
+        """qs.update() raises NoTenantContextError without context."""
+        qs = Order.objects.all()
+        with pytest.raises(NoTenantContextError, match="strict mode"):
+            qs.update(product="X")
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_delete_raises(self, sample_orders):
+        """qs.delete() raises NoTenantContextError without context."""
+        qs = Order.objects.all()
+        with pytest.raises(NoTenantContextError, match="strict mode"):
+            qs.delete()
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_get_raises(self, sample_orders):
+        """qs.get() raises NoTenantContextError without context."""
+        qs = Order.objects.all()
+        with pytest.raises(NoTenantContextError, match="strict mode"):
+            qs.get(pk=sample_orders["a1"].pk)
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_first_raises(self, sample_orders):
+        """qs.first() raises NoTenantContextError without context."""
+        qs = Order.objects.all()
+        with pytest.raises(NoTenantContextError, match="strict mode"):
+            qs.first()
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_last_raises(self, sample_orders):
+        """qs.last() raises NoTenantContextError without context."""
+        qs = Order.objects.all()
+        with pytest.raises(NoTenantContextError, match="strict mode"):
+            qs.last()
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_iterator_raises(self, sample_orders):
+        """qs.iterator() raises NoTenantContextError without context."""
+        qs = Order.objects.all()
+        with pytest.raises(NoTenantContextError, match="strict mode"):
+            list(qs.iterator())
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_bulk_create_raises(self, sample_orders, tenant_a):
+        """qs.bulk_create() raises NoTenantContextError without context."""
+        qs = Order.objects.all()
+        with pytest.raises(NoTenantContextError, match="strict mode"):
+            qs.bulk_create([Order(product="X", amount=1, tenant=tenant_a)])
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_bulk_update_raises(self, sample_orders):
+        """qs.bulk_update() raises NoTenantContextError without context."""
+        qs = Order.objects.all()
+        with pytest.raises(NoTenantContextError, match="strict mode"):
+            qs.bulk_update([], fields=["product"])
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_error_message_contains_model_name(self, sample_orders):
+        """Error message includes the model name for debugging."""
+        qs = Order.objects.all()
+        with pytest.raises(NoTenantContextError, match="Order"):
+            list(qs)
+
+
+class TestStrictModeAllowsContext:
+    """Tests that strict mode does NOT raise when context is properly set."""
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_tenant_context_allows_query(self, sample_orders, tenant_a):
+        """No error when tenant_context() is active."""
+        with tenant_context(tenant_a.pk):
+            products = list(Order.objects.values_list("product", flat=True))
+            assert sorted(products) == ["Widget A1", "Widget A2"]
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_admin_context_allows_query(self, sample_orders):
+        """No error when admin_context() is active."""
+        with admin_context():
+            count = Order.objects.count()
+            assert count == 3
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_for_user_allows_query(self, sample_orders, tenant_a_user):
+        """No error when for_user() was called."""
+        qs = Order.objects.for_user(tenant_a_user)
+        products = list(qs.values_list("product", flat=True))
+        assert sorted(products) == ["Widget A1", "Widget A2"]
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_middleware_allows_query(self, sample_orders, tenant_a_user):
+        """No error when middleware has set context."""
+        mw = RLSTenantMiddleware(get_response=lambda r: MagicMock())
+        request = MagicMock()
+        request.user = tenant_a_user
+        mw.process_request(request)
+        try:
+            products = list(Order.objects.values_list("product", flat=True))
+            assert sorted(products) == ["Widget A1", "Widget A2"]
+        finally:
+            mw.process_response(request, MagicMock())
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_all_guarded_methods_pass_with_context(self, sample_orders, tenant_a):
+        """All guarded methods work within tenant_context()."""
+        with tenant_context(tenant_a.pk):
+            qs = Order.objects.all()
+            # These should all succeed without raising
+            list(qs)
+            Order.objects.all().count()
+            Order.objects.all().exists()
+            Order.objects.all().first()
+            Order.objects.all().last()
+            list(Order.objects.all().iterator())
+
+
+class TestStrictModeContextVarLifecycle:
+    """Tests that _rls_context_active is properly set and restored."""
+
+    def test_tenant_context_sets_active(self, db, tenant_a):
+        """tenant_context() sets _rls_context_active to True."""
+        assert get_rls_context_active() is False
+        with tenant_context(tenant_a.pk):
+            assert get_rls_context_active() is True
+        assert get_rls_context_active() is False
+
+    def test_admin_context_sets_active(self, db):
+        """admin_context() sets _rls_context_active to True."""
+        assert get_rls_context_active() is False
+        with admin_context():
+            assert get_rls_context_active() is True
+        assert get_rls_context_active() is False
+
+    def test_nested_contexts_restore_active_flag(self, db, tenant_a, tenant_b):
+        """Nested contexts properly restore the active flag."""
+        assert get_rls_context_active() is False
+        with tenant_context(tenant_a.pk):
+            assert get_rls_context_active() is True
+            with admin_context():
+                assert get_rls_context_active() is True
+            assert get_rls_context_active() is True
+        assert get_rls_context_active() is False
+
+    def test_active_flag_restored_on_exception(self, db, tenant_a):
+        """_rls_context_active is restored when an exception occurs."""
+        assert get_rls_context_active() is False
+        with pytest.raises(RuntimeError, match="boom"), tenant_context(tenant_a.pk):
+            raise RuntimeError("boom")
+        assert get_rls_context_active() is False
+
+    def test_middleware_sets_and_clears_active(self, db, tenant_a_user):
+        """Middleware sets active on request and clears on response."""
+        assert get_rls_context_active() is False
+        mw = RLSTenantMiddleware(get_response=lambda r: MagicMock())
+        request = MagicMock()
+        request.user = tenant_a_user
+        mw.process_request(request)
+        assert get_rls_context_active() is True
+        mw.process_response(request, MagicMock())
+        assert get_rls_context_active() is False
+
+    def test_middleware_clears_active_on_exception(self, db, tenant_a_user):
+        """Middleware clears active flag via process_exception."""
+        assert get_rls_context_active() is False
+        mw = RLSTenantMiddleware(get_response=lambda r: MagicMock())
+        request = MagicMock()
+        request.user = tenant_a_user
+        mw.process_request(request)
+        assert get_rls_context_active() is True
+        mw.process_exception(request, RuntimeError("view error"))
+        assert get_rls_context_active() is False

@@ -1,5 +1,8 @@
 from django.contrib.auth.decorators import login_required
+from django.http import HttpResponseServerError
 from django.shortcuts import get_object_or_404, redirect, render
+
+from django_rls_tenants import NoTenantContextError
 
 from .models import Category, Note
 from .services import get_note_stats
@@ -42,7 +45,13 @@ def note_create(request):
 
 @login_required
 def note_delete(request, pk):
-    note = get_object_or_404(Note, pk=pk)
+    # Demonstrates handling NoTenantContextError gracefully.
+    # With STRICT_MODE=True, queries without tenant context raise
+    # NoTenantContextError instead of silently returning empty results.
+    try:
+        note = get_object_or_404(Note, pk=pk)
+    except NoTenantContextError:
+        return HttpResponseServerError("Tenant context required to access notes.")
     if request.method == "POST":
         note.delete()
     return redirect("note_list")

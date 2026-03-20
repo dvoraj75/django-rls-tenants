@@ -123,6 +123,82 @@ migration that assigns the correct tenant to each existing record.
 
 ## Upgrading django-rls-tenants
 
+### From 1.1.0 to 1.2.0
+
+This release has **one minor breaking change**: some `ValueError` exceptions have
+been replaced with custom exception types.
+
+#### What Changed
+
+1. **Custom exceptions**: The library introduces a custom exception hierarchy in
+   `django_rls_tenants.exceptions`. `tenant_context(None)` and
+   `_resolve_user_guc_vars()` now raise `NoTenantContextError` instead of
+   `ValueError`. `RLSTenantsConfig._get()` now raises `RLSConfigurationError`
+   instead of `ValueError`. If you catch `ValueError` from these functions,
+   update your except clauses. Both are subclasses of `RLSTenantError`, which
+   is a subclass of `Exception`.
+
+2. **Multi-database GUC support**: The middleware now sets GUC variables on all
+   database aliases listed in `RLS_TENANTS["DATABASES"]` (default: `["default"]`).
+   No changes needed for single-database setups.
+
+3. **Strict mode** (`STRICT_MODE=True`): An opt-in setting that raises
+   `NoTenantContextError` when queries execute without an active RLS context.
+   Off by default -- existing behavior is unchanged.
+
+4. **New public API**: `get_rls_context_active()`, `set_rls_context_active()`,
+   `reset_rls_context_active()` for tracking whether an RLS context is active.
+   These are primarily used internally by strict mode but are available for
+   custom middleware implementations.
+
+#### Upgrade Steps
+
+1. **Update the package**:
+
+    ```bash
+    pip install --upgrade django-rls-tenants
+    ```
+
+2. **Update exception handling** (if applicable):
+
+    ```python
+    # Before (1.1.0)
+    from django_rls_tenants import tenant_context
+    try:
+        with tenant_context(tenant_id=None):
+            ...
+    except ValueError:
+        ...
+
+    # After (1.2.0)
+    from django_rls_tenants import tenant_context, NoTenantContextError
+    try:
+        with tenant_context(tenant_id=None):
+            ...
+    except NoTenantContextError:
+        ...
+    ```
+
+3. **Optional: enable multi-database support**:
+
+    ```python
+    RLS_TENANTS = {
+        "TENANT_MODEL": "myapp.Tenant",
+        "DATABASES": ["default", "replica"],
+    }
+    ```
+
+4. **Optional: enable strict mode**:
+
+    ```python
+    RLS_TENANTS = {
+        "TENANT_MODEL": "myapp.Tenant",
+        "STRICT_MODE": True,
+    }
+    ```
+
+5. **Verify**: run `python manage.py check` and `python manage.py check_rls`.
+
 ### From 1.0.0 to 1.1.0
 
 This release has **no breaking changes**. All existing code continues to work without

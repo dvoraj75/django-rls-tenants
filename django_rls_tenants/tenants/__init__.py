@@ -26,8 +26,11 @@ from django_rls_tenants.tenants.managers import RLSManager, TenantQuerySet
 from django_rls_tenants.tenants.models import RLSProtectedModel
 from django_rls_tenants.tenants.state import (
     get_current_tenant_id,
+    get_rls_context_active,
     reset_current_tenant_id,
+    reset_rls_context_active,
     set_current_tenant_id,
+    set_rls_context_active,
 )
 from django_rls_tenants.tenants.types import TenantUser
 
@@ -43,10 +46,13 @@ __all__ = [
     "bypass_flag",
     "clear_bypass_flag",
     "get_current_tenant_id",
+    "get_rls_context_active",
     "reset_current_tenant_id",
+    "reset_rls_context_active",
     "rls_tenants_config",
     "set_bypass_flag",
     "set_current_tenant_id",
+    "set_rls_context_active",
     "tenant_context",
     "with_rls_context",
 ]

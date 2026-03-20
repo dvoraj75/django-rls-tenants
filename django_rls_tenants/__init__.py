@@ -24,8 +24,11 @@ __all__ = [
     "__version__",
     "admin_context",
     "get_current_tenant_id",
+    "get_rls_context_active",
     "reset_current_tenant_id",
+    "reset_rls_context_active",
     "set_current_tenant_id",
+    "set_rls_context_active",
     "tenant_context",
     "with_rls_context",
 ]
@@ -42,8 +45,11 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "TenantUser": ("django_rls_tenants.tenants.types", "TenantUser"),
     "admin_context": ("django_rls_tenants.tenants.context", "admin_context"),
     "get_current_tenant_id": ("django_rls_tenants.tenants.state", "get_current_tenant_id"),
+    "get_rls_context_active": ("django_rls_tenants.tenants.state", "get_rls_context_active"),
     "reset_current_tenant_id": ("django_rls_tenants.tenants.state", "reset_current_tenant_id"),
+    "reset_rls_context_active": ("django_rls_tenants.tenants.state", "reset_rls_context_active"),
     "set_current_tenant_id": ("django_rls_tenants.tenants.state", "set_current_tenant_id"),
+    "set_rls_context_active": ("django_rls_tenants.tenants.state", "set_rls_context_active"),
     "tenant_context": ("django_rls_tenants.tenants.context", "tenant_context"),
     "with_rls_context": ("django_rls_tenants.tenants.context", "with_rls_context"),
 }

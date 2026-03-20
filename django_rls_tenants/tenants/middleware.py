@@ -15,7 +15,12 @@ from django.utils.deprecation import MiddlewareMixin
 from django_rls_tenants.rls.guc import clear_guc, set_guc
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import _resolve_user_guc_vars
-from django_rls_tenants.tenants.state import reset_current_tenant_id, set_current_tenant_id
+from django_rls_tenants.tenants.state import (
+    reset_current_tenant_id,
+    reset_rls_context_active,
+    set_current_tenant_id,
+    set_rls_context_active,
+)
 
 if TYPE_CHECKING:
     from django.http import HttpRequest, HttpResponse
@@ -94,6 +99,11 @@ class RLSTenantMiddleware(MiddlewareMixin):
         conf = rls_tenants_config
         user: Any = request.user
 
+        # Track tokens so the except branch can reset via token (not
+        # push a new value) when the ContextVar was already set before
+        # the failure.
+        tenant_token: Token[int | str | None] | None = None
+        active_token: Token[bool] | None = None
         try:
             guc_vars = _resolve_user_guc_vars(user, conf)
             self._set_gucs_on_all_databases(guc_vars, conf)
@@ -103,14 +113,29 @@ class RLSTenantMiddleware(MiddlewareMixin):
             # rather than the string GUC representation, so that
             # get_current_tenant_id() returns a consistent type.
             if not user.is_tenant_admin:
-                token = set_current_tenant_id(user.rls_tenant_id)
+                tenant_token = set_current_tenant_id(user.rls_tenant_id)
             else:
-                token = set_current_tenant_id(None)
-            setattr(request, "_rls_tenant_token", token)  # noqa: B010  -- dynamic attr on HttpRequest
+                tenant_token = set_current_tenant_id(None)
+            setattr(request, "_rls_tenant_token", tenant_token)  # noqa: B010  -- dynamic attr on HttpRequest
+
+            # Mark RLS context as active for strict mode. This
+            # distinguishes "middleware set context" from "no context".
+            active_token = set_rls_context_active(True)
+            setattr(request, "_rls_context_active_token", active_token)  # noqa: B010  -- dynamic attr on HttpRequest
             _mark_gucs_set()
         except Exception:
             logger.exception("Failed to set RLS GUC variables, clearing to prevent leak")
-            set_current_tenant_id(None)
+            # Reset via token when available to avoid stacking unreset
+            # ContextVar values; fall back to set() when the token was
+            # never created (error occurred before set call).
+            if isinstance(tenant_token, Token):
+                reset_current_tenant_id(tenant_token)
+            else:
+                set_current_tenant_id(None)
+            if isinstance(active_token, Token):
+                reset_rls_context_active(active_token)
+            else:
+                set_rls_context_active(False)
             _clear_gucs_on_all_databases(conf)
             raise
 
@@ -173,7 +198,7 @@ class RLSTenantMiddleware(MiddlewareMixin):
 
     @staticmethod
     def _cleanup_rls_state(request: HttpRequest) -> None:
-        """Reset ContextVar (via token if available) and clear GUCs.
+        """Reset ContextVars (via tokens if available) and clear GUCs.
 
         Clears GUCs on all configured database aliases. Skips database
         round-trips for requests where GUCs were never set (e.g.,
@@ -189,6 +214,13 @@ class RLSTenantMiddleware(MiddlewareMixin):
             # Fallback: no token stored (unauthenticated request or error
             # during process_request before token was saved).
             set_current_tenant_id(None)
+
+        active_token = getattr(request, "_rls_context_active_token", None)
+        if isinstance(active_token, Token):
+            reset_rls_context_active(active_token)
+        else:
+            set_rls_context_active(False)
+
         if not _were_gucs_set():
             return
         conf = rls_tenants_config

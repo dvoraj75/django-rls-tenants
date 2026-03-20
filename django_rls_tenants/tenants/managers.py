@@ -32,11 +32,13 @@ from django.core.exceptions import FieldDoesNotExist
 from django.db import models
 from django.db.models import Q
 
+from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.guc import clear_guc, set_guc
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import _resolve_user_guc_vars
 from django_rls_tenants.tenants.state import (
     get_current_tenant_id,
+    get_rls_context_active,
     reset_current_tenant_id,
     set_current_tenant_id,
 )
@@ -225,6 +227,124 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         clone._rls_user = self._rls_user
         return clone
 
+    # ---- Strict mode guard ----
+
+    def _check_strict_mode(self) -> None:
+        """Raise if strict mode is on and no RLS context is active.
+
+        Only applies to RLS-protected models (those with an
+        ``RLSConstraint``). Non-protected models that happen to use
+        ``TenantQuerySet`` (e.g., via inheritance) are not guarded.
+
+        The check reads two ``ContextVar`` values -- negligible cost.
+
+        Raises:
+            NoTenantContextError: If ``STRICT_MODE=True`` and neither a
+                context manager/middleware nor ``for_user()`` has
+                established an RLS context.
+        """
+        if not rls_tenants_config.STRICT_MODE:
+            return
+        if not _is_rls_protected(self.model):
+            return  # not an RLS-protected model; skip guard
+        if get_rls_context_active():
+            return  # tenant_context / admin_context / middleware active
+        if self._rls_user is not None:
+            return  # for_user() was called
+        model_name = self.model.__name__
+        msg = (
+            f"RLS strict mode: query on {model_name} attempted without "
+            f"tenant context. Use tenant_context(), admin_context(), "
+            f"for_user(), or RLSTenantMiddleware before querying "
+            f"RLS-protected models. Set STRICT_MODE=False in RLS_TENANTS "
+            f"to disable this check."
+        )
+        raise NoTenantContextError(msg)
+
+    # ---- Guarded evaluation methods ----
+    #
+    # Methods like first()/last()/get() may also trigger _fetch_all()
+    # on a cloned queryset internally, resulting in a double check.
+    # This is intentional defense-in-depth: the direct check here
+    # catches the call at the public API boundary, while the
+    # _fetch_all() check catches any code path that reaches
+    # evaluation without going through these overrides.
+
+    def count(self) -> int:
+        """Guard ``count()`` with strict mode check."""
+        self._check_strict_mode()
+        return super().count()
+
+    def exists(self) -> bool:
+        """Guard ``exists()`` with strict mode check."""
+        self._check_strict_mode()
+        return super().exists()
+
+    def aggregate(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Guard ``aggregate()`` with strict mode check."""
+        self._check_strict_mode()
+        return super().aggregate(*args, **kwargs)
+
+    def update(self, **kwargs: Any) -> int:
+        """Guard ``update()`` with strict mode check."""
+        self._check_strict_mode()
+        return super().update(**kwargs)
+
+    def delete(self) -> tuple[int, dict[str, int]]:
+        """Guard ``delete()`` with strict mode check."""
+        self._check_strict_mode()
+        return super().delete()
+
+    def iterator(self, chunk_size: int | None = None) -> Any:
+        """Guard ``iterator()`` with strict mode check."""
+        self._check_strict_mode()
+        return super().iterator(chunk_size=chunk_size)
+
+    def bulk_create(
+        self,
+        objs: Any,
+        batch_size: int | None = None,
+        ignore_conflicts: bool = False,
+        update_conflicts: bool = False,
+        update_fields: Any = None,
+        unique_fields: Any = None,
+    ) -> list[Any]:
+        """Guard ``bulk_create()`` with strict mode check."""
+        self._check_strict_mode()
+        return super().bulk_create(
+            objs,
+            batch_size=batch_size,
+            ignore_conflicts=ignore_conflicts,
+            update_conflicts=update_conflicts,
+            update_fields=update_fields,
+            unique_fields=unique_fields,
+        )
+
+    def bulk_update(
+        self,
+        objs: Any,
+        fields: Any,
+        batch_size: int | None = None,
+    ) -> int:
+        """Guard ``bulk_update()`` with strict mode check."""
+        self._check_strict_mode()
+        return super().bulk_update(objs, fields, batch_size=batch_size)
+
+    def get(self, *args: Any, **kwargs: Any) -> Any:
+        """Guard ``get()`` with strict mode check."""
+        self._check_strict_mode()
+        return super().get(*args, **kwargs)
+
+    def first(self) -> Any:
+        """Guard ``first()`` with strict mode check."""
+        self._check_strict_mode()
+        return super().first()
+
+    def last(self) -> Any:
+        """Guard ``last()`` with strict mode check."""
+        self._check_strict_mode()
+        return super().last()
+
     def _fetch_all(self) -> None:
         """Set GUC variables just before query execution.
 
@@ -235,6 +355,7 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         that any querysets created during fetch (e.g., prefetch queries,
         deferred loads) benefit from auto-scope.
         """
+        self._check_strict_mode()
         if self._rls_user is not None:
             conf = rls_tenants_config
             db_alias = self.db

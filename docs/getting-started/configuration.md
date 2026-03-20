@@ -9,6 +9,7 @@ settings module.
 RLS_TENANTS = {
     "TENANT_MODEL": "myapp.Tenant",
     "DATABASES": ["default"],
+    "STRICT_MODE": False,
     "TENANT_FK_FIELD": "tenant",
     "GUC_PREFIX": "rls",
     "USER_PARAM_NAME": "as_user",
@@ -59,6 +60,48 @@ that don't exist when the middleware runs.
 !!! warning
     Each alias must exist in Django's `DATABASES` setting. A typo (e.g., `"replca"`)
     will trigger system check `W006` at startup and cause runtime errors.
+
+### `STRICT_MODE`
+
+| | |
+|---|---|
+| **Type** | `bool` |
+| **Default** | `False` |
+
+When `True`, `TenantQuerySet` evaluation methods raise `NoTenantContextError`
+if no RLS context is active. This catches accidental queries outside a
+`tenant_context()`, `admin_context()`, `for_user()`, or `RLSTenantMiddleware`
+scope at the point of query execution rather than silently returning zero rows.
+
+**Guarded methods:** `_fetch_all()` (iteration), `count()`, `exists()`,
+`aggregate()`, `update()`, `delete()`, `iterator()`, `bulk_create()`,
+`bulk_update()`, `get()`, `first()`, `last()`.
+
+```python
+RLS_TENANTS = {
+    "TENANT_MODEL": "myapp.Tenant",
+    "STRICT_MODE": True,  # Recommended for development
+}
+```
+
+**Recommended usage:** Enable in development and staging to surface missing
+context early. In production, the fail-closed behavior (zero rows) is still
+the safety net, but strict mode makes the failure loud instead of silent.
+
+```python title="settings.py"
+import os
+
+RLS_TENANTS = {
+    "TENANT_MODEL": "myapp.Tenant",
+    "STRICT_MODE": os.environ.get("DJANGO_ENV") != "production",
+}
+```
+
+!!! note
+    Strict mode does **not** change the database-level behavior. RLS policies
+    continue to enforce fail-closed isolation regardless of this setting. Strict
+    mode adds an application-level check that raises before the query reaches
+    the database.
 
 ### `TENANT_FK_FIELD`
 

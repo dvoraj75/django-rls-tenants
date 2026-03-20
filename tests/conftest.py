@@ -10,7 +10,7 @@ from django.db import connection
 
 from django_rls_tenants.rls.guc import clear_guc
 from django_rls_tenants.tenants.context import admin_context
-from django_rls_tenants.tenants.state import set_current_tenant_id
+from django_rls_tenants.tenants.state import set_current_tenant_id, set_rls_context_active
 from tests.test_app.models import (
     Document,
     Order,
@@ -43,6 +43,7 @@ def _clear_gucs_after_test(db):
     yield
     try:
         set_current_tenant_id(None)
+        set_rls_context_active(False)
     finally:
         for name in _GUC_NAMES_TO_CLEAR:
             with contextlib.suppress(Exception):

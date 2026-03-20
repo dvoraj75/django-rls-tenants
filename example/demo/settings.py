@@ -63,6 +63,12 @@ RLS_TENANTS = {
     "TENANT_MODEL": "tenants.Tenant",
     "TENANT_FK_FIELD": "tenant",
     "TENANT_PK_TYPE": "int",
+    # Strict mode: raise NoTenantContextError when querying RLS-protected
+    # models without an active tenant context (instead of silently returning
+    # empty results). Recommended for development/staging.
+    "STRICT_MODE": True,
+    # "DATABASES": ["default"],     # Database aliases for GUC setup (default: ["default"])
+    # "USE_LOCAL_SET": False,       # Use SET LOCAL instead of set_config (default: False)
 }
 
 TEMPLATES = [

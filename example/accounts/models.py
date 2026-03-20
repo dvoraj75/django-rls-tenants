@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from django.contrib.auth.models import AbstractUser
 from django.db import models
 
@@ -13,11 +15,11 @@ class User(AbstractUser):
     is_tenant_admin = models.BooleanField(default=False)
 
     @property
-    def rls_tenant_id(self):
-        return self.tenant_id
+    def rls_tenant_id(self) -> int | None:
+        return self.tenant_id  # type: ignore[return-value]
 
-    def __str__(self):
-        label = self.email or self.username
+    def __str__(self) -> str:
+        label: str = self.email or self.username
         if self.tenant:
             return f"{label} ({self.tenant.name})"
         return f"{label} (admin)"
