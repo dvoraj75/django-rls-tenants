@@ -18,6 +18,7 @@ _KNOWN_KEYS = frozenset(
     {
         "DATABASES",
         "GUC_PREFIX",
+        "STRICT_MODE",
         "TENANT_FK_FIELD",
         "TENANT_MODEL",
         "TENANT_PK_TYPE",
@@ -36,6 +37,7 @@ class RLSTenantsConfig:
             "TENANT_MODEL": "myapp.Tenant",       # Required
             "DATABASES": ["default"],              # Default: ["default"]
             "GUC_PREFIX": "rls",                   # Default: "rls"
+            "STRICT_MODE": False,                  # Default: False
             "TENANT_FK_FIELD": "tenant",           # Default: "tenant"
             "USER_PARAM_NAME": "as_user",          # Default: "as_user"
             "TENANT_PK_TYPE": "int",               # Default: "int"
@@ -82,6 +84,17 @@ class RLSTenantsConfig:
     def USE_LOCAL_SET(self) -> bool:
         """Use ``SET LOCAL`` instead of ``set_config``. Default: ``False``."""
         return self._get("USE_LOCAL_SET", default=False)  # type: ignore[no-any-return]
+
+    @property
+    def STRICT_MODE(self) -> bool:
+        """Raise on queries without tenant context. Default: ``False``.
+
+        When enabled, ``TenantQuerySet`` evaluation methods raise
+        ``NoTenantContextError`` if no RLS context is active (no
+        ``tenant_context()``, ``admin_context()``, ``for_user()``,
+        or ``RLSTenantMiddleware``).
+        """
+        return self._get("STRICT_MODE", default=False)  # type: ignore[no-any-return]
 
     @property
     def DATABASES(self) -> list[str]:

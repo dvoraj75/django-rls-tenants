@@ -187,6 +187,36 @@ def test_rls_with_transactions(tenant_a):
     ...
 ```
 
+## Strict Mode in Tests
+
+When `STRICT_MODE=True`, any query on an RLS-protected model without an active
+context raises `NoTenantContextError`. This affects test setup code that queries
+models outside a context.
+
+Use `rls_bypass()` (which wraps `admin_context()`) or `rls_as_tenant()` in
+fixture and setup code:
+
+```python
+@pytest.fixture
+def sample_data():
+    # rls_bypass establishes an active context -- passes strict mode check
+    with rls_bypass():
+        tenant = Tenant.objects.create(name="Test")
+        Order.objects.create(tenant=tenant, title="Order 1", amount=100)
+    return tenant
+```
+
+To explicitly test that strict mode raises, use `pytest.raises`:
+
+```python
+from django_rls_tenants import NoTenantContextError
+
+@override_settings(RLS_TENANTS={**RLS_SETTINGS, "STRICT_MODE": True})
+def test_strict_mode_raises_without_context():
+    with pytest.raises(NoTenantContextError, match="strict mode"):
+        Order.objects.count()
+```
+
 ## Multi-Database Testing
 
 All test helpers accept a `using` parameter:

@@ -74,6 +74,17 @@ The safety-net `request_finished` handler clears GUCs on all configured aliases.
 When modifying middleware or GUC-related code, ensure all database iteration
 uses `conf.DATABASES` rather than hardcoding `"default"`.
 
+### Strict Mode
+
+When `STRICT_MODE=True`, `TenantQuerySet` evaluation methods raise
+`NoTenantContextError` if no RLS context is active. A second `ContextVar`
+(`_rls_context_active` in `state.py`) tracks whether `tenant_context()`,
+`admin_context()`, `RLSTenantMiddleware`, or `for_user()` has established
+context. This distinguishes "no context" (should raise) from "admin context"
+(both have `_current_tenant_id=None`). All entry points set the flag to `True`
+on entry and restore via token on exit. The guard is in
+`TenantQuerySet._check_strict_mode()`.
+
 ## Code Style
 
 ### General Formatting

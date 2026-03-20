@@ -112,3 +112,9 @@ class Command(BaseCommand):
     Without a context manager, queries against RLS-protected tables will return
     zero rows (fail-closed). This is intentional -- it prevents accidental
     cross-tenant data access in scripts.
+
+!!! tip
+    With `STRICT_MODE=True`, queries without a context manager raise
+    `NoTenantContextError` instead of silently returning empty results. This is
+    especially useful during development to catch management commands that forget
+    to set a context.

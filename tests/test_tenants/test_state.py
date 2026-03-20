@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from django_rls_tenants.tenants.state import (
     get_current_tenant_id,
+    get_rls_context_active,
     reset_current_tenant_id,
+    reset_rls_context_active,
     set_current_tenant_id,
+    set_rls_context_active,
 )
 
 
@@ -107,3 +110,58 @@ class TestTenantIdTypes:
         token = set_current_tenant_id("42")
         assert get_current_tenant_id() == "42"
         reset_current_tenant_id(token)
+
+
+class TestGetRlsContextActive:
+    """Tests for get_rls_context_active()."""
+
+    def test_default_is_false(self):
+        """Returns False when no RLS context is active."""
+        assert get_rls_context_active() is False
+
+    def test_returns_set_value(self):
+        """Returns the value set by set_rls_context_active()."""
+        token = set_rls_context_active(True)
+        assert get_rls_context_active() is True
+        reset_rls_context_active(token)
+
+
+class TestRlsContextActiveSetAndReset:
+    """Tests for set_rls_context_active() and reset_rls_context_active()."""
+
+    def test_set_true_and_reset(self):
+        """Set active to True and reset restores False."""
+        token = set_rls_context_active(True)
+        assert get_rls_context_active() is True
+        reset_rls_context_active(token)
+        assert get_rls_context_active() is False
+
+    def test_nested_set_and_reset(self):
+        """Nested set/reset restores the outer value."""
+        token_outer = set_rls_context_active(True)
+        token_inner = set_rls_context_active(False)
+        assert get_rls_context_active() is False
+        reset_rls_context_active(token_inner)
+        assert get_rls_context_active() is True
+        reset_rls_context_active(token_outer)
+        assert get_rls_context_active() is False
+
+    def test_three_level_nesting(self):
+        """Three levels of nesting restore correctly."""
+        token_1 = set_rls_context_active(True)
+        assert get_rls_context_active() is True
+
+        token_2 = set_rls_context_active(False)
+        assert get_rls_context_active() is False
+
+        token_3 = set_rls_context_active(True)
+        assert get_rls_context_active() is True
+
+        reset_rls_context_active(token_3)
+        assert get_rls_context_active() is False
+
+        reset_rls_context_active(token_2)
+        assert get_rls_context_active() is True
+
+        reset_rls_context_active(token_1)
+        assert get_rls_context_active() is False

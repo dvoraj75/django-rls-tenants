@@ -153,12 +153,48 @@ See [Connection Pooling](../guides/connection-pooling.md) for details.
 | Application-level logic bugs | RLS filters rows, not application behavior |
 | Denial of service | RLS does not rate-limit or throttle |
 
+## Strict Mode
+
+By default, queries without RLS context silently return zero rows (fail-closed).
+While this is secure, it can mask developer mistakes -- the classic "where did my
+data go?" debugging experience.
+
+`STRICT_MODE=True` adds an application-level guard: `TenantQuerySet` evaluation
+methods raise `NoTenantContextError` before the query reaches the database if no
+RLS context is active. This makes missing context failures **loud** instead of
+silent.
+
+```python title="settings.py"
+RLS_TENANTS = {
+    "TENANT_MODEL": "myapp.Tenant",
+    "STRICT_MODE": True,
+}
+```
+
+**What counts as "active context":**
+
+- `tenant_context()` or `admin_context()` context managers
+- `RLSTenantMiddleware` (for authenticated requests)
+- `for_user()` on the queryset
+
+**Guarded methods:** `_fetch_all()` (iteration), `count()`, `exists()`,
+`aggregate()`, `update()`, `delete()`, `iterator()`, `bulk_create()`,
+`bulk_update()`, `get()`, `first()`, `last()`.
+
+!!! note
+    Strict mode does **not** change database-level behavior. RLS policies
+    continue to enforce fail-closed isolation regardless. Strict mode is an
+    additional application-level safety net that surfaces mistakes earlier.
+
+See [Configuration](../getting-started/configuration.md#strict_mode) for setup.
+
 ## Recommendations
 
 1. **Use a non-superuser database role** in production.
-2. **Enable `USE_LOCAL_SET`** if using connection pooling.
-3. **Use UUIDs** for tenant PKs if sequence-based leaks are a concern.
-4. **Include tenant FK in unique constraints** that should be per-tenant.
-5. **Run `check_rls`** in CI to verify policies exist.
-6. **Audit bypass usage** (`admin_context`, `bypass_flag`) regularly.
-7. **Test fail-closed behavior** with `assert_rls_blocks_without_context`.
+2. **Enable `STRICT_MODE`** in development and staging to catch missing context early.
+3. **Enable `USE_LOCAL_SET`** if using connection pooling.
+4. **Use UUIDs** for tenant PKs if sequence-based leaks are a concern.
+5. **Include tenant FK in unique constraints** that should be per-tenant.
+6. **Run `check_rls`** in CI to verify policies exist.
+7. **Audit bypass usage** (`admin_context`, `bypass_flag`) regularly.
+8. **Test fail-closed behavior** with `assert_rls_blocks_without_context`.

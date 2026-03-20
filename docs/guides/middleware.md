@@ -39,24 +39,28 @@ MIDDLEWARE = [
    cleaned up before the exception propagates.
 5. Sets the internal `ContextVar` state for automatic query scoping (tenant users get
    auto-scoped queries; admin users and unauthenticated requests do not).
-6. Marks a `ContextVar` flag that GUCs were set (used by the safety-net signal handler).
+6. Sets `_rls_context_active=True` to mark that an RLS context is active. This is used
+   by strict mode to distinguish "middleware set context" from "no context at all".
+7. Marks a `ContextVar` flag that GUCs were set (used by the safety-net signal handler).
 
 ### Response Phase (`process_response`)
 
-1. Clears the `ContextVar` auto-scope state to prevent cross-request leaks.
-2. If `USE_LOCAL_SET` is `False` (default): clears both GUC variables on **all
+1. Resets the `_rls_context_active` flag (via saved token) to prevent cross-request leaks.
+2. Clears the `ContextVar` auto-scope state to prevent cross-request leaks.
+3. If `USE_LOCAL_SET` is `False` (default): clears both GUC variables on **all
    configured database aliases** to prevent cross-request leaks on persistent connections.
-3. If `USE_LOCAL_SET` is `True`: GUCs are automatically cleared at transaction end
+4. If `USE_LOCAL_SET` is `True`: GUCs are automatically cleared at transaction end
    (by PostgreSQL), so explicit cleanup is skipped.
-4. Clears the `ContextVar` GUC flag.
+5. Clears the `ContextVar` GUC flag.
 
 ### Exception Phase (`process_exception`)
 
 If a view raises an unhandled exception, `process_response` may not run (depending
 on middleware ordering). The `process_exception` handler ensures cleanup still happens:
 
-1. Resets the `ContextVar` auto-scope state (via the saved token or fallback to `None`).
-2. Clears GUC variables (same logic as `process_response`).
+1. Resets the `_rls_context_active` flag (via saved token or fallback to `False`).
+2. Resets the `ContextVar` auto-scope state (via the saved token or fallback to `None`).
+3. Clears GUC variables (same logic as `process_response`).
 
 This prevents `ContextVar` leaks that could affect subsequent requests on the same
 thread (WSGI) or async task (ASGI).
@@ -87,18 +91,22 @@ RLSTenantMiddleware.process_request()
     │   └── SET rls.is_admin = 'true'
     │       CLEAR rls.current_tenant
     │       SET auto-scope state = None (no filter)
+    │       SET _rls_context_active = True
     │
     └── user.is_tenant_admin == False
         └── SET rls.current_tenant = str(tenant_id)
             SET rls.is_admin = 'false'
             SET auto-scope state = tenant_id
+            SET _rls_context_active = True
     │
     ▼
 View executes (queries auto-scoped + filtered by RLS)
+  (strict mode: queries pass because _rls_context_active = True)
     │
     ▼
 RLSTenantMiddleware.process_response()  (or process_exception on error)
     │
+    ├── RESET _rls_context_active (via saved token)
     ├── RESET auto-scope ContextVar (via saved token)
     ├── USE_LOCAL_SET == False → CLEAR both GUCs
     └── USE_LOCAL_SET == True  → no-op (transaction handles cleanup)
@@ -144,6 +152,17 @@ The middleware is API-agnostic. It works identically for:
 - Any other Django-compatible request handler
 
 The only requirement is that `request.user` satisfies the `TenantUser` protocol.
+
+## Strict Mode
+
+The middleware sets `_rls_context_active=True` for authenticated requests, which
+satisfies the strict mode check. Unauthenticated requests do **not** set this
+flag -- if strict mode is enabled, queries in unauthenticated views will raise
+`NoTenantContextError` rather than silently returning zero rows.
+
+This is the intended behavior: strict mode surfaces missing context at the point
+of query execution, making it easier to identify views that should require
+authentication.
 
 ## Using Without Middleware
 

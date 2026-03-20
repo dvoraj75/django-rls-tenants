@@ -173,6 +173,36 @@ create_order(request, as_user=tenant_user)
 create_order(request, tenant_user)  # also works (positional)
 ```
 
+## Strict Mode
+
+When `STRICT_MODE=True`, queries on RLS-protected models raise
+`NoTenantContextError` if no RLS context is active. Both `tenant_context()` and
+`admin_context()` establish an active context, so queries inside these blocks
+always pass the strict mode check.
+
+```python
+from django_rls_tenants import tenant_context, admin_context, NoTenantContextError
+
+# Without context -- raises NoTenantContextError (strict mode)
+try:
+    Order.objects.count()  # NoTenantContextError
+except NoTenantContextError:
+    pass
+
+# With context -- works normally
+with tenant_context(tenant_id=42):
+    Order.objects.count()  # OK
+
+with admin_context():
+    Order.objects.count()  # OK
+```
+
+The `@with_rls_context` decorator also establishes an active context when a valid
+user argument is provided, so decorated functions pass the strict mode check.
+
+See [Configuration](../getting-started/configuration.md#strict_mode) for setup
+instructions.
+
 ## Multi-Database Support
 
 All context managers accept a `using` parameter for multi-database setups:
