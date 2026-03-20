@@ -28,6 +28,7 @@ policy. The database itself becomes the trust boundary.
 - **Database-enforced isolation** -- RLS policies apply to every query, not just ORM calls.
 - **Automatic query scoping** -- queries are filtered at both ORM and database levels for defense-in-depth.
 - **Fail-closed by default** -- missing tenant context returns zero rows, never leaks data.
+- **Optional strict mode** -- `STRICT_MODE=True` raises `NoTenantContextError` on unscoped queries, turning silent empty results into loud errors during development.
 - **Single schema, single database** -- no schema-per-tenant overhead.
 - **API-agnostic** -- works with Django REST Framework, GraphQL, async views, management commands.
 - **Clean internal layering** -- generic `rls/` primitives separate from `tenants/` conveniences.

@@ -19,8 +19,11 @@ from django_rls_tenants import (
     TenantUser,
     admin_context,
     get_current_tenant_id,
+    get_rls_context_active,
     reset_current_tenant_id,
+    reset_rls_context_active,
     set_current_tenant_id,
+    set_rls_context_active,
     tenant_context,
     with_rls_context,
 )
@@ -94,11 +97,21 @@ Django multitenancy built on top of the `rls/` primitives.
 
 ### State
 
+#### Tenant ID
+
 ::: django_rls_tenants.tenants.state.get_current_tenant_id
 
 ::: django_rls_tenants.tenants.state.set_current_tenant_id
 
 ::: django_rls_tenants.tenants.state.reset_current_tenant_id
+
+#### RLS Context Active (Strict Mode)
+
+::: django_rls_tenants.tenants.state.get_rls_context_active
+
+::: django_rls_tenants.tenants.state.set_rls_context_active
+
+::: django_rls_tenants.tenants.state.reset_rls_context_active
 
 ### Middleware
 

@@ -40,6 +40,8 @@ RLS_TENANTS = {
     "USER_PARAM_NAME": "as_user",
     "TENANT_PK_TYPE": "int",
     "USE_LOCAL_SET": False,
+    "DATABASES": ["default"],
+    "STRICT_MODE": False,
 }
 
 MIDDLEWARE = [..."django_rls_tenants.RLSTenantMiddleware"]

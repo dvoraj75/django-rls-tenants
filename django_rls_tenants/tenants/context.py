@@ -16,7 +16,12 @@ from typing import TYPE_CHECKING, Any
 from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.guc import clear_guc, get_guc, set_guc
 from django_rls_tenants.tenants.conf import rls_tenants_config
-from django_rls_tenants.tenants.state import reset_current_tenant_id, set_current_tenant_id
+from django_rls_tenants.tenants.state import (
+    reset_current_tenant_id,
+    reset_rls_context_active,
+    set_current_tenant_id,
+    set_rls_context_active,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -97,6 +102,7 @@ def tenant_context(
         prev_admin = get_guc(conf.GUC_IS_ADMIN, using=using)
         prev_tenant = get_guc(conf.GUC_CURRENT_TENANT, using=using)
 
+    active_token = set_rls_context_active(True)
     token = set_current_tenant_id(tenant_id)
     try:
         set_guc(conf.GUC_IS_ADMIN, "false", is_local=is_local, using=using)
@@ -109,6 +115,7 @@ def tenant_context(
         yield
     finally:
         reset_current_tenant_id(token)
+        reset_rls_context_active(active_token)
         if not is_local:
             _restore_guc(conf.GUC_IS_ADMIN, prev_admin, using=using)
             _restore_guc(conf.GUC_CURRENT_TENANT, prev_tenant, using=using)
@@ -134,6 +141,7 @@ def admin_context(
         prev_admin = get_guc(conf.GUC_IS_ADMIN, using=using)
         prev_tenant = get_guc(conf.GUC_CURRENT_TENANT, using=using)
 
+    active_token = set_rls_context_active(True)
     token = set_current_tenant_id(None)
     try:
         set_guc(conf.GUC_IS_ADMIN, "true", is_local=is_local, using=using)
@@ -144,6 +152,7 @@ def admin_context(
         yield
     finally:
         reset_current_tenant_id(token)
+        reset_rls_context_active(active_token)
         if not is_local:
             _restore_guc(conf.GUC_IS_ADMIN, prev_admin, using=using)
             _restore_guc(conf.GUC_CURRENT_TENANT, prev_tenant, using=using)
