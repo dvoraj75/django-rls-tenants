@@ -3,10 +3,15 @@
 Shows how to use ``rls_bypass``, ``rls_as_tenant``, ``assert_rls_enabled``,
 ``assert_rls_policy_exists``, and ``assert_rls_blocks_without_context``
 in a real project's test suite.
+
+Also demonstrates strict mode: when ``STRICT_MODE=True``, querying
+RLS-protected models without an active tenant context raises
+``NoTenantContextError`` instead of silently returning empty results.
 """
 
 import pytest
 
+from django_rls_tenants import NoTenantContextError
 from django_rls_tenants.tenants.testing import (
     assert_rls_blocks_without_context,
     assert_rls_enabled,
@@ -41,7 +46,28 @@ class TestRLSPolicies:
 
 
 class TestFailClosed:
-    """Verify that queries without RLS context return zero rows."""
+    """Verify that queries without RLS context return zero rows.
+
+    These tests verify the **database-level** RLS enforcement (PostgreSQL
+    returns zero rows when no GUC context is set). We temporarily disable
+    ``STRICT_MODE`` so the ORM-level guard does not fire first -- this
+    isolates the database-layer behavior.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _disable_strict_mode(self, settings):
+        """Disable strict mode so database-layer RLS is tested in isolation.
+
+        Clears the config cache so ``RLSTenantsConfig`` re-reads the
+        overridden setting, and restores it after the test.
+        """
+        from django_rls_tenants.tenants.conf import rls_tenants_config
+
+        old_cache = rls_tenants_config._config_cache  # noqa: SLF001
+        settings.RLS_TENANTS = {**settings.RLS_TENANTS, "STRICT_MODE": False}
+        rls_tenants_config._config_cache = None  # noqa: SLF001
+        yield
+        rls_tenants_config._config_cache = old_cache  # noqa: SLF001
 
     def test_notes_blocked_without_context(self, tenant_acme):
         from notes.models import Note
@@ -116,3 +142,48 @@ class TestTenantIsolation:
             assert len(notes) == 1
             assert notes[0].category.name == "Eng"
             assert notes[0].category.tenant_id == tenant_acme.pk
+
+
+# ── Strict mode tests ─────────────────────────────────────────────
+
+
+class TestStrictMode:
+    """Verify strict mode raises NoTenantContextError on unscoped queries.
+
+    When ``STRICT_MODE=True`` in ``RLS_TENANTS``, querying an
+    RLS-protected model without an active tenant context raises
+    ``NoTenantContextError`` instead of silently returning zero rows.
+    This catches accidental unscoped queries during development.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _ensure_strict_mode(self):
+        """Clear config cache so STRICT_MODE=True is read from settings."""
+        from django_rls_tenants.tenants.conf import rls_tenants_config
+
+        rls_tenants_config._config_cache = None  # noqa: SLF001
+        yield
+        rls_tenants_config._config_cache = None  # noqa: SLF001
+
+    def test_query_without_context_raises(self):
+        """Querying without tenant context raises NoTenantContextError."""
+        from notes.models import Note
+
+        with pytest.raises(NoTenantContextError, match="strict mode"):
+            Note.objects.count()
+
+    def test_query_with_context_succeeds(self, tenant_acme):
+        """Querying with tenant context works normally."""
+        from notes.models import Note
+
+        with rls_as_tenant(tenant_acme.pk):
+            # Should not raise -- context is active
+            assert Note.objects.count() == 0
+
+    def test_admin_bypass_succeeds(self):
+        """Admin bypass context is not blocked by strict mode."""
+        from notes.models import Note
+
+        with rls_bypass():
+            # Should not raise -- admin context is active
+            assert Note.objects.count() >= 0

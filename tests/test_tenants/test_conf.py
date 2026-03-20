@@ -110,6 +110,18 @@ class TestRLSTenantsConfig:
             conf = RLSTenantsConfig()
             assert conf.DATABASES == ["default", "replica"]
 
+    def test_strict_mode_default(self):
+        """STRICT_MODE defaults to False."""
+        with override_settings(RLS_TENANTS={"TENANT_MODEL": "x.Y"}):
+            conf = RLSTenantsConfig()
+            assert conf.STRICT_MODE is False
+
+    def test_strict_mode_true(self):
+        """STRICT_MODE reads True from settings."""
+        with override_settings(RLS_TENANTS={"TENANT_MODEL": "x.Y", "STRICT_MODE": True}):
+            conf = RLSTenantsConfig()
+            assert conf.STRICT_MODE is True
+
     def test_unknown_key_warns(self):
         """Unrecognized keys in RLS_TENANTS emit a UserWarning."""
         with override_settings(

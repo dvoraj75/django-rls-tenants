@@ -123,6 +123,34 @@ is not leakproof, so the planner cannot push the RLS predicate into index scans.
 The automatic ORM-level `WHERE tenant_id = X` filter enables composite indexes,
 eliminating sequential scan penalties at scale.
 
+## Strict Mode Guard
+
+When `STRICT_MODE=True` in your `RLS_TENANTS` configuration, `TenantQuerySet`
+evaluation methods raise `NoTenantContextError` if no RLS context is active.
+This catches accidental unscoped queries at the point of execution:
+
+```python
+from django_rls_tenants import NoTenantContextError
+
+# Without context -- raises in strict mode
+Order.objects.count()       # NoTenantContextError
+Order.objects.all().first() # NoTenantContextError
+Order.objects.filter(active=True).exists()  # NoTenantContextError
+
+# With context -- works normally
+with tenant_context(tenant_id=42):
+    Order.objects.count()   # OK
+```
+
+The following queryset methods are guarded: iteration (`_fetch_all()`), `count()`,
+`exists()`, `aggregate()`, `update()`, `delete()`, `iterator()`, `bulk_create()`,
+`bulk_update()`, `get()`, `first()`, `last()`.
+
+Queryset *construction* (e.g., `Order.objects.filter(...)`) does not trigger the
+check -- only evaluation does. This matches Django's lazy queryset philosophy.
+
+See [Configuration](../getting-started/configuration.md#strict_mode) for setup.
+
 ## Using for_user()
 
 `for_user()` is still available and works as before. It scopes queries to a specific

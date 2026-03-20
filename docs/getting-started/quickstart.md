@@ -87,8 +87,14 @@ RLS_TENANTS = {
     "USER_PARAM_NAME": "as_user",      # Parameter name for @with_rls_context
     "TENANT_PK_TYPE": "int",           # SQL cast type: "int", "bigint", or "uuid"
     "USE_LOCAL_SET": False,            # Use SET LOCAL (for connection pooling)
+    "DATABASES": ["default"],          # Database aliases to set GUCs on
+    "STRICT_MODE": False,              # Raise on queries without tenant context
 }
 ```
+
+!!! tip
+    Enable `STRICT_MODE` during development to catch accidental unscoped queries
+    early. See [Configuration](configuration.md#strict_mode) for details.
 
 See [Configuration](configuration.md) for a detailed explanation of each setting.
 
@@ -148,7 +154,7 @@ If any policies are missing, the command exits with a non-zero status and lists 
 
 ## What's Next?
 
-- [Configuration](configuration.md) -- understand all 6 settings.
+- [Configuration](configuration.md) -- understand all 8 settings.
 - [Protecting Models](../guides/protecting-models.md) -- customize FK fields and constraints.
 - [Context Managers](../guides/context-managers.md) -- use `tenant_context` and `admin_context` in scripts.
 - [Testing](../guides/testing.md) -- test helpers for RLS verification.

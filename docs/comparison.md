@@ -78,6 +78,8 @@
 - **Dual-layer filtering**: ORM-level `WHERE` enables composite indexes, while
   RLS provides a database-level safety net.
 - **Fail-closed**: missing tenant context = zero rows, not all rows.
+- **Optional strict mode**: `STRICT_MODE=True` raises `NoTenantContextError` on
+  unscoped queries, turning silent empty results into loud errors.
 - **Single schema**: standard Django migrations run once, not once per tenant.
 - **No catalog bloat**: 1000 tenants ≈ same DB footprint as 1 tenant.
 

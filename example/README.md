@@ -63,7 +63,18 @@ Open **<http://localhost:8000>** and log in with any demo account:
    docker compose exec web python manage.py check_rls
    ```
 
-7. **Django admin** -- Visit <http://localhost:8000/admin/>
+7. **Strict mode** -- The demo has `STRICT_MODE=True` in `RLS_TENANTS`. Try
+   querying an RLS-protected model in `manage.py shell` without establishing
+   a tenant context:
+   ```python
+   from notes.models import Note
+   Note.objects.count()  # -> raises NoTenantContextError
+   ```
+   This catches accidental unscoped queries during development. The
+   `note_delete` view in `notes/views.py` shows how to handle the error
+   gracefully.
+
+8. **Django admin** -- Visit <http://localhost:8000/admin/>
    (`admin@example.com` / `admin1234`).
 
 ## Library Features Demonstrated
@@ -79,7 +90,10 @@ Open **<http://localhost:8000>** and log in with any demo account:
 | `admin_context()` | `seed_demo.py` -- bulk data creation bypassing RLS |
 | `tenant_context()` | `seed_demo.py` -- programmatic tenant scoping for verification |
 | `check_rls` command | `docker-compose.yml` -- runs after migrations |
+| `STRICT_MODE` | `demo/settings.py` -- raises `NoTenantContextError` on unscoped queries |
+| `NoTenantContextError` handling | `notes/views.py` -- graceful handling in view code |
 | Testing utilities | `tests/test_rls.py` -- `rls_bypass`, `rls_as_tenant`, assert helpers |
+| Strict mode tests | `tests/test_rls.py` -- `TestStrictMode` class |
 
 ## How It Works
 
