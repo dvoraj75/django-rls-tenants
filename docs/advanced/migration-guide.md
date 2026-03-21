@@ -123,6 +123,41 @@ migration that assigns the correct tenant to each existing record.
 
 ## Upgrading django-rls-tenants
 
+### From 1.2.0 to 1.2.1
+
+This release has **one breaking change**: internal helpers have been removed from
+the top-level package exports.
+
+#### What Changed
+
+1. **Removed from top-level exports**: Raw state functions
+   (`get_current_tenant_id`, `set_current_tenant_id`, `reset_current_tenant_id`,
+   `get_rls_context_active`, `set_rls_context_active`, `reset_rls_context_active`)
+   and exception classes (`NoTenantContextError`, `RLSConfigurationError`,
+   `RLSTenantError`) are no longer in `__all__` or importable via
+   `from django_rls_tenants import ...`.
+
+2. **Still importable from submodules**: All removed symbols remain available
+   from their actual modules.
+
+#### Upgrade Steps
+
+1. **Update imports** that reference the removed symbols from the top-level
+   package:
+
+    ```python
+    # Before (1.2.0)
+    from django_rls_tenants import NoTenantContextError, get_current_tenant_id
+
+    # After (1.2.1)
+    from django_rls_tenants.exceptions import NoTenantContextError
+    from django_rls_tenants.tenants.state import get_current_tenant_id
+    ```
+
+2. **No other changes required.** The context managers (`tenant_context`,
+   `admin_context`, `with_rls_context`) remain top-level exports and are the
+   recommended API for managing RLS state.
+
 ### From 1.1.0 to 1.2.0
 
 This release has **one minor breaking change**: some `ValueError` exceptions have
@@ -171,7 +206,8 @@ been replaced with custom exception types.
         ...
 
     # After (1.2.0)
-    from django_rls_tenants import tenant_context, NoTenantContextError
+    from django_rls_tenants import tenant_context
+    from django_rls_tenants.exceptions import NoTenantContextError
     try:
         with tenant_context(tenant_id=None):
             ...

@@ -33,7 +33,7 @@ with tenant_context(tenant_id=42):
 - Raises `NoTenantContextError` if `tenant_id` is `None`.
 
 ```python
-from django_rls_tenants import NoTenantContextError
+from django_rls_tenants.exceptions import NoTenantContextError
 
 # NoTenantContextError: use admin_context() for admin access
 with tenant_context(tenant_id=None):  # raises NoTenantContextError
@@ -181,7 +181,8 @@ When `STRICT_MODE=True`, queries on RLS-protected models raise
 always pass the strict mode check.
 
 ```python
-from django_rls_tenants import tenant_context, admin_context, NoTenantContextError
+from django_rls_tenants import tenant_context, admin_context
+from django_rls_tenants.exceptions import NoTenantContextError
 
 # Without context -- raises NoTenantContextError (strict mode)
 try:

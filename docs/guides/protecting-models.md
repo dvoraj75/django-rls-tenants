@@ -130,7 +130,7 @@ evaluation methods raise `NoTenantContextError` if no RLS context is active.
 This catches accidental unscoped queries at the point of execution:
 
 ```python
-from django_rls_tenants import NoTenantContextError
+from django_rls_tenants.exceptions import NoTenantContextError
 
 # Without context -- raises in strict mode
 Order.objects.count()       # NoTenantContextError

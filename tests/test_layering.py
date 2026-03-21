@@ -62,30 +62,115 @@ class TestLazyImports:
         assert admin_context is ctx_mod.admin_context
         assert tenant_context is ctx_mod.tenant_context
 
-    def test_exceptions(self):
-        """Exception classes are importable from the top-level package."""
-        from django_rls_tenants import (  # noqa: PLC0415
-            NoTenantContextError,
-            RLSConfigurationError,
-            RLSTenantError,
-        )
-        from django_rls_tenants.exceptions import (  # noqa: PLC0415
-            NoTenantContextError as DirectNoCtx,
-        )
-        from django_rls_tenants.exceptions import (  # noqa: PLC0415
-            RLSConfigurationError as DirectCfgErr,
-        )
-        from django_rls_tenants.exceptions import (  # noqa: PLC0415
-            RLSTenantError as DirectBase,
-        )
-
-        assert NoTenantContextError is DirectNoCtx
-        assert RLSConfigurationError is DirectCfgErr
-        assert RLSTenantError is DirectBase
-
     def test_invalid_attribute_raises(self):
         """Accessing an undefined attribute raises AttributeError."""
         import django_rls_tenants  # noqa: PLC0415
 
         with pytest.raises(AttributeError, match="no attribute"):
             _ = django_rls_tenants.nonexistent_symbol
+
+
+class TestRemovedTopLevelExports:
+    """Verify internal helpers are NOT re-exported from the top-level package.
+
+    These symbols were removed from ``__all__`` and ``_LAZY_IMPORTS`` in v1.2.1
+    to guide users toward the safe context manager APIs instead of raw state
+    manipulation.  They remain importable from their actual submodules.
+    """
+
+    # -- State functions: NOT in top-level --
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "get_current_tenant_id",
+            "set_current_tenant_id",
+            "reset_current_tenant_id",
+            "get_rls_context_active",
+            "set_rls_context_active",
+            "reset_rls_context_active",
+        ],
+    )
+    def test_state_functions_not_in_top_level(self, name):
+        """Raw state functions are not importable from the top-level package."""
+        import django_rls_tenants  # noqa: PLC0415
+
+        assert name not in django_rls_tenants.__all__
+        with pytest.raises(AttributeError, match="no attribute"):
+            getattr(django_rls_tenants, name)
+
+    # -- Exception classes: NOT in top-level --
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "NoTenantContextError",
+            "RLSConfigurationError",
+            "RLSTenantError",
+        ],
+    )
+    def test_exceptions_not_in_top_level(self, name):
+        """Exception classes are not importable from the top-level package."""
+        import django_rls_tenants  # noqa: PLC0415
+
+        assert name not in django_rls_tenants.__all__
+        with pytest.raises(AttributeError, match="no attribute"):
+            getattr(django_rls_tenants, name)
+
+    # -- State functions: still importable from submodule --
+
+    def test_get_current_tenant_id_from_submodule(self):
+        """get_current_tenant_id is importable from its actual module."""
+        from django_rls_tenants.tenants.state import get_current_tenant_id  # noqa: PLC0415
+
+        assert callable(get_current_tenant_id)
+
+    def test_set_current_tenant_id_from_submodule(self):
+        """set_current_tenant_id is importable from its actual module."""
+        from django_rls_tenants.tenants.state import set_current_tenant_id  # noqa: PLC0415
+
+        assert callable(set_current_tenant_id)
+
+    def test_reset_current_tenant_id_from_submodule(self):
+        """reset_current_tenant_id is importable from its actual module."""
+        from django_rls_tenants.tenants.state import reset_current_tenant_id  # noqa: PLC0415
+
+        assert callable(reset_current_tenant_id)
+
+    def test_get_rls_context_active_from_submodule(self):
+        """get_rls_context_active is importable from its actual module."""
+        from django_rls_tenants.tenants.state import get_rls_context_active  # noqa: PLC0415
+
+        assert callable(get_rls_context_active)
+
+    def test_set_rls_context_active_from_submodule(self):
+        """set_rls_context_active is importable from its actual module."""
+        from django_rls_tenants.tenants.state import set_rls_context_active  # noqa: PLC0415
+
+        assert callable(set_rls_context_active)
+
+    def test_reset_rls_context_active_from_submodule(self):
+        """reset_rls_context_active is importable from its actual module."""
+        from django_rls_tenants.tenants.state import reset_rls_context_active  # noqa: PLC0415
+
+        assert callable(reset_rls_context_active)
+
+    # -- Exception classes: still importable from submodule --
+
+    def test_no_tenant_context_error_from_submodule(self):
+        """NoTenantContextError is importable from its actual module."""
+        from django_rls_tenants.exceptions import NoTenantContextError  # noqa: PLC0415
+
+        assert issubclass(NoTenantContextError, Exception)
+
+    def test_rls_configuration_error_from_submodule(self):
+        """RLSConfigurationError is importable from its actual module."""
+        from django_rls_tenants.exceptions import RLSConfigurationError  # noqa: PLC0415
+
+        assert issubclass(RLSConfigurationError, Exception)
+
+    def test_rls_tenant_error_from_submodule(self):
+        """RLSTenantError is importable from its actual module."""
+        from django_rls_tenants.exceptions import RLSTenantError  # noqa: PLC0415
+
+        assert issubclass(RLSTenantError, Exception)

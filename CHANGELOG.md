@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-03-21
+
+### Changed
+
+- **Public API surface cleanup** (#20): Removed internal helpers from
+  top-level `__all__` and `_LAZY_IMPORTS` in `__init__.py`. The following
+  symbols are no longer re-exported from `django_rls_tenants`:
+  - Raw state functions: `get_current_tenant_id`, `set_current_tenant_id`,
+    `reset_current_tenant_id`, `get_rls_context_active`,
+    `set_rls_context_active`, `reset_rls_context_active`
+  - Exception classes: `NoTenantContextError`, `RLSConfigurationError`,
+    `RLSTenantError`
+
+  These remain importable from their actual modules
+  (`django_rls_tenants.tenants.state` and `django_rls_tenants.exceptions`).
+  This guides users toward the safe context manager APIs (`tenant_context`,
+  `admin_context`) instead of direct state manipulation.
+
 ## [1.2.0] - 2026-03-21
 
 ### Added
@@ -221,7 +239,8 @@ Initial stable release of django-rls-tenants.
   and manager `_fetch_all` could clear GUCs with session scope while setting
   them with transaction scope, causing mismatched lifetimes.
 
-[Unreleased]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/dvoraj75/django-rls-tenants/releases/tag/v1.0.0
