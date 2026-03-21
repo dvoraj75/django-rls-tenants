@@ -209,7 +209,7 @@ def sample_data():
 To explicitly test that strict mode raises, use `pytest.raises`:
 
 ```python
-from django_rls_tenants import NoTenantContextError
+from django_rls_tenants.exceptions import NoTenantContextError
 
 @override_settings(RLS_TENANTS={**RLS_SETTINGS, "STRICT_MODE": True})
 def test_strict_mode_raises_without_context():

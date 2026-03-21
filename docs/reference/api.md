@@ -9,34 +9,37 @@ The most common symbols are available directly from `django_rls_tenants`:
 ```python
 from django_rls_tenants import (
     AddM2MRLSPolicy,
-    NoTenantContextError,
-    RLSConfigurationError,
     RLSConstraint,
     RLSM2MConstraint,
     RLSManager,
     RLSProtectedModel,
-    RLSTenantError,
     RLSTenantMiddleware,
     TenantQuerySet,
     TenantUser,
     admin_context,
-    get_current_tenant_id,
-    get_rls_context_active,
-    reset_current_tenant_id,
-    reset_rls_context_active,
-    set_current_tenant_id,
-    set_rls_context_active,
     tenant_context,
     with_rls_context,
 )
 ```
+
+!!! note "Removed from top-level in v1.2.1"
+    Raw state functions (`get_current_tenant_id`, `set_current_tenant_id`,
+    `reset_current_tenant_id`, `get_rls_context_active`, `set_rls_context_active`,
+    `reset_rls_context_active`) and exception classes (`NoTenantContextError`,
+    `RLSConfigurationError`, `RLSTenantError`) are no longer re-exported from the
+    top-level package. Import them from their actual modules instead:
+
+    ```python
+    from django_rls_tenants.tenants.state import get_current_tenant_id
+    from django_rls_tenants.exceptions import NoTenantContextError
+    ```
 
 ---
 
 ## Exceptions
 
 Custom exception hierarchy for precise error handling. All exceptions live in
-`django_rls_tenants.exceptions` and are re-exported from the top-level package.
+`django_rls_tenants.exceptions`. Import them from that module directly.
 
 ::: django_rls_tenants.exceptions.RLSTenantError
 
@@ -104,6 +107,11 @@ Django multitenancy built on top of the `rls/` primitives.
 ::: django_rls_tenants.tenants.context.with_rls_context
 
 ### State
+
+!!! warning "Internal helpers"
+    State functions are internal helpers for custom middleware and advanced use cases.
+    Prefer `tenant_context()` and `admin_context()` for managing RLS state.
+    Import state functions from `django_rls_tenants.tenants.state`, not the top-level package.
 
 #### Tenant ID
 
