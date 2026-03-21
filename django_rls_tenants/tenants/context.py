@@ -11,7 +11,7 @@ import functools
 import inspect
 import logging
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.guc import clear_guc, get_guc, set_guc
@@ -22,6 +22,9 @@ from django_rls_tenants.tenants.state import (
     set_current_tenant_id,
     set_rls_context_active,
 )
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -194,10 +197,10 @@ def _get_arg_from_signature(
 
 
 def with_rls_context(
-    func: Callable[..., Any] | None = None,
+    func: Callable[_P, _R] | None = None,
     *,
     user_param: str | None = None,
-) -> Callable[..., Any]:
+) -> Callable[_P, _R] | Callable[[Callable[_P, _R]], Callable[_P, _R]]:
     """Decorator that extracts a user argument and sets RLS context.
 
     Can be used bare or with an explicit ``user_param``::
@@ -213,11 +216,15 @@ def with_rls_context(
         user_param: Override the parameter name to look for. Defaults to
             ``RLS_TENANTS["USER_PARAM_NAME"]`` (default: ``"as_user"``).
 
+    Returns:
+        The decorated function with the same signature as the original,
+        or a decorator factory when called with keyword arguments.
+
     When the user argument is ``None``, logs a warning and proceeds
     without context (fail-closed: RLS blocks all access).
     """
 
-    def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+    def decorator(fn: Callable[_P, _R]) -> Callable[_P, _R]:
         # Cache signature at decoration time (not per-invocation).
         sig = inspect.signature(fn)
         param_name = user_param if user_param is not None else rls_tenants_config.USER_PARAM_NAME
@@ -232,7 +239,7 @@ def with_rls_context(
             )
 
         @functools.wraps(fn)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
+        def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
             as_user: TenantUser | None = _get_arg_from_signature(sig, param_name, *args, **kwargs)
 
             if as_user is not None and as_user.is_tenant_admin:
