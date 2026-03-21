@@ -156,6 +156,9 @@ class Command(BaseCommand):
         conn = connections[db_alias]
         with conn.cursor() as cursor:
             placeholders = ", ".join(["%s"] * len(tables))
+            # Safety: ``placeholders`` contains only literal ``%s`` tokens —
+            # no user data is interpolated into the SQL string. Table names
+            # are passed as parameterised values, preventing SQL injection.
             cursor.execute(
                 f"SELECT relname, relrowsecurity, relforcerowsecurity "
                 f"FROM pg_class WHERE relname IN ({placeholders})",
@@ -185,6 +188,9 @@ class Command(BaseCommand):
         conn = connections[db_alias]
         with conn.cursor() as cursor:
             placeholders = ", ".join(["%s"] * len(tables))
+            # Safety: ``placeholders`` contains only literal ``%s`` tokens —
+            # no user data is interpolated into the SQL string. Table names
+            # are passed as parameterised values, preventing SQL injection.
             cursor.execute(
                 f"SELECT tablename, policyname "
                 f"FROM pg_policies WHERE tablename IN ({placeholders})",
