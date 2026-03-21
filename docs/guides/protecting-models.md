@@ -227,6 +227,88 @@ allow reading but not writing without proper tenant context.
 
 See [Bypass Mode](bypass-mode.md) for more details.
 
+## Many-to-Many Relationships
+
+M2M relationships between `RLSProtectedModel` subclasses are automatically detected
+and protected. When Django auto-generates a through table for an M2M field,
+`django-rls-tenants` registers an `RLSM2MConstraint` on it during `AppConfig.ready()`.
+
+### Automatic Protection
+
+Simply define your M2M fields as usual:
+
+```python
+from django_rls_tenants import RLSProtectedModel
+
+class Tag(models.Model):
+    """Non-RLS model (shared across tenants)."""
+    name = models.CharField(max_length=100)
+
+class Project(RLSProtectedModel):
+    name = models.CharField(max_length=100)
+    members = models.ManyToManyField("User")   # both sides RLS-protected
+    tags = models.ManyToManyField(Tag)          # one side RLS-protected
+
+    class Meta(RLSProtectedModel.Meta):
+        db_table = "myapp_project"
+```
+
+The auto-generated through tables (`myapp_project_members`, `myapp_project_tags`)
+will get `EXISTS`-based subquery RLS policies that check each FK reference belongs
+to the current tenant.
+
+### Migration Operation
+
+For explicit control in migrations, use `AddM2MRLSPolicy`:
+
+```python
+from django.db import migrations
+import django_rls_tenants.operations
+
+class Migration(migrations.Migration):
+    operations = [
+        django_rls_tenants.operations.AddM2MRLSPolicy(
+            m2m_table="myapp_project_members",
+            from_model="myapp.Project",
+            to_model="myapp.User",
+            from_fk="project_id",
+            to_fk="user_id",
+            from_tenant_fk="tenant",  # or None if not RLS-protected
+            to_tenant_fk="tenant",
+        ),
+    ]
+```
+
+This operation is **reversible** -- rolling back the migration drops the policy and
+disables RLS on the through table.
+
+### Supported Scenarios
+
+| Scenario | Example | Policy checks |
+|----------|---------|---------------|
+| Both sides protected | `Project.members` (Project + User) | Both FK subqueries |
+| One side protected | `Project.tags` (Project + Tag) | Only the protected FK |
+| Self-referential | `SelfRefModel.friends` | Both FKs against same table |
+
+### Explicit Through Models
+
+If you define an explicit through model (e.g., with extra fields), make it a
+`RLSProtectedModel` subclass and manage RLS yourself -- the auto-detection skips
+explicit through models.
+
+```python
+class ProjectMembership(RLSProtectedModel):
+    project = models.ForeignKey(Project, on_delete=models.CASCADE)
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    role = models.CharField(max_length=50)
+
+    class Meta(RLSProtectedModel.Meta):
+        db_table = "myapp_project_membership"
+
+class Project(RLSProtectedModel):
+    members = models.ManyToManyField("User", through=ProjectMembership)
+```
+
 ## Multiple Protected Models
 
 You can have as many `RLSProtectedModel` subclasses as needed. Each gets its own
