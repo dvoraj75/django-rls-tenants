@@ -31,6 +31,7 @@ policy. The database itself becomes the trust boundary.
 - **Optional strict mode** -- `STRICT_MODE=True` raises `NoTenantContextError` on unscoped queries, turning silent empty results into loud errors during development.
 - **Single schema, single database** -- no schema-per-tenant overhead.
 - **API-agnostic** -- works with Django REST Framework, GraphQL, async views, management commands.
+- **M2M isolation** -- auto-detected subquery-based RLS policies on M2M through tables.
 - **Clean internal layering** -- generic `rls/` primitives separate from `tenants/` conveniences.
 - **Configurable escape hatches** -- bypass flags for authentication, admin, migrations.
 - **Drop-in for new projects** -- abstract model, middleware, and test helpers included.

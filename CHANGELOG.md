@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **M2M join table RLS support** (#11): subquery-based RLS policies for
+  auto-generated M2M through tables, ensuring tenant isolation extends to
+  many-to-many relationships.
+  - `RLSM2MConstraint`: migration-aware `BaseConstraint` that generates
+    `EXISTS`-based subquery policies on M2M join tables. Supports
+    both-sides-protected, one-side-protected, and self-referential M2M.
+  - `AddM2MRLSPolicy`: reversible Django migration operation for applying
+    M2M RLS policies. All inputs validated against SQL injection.
+  - `register_m2m_rls()`: auto-detection in `AppConfig.ready()` that
+    discovers M2M fields on `RLSProtectedModel` subclasses and registers
+    `RLSM2MConstraint` on their auto-generated through tables.
+  - `setup_m2m_rls` management command for retroactive M2M RLS application
+    on existing deployments (with `--dry-run` and `--database` flags).
+  - `check_rls` now also verifies RLS on M2M through tables.
 - `STRICT_MODE` configuration option. When enabled, `TenantQuerySet` evaluation
   methods (`count()`, `exists()`, `aggregate()`, `update()`, `delete()`,
   `iterator()`, `bulk_create()`, `bulk_update()`, `get()`, `first()`, `last()`,

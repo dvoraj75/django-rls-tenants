@@ -141,6 +141,7 @@ See [Connection Pooling](../guides/connection-pooling.md) for details.
 | Unauthenticated access | No GUCs set → zero rows |
 | Tenant impersonation via SQL | GUC values are set server-side, not by the client |
 | INSERT/UPDATE to wrong tenant | `WITH CHECK` clause validates writes |
+| M2M link to wrong tenant's records | `EXISTS`-based subquery policies on M2M through tables |
 
 ### Not Protected Against
 

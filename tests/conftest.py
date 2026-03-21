@@ -16,7 +16,10 @@ from tests.test_app.models import (
     Order,
     OrderItem,
     OrderNote,
+    Project,
     ProtectedUser,
+    SelfRefModel,
+    Tag,
     Tenant,
     TenantUser,
 )
@@ -224,3 +227,48 @@ def sample_protected_users(db, tenant_a, tenant_b):
             tenant=tenant_b,
         )
     return {"a": pu_a, "b": pu_b}
+
+
+# ---------------------------------------------------------------------------
+# M2M fixtures (Phase 3 - Issue #11)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def sample_tags(db):
+    """Create sample tags (non-RLS model)."""
+    tag_x = Tag.objects.create(name="Tag X")
+    tag_y = Tag.objects.create(name="Tag Y")
+    return {"x": tag_x, "y": tag_y}
+
+
+@pytest.fixture
+def sample_projects(db, tenant_a, tenant_b, sample_protected_users, sample_tags):
+    """Create projects with M2M relationships for both tenants."""
+    with admin_context():
+        proj_a = Project.objects.create(name="Project A", tenant=tenant_a)
+        proj_b = Project.objects.create(name="Project B", tenant=tenant_b)
+
+        # M2M: members (both sides RLS-protected)
+        proj_a.members.add(sample_protected_users["a"])
+        proj_b.members.add(sample_protected_users["b"])
+
+        # M2M: tags (one side RLS-protected)
+        proj_a.tags.add(sample_tags["x"])
+        proj_b.tags.add(sample_tags["y"])
+
+    return {"a": proj_a, "b": proj_b}
+
+
+@pytest.fixture
+def sample_selfref(db, tenant_a, tenant_b):
+    """Create self-referential M2M test data."""
+    with admin_context():
+        sr_a1 = SelfRefModel.objects.create(name="SR A1", tenant=tenant_a)
+        sr_a2 = SelfRefModel.objects.create(name="SR A2", tenant=tenant_a)
+        sr_b1 = SelfRefModel.objects.create(name="SR B1", tenant=tenant_b)
+
+        sr_a1.friends.add(sr_a2)
+        sr_b1.friends.add(sr_b1)  # self-friend
+
+    return {"a1": sr_a1, "a2": sr_a2, "b1": sr_b1}

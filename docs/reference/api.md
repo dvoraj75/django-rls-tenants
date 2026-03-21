@@ -8,9 +8,11 @@ The most common symbols are available directly from `django_rls_tenants`:
 
 ```python
 from django_rls_tenants import (
+    AddM2MRLSPolicy,
     NoTenantContextError,
     RLSConfigurationError,
     RLSConstraint,
+    RLSM2MConstraint,
     RLSManager,
     RLSProtectedModel,
     RLSTenantError,
@@ -60,6 +62,12 @@ from `tenants/`.
 ### Constraints
 
 ::: django_rls_tenants.rls.constraints.RLSConstraint
+
+::: django_rls_tenants.rls.constraints.RLSM2MConstraint
+
+### Migration Operations
+
+::: django_rls_tenants.operations.AddM2MRLSPolicy
 
 ### Context Managers
 
