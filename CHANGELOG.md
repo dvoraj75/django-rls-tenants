@@ -23,6 +23,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   This guides users toward the safe context manager APIs (`tenant_context`,
   `admin_context`) instead of direct state manipulation.
 
+### Fixed
+
+- **Documentation accuracy pass** (#21): corrected inaccuracies across
+  CHANGELOG, SECURITY.md, README.md, and docs/ pages.
+  - SECURITY.md: updated supported versions table to include 1.1.x and 1.2.x.
+  - CHANGELOG.md: fixed strict mode PR references from #13 to #14. Corrected
+    claim that `for_user()` sets `_rls_context_active` (it satisfies strict
+    mode via `_rls_user` instead).
+  - README.md: simplified Quick Start config to show only the required
+    `TENANT_MODEL` key instead of listing all defaults (which were incomplete).
+  - docs/why-rls.md: replaced incorrect `COALESCE`-based policy example with
+    the actual `CASE WHEN` / `nullif()` pattern used by `RLSConstraint`. Fixed
+    GUC-setting description to distinguish `set_config()` from `SET LOCAL`.
+
 ## [1.2.0] - 2026-03-21
 
 ### Added
@@ -45,12 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   methods (`count()`, `exists()`, `aggregate()`, `update()`, `delete()`,
   `iterator()`, `bulk_create()`, `bulk_update()`, `get()`, `first()`, `last()`,
   and iteration via `_fetch_all()`) raise `NoTenantContextError` if no RLS
-  context is active. Off by default. (#13)
+  context is active. Off by default. (#14)
 - `_rls_context_active` ContextVar in `state.py` with public accessors
   `get_rls_context_active()`, `set_rls_context_active()`, and
   `reset_rls_context_active()`. Tracks whether any RLS context (tenant or admin)
   is active, enabling strict mode to distinguish "no context" from "admin
-  context". (#13)
+  context". (#14)
 - Custom exception hierarchy in `django_rls_tenants.exceptions`: `RLSTenantError`
   (base), `NoTenantContextError`, `RLSConfigurationError`. All importable from
   the top-level `django_rls_tenants` package. (#12)
@@ -65,9 +79,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `tenant_context()`, `admin_context()`, `RLSTenantMiddleware`, and `for_user()`
-  now set `_rls_context_active=True` on entry and restore the previous value on
-  exit. This enables strict mode's "no context" detection. (#13)
+- `tenant_context()`, `admin_context()`, and `RLSTenantMiddleware` now set
+  `_rls_context_active=True` on entry and restore the previous value on exit.
+  This enables strict mode's "no context" detection. `for_user()` satisfies
+  strict mode via the stored `_rls_user` reference. (#14)
 - `tenant_context()` and `_resolve_user_guc_vars()` now raise
   `NoTenantContextError` instead of `ValueError` when a non-admin user has
   `rls_tenant_id=None` or when `tenant_id` is `None`.
