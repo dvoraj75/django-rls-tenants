@@ -98,11 +98,21 @@ def register_m2m_rls() -> None:
 
             # Skip explicit through models -- user manages RLS themselves
             if not through_model._meta.auto_created:  # type: ignore[union-attr]  # noqa: SLF001
+                logger.debug(
+                    "register_m2m_rls: skipping %s.%s -- explicit through model",
+                    model.__name__,
+                    m2m_field.name,
+                )
                 continue
 
             # Skip if constraint already exists (e.g., from the other side)
             constraints = through_model._meta.constraints  # type: ignore[union-attr]  # noqa: SLF001
             if any(isinstance(c, RLSM2MConstraint) for c in constraints):
+                logger.debug(
+                    "register_m2m_rls: skipping %s.%s -- RLSM2MConstraint already exists",
+                    model.__name__,
+                    m2m_field.name,
+                )
                 continue
 
             from_model = model
@@ -110,6 +120,12 @@ def register_m2m_rls() -> None:
 
             # Skip unresolved lazy references (shouldn't happen in ready())
             if isinstance(to_model_ref, str):
+                logger.debug(
+                    "register_m2m_rls: skipping %s.%s -- unresolved lazy reference %r",
+                    model.__name__,
+                    m2m_field.name,
+                    to_model_ref,
+                )
                 continue
 
             to_model: type[models.Model] = to_model_ref
@@ -133,6 +149,11 @@ def register_m2m_rls() -> None:
 
             # Need at least one protected side
             if from_tenant_fk is None and to_tenant_fk is None:
+                logger.debug(
+                    "register_m2m_rls: skipping %s.%s -- neither side is RLS-protected",
+                    model.__name__,
+                    m2m_field.name,
+                )
                 continue
 
             from_path = f"{from_model._meta.app_label}.{from_model.__name__}"  # noqa: SLF001

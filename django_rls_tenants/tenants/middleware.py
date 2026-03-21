@@ -107,6 +107,13 @@ class RLSTenantMiddleware(MiddlewareMixin):
         try:
             guc_vars = _resolve_user_guc_vars(user, conf)
             self._set_gucs_on_all_databases(guc_vars, conf)
+            logger.debug(
+                "Middleware set GUCs on databases=%s for user=%s (admin=%s, tenant=%s)",
+                conf.DATABASES,
+                type(user).__name__,
+                user.is_tenant_admin,
+                getattr(user, "rls_tenant_id", None),
+            )
 
             # Set auto-scope state for RLSManager.get_queryset().
             # Use the original tenant ID from the user (preserving type)
@@ -228,4 +235,5 @@ class RLSTenantMiddleware(MiddlewareMixin):
             for db_alias in conf.DATABASES:
                 clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
                 clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
+            logger.debug("Middleware cleared GUCs on databases=%s", conf.DATABASES)
         _clear_gucs_set_flag()
