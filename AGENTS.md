@@ -58,11 +58,28 @@ tests/
 The library has two internal layers with a strict import boundary:
 
 - **`django_rls_tenants/rls/`** — Generic PostgreSQL RLS primitives (GUC helpers,
-  `RLSConstraint`, context managers). **Zero imports from `tenants/`.**
+  `RLSConstraint`, `RLSM2MConstraint`, context managers). **Zero imports from `tenants/`.**
 - **`django_rls_tenants/tenants/`** — Django multitenancy built on `rls/` (models,
   managers, middleware, config, testing utilities).
+- **`django_rls_tenants/operations.py`** — Migration operations (`AddM2MRLSPolicy`)
+  for M2M join table RLS policies. Imports from `rls/` for shared SQL builders and validation.
 
 This boundary is enforced by `tests/test_layering.py`. Never import from `tenants/` in `rls/`.
+
+### M2M RLS Support
+
+M2M through tables get `EXISTS`-based subquery RLS policies. Three components
+cooperate:
+
+- `RLSM2MConstraint` (in `rls/constraints.py`) — constraint for `Meta.constraints`
+- `AddM2MRLSPolicy` (in `operations.py`) — reversible migration operation
+- `register_m2m_rls()` (in `tenants/models.py`) — auto-detection in `AppConfig.ready()`
+
+All three share SQL builder functions (`_build_m2m_conditions`,
+`_build_m2m_create_sql`, `_build_m2m_drop_sql`) from `rls/constraints.py` to
+avoid duplication. All SQL-interpolated inputs are validated via
+`_validate_field_name`, `_validate_model_path`, `_validate_pk_type`, and
+`_validate_guc_name_for_ddl`.
 
 ### Multi-Database Support
 

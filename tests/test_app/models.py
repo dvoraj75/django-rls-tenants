@@ -124,3 +124,45 @@ class ProtectedUser(RLSProtectedModel):
                 ],
             ),
         ]
+
+
+# ---------------------------------------------------------------------------
+# M2M test models (Phase 3 - Issue #11)
+# ---------------------------------------------------------------------------
+
+
+class Tag(models.Model):
+    """Non-RLS model for mixed M2M testing (one side RLS-protected)."""
+
+    name = models.CharField(max_length=100)
+
+    class Meta:
+        db_table = "test_tag"
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class Project(RLSProtectedModel):
+    """RLS-protected model with M2M relationships.
+
+    - ``members``: Both sides RLS-protected (Project <-> ProtectedUser)
+    - ``tags``: Only one side RLS-protected (Project <-> Tag)
+    """
+
+    name = models.CharField(max_length=100)
+    members = models.ManyToManyField(ProtectedUser)
+    tags = models.ManyToManyField(Tag)
+
+    class Meta(RLSProtectedModel.Meta):
+        db_table = "test_project"
+
+
+class SelfRefModel(RLSProtectedModel):
+    """RLS-protected model with a self-referential M2M for testing."""
+
+    name = models.CharField(max_length=100)
+    friends = models.ManyToManyField("self", symmetrical=False)
+
+    class Meta(RLSProtectedModel.Meta):
+        db_table = "test_selfref"

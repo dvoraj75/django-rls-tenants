@@ -132,3 +132,10 @@ class DjangoRlsTenantsConfig(AppConfig):
 
         with contextlib.suppress(RLSConfigurationError):
             _ = rls_tenants_config.TENANT_MODEL
+
+        # Auto-detect M2M fields on RLSProtectedModel subclasses and
+        # register RLSM2MConstraint on their auto-generated through tables.
+        # Must run after all models are loaded (ready() is the right hook).
+        from django_rls_tenants.tenants.models import register_m2m_rls  # noqa: PLC0415
+
+        register_m2m_rls()
