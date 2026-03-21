@@ -109,6 +109,13 @@ class RLSTenantsConfig:
         """
         return self._get("DATABASES", ["default"])  # type: ignore[no-any-return]
 
+    def __repr__(self) -> str:
+        try:
+            model = self.TENANT_MODEL
+        except Exception:
+            model = "<unset>"
+        return f"RLSTenantsConfig(TENANT_MODEL={model!r})"
+
     def __init__(self) -> None:
         self._config_cache: dict[str, Any] | None = None
         self._unknown_keys_checked: bool = False

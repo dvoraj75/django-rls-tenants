@@ -224,6 +224,18 @@ class RLSConstraint(BaseConstraint):
     ) -> None:
         """No-op: RLS is enforced at the database level, not in Django validation."""
 
+    def __repr__(self) -> str:
+        parts = [f"name={self.name!r}", f"field={self.field!r}"]
+        if self.guc_tenant_var != "rls.current_tenant":
+            parts.append(f"guc_tenant_var={self.guc_tenant_var!r}")
+        if self.guc_admin_var != "rls.is_admin":
+            parts.append(f"guc_admin_var={self.guc_admin_var!r}")
+        if self.tenant_pk_type != "int":
+            parts.append(f"tenant_pk_type={self.tenant_pk_type!r}")
+        if self.extra_bypass_flags:
+            parts.append(f"extra_bypass_flags={self.extra_bypass_flags!r}")
+        return f"RLSConstraint({', '.join(parts)})"
+
     def __eq__(self, other: object) -> bool:
         if isinstance(other, RLSConstraint):
             return (
@@ -511,6 +523,26 @@ class RLSM2MConstraint(BaseConstraint):
         using: str | None = None,
     ) -> None:
         """No-op: RLS is enforced at the database level, not in Django validation."""
+
+    def __repr__(self) -> str:
+        parts = [
+            f"name={self.name!r}",
+            f"from_model={self.from_model!r}",
+            f"to_model={self.to_model!r}",
+            f"from_fk={self.from_fk!r}",
+            f"to_fk={self.to_fk!r}",
+        ]
+        if self.from_tenant_fk != "tenant":
+            parts.append(f"from_tenant_fk={self.from_tenant_fk!r}")
+        if self.to_tenant_fk != "tenant":
+            parts.append(f"to_tenant_fk={self.to_tenant_fk!r}")
+        if self.guc_tenant_var != "rls.current_tenant":
+            parts.append(f"guc_tenant_var={self.guc_tenant_var!r}")
+        if self.guc_admin_var != "rls.is_admin":
+            parts.append(f"guc_admin_var={self.guc_admin_var!r}")
+        if self.tenant_pk_type != "int":
+            parts.append(f"tenant_pk_type={self.tenant_pk_type!r}")
+        return f"RLSM2MConstraint({', '.join(parts)})"
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, RLSM2MConstraint):
