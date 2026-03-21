@@ -115,6 +115,7 @@ def tenant_context(
             is_local=is_local,
             using=using,
         )
+        logger.debug("tenant_context entered: tenant_id=%s, using=%s", tenant_id, using)
         yield
     finally:
         reset_current_tenant_id(token)
@@ -122,6 +123,7 @@ def tenant_context(
         if not is_local:
             _restore_guc(conf.GUC_IS_ADMIN, prev_admin, using=using)
             _restore_guc(conf.GUC_CURRENT_TENANT, prev_tenant, using=using)
+        logger.debug("tenant_context exited: tenant_id=%s, using=%s", tenant_id, using)
 
 
 @contextmanager
@@ -152,6 +154,7 @@ def admin_context(
         # RLS policy handles access independently. Avoids the old "-1"
         # sentinel which could collide with integer PKs or fail UUID casts.
         clear_guc(conf.GUC_CURRENT_TENANT, is_local=is_local, using=using)
+        logger.debug("admin_context entered: using=%s", using)
         yield
     finally:
         reset_current_tenant_id(token)
@@ -159,6 +162,7 @@ def admin_context(
         if not is_local:
             _restore_guc(conf.GUC_IS_ADMIN, prev_admin, using=using)
             _restore_guc(conf.GUC_CURRENT_TENANT, prev_tenant, using=using)
+        logger.debug("admin_context exited: using=%s", using)
 
 
 def _restore_guc(

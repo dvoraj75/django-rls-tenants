@@ -204,6 +204,37 @@ user argument is provided, so decorated functions pass the strict mode check.
 See [Configuration](../getting-started/configuration.md#strict_mode) for setup
 instructions.
 
+## Debug Logging
+
+Both `tenant_context()` and `admin_context()` emit `DEBUG`-level log messages
+on entry and exit. This is useful for tracing RLS context transitions in
+management commands, Celery tasks, and service-layer code. No output is
+produced unless you enable `DEBUG` level on the `django_rls_tenants` logger:
+
+```python title="settings.py"
+LOGGING = {
+    "version": 1,
+    "handlers": {
+        "console": {"class": "logging.StreamHandler"},
+    },
+    "loggers": {
+        "django_rls_tenants": {
+            "handlers": ["console"],
+            "level": "DEBUG",
+        },
+    },
+}
+```
+
+Example output:
+
+```
+DEBUG tenant_context entered: tenant_id=42, using=default
+DEBUG tenant_context exited: tenant_id=42, using=default
+DEBUG admin_context entered: using=default
+DEBUG admin_context exited: using=default
+```
+
 ## Multi-Database Support
 
 All context managers accept a `using` parameter for multi-database setups:

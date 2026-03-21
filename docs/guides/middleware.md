@@ -164,6 +164,35 @@ This is the intended behavior: strict mode surfaces missing context at the point
 of query execution, making it easier to identify views that should require
 authentication.
 
+## Debug Logging
+
+The middleware emits `DEBUG`-level log messages when GUCs are set and cleared.
+This is useful for tracing RLS context in development or diagnosing issues in
+production. No output is produced unless you enable `DEBUG` level on the
+`django_rls_tenants` logger:
+
+```python title="settings.py"
+LOGGING = {
+    "version": 1,
+    "handlers": {
+        "console": {"class": "logging.StreamHandler"},
+    },
+    "loggers": {
+        "django_rls_tenants": {
+            "handlers": ["console"],
+            "level": "DEBUG",
+        },
+    },
+}
+```
+
+Example output:
+
+```
+DEBUG Middleware set GUCs on databases=['default'] for user=User (admin=False, tenant=42)
+DEBUG Middleware cleared GUCs on databases=['default']
+```
+
 ## Using Without Middleware
 
 For non-web contexts (management commands, Celery tasks, scripts), use context managers
