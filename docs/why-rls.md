@@ -56,25 +56,35 @@ where `tenant_id` matches the current session variable."
 The SQL behind this is straightforward:
 
 ```sql
-CREATE POLICY rls_policy ON orders
-    USING (tenant_id = COALESCE(
-        NULLIF(current_setting('rls.current_tenant', true), ''),
-        ''
-    )::integer);
+CREATE POLICY "orders_tenant_isolation_policy" ON "orders"
+    USING (
+        CASE WHEN current_setting('rls.is_admin', true) = 'true'
+             THEN true
+             ELSE tenant_id = nullif(
+                 current_setting('rls.current_tenant', true), '')::int
+        END
+    )
+    WITH CHECK (
+        CASE WHEN current_setting('rls.is_admin', true) = 'true'
+             THEN true
+             ELSE tenant_id = nullif(
+                 current_setting('rls.current_tenant', true), '')::int
+        END
+    );
 ```
 
 Key properties:
 
 - **Every query is filtered** — ORM, raw SQL, `cursor.execute()`, `dbshell`.
-- **INSERT and UPDATE are checked** — you cannot write a row for a tenant you
-  do not belong to.
+- **INSERT and UPDATE are checked** — the `WITH CHECK` clause validates writes.
 - **FORCE ROW LEVEL SECURITY** — even the table owner is subject to the policy.
 
 ## The "Missing Context = Zero Rows" Guarantee
 
-The most important safety property: if the session variable is not set, the
-`COALESCE` expression evaluates to an empty string. An empty string does not
-match any `tenant_id`, so the query returns **zero rows**.
+The most important safety property: if the session variable is not set,
+`current_setting('rls.current_tenant', true)` returns an empty string, and
+`nullif('', '')` converts it to `NULL`. Since `tenant_id = NULL` is always
+false, the query returns **zero rows**.
 
 This is fail-closed by design:
 
@@ -90,7 +100,8 @@ enforces the boundary.
 1. **Middleware** reads `request.user` and extracts tenant identity via the
    `TenantUser` protocol.
 2. **GUC variables** (`rls.current_tenant`, `rls.is_admin`) are set on the
-   PostgreSQL connection using `SET` or `SET LOCAL`.
+   PostgreSQL connection using `set_config()` (session-scoped) or `SET LOCAL`
+   (transaction-scoped, when `USE_LOCAL_SET=True`).
 3. **RLS policies** are generated automatically when you run Django migrations
    — no hand-written SQL required.
 4. **Context managers** (`tenant_context`, `admin_context`) handle non-request
