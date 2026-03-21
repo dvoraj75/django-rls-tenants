@@ -34,14 +34,7 @@ pip install django-rls-tenants
 INSTALLED_APPS = [..."django_rls_tenants"]
 
 RLS_TENANTS = {
-    "TENANT_MODEL": "myapp.Tenant",
-    "TENANT_FK_FIELD": "tenant",
-    "GUC_PREFIX": "rls",
-    "USER_PARAM_NAME": "as_user",
-    "TENANT_PK_TYPE": "int",
-    "USE_LOCAL_SET": False,
-    "DATABASES": ["default"],
-    "STRICT_MODE": False,
+    "TENANT_MODEL": "myapp.Tenant",  # required
 }
 
 MIDDLEWARE = [..."django_rls_tenants.RLSTenantMiddleware"]
