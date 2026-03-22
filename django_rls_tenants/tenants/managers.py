@@ -94,7 +94,7 @@ def _rls_model_cache() -> frozenset[type[models.Model]]:
     return frozenset(protected)
 
 
-class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
+class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]  -- Django's QuerySet is generic at runtime but unparameterised in django-stubs; suppressed to avoid false positives.
     """QuerySet that sets RLS GUC variables at evaluation time.
 
     Stores the user reference from ``for_user()`` and defers GUC setup
@@ -223,7 +223,7 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
 
     def _clone(self) -> TenantQuerySet:
         """Propagate ``_rls_user`` to cloned querysets."""
-        clone: TenantQuerySet = super()._clone()  # type: ignore[misc]
+        clone: TenantQuerySet = super()._clone()  # type: ignore[misc]  -- _clone() is an internal Django API not typed in django-stubs; return type is QuerySet, not TenantQuerySet.
         clone._rls_user = self._rls_user
         return clone
 
@@ -412,7 +412,7 @@ def _resolve_related_model(
     return current
 
 
-class RLSManager(models.Manager):  # type: ignore[type-arg]
+class RLSManager(models.Manager):  # type: ignore[type-arg]  -- Same as TenantQuerySet: Manager is generic at runtime but unparameterised in django-stubs.
     """Manager for RLS-protected models.
 
     Provides ``for_user()`` for scoped queries and
