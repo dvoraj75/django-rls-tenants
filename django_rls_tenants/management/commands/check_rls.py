@@ -132,7 +132,7 @@ class Command(BaseCommand):
         # Check standard RLS-protected tables
         if table_to_model:
             tables = list(table_to_model.keys())
-            self._check_rls_status(tables, table_to_model, errors, db_alias=db_alias, quiet=quiet)
+            self._check_rls_status(tables, table_to_model, errors, db_alias=db_alias)
             self._check_policies(tables, table_to_model, errors, db_alias=db_alias, quiet=quiet)
 
         # Check M2M through tables
@@ -141,7 +141,7 @@ class Command(BaseCommand):
                 self.stdout.write("\nM2M through tables:")
             m2m_table_to_desc = {t: info["description"] for t, info in m2m_tables.items()}
             m2m_table_list = list(m2m_table_to_desc.keys())
-            self._check_rls_status(m2m_table_list, m2m_table_to_desc, errors, db_alias=db_alias, quiet=quiet)
+            self._check_rls_status(m2m_table_list, m2m_table_to_desc, errors, db_alias=db_alias)
             self._check_policies(m2m_table_list, m2m_table_to_desc, errors, db_alias=db_alias, quiet=quiet)
 
         if errors:
@@ -161,7 +161,6 @@ class Command(BaseCommand):
         errors: list[str],
         *,
         db_alias: str = "default",
-        quiet: bool = False,
     ) -> None:
         """Batch-check ``relrowsecurity`` / ``relforcerowsecurity`` via ``pg_class``."""
         conn = connections[db_alias]
