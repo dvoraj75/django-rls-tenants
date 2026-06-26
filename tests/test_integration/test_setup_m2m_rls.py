@@ -35,6 +35,22 @@ def _unprotect_one_m2m_table() -> str:
     return table
 
 
+def _m2m_policy_exists(table: str) -> bool:
+    """Return whether the M2M RLS policy exists on ``table``.
+
+    Queries ``pg_policies`` directly so tests can assert on the real database
+    state -- e.g. that ``--dry-run`` did *not* create the policy -- instead of
+    trusting the command's own stdout.
+    """
+    policy_name = f"{table}_m2m_rls_policy"
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT 1 FROM pg_policies WHERE tablename = %s AND policyname = %s",
+            [table, policy_name],
+        )
+        return cursor.fetchone() is not None
+
+
 class TestSetupM2MRlsCommand:
     """Tests for the setup_m2m_rls management command."""
 
@@ -63,6 +79,7 @@ class TestSetupM2MRlsCommand:
     def test_verbose_prints_sql_and_applies(self):
         """--verbose prints each policy's SQL and still applies it."""
         table = _unprotect_one_m2m_table()
+        assert not _m2m_policy_exists(table)  # precondition: dropped above
 
         out = StringIO()
         call_command("setup_m2m_rls", "--verbose", stdout=out)
@@ -73,10 +90,11 @@ class TestSetupM2MRlsCommand:
         assert f"{table}_m2m_rls_policy" in output
         # ...and the policy is actually applied (unlike --dry-run).
         assert "policy applied" in output
+        assert _m2m_policy_exists(table)
 
     def test_non_verbose_does_not_print_sql(self):
         """Without --verbose the policy is applied but the SQL is not printed."""
-        _unprotect_one_m2m_table()
+        table = _unprotect_one_m2m_table()
 
         out = StringIO()
         call_command("setup_m2m_rls", stdout=out)
@@ -84,3 +102,36 @@ class TestSetupM2MRlsCommand:
 
         assert "policy applied" in output
         assert "CREATE POLICY" not in output
+        assert _m2m_policy_exists(table)
+
+    def test_dry_run_does_not_apply_unprotected_table(self):
+        """--dry-run prints the SQL for an unprotected table but never applies it."""
+        table = _unprotect_one_m2m_table()
+        assert not _m2m_policy_exists(table)  # precondition: dropped above
+
+        out = StringIO()
+        call_command("setup_m2m_rls", "--dry-run", stdout=out)
+        output = out.getvalue()
+
+        # SQL is shown and counted as "would be updated"...
+        assert "CREATE POLICY" in output
+        assert f"{table}_m2m_rls_policy" in output
+        assert "would be updated" in output
+        # ...but nothing is executed: no success line and no policy in the catalog.
+        assert "policy applied" not in output
+        assert not _m2m_policy_exists(table)
+
+    def test_verbose_dry_run_prints_once_without_applying(self):
+        """--verbose --dry-run prints the SQL exactly once and applies nothing."""
+        table = _unprotect_one_m2m_table()
+
+        out = StringIO()
+        call_command("setup_m2m_rls", "--verbose", "--dry-run", stdout=out)
+        output = out.getvalue()
+
+        # dry-run wins: the SQL is printed a single time (the verbose and
+        # dry-run branches share one block, so it is not duplicated)...
+        assert output.count("CREATE POLICY") == 1
+        # ...and the policy is never created.
+        assert "policy applied" not in output
+        assert not _m2m_policy_exists(table)
