@@ -75,7 +75,8 @@ def _rls_model_cache() -> frozenset[type[models.Model]]:
         RuntimeError: If called before ``django.apps`` is fully ready,
             to prevent caching an incomplete model set.
     """
-    from django.apps import apps  # noqa: PLC0415  -- lazy import avoids circular
+    # Lazy import avoids a circular import.
+    from django.apps import apps  # noqa: PLC0415
 
     from django_rls_tenants.rls.constraints import RLSConstraint  # noqa: PLC0415
 
@@ -94,6 +95,8 @@ def _rls_model_cache() -> frozenset[type[models.Model]]:
     return frozenset(protected)
 
 
+# Type ignore explanation: Django's QuerySet is generic at runtime but
+# unparameterised in django-stubs; suppressed to avoid false positives.
 class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
     """QuerySet that sets RLS GUC variables at evaluation time.
 
@@ -223,6 +226,8 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
 
     def _clone(self) -> TenantQuerySet:
         """Propagate ``_rls_user`` to cloned querysets."""
+        # Type ignore explanation: _clone() is an internal Django API not typed in
+        # django-stubs; return type is QuerySet, not TenantQuerySet.
         clone: TenantQuerySet = super()._clone()  # type: ignore[misc]
         clone._rls_user = self._rls_user
         return clone
@@ -412,6 +417,8 @@ def _resolve_related_model(
     return current
 
 
+# Type ignore explanation: Same as TenantQuerySet: Manager is generic at runtime
+# but unparameterised in django-stubs.
 class RLSManager(models.Manager):  # type: ignore[type-arg]
     """Manager for RLS-protected models.
 
@@ -441,7 +448,8 @@ class RLSManager(models.Manager):  # type: ignore[type-arg]
     def prepare_tenant_in_model_data(
         self,
         model_data: dict[str, Any],
-        as_user: TenantUser,  # noqa: ARG002  -- part of public API
+        # Unused but part of the public API contract.
+        as_user: TenantUser,  # noqa: ARG002
     ) -> None:
         """Resolve a raw tenant ID for model creation.
 
@@ -454,7 +462,8 @@ class RLSManager(models.Manager):  # type: ignore[type-arg]
             model_data: Dict of field names to values.
             as_user: User for context (unused here but part of API).
         """
-        from django.apps import apps  # noqa: PLC0415  -- lazy import avoids circular
+        # Lazy import avoids a circular import.
+        from django.apps import apps  # noqa: PLC0415
 
         conf = rls_tenants_config
         field_name = conf.TENANT_FK_FIELD
