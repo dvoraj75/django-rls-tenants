@@ -391,6 +391,36 @@ class TestCheckRlsCommand:
         output = out.getvalue()
         assert "verified" in output.lower()
 
+    def test_quiet_suppresses_success_output(self):
+        """--quiet produces no stdout when all RLS-protected tables are correct."""
+        out = StringIO()
+        call_command("check_rls", "--quiet", stdout=out)
+        assert out.getvalue() == ""
+
+    def test_quiet_still_reports_errors(self):
+        """--quiet suppresses success output but still surfaces errors and exit 1.
+
+        Temporarily disables RLS on a table, runs the command with --quiet, and
+        confirms the error is still written to stderr (errors are never silenced)
+        while stdout stays empty. Re-enables RLS afterwards to restore state.
+        """
+        # Must RESET ROLE to superuser for ALTER TABLE (enforce_rls sets
+        # a non-superuser role).
+        with connection.cursor() as cur:
+            cur.execute("RESET ROLE")
+            cur.execute('ALTER TABLE "test_order" DISABLE ROW LEVEL SECURITY')
+        try:
+            out = StringIO()
+            err = StringIO()
+            with pytest.raises(SystemExit) as exc_info:
+                call_command("check_rls", "--quiet", stdout=out, stderr=err)
+            assert exc_info.value.code == 1
+            assert "RLS not enabled" in err.getvalue()
+            assert out.getvalue() == ""
+        finally:
+            with connection.cursor() as cur:
+                cur.execute('ALTER TABLE "test_order" ENABLE ROW LEVEL SECURITY')
+
 
 # ---------------------------------------------------------------------------
 # EXPLAIN-based index usage verification
