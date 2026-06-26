@@ -10,6 +10,7 @@ have the expected RLS policies applied in the database.
 ```bash
 python manage.py check_rls
 python manage.py check_rls --database replica  # check a specific database
+python manage.py check_rls --quiet            # only print output on failure (for CI)
 ```
 
 ### Successful Output
@@ -62,7 +63,7 @@ M2M through tables are auto-discovered by scanning `RLSProtectedModel` subclasse
   run: python manage.py migrate
 
 - name: Verify RLS policies
-  run: python manage.py check_rls
+  run: python manage.py check_rls --quiet
 ```
 
 ### Options
@@ -70,6 +71,14 @@ M2M through tables are auto-discovered by scanning `RLSProtectedModel` subclasse
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--database` | `default` | Database alias to check RLS status on |
+| `--quiet` | off | Suppress success output; only print errors (exit 1 on failure). Ideal for CI. |
+
+### Quiet Mode
+
+`--quiet` silences all success output — the per-table listing, the M2M header, and
+the final summary line. On a fully-correct database, stdout is empty. Errors are never
+suppressed: when RLS is missing or misconfigured, the command still writes the error
+report to stderr and exits with status code 1.
 
 ### Limitations
 
