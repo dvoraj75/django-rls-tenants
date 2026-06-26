@@ -97,7 +97,13 @@ jobs:
         run: uv run pytest --cov --cov-report=xml
 
       - name: Coverage PR comment
-        if: github.event_name == 'pull_request' && matrix.python-version == '3.12' && matrix.django-version == '5.1'
+        # Skip on PRs from forks: they get a read-only GITHUB_TOKEN, so posting
+        # the coverage comment fails with "Resource not accessible by integration"
+        # and reds the whole job even when tests and coverage pass.
+        if: >-
+          github.event_name == 'pull_request'
+          && matrix.python-version == '3.12' && matrix.django-version == '5.1'
+          && github.event.pull_request.head.repo.full_name == github.repository
         uses: orgoro/coverage@v3.2
         with:
           coverageFile: coverage.xml
