@@ -108,15 +108,23 @@ class Command(BaseCommand):
             default="default",
             help="Database alias to check RLS status on. Default: 'default'.",
         )
+        parser.add_argument(
+            "--quiet",
+            action="store_true",
+            default=False,
+            help="Suppress success output; only show errors. Useful for CI/CD pipelines.",
+        )
 
     def handle(self, *args: Any, **options: Any) -> None:  # noqa: ARG002
         """Check each RLSProtectedModel subclass and M2M through tables."""
         db_alias: str = options["database"]
+        quiet: bool = options["quiet"]
         table_to_model = _collect_rls_tables()
         m2m_tables = _collect_m2m_tables()
 
         if not table_to_model and not m2m_tables:
-            self.stdout.write("No RLS-protected models found.")
+            if not quiet:
+                self.stdout.write("No RLS-protected models found.")
             return
 
         errors: list[str] = []
@@ -125,15 +133,18 @@ class Command(BaseCommand):
         if table_to_model:
             tables = list(table_to_model.keys())
             self._check_rls_status(tables, table_to_model, errors, db_alias=db_alias)
-            self._check_policies(tables, table_to_model, errors, db_alias=db_alias)
+            self._check_policies(tables, table_to_model, errors, db_alias=db_alias, quiet=quiet)
 
         # Check M2M through tables
         if m2m_tables:
-            self.stdout.write("\nM2M through tables:")
+            if not quiet:
+                self.stdout.write("\nM2M through tables:")
             m2m_table_to_desc = {t: info["description"] for t, info in m2m_tables.items()}
             m2m_table_list = list(m2m_table_to_desc.keys())
             self._check_rls_status(m2m_table_list, m2m_table_to_desc, errors, db_alias=db_alias)
-            self._check_policies(m2m_table_list, m2m_table_to_desc, errors, db_alias=db_alias)
+            self._check_policies(
+                m2m_table_list, m2m_table_to_desc, errors, db_alias=db_alias, quiet=quiet
+            )
 
         if errors:
             self.stderr.write(self.style.ERROR(f"\nFound {len(errors)} issue(s):"))
@@ -141,8 +152,9 @@ class Command(BaseCommand):
                 self.stderr.write(self.style.ERROR(error))
             raise SystemExit(1)
 
-        total = len(table_to_model) + len(m2m_tables)
-        self.stdout.write(self.style.SUCCESS(f"\nAll {total} RLS-protected tables verified."))
+        if not quiet:
+            total = len(table_to_model) + len(m2m_tables)
+            self.stdout.write(self.style.SUCCESS(f"\nAll {total} RLS-protected tables verified."))
 
     def _check_rls_status(
         self,
@@ -183,6 +195,7 @@ class Command(BaseCommand):
         errors: list[str],
         *,
         db_alias: str = "default",
+        quiet: bool = False,
     ) -> None:
         """Batch-check RLS policies via ``pg_policies``."""
         conn = connections[db_alias]
@@ -204,5 +217,5 @@ class Command(BaseCommand):
             policies = policies_by_table.get(table, [])
             if not policies:
                 errors.append(f"  {model_name} ({table}): no RLS policies found")
-            else:
+            elif not quiet:
                 self.stdout.write(f"  {model_name} ({table}): {', '.join(policies)}")
