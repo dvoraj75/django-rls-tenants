@@ -5,7 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.2.1] - 2026-03-21
+## [1.2.1] - unreleased
+
+### Added
+
+- **DEBUG-level logging** (#24): `logger.debug()` calls in middleware, context
+  managers, and M2M auto-detection for tracing the RLS context lifecycle. Uses
+  Django's logging framework, so there is zero output unless DEBUG is enabled on
+  the `django_rls_tenants` logger.
+  - `RLSTenantMiddleware`: logs when GUCs are set (with user type, admin status,
+    and tenant ID) and when they are cleared.
+  - `tenant_context()` / `admin_context()`: log entry (with tenant ID and
+    database alias) and exit.
+  - `register_m2m_rls()`: logs skip reasons during M2M auto-detection (explicit
+    through model, constraint already exists, unresolved lazy reference, neither
+    side protected).
+- **`check_rls --quiet`** (#27): suppress success output and report only errors,
+  for clean CI/CD pipeline runs. Errors and the non-zero exit code are
+  unaffected.
+- **`__repr__` on key classes** (#23): added `__repr__()` to `RLSConstraint`,
+  `RLSM2MConstraint`, and `RLSTenantsConfig` for readable output in tracebacks,
+  shell sessions, and test failures.
 
 ### Changed
 
@@ -22,6 +42,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`django_rls_tenants.tenants.state` and `django_rls_tenants.exceptions`).
   This guides users toward the safe context manager APIs (`tenant_context`,
   `admin_context`) instead of direct state manipulation.
+- **Type annotation completeness for public API** (#25): tightened the
+  `@with_rls_context` decorator signature using `ParamSpec` and `TypeVar`, so
+  type checkers and IDEs correctly infer the parameter and return types of
+  decorated functions instead of collapsing to `Callable[..., Any]`. Verified
+  the return annotations on `RLSManager.get_queryset()`, `RLSManager.for_user()`,
+  `set_guc()`, `get_guc()`, and `clear_guc()`.
+- **Code comment consistency** (#22): added module docstrings to the
+  `management` packages, SQL-safety comments on the parameterised `pg_class` /
+  `pg_policies` queries in `check_rls`, and explanatory text on the
+  `type: ignore` comments in `managers.py`.
 
 ### Fixed
 
