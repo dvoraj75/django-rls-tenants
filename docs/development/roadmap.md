@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: 2026-03-21
+> Last updated: 2026-06-27
 >
 > Priorities may shift based on community feedback.
 > Have a suggestion? [Open an issue](https://github.com/dvoraj75/django-rls-tenants/issues).
@@ -13,14 +13,14 @@
 
 Quick wins that improve the debugging and development experience.
 
-- [ ] **Fix: `TENANT_FK_FIELD` signal handler** — The `_add_tenant_fk` handler
+- [x] **Fix: `TENANT_FK_FIELD` signal handler** — The `_add_tenant_fk` handler
   hardcodes `"tenant"` when checking whether a model already defines the FK
   field, but uses the configured `TENANT_FK_FIELD` when adding it. This causes
   duplicate FK attempts when a custom field name is configured and the model
   already defines that field.
   *Why:* Real bug affecting anyone using a custom `TENANT_FK_FIELD` name.
 
-- [ ] **Public API surface cleanup** — Remove internal helpers from `__all__`
+- [x] **Public API surface cleanup** — Remove internal helpers from `__all__`
   and `_LAZY_IMPORTS`: raw state functions (`get_current_tenant_id`,
   `set_current_tenant_id`, `get_rls_context_active`, etc.) and exception
   classes (`NoTenantContextError`, `RLSConfigurationError`, `RLSTenantError`).
@@ -29,29 +29,29 @@ Quick wins that improve the debugging and development experience.
   *Why:* These are internal implementation details. Exporting them encourages
   direct state manipulation instead of using the safe context manager APIs.
 
-- [ ] **Docs accuracy pass** — Correct inaccuracies in CHANGELOG, SECURITY.md,
+- [x] **Docs accuracy pass** — Correct inaccuracies in CHANGELOG, SECURITY.md,
   and README that reference features differently from the actual implementation.
   *Why:* Misleading docs erode trust and cause integration mistakes.
 
-- [ ] **Code comment consistency** — Add module docstrings to management package
+- [x] **Code comment consistency** — Add module docstrings to management package
   `__init__.py` files, safety comments on f-string SQL in `check_rls` command,
   and explanatory text to `type: ignore` comments in `managers.py`.
   *Why:* Makes the codebase easier to audit and contribute to.
 
-- [ ] **`__repr__` on key classes** — Add `__repr__()` to `RLSConstraint`,
+- [x] **`__repr__` on key classes** — Add `__repr__()` to `RLSConstraint`,
   `RLSM2MConstraint`, and `RLSTenantsConfig` for better output in tracebacks,
   Django shell sessions, and test failures.
   *Why:* These objects currently show as `<RLSConstraint object>` which tells
   you nothing when debugging migration or configuration issues.
 
-- [ ] **DEBUG-level logging** — Add `logger.debug()` calls to middleware (GUC
+- [x] **DEBUG-level logging** — Add `logger.debug()` calls to middleware (GUC
   set/clear), `tenant_context`/`admin_context` (entry/exit), and
   `register_m2m_rls()` (skip reasons). Uses Django's logging framework — zero
   output unless the user enables DEBUG.
   *Why:* When things go wrong, there is no trace of what RLS context was set
   or why a model was skipped during M2M auto-detection.
 
-- [ ] **Type annotation completeness** — Add missing return type annotations on
+- [x] **Type annotation completeness** — Add missing return type annotations on
   `RLSManager.get_queryset()`, `RLSManager.for_user()`, `set_guc()`, and
   tighten the `@with_rls_context` decorator signature.
   *Why:* Improves IDE auto-complete and type checker support for library users.
@@ -67,8 +67,9 @@ Better CLI tooling and earlier misconfiguration detection.
   *Why:* When policies exist but behave unexpectedly, seeing the actual SQL
   is the fastest way to diagnose the issue.
 
-- [ ] **`check_rls --quiet`** — Suppress success output, only show errors.
+- [x] **`check_rls --quiet`** — Suppress success output, only show errors.
   *Why:* CI/CD pipelines need clean output — success should be silent.
+  (shipped in v1.2.1)
 
 - [ ] **`setup_m2m_rls --verbose`** — Show the generated SQL before execution.
   *Why:* DBAs and security reviewers need to audit what SQL will run before
