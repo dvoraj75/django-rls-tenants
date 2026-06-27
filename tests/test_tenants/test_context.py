@@ -52,6 +52,14 @@ class TestTenantContext:
             with tenant_context(None):
                 pass
 
+    def test_none_error_carries_hint(self):
+        """tenant_context(None) attaches an actionable hint pointing to admin_context()."""
+        with pytest.raises(NoTenantContextError) as exc_info:  # noqa: SIM117
+            with tenant_context(None):
+                pass
+        assert exc_info.value.hint is not None
+        assert "admin_context()" in exc_info.value.hint
+
     def test_string_tenant_id(self):
         """Works with string tenant IDs (e.g., UUIDs)."""
         with tenant_context("abc-123"):
@@ -203,6 +211,16 @@ class TestResolveUserGucVars:
         with pytest.raises(NoTenantContextError, match="rls_tenant_id=None"):
             _resolve_user_guc_vars(user)
 
+    def test_non_admin_none_tenant_id_error_carries_hint(self):
+        """The error tells the user to assign a tenant or set is_tenant_admin=True."""
+        user = MagicMock()
+        user.is_tenant_admin = False
+        user.rls_tenant_id = None
+        with pytest.raises(NoTenantContextError) as exc_info:
+            _resolve_user_guc_vars(user)
+        assert exc_info.value.hint is not None
+        assert "is_tenant_admin=True" in exc_info.value.hint
+
     def test_admin_with_none_tenant_id_ok(self):
         """Admin user with rls_tenant_id=None is valid (admin bypasses RLS)."""
         user = MagicMock()
@@ -301,6 +319,21 @@ class TestWithRlsContext:
 
         with pytest.raises(NoTenantContextError, match="rls_tenant_id=None"):
             my_func(as_user=user)
+
+    def test_non_admin_none_tenant_id_error_carries_hint(self):
+        """The decorator's NoTenantContextError carries the assign-a-tenant hint."""
+        user = MagicMock()
+        user.is_tenant_admin = False
+        user.rls_tenant_id = None
+
+        @with_rls_context
+        def my_func(as_user):
+            return "should not reach"
+
+        with pytest.raises(NoTenantContextError) as exc_info:
+            my_func(as_user=user)
+        assert exc_info.value.hint is not None
+        assert "is_tenant_admin=True" in exc_info.value.hint
 
 
 class TestIsLocalMode:

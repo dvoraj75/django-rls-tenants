@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Actionable error hints** (#34): `RLSTenantError` now accepts a keyword-only
+  `hint=` argument and exposes `.message` / `.hint` attributes for programmatic
+  access. The `NoTenantContextError` raised by `tenant_context()`,
+  `admin_context()`, `_resolve_user_guc_vars()`, the `@with_rls_context`
+  decorator, and `STRICT_MODE` now carries a `Hint:` line telling you exactly how
+  to fix it, and the `W001`/`W002`/`W008`/`W009` system-check hints name the exact
+  setting (and, for `W009`, the missing field). Backward compatible: `str(exc)` is
+  unchanged when no hint is supplied.
+
 - **Code of Conduct** (#35): adopted the Contributor Covenant v2.1
   (`CODE_OF_CONDUCT.md`), linked from the contributing guides and the
   documentation. Enforcement contact: dvoraj75@gmail.com.

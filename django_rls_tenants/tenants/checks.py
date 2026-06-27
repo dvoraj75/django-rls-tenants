@@ -116,8 +116,9 @@ def _check_guc_prefix_mismatch() -> list[CheckWarning]:
                         f"GUC_PREFIX derives {runtime_tenant_guc!r}. "
                         f"Tenant isolation will silently break.",
                         hint=(
-                            f"Either pass guc_tenant_var={runtime_tenant_guc!r} "
-                            f"to RLSConstraint or change GUC_PREFIX to match."
+                            f"Either pass guc_tenant_var={runtime_tenant_guc!r} to "
+                            f"the RLSConstraint, or set RLS_TENANTS['GUC_PREFIX'] so "
+                            f"it derives {runtime_tenant_guc!r}."
                         ),
                         id="django_rls_tenants.W001",
                     )
@@ -130,8 +131,9 @@ def _check_guc_prefix_mismatch() -> list[CheckWarning]:
                         f"GUC_PREFIX derives {runtime_admin_guc!r}. "
                         f"Admin bypass will silently break.",
                         hint=(
-                            f"Either pass guc_admin_var={runtime_admin_guc!r} "
-                            f"to RLSConstraint or change GUC_PREFIX to match."
+                            f"Either pass guc_admin_var={runtime_admin_guc!r} to "
+                            f"the RLSConstraint, or set RLS_TENANTS['GUC_PREFIX'] so "
+                            f"it derives {runtime_admin_guc!r}."
                         ),
                         id="django_rls_tenants.W002",
                     )
@@ -297,7 +299,8 @@ def _check_tenant_model_resolves() -> list[CheckWarning]:
                 f"RLS_TENANTS['TENANT_MODEL'] = {model_path!r} does not "
                 f"resolve to an installed model.",
                 hint=(
-                    "Set TENANT_MODEL to '<app_label>.<ModelName>' for a model in INSTALLED_APPS."
+                    "Set RLS_TENANTS['TENANT_MODEL'] to '<app_label>.<ModelName>' "
+                    "naming a model in INSTALLED_APPS."
                 ),
                 id="django_rls_tenants.W008",
             )
@@ -346,8 +349,9 @@ def _check_tenant_fk_field_exists() -> list[CheckWarning]:
                 CheckWarning(
                     f"{model.__name__} has no field {fk_field!r} referenced by its RLS policy.",
                     hint=(
-                        "Add the tenant ForeignKey, or set TENANT_FK_FIELD "
-                        "(or the constraint's field=) to the correct name."
+                        f"Add a {fk_field!r} ForeignKey to {model.__name__}, or "
+                        f"point RLS_TENANTS['TENANT_FK_FIELD'] (or the constraint's "
+                        f"field=) at an existing field."
                     ),
                     id="django_rls_tenants.W009",
                     obj=model,

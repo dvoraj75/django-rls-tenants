@@ -60,6 +60,8 @@ class TestCheckGucPrefixMismatch:
             warnings = _check_guc_prefix_mismatch()
         ids = [w.id for w in warnings]
         assert "django_rls_tenants.W001" in ids
+        w001 = next(w for w in warnings if w.id == "django_rls_tenants.W001")
+        assert "RLS_TENANTS['GUC_PREFIX']" in w001.hint
 
     def test_w002_admin_guc_mismatch(self):
         """W002 fires when GUC_PREFIX differs from RLSConstraint guc_admin_var."""
@@ -652,5 +654,7 @@ class TestCheckTenantFkFieldExists:
         with patch(self._RESOLVER_PATCH, return_value="nonexistent"):
             warnings = _check_tenant_fk_field_exists()
         assert "nonexistent" in warnings[0].msg
+        # The actionable hint also names the exact missing field.
+        assert "nonexistent" in warnings[0].hint
         assert warnings[0].obj is not None
         assert isinstance(warnings[0], CheckWarning)

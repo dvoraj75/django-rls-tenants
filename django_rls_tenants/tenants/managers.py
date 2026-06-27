@@ -36,6 +36,7 @@ from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.guc import clear_guc, set_guc
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import _resolve_user_guc_vars
+from django_rls_tenants.tenants.errors import HINT_NO_CONTEXT
 from django_rls_tenants.tenants.state import (
     get_current_tenant_id,
     get_rls_context_active,
@@ -257,14 +258,9 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         if self._rls_user is not None:
             return  # for_user() was called
         model_name = self.model.__name__
-        msg = (
-            f"RLS strict mode: query on {model_name} attempted without "
-            f"tenant context. Use tenant_context(), admin_context(), "
-            f"for_user(), or RLSTenantMiddleware before querying "
-            f"RLS-protected models. Set STRICT_MODE=False in RLS_TENANTS "
-            f"to disable this check."
-        )
-        raise NoTenantContextError(msg)
+        msg = f"RLS strict mode: query on {model_name} attempted without an active RLS context."
+        hint = f"{HINT_NO_CONTEXT} To disable this guard, set STRICT_MODE=False in RLS_TENANTS."
+        raise NoTenantContextError(msg, hint=hint)
 
     # ---- Guarded evaluation methods ----
     #
