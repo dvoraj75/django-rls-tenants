@@ -27,7 +27,9 @@ if TYPE_CHECKING:
 _ALLOWED_PK_TYPES = frozenset({"int", "bigint", "uuid"})
 
 # Valid SQL identifier for field names (no dots, just a column name).
-_FIELD_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+# ``\Z`` (not ``$``) anchors the end: ``$`` also matches just before a trailing
+# newline, which would let "tenant_id\n" slip through.
+_FIELD_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*\Z")
 
 
 def _validate_field_name(field: str, param: str = "field") -> None:
