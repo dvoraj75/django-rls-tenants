@@ -169,6 +169,8 @@ def process_batch(tenant_id: int):
         ...
 ```
 
+For a full Celery integration pattern using `tenant_context()` directly, see [Celery Tasks](celery-tasks.md).
+
 ## Runtime Type Checking
 
 `TenantUser` is decorated with `@runtime_checkable`, so you can use `isinstance()`
