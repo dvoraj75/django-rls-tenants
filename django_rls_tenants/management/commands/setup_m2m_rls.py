@@ -37,11 +37,18 @@ class Command(BaseCommand):
             default=False,
             help="Print the SQL that would be executed without applying it.",
         )
+        parser.add_argument(
+            "--verbose",
+            action="store_true",
+            default=False,
+            help="Print each policy's SQL before applying it.",
+        )
 
     def handle(self, *args: Any, **options: Any) -> None:  # noqa: ARG002
         """Discover and apply M2M RLS policies."""
         db_alias: str = options["database"]
         dry_run: bool = options["dry_run"]
+        verbose: bool = options["verbose"]
 
         m2m_info = _collect_m2m_tables()
         if not m2m_info:
@@ -91,10 +98,10 @@ class Command(BaseCommand):
                 table=table, admin_check=admin_check, subquery_clause=subquery_clause
             )
 
-            if dry_run:
+            if verbose or dry_run:
                 self.stdout.write(f"\n-- {info['description']} ({table}):")
                 self.stdout.write(sql)
-            else:
+            if not dry_run:
                 with conn.cursor() as cursor:
                     cursor.execute(sql)
                 self.stdout.write(

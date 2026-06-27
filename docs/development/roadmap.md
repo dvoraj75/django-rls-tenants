@@ -71,7 +71,7 @@ Better CLI tooling and earlier misconfiguration detection.
   *Why:* CI/CD pipelines need clean output — success should be silent.
   (shipped in v1.2.1)
 
-- [ ] **`setup_m2m_rls --verbose`** — Show the generated SQL before execution.
+- [x] **`setup_m2m_rls --verbose`** — Show the generated SQL before execution.
   *Why:* DBAs and security reviewers need to audit what SQL will run before
   approving it.
 

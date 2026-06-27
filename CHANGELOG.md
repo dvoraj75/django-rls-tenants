@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - Unreleased
+
+### Added
+
+- **`setup_m2m_rls --verbose`** (#28): print each M2M through-table policy's
+  `CREATE POLICY` SQL before applying it, so DBAs and security reviewers can
+  audit the exact SQL while still applying it in one run. Combine with
+  `--dry-run` to print without executing.
+
 ## [1.2.1] - 2026-06-27
 
 ### Added

@@ -98,6 +98,7 @@ that need to add M2M RLS coverage without re-running migrations.
 ```bash
 python manage.py setup_m2m_rls              # apply policies
 python manage.py setup_m2m_rls --dry-run    # preview SQL without executing
+python manage.py setup_m2m_rls --verbose    # print each policy's SQL, then apply it
 python manage.py setup_m2m_rls --database replica
 ```
 
@@ -114,6 +115,7 @@ python manage.py setup_m2m_rls --database replica
 |------|---------|-------------|
 | `--database` | `default` | Database alias to apply policies on |
 | `--dry-run` | off | Print SQL without executing |
+| `--verbose` | off | Print each policy's SQL before applying it |
 
 ### When to Use
 
@@ -125,6 +127,20 @@ python manage.py setup_m2m_rls --database replica
 !!! tip
     For new M2M fields, prefer using `AddM2MRLSPolicy` in a migration instead.
     `setup_m2m_rls` is a convenience for retroactive application.
+
+### Verbose Mode
+
+`--verbose` prints the same `CREATE POLICY` SQL that `--dry-run` shows, but then still
+applies each policy — useful for DBAs and security reviewers who want to audit the SQL
+while applying it in one run. Passing both `--verbose` and `--dry-run` is equivalent to
+`--dry-run`: the SQL is printed once and nothing is executed.
+
+```
+-- Project.members (auto M2M) (test_project_members):
+CREATE POLICY ...
+
+Project.members (auto M2M) (test_project_members): policy applied
+```
 
 ## Using RLS in Custom Management Commands
 
