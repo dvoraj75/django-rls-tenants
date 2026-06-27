@@ -14,6 +14,7 @@ import pytest
 from django.core.management import call_command
 from django.db import connection
 
+from django_rls_tenants.management.commands.check_rls import Command as CheckRlsCommand
 from django_rls_tenants.rls.guc import get_guc, set_guc
 from django_rls_tenants.tenants.bypass import bypass_flag
 from django_rls_tenants.tenants.context import admin_context, tenant_context
@@ -420,6 +421,50 @@ class TestCheckRlsCommand:
         finally:
             with connection.cursor() as cur:
                 cur.execute('ALTER TABLE "test_order" ENABLE ROW LEVEL SECURITY')
+
+    def test_verbose_shows_policy_definitions(self):
+        """--verbose prints each policy's USING / WITH CHECK SQL from the catalog."""
+        out = StringIO()
+        call_command("check_rls", "--verbose", stdout=out)
+        output = out.getvalue()
+        # The command label and both expression clauses are shown...
+        assert "[ALL]" in output
+        assert "USING:" in output
+        assert "WITH CHECK:" in output
+        # ...with the live policy expression read back via pg_get_expr.
+        assert "current_setting" in output
+
+    def test_non_verbose_omits_policy_definitions(self):
+        """Without --verbose, policy expressions (USING) are not printed."""
+        out = StringIO()
+        call_command("check_rls", stdout=out)
+        output = out.getvalue()
+        assert "verified" in output.lower()  # command still ran successfully
+        assert "USING:" not in output
+        assert "current_setting" not in output
+
+    def test_quiet_overrides_verbose(self):
+        """--quiet wins over --verbose: no success/detail output on a clean run."""
+        out = StringIO()
+        call_command("check_rls", "--quiet", "--verbose", stdout=out)
+        assert out.getvalue() == ""
+
+    def test_verbose_skips_null_policy_clause(self):
+        """A NULL catalog clause is skipped rather than printed.
+
+        Every policy this package creates is ``FOR ALL`` with both ``USING`` and
+        ``WITH CHECK`` set, so the integration path never exercises a NULL clause
+        (e.g. a ``FOR INSERT`` policy has no ``USING``). Drive the formatter
+        directly to cover that defensive branch.
+        """
+        out = StringIO()
+        cmd = CheckRlsCommand(stdout=out)
+        cmd._write_clause("USING", None)
+        assert out.getvalue() == ""  # nothing printed for a NULL clause
+        cmd._write_clause("USING", "\nCASE WHEN true THEN true END")
+        rendered = out.getvalue()
+        assert "      USING:" in rendered
+        assert "        CASE WHEN true THEN true END" in rendered
 
 
 # ---------------------------------------------------------------------------
