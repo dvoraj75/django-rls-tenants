@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CREATE POLICY` SQL before applying it, so DBAs and security reviewers can
   audit the exact SQL while still applying it in one run. Combine with
   `--dry-run` to print without executing.
+- **`check_rls --verbose`** (#26): print each policy's live `USING` /
+  `WITH CHECK` definition (read from the `pg_policy` catalog via
+  `pg_get_expr`) under the pass/fail line, for auditing and diagnosing
+  unexpected policy behaviour. `--quiet` takes precedence when both are given.
 
 ## [1.2.1] - 2026-06-27
 
