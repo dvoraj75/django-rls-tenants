@@ -165,3 +165,25 @@ Helpers for scoping hand-written SQL to the current tenant. See the
 ::: django_rls_tenants.tenants.testing.assert_rls_policy_exists
 
 ::: django_rls_tenants.tenants.testing.assert_rls_blocks_without_context
+
+---
+
+## Contrib
+
+Optional integrations with third-party libraries. These are **not** re-exported
+from the top-level package; import them from their module.
+
+### Celery
+
+Native Celery integration. Requires the `celery` extra
+(`pip install django-rls-tenants[celery]`); import from
+`django_rls_tenants.contrib.celery`. See the [Celery Tasks guide](../guides/celery-tasks.md)
+for usage, chains/groups, and the `install()` escape hatch.
+
+::: django_rls_tenants.contrib.celery.rls_task
+
+::: django_rls_tenants.contrib.celery.RLSTask
+
+::: django_rls_tenants.contrib.celery.install
+
+::: django_rls_tenants.contrib.celery.uninstall

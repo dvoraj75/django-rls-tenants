@@ -33,6 +33,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-exported from the top-level package, and are documented in the new Raw SQL
   guide.
 
+- **Native Celery integration** (#32): a new optional `celery` extra
+  (`pip install django-rls-tenants[celery]`) adds `django_rls_tenants.contrib.celery`.
+  `@rls_task` (a `shared_task` drop-in) and the `RLSTask` base class capture the
+  active tenant/admin context into the task's message headers on enqueue and
+  restore it on the worker — around the whole body, so it unwinds on both success
+  and exception — without passing `tenant_id` by hand. Context propagates across
+  chains, groups, and chords (every step must use the integration). Set
+  `rls_require_context = True` on an `RLSTask` subclass to fail fast (with the #34
+  hint) instead of running unscoped. `install()` / `uninstall()` wire the same
+  behaviour globally via Celery signals as an escape hatch for tasks that cannot
+  be re-based. Celery stays optional and is **not** re-exported from the
+  top-level package; importing the module without Celery raises a clear
+  `ImportError`. Synchronous task bodies only (`async def` is out of scope for
+  v1.3.0).
+
 ### Changed
 
 - **Performance: InitPlan-wrapped GUC reads** (#57): RLS policy predicates now

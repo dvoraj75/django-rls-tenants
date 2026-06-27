@@ -53,6 +53,13 @@ dependencies = [
     "django>=4.2",
 ]
 
+[project.optional-dependencies]
+# Native Celery integration (contrib.celery): @rls_task / RLSTask / install().
+# Optional -- the core library never imports celery.
+celery = [
+    "celery>=5.3",
+]
+
 [project.urls]
 Homepage = "https://github.com/dvoraj75/django-rls-tenants"
 Documentation = "https://dvoraj75.github.io/django-rls-tenants/"
@@ -77,11 +84,14 @@ test = [
     "pytest-cov>=6.0",
     "coverage[toml]>=7.0",
     "psycopg2-binary>=2.9",
+    "celery>=5.3",
 ]
 docs = [
     "mkdocs>=1.6",
     "mkdocs-material>=9.5",
     "mkdocstrings[python]>=0.27",
+    # mkdocstrings imports contrib.celery to render its API reference.
+    "celery>=5.3",
 ]
 
 # ---------------------------------------------------------------------------
@@ -190,6 +200,21 @@ mypy_path = "."
 [[tool.mypy.overrides]]
 module = "tests.*"
 disallow_untyped_defs = false
+
+# Celery is an optional dependency and ships no type information. It is not
+# installed in the lint/type-check job (which syncs only the ``dev`` group), so
+# tell mypy not to error on the missing stubs.
+[[tool.mypy.overrides]]
+module = "celery.*"
+ignore_missing_imports = true
+
+# ``contrib.celery`` subclasses celery's ``Task``, which is typed as ``Any``
+# here (celery ships no stubs and is absent from the lint env). Relax just the
+# subclassing-any check for this one module; everything else stays strict and
+# the module is fully annotated.
+[[tool.mypy.overrides]]
+module = "django_rls_tenants.contrib.celery"
+disallow_subclassing_any = false
 
 [tool.django-stubs]
 django_settings_module = "tests.settings"
