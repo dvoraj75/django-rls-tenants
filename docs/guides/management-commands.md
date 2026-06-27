@@ -11,6 +11,7 @@ have the expected RLS policies applied in the database.
 python manage.py check_rls
 python manage.py check_rls --database replica  # check a specific database
 python manage.py check_rls --quiet            # only print output on failure (for CI)
+python manage.py check_rls --verbose          # show each policy's USING / WITH CHECK SQL
 ```
 
 ### Successful Output
@@ -72,6 +73,7 @@ M2M through tables are auto-discovered by scanning `RLSProtectedModel` subclasse
 |------|---------|-------------|
 | `--database` | `default` | Database alias to check RLS status on |
 | `--quiet` | off | Suppress success output; only print errors (exit 1 on failure). Ideal for CI. |
+| `--verbose` | off | Show each policy's full definition (USING / WITH CHECK SQL) from the `pg_policies` view. |
 
 ### Quiet Mode
 
@@ -80,10 +82,34 @@ the final summary line. On a fully-correct database, stdout is empty. Errors are
 suppressed: when RLS is missing or misconfigured, the command still writes the error
 report to stderr and exits with status code 1.
 
+### Verbose Mode
+
+`--verbose` prints the live policy definition from the `pg_policies` view (its `qual` /
+`with_check` columns, which are PostgreSQL's own `pg_get_expr()` output) under each
+pass/fail line — the SQL expression PostgreSQL actually enforces, not a reconstruction.
+It complements the pass/fail check rather than replacing it: the exit code and error
+reporting are unchanged. `--quiet` and `--verbose` are logical opposites; `--quiet`
+takes precedence, so verbose detail only appears on a non-quiet run.
+
+```
+  Order (myapp_order): myapp_order_tenant_isolation_policy
+    myapp_order_tenant_isolation_policy [ALL]
+      USING:
+        CASE
+            WHEN (current_setting('rls.is_admin'::text, true) = 'true'::text) THEN true
+            ELSE (tenant_id = (NULLIF(current_setting('rls.current_tenant'::text, true), ''::text))::integer)
+        END
+      WITH CHECK:
+        CASE
+            WHEN (current_setting('rls.is_admin'::text, true) = 'true'::text) THEN true
+            ELSE (tenant_id = (NULLIF(current_setting('rls.current_tenant'::text, true), ''::text))::integer)
+        END
+```
+
 ### Limitations
 
 - Does not verify the **content** of the RLS policy (e.g., correct GUC variable names).
-  It only checks that a policy exists.
+  It only checks that a policy exists. Use `--verbose` to eyeball the policy body manually.
 - Does not check policies on non-`RLSProtectedModel` tables. If you manually manage
   RLS policies, use `assert_rls_policy_exists()` from the testing helpers.
 
