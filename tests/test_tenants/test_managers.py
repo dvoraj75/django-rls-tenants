@@ -585,6 +585,19 @@ class TestStrictModeRaises:
         with pytest.raises(NoTenantContextError, match="Order"):
             list(qs)
 
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_error_carries_actionable_hint(self, sample_orders):
+        """The bare message states the problem; .hint covers the fixes and STRICT_MODE."""
+        qs = Order.objects.all()
+        with pytest.raises(NoTenantContextError) as exc_info:
+            list(qs)
+        # The fix-it guidance moved out of the message into the hint.
+        assert exc_info.value.message.endswith("without an active RLS context.")
+        hint = exc_info.value.hint
+        assert hint is not None
+        assert "tenant_context(" in hint
+        assert "STRICT_MODE=False" in hint
+
 
 class TestStrictModeAllowsContext:
     """Tests that strict mode does NOT raise when context is properly set."""
