@@ -99,17 +99,17 @@ ALTER TABLE "myapp_order" FORCE ROW LEVEL SECURITY;
 CREATE POLICY "myapp_order_tenant_isolation_policy"
 ON "myapp_order"
 USING (
-    CASE WHEN current_setting('rls.is_admin', true) = 'true'
+    CASE WHEN (SELECT current_setting('rls.is_admin', true)) = 'true'
          THEN true
          ELSE tenant_id = nullif(
-             current_setting('rls.current_tenant', true), '')::int
+             (SELECT current_setting('rls.current_tenant', true)), '')::int
     END
 )
 WITH CHECK (
-    CASE WHEN current_setting('rls.is_admin', true) = 'true'
+    CASE WHEN (SELECT current_setting('rls.is_admin', true)) = 'true'
          THEN true
          ELSE tenant_id = nullif(
-             current_setting('rls.current_tenant', true), '')::int
+             (SELECT current_setting('rls.current_tenant', true)), '')::int
     END
 );
 ```
@@ -119,10 +119,12 @@ Key design decisions in the policy:
 - **`CASE WHEN ... THEN true ELSE ...`**: the `CASE` structure clearly separates
   admin bypass from tenant matching. For admin queries the tenant check is skipped.
   For normal tenant queries the expression reduces to a simple `tenant_id = <value>`
-  equality. Note: since ``current_setting()`` is ``VOLATILE``, both ``CASE WHEN`` and
-  ``OR``-based policies have equivalent per-row evaluation cost. The primary
-  performance benefit comes from auto-scoping (``WHERE tenant_id = X`` in
-  ``get_queryset()``), which enables composite index usage.
+  equality. Since v1.3.0 each ``current_setting()`` read is wrapped in an
+  uncorrelated scalar sub-SELECT -- ``(SELECT current_setting('rls.current_tenant',
+  true))`` -- which PostgreSQL evaluates once per statement (an InitPlan) instead
+  of per row; the predicate is otherwise identical. The larger performance benefit
+  still comes from auto-scoping (``WHERE tenant_id = X`` in ``get_queryset()``),
+  which enables composite index usage.
 - **`current_setting(..., true)`**: the `true` parameter returns empty string instead
   of raising an error when the GUC is not set. This enables fail-closed behavior.
 - **`nullif(..., '')`**: converts empty string to `NULL`, making the
@@ -142,16 +144,16 @@ through tables have no tenant FK column:
 CREATE POLICY "myapp_project_members_m2m_rls_policy"
 ON "myapp_project_members"
 USING (
-    CASE WHEN current_setting('rls.is_admin', true) = 'true'
+    CASE WHEN (SELECT current_setting('rls.is_admin', true)) = 'true'
          THEN true
          ELSE EXISTS (SELECT 1 FROM "myapp_project"
                       WHERE id = project_id
                       AND tenant_id = nullif(
-                          current_setting('rls.current_tenant', true), '')::int)
+                          (SELECT current_setting('rls.current_tenant', true)), '')::int)
               AND EXISTS (SELECT 1 FROM "myapp_user"
                           WHERE id = user_id
                           AND tenant_id = nullif(
-                              current_setting('rls.current_tenant', true), '')::int)
+                              (SELECT current_setting('rls.current_tenant', true)), '')::int)
     END
 )
 WITH CHECK (...same...);

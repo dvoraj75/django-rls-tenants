@@ -37,17 +37,17 @@ ALTER TABLE "myapp_order" FORCE ROW LEVEL SECURITY;
 CREATE POLICY "myapp_order_tenant_isolation_policy"
 ON "myapp_order"
 USING (
-    CASE WHEN current_setting('rls.is_admin', true) = 'true'
+    CASE WHEN (SELECT current_setting('rls.is_admin', true)) = 'true'
          THEN true
          ELSE tenant_id = nullif(
-             current_setting('rls.current_tenant', true), '')::int
+             (SELECT current_setting('rls.current_tenant', true)), '')::int
     END
 )
 WITH CHECK (
-    CASE WHEN current_setting('rls.is_admin', true) = 'true'
+    CASE WHEN (SELECT current_setting('rls.is_admin', true)) = 'true'
          THEN true
          ELSE tenant_id = nullif(
-             current_setting('rls.current_tenant', true), '')::int
+             (SELECT current_setting('rls.current_tenant', true)), '')::int
     END
 );
 ```

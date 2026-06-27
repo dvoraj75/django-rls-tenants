@@ -6,7 +6,9 @@ from io import StringIO
 
 import pytest
 from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.db import connection
+from django.test import override_settings
 
 from django_rls_tenants.management.commands.check_rls import _collect_m2m_tables
 from django_rls_tenants.rls.constraints import _build_m2m_drop_sql
@@ -135,3 +137,60 @@ class TestSetupM2MRlsCommand:
         # ...and the policy is never created.
         assert "policy applied" not in output
         assert not _m2m_policy_exists(table)
+
+    @override_settings(
+        RLS_TENANTS={
+            "TENANT_MODEL": "test_app.Tenant",
+            "GUC_PREFIX": "myco",
+            "TENANT_FK_FIELD": "tenant",
+            "TENANT_PK_TYPE": "int",
+        }
+    )
+    def test_guc_names_derived_from_settings(self):
+        """GUC names come from RLS_TENANTS, not hardcoded rls.* / int (#57).
+
+        Pre-#57 the command hardcoded ``rls.is_admin`` / ``rls.current_tenant`` /
+        ``int``; with ``GUC_PREFIX='myco'`` the emitted SQL must use the
+        ``myco.*`` names, and each read must be InitPlan-wrapped.
+        """
+        _unprotect_one_m2m_table()  # force the apply/print path
+
+        out = StringIO()
+        call_command("setup_m2m_rls", "--dry-run", stdout=out)
+        output = out.getvalue()
+
+        # GUC names honour the configured prefix, InitPlan-wrapped...
+        assert "(SELECT current_setting('myco.is_admin', true)) = 'true'" in output
+        assert "(SELECT current_setting('myco.current_tenant', true))" in output
+        # ...and the previously hardcoded rls.* GUC names are gone.
+        assert "rls.is_admin" not in output
+        assert "rls.current_tenant" not in output
+        # InitPlan form, not the pre-#57 inline read.
+        assert "nullif(current_setting(" not in output
+
+    @override_settings(
+        RLS_TENANTS={
+            "TENANT_MODEL": "test_app.Tenant",
+            "TENANT_PK_TYPE": "text",  # not in the {int, bigint, uuid} allowlist
+        }
+    )
+    def test_invalid_tenant_pk_type_rejected(self):
+        """A bad TENANT_PK_TYPE is rejected before it reaches raw DDL (#57).
+
+        The command interpolates ``TENANT_PK_TYPE`` into a ``::<type>`` cast and
+        reads it straight from settings, so an out-of-allowlist value must raise
+        a clean ``CommandError`` instead of emitting invalid policy SQL.
+        """
+        with pytest.raises(CommandError, match="Invalid tenant_pk_type"):
+            call_command("setup_m2m_rls", "--dry-run", stdout=StringIO())
+
+    @override_settings(
+        RLS_TENANTS={
+            "TENANT_MODEL": "test_app.Tenant",
+            "GUC_PREFIX": "bad prefix",  # space is not a valid GUC-name character
+        }
+    )
+    def test_invalid_guc_prefix_rejected(self):
+        """A malformed GUC_PREFIX is rejected before it reaches raw DDL (#57)."""
+        with pytest.raises(CommandError, match="Invalid GUC name"):
+            call_command("setup_m2m_rls", "--dry-run", stdout=StringIO())

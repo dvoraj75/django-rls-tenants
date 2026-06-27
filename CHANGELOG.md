@@ -22,6 +22,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`CODE_OF_CONDUCT.md`), linked from the contributing guides and the
   documentation. Enforcement contact: dvoraj75@gmail.com.
 
+### Changed
+
+- **Performance: InitPlan-wrapped GUC reads** (#57): RLS policy predicates now
+  read PostgreSQL session variables through an uncorrelated scalar sub-SELECT
+  -- `(SELECT current_setting('rls.current_tenant', true))` -- so each GUC is
+  evaluated once per statement (a planner *InitPlan*) instead of once per row.
+  The predicate is otherwise unchanged, so query results are identical; the win
+  shows on large, admin, and raw-SQL scans. Applies to `RLSConstraint`,
+  `RLSM2MConstraint`, the `AddM2MRLSPolicy` migration operation, and the
+  `setup_m2m_rls` command (which also stops hardcoding `rls.is_admin` /
+  `rls.current_tenant` / `int` and instead derives the GUC names and tenant PK
+  cast from `RLS_TENANTS`). Existing policies are **not** rewritten
+  automatically -- see the migration guide ("From 1.2.2 to 1.3.0") to adopt the
+  new form.
+
 ## [1.2.2] - 2026-06-27
 
 ### Added

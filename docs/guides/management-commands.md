@@ -96,13 +96,13 @@ takes precedence, so verbose detail only appears on a non-quiet run.
     myapp_order_tenant_isolation_policy [ALL]
       USING:
         CASE
-            WHEN (current_setting('rls.is_admin'::text, true) = 'true'::text) THEN true
-            ELSE (tenant_id = (NULLIF(current_setting('rls.current_tenant'::text, true), ''::text))::integer)
+            WHEN (( SELECT current_setting('rls.is_admin'::text, true) AS current_setting) = 'true'::text) THEN true
+            ELSE (tenant_id = (NULLIF(( SELECT current_setting('rls.current_tenant'::text, true) AS current_setting), ''::text))::integer)
         END
       WITH CHECK:
         CASE
-            WHEN (current_setting('rls.is_admin'::text, true) = 'true'::text) THEN true
-            ELSE (tenant_id = (NULLIF(current_setting('rls.current_tenant'::text, true), ''::text))::integer)
+            WHEN (( SELECT current_setting('rls.is_admin'::text, true) AS current_setting) = 'true'::text) THEN true
+            ELSE (tenant_id = (NULLIF(( SELECT current_setting('rls.current_tenant'::text, true) AS current_setting), ''::text))::integer)
         END
 ```
 

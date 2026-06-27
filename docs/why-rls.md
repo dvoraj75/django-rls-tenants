@@ -58,17 +58,17 @@ The SQL behind this is straightforward:
 ```sql
 CREATE POLICY "orders_tenant_isolation_policy" ON "orders"
     USING (
-        CASE WHEN current_setting('rls.is_admin', true) = 'true'
+        CASE WHEN (SELECT current_setting('rls.is_admin', true)) = 'true'
              THEN true
              ELSE tenant_id = nullif(
-                 current_setting('rls.current_tenant', true), '')::int
+                 (SELECT current_setting('rls.current_tenant', true)), '')::int
         END
     )
     WITH CHECK (
-        CASE WHEN current_setting('rls.is_admin', true) = 'true'
+        CASE WHEN (SELECT current_setting('rls.is_admin', true)) = 'true'
              THEN true
              ELSE tenant_id = nullif(
-                 current_setting('rls.current_tenant', true), '')::int
+                 (SELECT current_setting('rls.current_tenant', true)), '')::int
         END
     );
 ```

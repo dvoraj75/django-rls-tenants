@@ -181,3 +181,41 @@ class TestAddM2MRLSPolicyStateForwards:
             to_fk="d_id",
         )
         assert op.reversible is True
+
+
+class TestAddM2MRLSPolicyInitPlanWrapping:
+    """Issue #57: database_forwards emits InitPlan-wrapped GUC reads."""
+
+    def _forwards_sql(self) -> str:
+        op = AddM2MRLSPolicy(
+            m2m_table="myapp_project_users",
+            from_model="myapp.Project",
+            to_model="myapp.User",
+            from_fk="project_id",
+            to_fk="user_id",
+        )
+        schema_editor = MagicMock()
+        to_state = MagicMock()
+        to_state.apps = _make_mock_apps(
+            ("myapp.Project", "myapp_project"),
+            ("myapp.User", "myapp_user"),
+        )
+        op.database_forwards("myapp", schema_editor, MagicMock(), to_state)
+        return schema_editor.execute.call_args[0][0]
+
+    def test_admin_check_wrapped(self):
+        sql = self._forwards_sql()
+        assert "(SELECT current_setting('rls.is_admin', true)) = 'true'" in sql
+
+    def test_tenant_value_wrapped(self):
+        sql = self._forwards_sql()
+        assert (
+            "tenant_id = nullif((SELECT current_setting('rls.current_tenant', true)), '')::int"
+            in sql
+        )
+
+    def test_no_unwrapped_current_setting(self):
+        """Regression guard: none of the pre-#57 inline forms remain."""
+        sql = self._forwards_sql()
+        assert "nullif(current_setting(" not in sql
+        assert "current_setting('rls.is_admin', true) = 'true'" not in sql
