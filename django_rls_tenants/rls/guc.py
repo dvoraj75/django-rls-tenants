@@ -11,7 +11,9 @@ import re
 from django.db import connections
 
 # Valid GUC names: dotted identifiers like "rls.current_tenant" or "myapp.is_admin".
-_GUC_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.]*$")
+# ``\Z`` (not ``$``) anchors the end: ``$`` also matches just before a trailing
+# newline, which would let "rls.x\n" slip through.
+_GUC_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.]*\Z")
 
 
 def _validate_guc_name(name: str) -> None:

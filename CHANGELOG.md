@@ -22,6 +22,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`CODE_OF_CONDUCT.md`), linked from the contributing guides and the
   documentation. Enforcement contact: dvoraj75@gmail.com.
 
+- **Raw SQL helper `safe_tenant_sql()`** (#33): a `WHERE`-clause fragment that
+  scopes raw queries to the current tenant using the same `current_setting()`
+  expression as the RLS policies (including the #57 InitPlan form); the GUC
+  names and the tenant PK cast come from `RLS_TENANTS`. Supports the same
+  `extra_bypass_flags` as `RLSConstraint`, so the fragment can mirror a policy's
+  full bypass set. Adds a companion `current_tenant_value_sql()` for `INSERT` /
+  `SELECT` value lists. Both contain no bind parameters (the tenant id is read
+  in-database from the session GUC), validate every interpolated identifier, are
+  re-exported from the top-level package, and are documented in the new Raw SQL
+  guide.
+
 ### Changed
 
 - **Performance: InitPlan-wrapped GUC reads** (#57): RLS policy predicates now
