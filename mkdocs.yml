@@ -99,4 +99,5 @@ nav:
       - API: reference/api.md
   - Development:
       - Contributing: development/contributing.md
+      - Code of Conduct: development/code-of-conduct.md
       - Changelog: development/changelog.md
