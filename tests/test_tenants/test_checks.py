@@ -14,6 +14,8 @@ from django_rls_tenants.tenants.checks import (
     _check_databases_atomic_requests,
     _check_guc_prefix_mismatch,
     _check_superuser_connection,
+    _check_tenant_fk_field_exists,
+    _check_tenant_model_resolves,
     _check_use_local_set_requires_atomic,
     check_rls_config,
 )
@@ -518,3 +520,125 @@ class TestCheckDatabasesAtomicRequests:
             warnings = _check_databases_atomic_requests()
         ids = [w.id for w in warnings]
         assert ids.count("django_rls_tenants.W007") == 2
+
+
+class TestCheckTenantModelResolves:
+    """Tests for _check_tenant_model_resolves (W008)."""
+
+    def test_no_warning_when_model_resolves(self):
+        """No W008 when TENANT_MODEL points at an installed model."""
+        with (
+            override_settings(RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant"}),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_tenant_model_resolves()
+        assert warnings == []
+
+    def test_w008_unknown_model_name(self):
+        """W008 fires when the app exists but the model name does not (LookupError)."""
+        with (
+            override_settings(RLS_TENANTS={"TENANT_MODEL": "test_app.DoesNotExist"}),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_tenant_model_resolves()
+        ids = [w.id for w in warnings]
+        assert "django_rls_tenants.W008" in ids
+
+    def test_w008_unknown_app_label(self):
+        """W008 fires when the app label is not installed (LookupError)."""
+        with (
+            override_settings(RLS_TENANTS={"TENANT_MODEL": "nonexistent_app.Tenant"}),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_tenant_model_resolves()
+        ids = [w.id for w in warnings]
+        assert "django_rls_tenants.W008" in ids
+
+    def test_w008_malformed_path(self):
+        """W008 fires when TENANT_MODEL is not an 'app_label.ModelName' path (ValueError)."""
+        with (
+            override_settings(RLS_TENANTS={"TENANT_MODEL": "notdotted"}),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_tenant_model_resolves()
+        ids = [w.id for w in warnings]
+        assert "django_rls_tenants.W008" in ids
+
+    def test_w008_message_includes_model_path(self):
+        """W008 message includes the offending model path."""
+        with (
+            override_settings(RLS_TENANTS={"TENANT_MODEL": "test_app.DoesNotExist"}),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_tenant_model_resolves()
+        assert "test_app.DoesNotExist" in warnings[0].msg
+        assert isinstance(warnings[0], CheckWarning)
+
+    def test_no_warning_when_tenant_model_unset(self):
+        """No crash and no W008 when TENANT_MODEL is missing (reported elsewhere)."""
+        with (
+            override_settings(RLS_TENANTS={}),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_tenant_model_resolves()
+        assert warnings == []
+
+
+class TestCheckTenantFkFieldExists:
+    """Tests for _check_tenant_fk_field_exists (W009)."""
+
+    def test_no_warning_with_default_fk_field(self):
+        """No W009 when TENANT_FK_FIELD matches the FK every model defines."""
+        with (
+            override_settings(RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant"}),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_tenant_fk_field_exists()
+        assert warnings == []
+
+    def test_w009_fires_for_nonexistent_fk_field(self):
+        """W009 fires when TENANT_FK_FIELD names a field no model defines."""
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "TENANT_FK_FIELD": "nonexistent",
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_tenant_fk_field_exists()
+        ids = [w.id for w in warnings]
+        assert "django_rls_tenants.W009" in ids
+
+    def test_w009_fires_once_per_protected_model(self):
+        """W009 reports every concrete RLSProtectedModel subclass that lacks the field."""
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "TENANT_FK_FIELD": "nonexistent",
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_tenant_fk_field_exists()
+        # Multiple RLSProtectedModel subclasses exist in test_app.
+        assert len(warnings) >= 2
+        assert all(w.id == "django_rls_tenants.W009" for w in warnings)
+
+    def test_w009_message_and_obj(self):
+        """W009 names the missing field and binds the warning to the offending model."""
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "TENANT_FK_FIELD": "nonexistent",
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_tenant_fk_field_exists()
+        assert "nonexistent" in warnings[0].msg
+        assert warnings[0].obj is not None
+        assert isinstance(warnings[0], CheckWarning)
