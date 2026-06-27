@@ -19,6 +19,7 @@ from django_rls_tenants.rls.constraints import (
     _validate_model_path,
     _validate_pk_type,
 )
+from django_rls_tenants.rls.policy_sql import bool_flag_sql
 
 if TYPE_CHECKING:
     from django.db.backends.base.schema import BaseDatabaseSchemaEditor
@@ -115,7 +116,7 @@ class AddM2MRLSPolicy(migrations.operations.base.Operation):
     ) -> None:
         """Create the M2M RLS policy."""
         table = self.m2m_table
-        admin_check = f"current_setting('{self.guc_admin_var}', true) = 'true'"
+        admin_check = bool_flag_sql(self.guc_admin_var)
         subquery_clause = _build_m2m_conditions(
             from_fk=self.from_fk,
             from_table=self._resolve_table(self.from_model, to_state.apps),

@@ -123,6 +123,60 @@ migration that assigns the correct tenant to each existing record.
 
 ## Upgrading django-rls-tenants
 
+### From 1.2.2 to 1.3.0
+
+A **drop-in upgrade** -- no code changes are required and runtime behaviour is
+unchanged. The release is additive, with one optional, opt-in performance step.
+
+#### Optional: adopt the InitPlan policy form (#57)
+
+v1.3.0 wraps every GUC read in a policy predicate in an uncorrelated scalar
+sub-SELECT -- `(SELECT current_setting('rls.current_tenant', true))` -- so
+PostgreSQL evaluates the variable **once per statement** (a planner *InitPlan*)
+instead of once per row. The predicate is otherwise identical, so query results
+never change; the benefit shows on large, admin, and raw-SQL scans.
+
+Because `RLSConstraint` / `RLSM2MConstraint` serialize identically
+(`deconstruct()` is unchanged), Django generates **no new migration**, and the
+`CREATE POLICY ... IF NOT EXISTS` guard **skips tables that already have a
+policy**. So *new* deployments get the InitPlan form automatically, while
+*existing* policies keep the previous inline form until you drop and recreate
+them. Adopting it on a running database is optional and can be done
+table-by-table.
+
+**M2M through tables** -- drop the policy, then re-run `setup_m2m_rls`, which
+recreates a policy only on tables that don't have one:
+
+```sql
+DROP POLICY IF EXISTS "<through_table>_m2m_rls_policy" ON "<through_table>";
+```
+
+```bash
+python manage.py setup_m2m_rls         # recreates the dropped policy (InitPlan form)
+python manage.py check_rls --verbose   # confirm the live USING / WITH CHECK
+```
+
+**Standard tenant tables** -- recreate the policy through the migration that
+defines the `RLSConstraint`. Reversing that migration runs the constraint's
+`remove_sql` (drops the policy and disables RLS); re-applying runs `create_sql`,
+which now emits the v1.3.0 InitPlan SQL:
+
+```bash
+python manage.py migrate <app> <migration_before_the_RLSConstraint>     # drops the old policy
+python manage.py migrate <app> <migration_that_adds_the_RLSConstraint>  # recreates it
+```
+
+!!! warning
+    Reversing the migration briefly **disables RLS** on that table. Run it inside
+    a maintenance window, or instead drop and recreate the single policy with
+    explicit SQL in one transaction. Always confirm with
+    `python manage.py check_rls --verbose`, which prints the live `USING` /
+    `WITH CHECK` so you can verify the `(SELECT current_setting(...))` form is in
+    place.
+
+Policy names follow `"{table}_tenant_isolation_policy"` (standard models) and
+`"{through_table}_m2m_rls_policy"` (M2M join tables).
+
 ### From 1.2.1 to 1.2.2
 
 A **drop-in upgrade** -- no breaking changes, and no code or data migration is
