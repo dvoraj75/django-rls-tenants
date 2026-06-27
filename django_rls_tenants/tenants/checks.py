@@ -9,6 +9,8 @@ silent failures at runtime:
 - ``CONN_MAX_AGE > 0`` with ``USE_LOCAL_SET=False`` (connection-pool GUC leak risk).
 - ``DATABASES`` contains aliases not in ``settings.DATABASES``.
 - ``USE_LOCAL_SET=True`` without ``ATOMIC_REQUESTS`` on configured databases.
+- ``TENANT_MODEL`` does not resolve to an installed model.
+- ``TENANT_FK_FIELD`` missing on an ``RLSProtectedModel`` subclass.
 """
 
 from __future__ import annotations
@@ -39,6 +41,8 @@ def check_rls_config(
     errors.extend(_check_conn_max_age_with_session_gucs())
     errors.extend(_check_databases_alias_exists())
     errors.extend(_check_databases_atomic_requests())
+    errors.extend(_check_tenant_model_resolves())
+    errors.extend(_check_tenant_fk_field_exists())
     return errors
 
 
@@ -257,6 +261,83 @@ def _check_databases_atomic_requests() -> list[CheckWarning]:
                     f"setting GUCs on {alias!r}.",
                     hint=f"Set DATABASES[{alias!r}]['ATOMIC_REQUESTS'] = True.",
                     id="django_rls_tenants.W007",
+                )
+            )
+    return warnings
+
+
+def _check_tenant_model_resolves() -> list[CheckWarning]:
+    """Warn if ``TENANT_MODEL`` does not resolve to an installed model.
+
+    ``RLS_TENANTS["TENANT_MODEL"]`` must be a ``"<app_label>.<ModelName>"``
+    path to a model in ``INSTALLED_APPS``. A typo or an app missing from
+    ``INSTALLED_APPS`` otherwise surfaces only at query time -- when the
+    tenant FK is resolved -- with a cryptic ``LookupError``.
+    """
+    from django.apps import apps  # noqa: PLC0415
+
+    from django_rls_tenants.exceptions import RLSConfigurationError  # noqa: PLC0415
+    from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
+
+    warnings: list[CheckWarning] = []
+    try:
+        model_path = rls_tenants_config.TENANT_MODEL
+    except RLSConfigurationError:
+        # TENANT_MODEL is required; its absence is reported when the config
+        # is first read elsewhere. Don't crash the check here.
+        return warnings
+
+    try:
+        apps.get_model(model_path)
+    except (LookupError, ValueError):
+        # ValueError: malformed path (not "app_label.ModelName").
+        # LookupError: unknown app label or model name.
+        warnings.append(
+            CheckWarning(
+                f"RLS_TENANTS['TENANT_MODEL'] = {model_path!r} does not "
+                f"resolve to an installed model.",
+                hint=(
+                    "Set TENANT_MODEL to '<app_label>.<ModelName>' for a model in INSTALLED_APPS."
+                ),
+                id="django_rls_tenants.W008",
+            )
+        )
+    return warnings
+
+
+def _check_tenant_fk_field_exists() -> list[CheckWarning]:
+    """Warn if an ``RLSProtectedModel`` subclass lacks the tenant FK field.
+
+    ``RLSProtectedModel`` injects a tenant ``ForeignKey`` named after
+    ``RLS_TENANTS["TENANT_FK_FIELD"]`` (default ``"tenant"``). If a subclass
+    declares its own tenant field under a different name -- or
+    ``TENANT_FK_FIELD`` is changed to a name no model actually defines -- the
+    generated RLS policy references a column that doesn't exist, failing at
+    migrate/query time. This catches that mismatch at startup.
+    """
+    from django.apps import apps  # noqa: PLC0415
+    from django.core.exceptions import FieldDoesNotExist  # noqa: PLC0415
+
+    from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
+    from django_rls_tenants.tenants.models import RLSProtectedModel  # noqa: PLC0415
+
+    warnings: list[CheckWarning] = []
+    fk_field = rls_tenants_config.TENANT_FK_FIELD
+    for model in apps.get_models():
+        if not issubclass(model, RLSProtectedModel) or model._meta.abstract:  # noqa: SLF001
+            continue
+        try:
+            model._meta.get_field(fk_field)  # noqa: SLF001
+        except FieldDoesNotExist:
+            warnings.append(
+                CheckWarning(
+                    f"{model.__name__} has no field {fk_field!r} "
+                    f"(RLS_TENANTS['TENANT_FK_FIELD']).",
+                    hint=(
+                        "Add the tenant ForeignKey, or set TENANT_FK_FIELD to the correct name."
+                    ),
+                    id="django_rls_tenants.W009",
+                    obj=model,
                 )
             )
     return warnings
