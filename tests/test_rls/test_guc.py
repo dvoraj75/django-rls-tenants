@@ -91,6 +91,11 @@ class TestGucNameValidation:
         with pytest.raises(ValueError, match="Invalid GUC variable name"):
             set_guc("rls()", "val")
 
+    def test_trailing_newline(self):
+        """A trailing newline is rejected (\\Z anchor, not $, which allows it)."""
+        with pytest.raises(ValueError, match="Invalid GUC variable name"):
+            set_guc("rls.current_tenant\n", "val")
+
     def test_get_guc_also_validates(self):
         """get_guc rejects invalid names too."""
         with pytest.raises(ValueError, match="Invalid GUC variable name"):

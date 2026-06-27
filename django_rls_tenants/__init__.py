@@ -22,6 +22,8 @@ __all__ = [
     "TenantUser",
     "__version__",
     "admin_context",
+    "current_tenant_value_sql",
+    "safe_tenant_sql",
     "tenant_context",
     "with_rls_context",
 ]
@@ -36,6 +38,8 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "TenantQuerySet": ("django_rls_tenants.tenants.managers", "TenantQuerySet"),
     "TenantUser": ("django_rls_tenants.tenants.types", "TenantUser"),
     "admin_context": ("django_rls_tenants.tenants.context", "admin_context"),
+    "current_tenant_value_sql": ("django_rls_tenants.tenants.sql", "current_tenant_value_sql"),
+    "safe_tenant_sql": ("django_rls_tenants.tenants.sql", "safe_tenant_sql"),
     "tenant_context": ("django_rls_tenants.tenants.context", "tenant_context"),
     "with_rls_context": ("django_rls_tenants.tenants.context", "with_rls_context"),
 }

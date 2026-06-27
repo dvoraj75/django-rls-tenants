@@ -62,6 +62,17 @@ class TestLazyImports:
         assert admin_context is ctx_mod.admin_context
         assert tenant_context is ctx_mod.tenant_context
 
+    def test_raw_sql_helpers(self):
+        """The raw-SQL helpers are importable from the top-level package."""
+        from django_rls_tenants import (  # noqa: PLC0415
+            current_tenant_value_sql,
+            safe_tenant_sql,
+        )
+        from django_rls_tenants.tenants import sql as sql_mod  # noqa: PLC0415
+
+        assert safe_tenant_sql is sql_mod.safe_tenant_sql
+        assert current_tenant_value_sql is sql_mod.current_tenant_value_sql
+
     def test_invalid_attribute_raises(self):
         """Accessing an undefined attribute raises AttributeError."""
         import django_rls_tenants  # noqa: PLC0415

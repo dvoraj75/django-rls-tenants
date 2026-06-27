@@ -17,6 +17,8 @@ from django_rls_tenants import (
     TenantQuerySet,
     TenantUser,
     admin_context,
+    current_tenant_value_sql,
+    safe_tenant_sql,
     tenant_context,
     with_rls_context,
 )
@@ -105,6 +107,15 @@ Django multitenancy built on top of the `rls/` primitives.
 ::: django_rls_tenants.tenants.context.admin_context
 
 ::: django_rls_tenants.tenants.context.with_rls_context
+
+### Raw SQL
+
+Helpers for scoping hand-written SQL to the current tenant. See the
+[Raw SQL guide](../guides/raw-sql.md) for usage and safety notes.
+
+::: django_rls_tenants.tenants.sql.safe_tenant_sql
+
+::: django_rls_tenants.tenants.sql.current_tenant_value_sql
 
 ### State
 
