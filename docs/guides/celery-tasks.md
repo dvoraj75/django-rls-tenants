@@ -108,6 +108,12 @@ def process_orders(tenant_id: int) -> None:
         ...
 ```
 
+!!! warning
+    This decorator assumes `tenant_id` is the **first positional argument**, so it
+    does not work with bound tasks (`@shared_task(bind=True)`) -- there Celery passes
+    the task instance first, and `tenant_id` would receive `self`. For bound tasks,
+    keep the explicit `with tenant_context(tenant_id):` block in the task body instead.
+
 !!! tip
     In multi-database setups, pass `using="..."` to `tenant_context()` to scope
     queries on a specific database alias:
