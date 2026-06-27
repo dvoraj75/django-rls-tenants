@@ -587,17 +587,23 @@ class TestCheckTenantModelResolves:
 class TestCheckTenantFkFieldExists:
     """Tests for _check_tenant_fk_field_exists (W009)."""
 
-    def test_no_warning_with_default_fk_field(self):
-        """No W009 when TENANT_FK_FIELD matches the FK every model defines."""
-        with (
-            override_settings(RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant"}),
-            patch(_CONF_PATCH, RLSTenantsConfig()),
-        ):
-            warnings = _check_tenant_fk_field_exists()
+    # The check resolves the policy field via this canonical helper; patching
+    # it lets us simulate a constraint that references a missing column.
+    _RESOLVER_PATCH = "django_rls_tenants.tenants.models._get_tenant_fk_field"
+
+    def test_no_warning_with_default_config(self):
+        """No W009 when every model's RLS-policy field exists (default ``tenant``)."""
+        warnings = _check_tenant_fk_field_exists()
         assert warnings == []
 
-    def test_w009_fires_for_nonexistent_fk_field(self):
-        """W009 fires when TENANT_FK_FIELD names a field no model defines."""
+    def test_no_warning_when_only_tenant_fk_field_changed(self):
+        """Changing TENANT_FK_FIELD alone does not fire: the policy uses the constraint field.
+
+        Regression guard against a tautological check. The ``class_prepared``
+        injector always adds a field named ``TENANT_FK_FIELD``, so the policy
+        filters on the constraint's ``field`` (``"tenant"`` here), which still
+        exists -- no column is actually missing.
+        """
         with (
             override_settings(
                 RLS_TENANTS={
@@ -607,28 +613,26 @@ class TestCheckTenantFkFieldExists:
             ),
             patch(_CONF_PATCH, RLSTenantsConfig()),
         ):
+            warnings = _check_tenant_fk_field_exists()
+        assert warnings == []
+
+    def test_w009_fires_when_policy_field_missing(self):
+        """W009 fires when the resolved policy field names a column no model defines."""
+        with patch(self._RESOLVER_PATCH, return_value="nonexistent"):
             warnings = _check_tenant_fk_field_exists()
         ids = [w.id for w in warnings]
         assert "django_rls_tenants.W009" in ids
 
     def test_w009_fires_once_per_protected_model(self):
         """W009 reports every concrete RLSProtectedModel subclass that lacks the field."""
-        with (
-            override_settings(
-                RLS_TENANTS={
-                    "TENANT_MODEL": "test_app.Tenant",
-                    "TENANT_FK_FIELD": "nonexistent",
-                },
-            ),
-            patch(_CONF_PATCH, RLSTenantsConfig()),
-        ):
+        with patch(self._RESOLVER_PATCH, return_value="nonexistent"):
             warnings = _check_tenant_fk_field_exists()
         # Multiple RLSProtectedModel subclasses exist in test_app.
         assert len(warnings) >= 2
         assert all(w.id == "django_rls_tenants.W009" for w in warnings)
 
-    def test_w009_message_and_obj(self):
-        """W009 names the missing field and binds the warning to the offending model."""
+    def test_w009_falls_back_to_tenant_fk_field_without_constraint(self):
+        """When a model has no RLSConstraint, the check falls back to TENANT_FK_FIELD."""
         with (
             override_settings(
                 RLS_TENANTS={
@@ -637,7 +641,15 @@ class TestCheckTenantFkFieldExists:
                 },
             ),
             patch(_CONF_PATCH, RLSTenantsConfig()),
+            patch(self._RESOLVER_PATCH, return_value=None),
         ):
+            warnings = _check_tenant_fk_field_exists()
+        ids = [w.id for w in warnings]
+        assert "django_rls_tenants.W009" in ids
+
+    def test_w009_message_and_obj(self):
+        """W009 names the missing field and binds the warning to the offending model."""
+        with patch(self._RESOLVER_PATCH, return_value="nonexistent"):
             warnings = _check_tenant_fk_field_exists()
         assert "nonexistent" in warnings[0].msg
         assert warnings[0].obj is not None

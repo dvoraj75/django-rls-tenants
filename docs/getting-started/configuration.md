@@ -245,7 +245,7 @@ django-rls-tenants registers Django system checks that warn about common misconf
 | `W006` | Warning | `DATABASES` contains an alias not defined in `settings.DATABASES` |
 | `W007` | Warning | `USE_LOCAL_SET=True` without `ATOMIC_REQUESTS` on a configured alias |
 | `W008` | Warning | `RLS_TENANTS['TENANT_MODEL']` does not resolve to an installed model |
-| `W009` | Warning | `TENANT_FK_FIELD` missing on an `RLSProtectedModel` subclass |
+| `W009` | Warning | Tenant field referenced by an `RLSProtectedModel`'s RLS policy is missing |
 
 Run `python manage.py check` to see any warnings.
 

@@ -20,9 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are given.
 - **System checks `W008` + `W009`** (#29): `W008` warns when
   `RLS_TENANTS['TENANT_MODEL']` does not resolve to an installed model;
-  `W009` warns when a concrete `RLSProtectedModel` subclass has no field
-  named `TENANT_FK_FIELD`. Both surface the misconfiguration at startup via
-  `manage.py check` instead of as a cryptic error at migrate/query time.
+  `W009` warns when a concrete `RLSProtectedModel` subclass is missing the
+  tenant field its RLS policy references (resolved from `RLSConstraint(field=…)`,
+  falling back to `TENANT_FK_FIELD`). Both surface the misconfiguration at
+  startup via `manage.py check` instead of as a cryptic error at
+  migrate/query time.
 
 ## [1.2.1] - 2026-06-27
 
