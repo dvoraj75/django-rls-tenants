@@ -75,7 +75,7 @@ Better CLI tooling and earlier misconfiguration detection.
   *Why:* DBAs and security reviewers need to audit what SQL will run before
   approving it.
 
-- [ ] **New system checks** — `W008`: verify `TENANT_MODEL` resolves to an
+- [x] **New system checks** — `W008`: verify `TENANT_MODEL` resolves to an
   installed model at startup; `W009`: verify `TENANT_FK_FIELD` exists on all
   `RLSProtectedModel` subclasses.
   *Why:* These misconfigurations currently fail at query time with cryptic
