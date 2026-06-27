@@ -103,6 +103,22 @@ RLS_TENANTS = {
     mode adds an application-level check that raises before the query reaches
     the database.
 
+!!! tip "Actionable error hints"
+    The `NoTenantContextError` raised by strict mode -- and by `tenant_context()`,
+    `admin_context()`, and `@with_rls_context` -- carries a `Hint:` line telling you
+    how to establish a context. The bare message and the hint are also available
+    separately via the `.message` and `.hint` attributes:
+
+    ```python
+    from django_rls_tenants.exceptions import NoTenantContextError
+
+    try:
+        list(Order.objects.all())  # STRICT_MODE=True, no active context
+    except NoTenantContextError as exc:
+        log.error(exc.message)  # "RLS strict mode: query on Order attempted ..."
+        show_hint(exc.hint)     # "Establish an RLS context before the query: ..."
+    ```
+
 ### `TENANT_FK_FIELD`
 
 | | |

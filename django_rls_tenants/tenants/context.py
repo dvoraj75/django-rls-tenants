@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.guc import clear_guc, get_guc, set_guc
 from django_rls_tenants.tenants.conf import rls_tenants_config
+from django_rls_tenants.tenants.errors import HINT_TENANT_ID_NONE, HINT_USER_NO_TENANT
 from django_rls_tenants.tenants.state import (
     reset_current_tenant_id,
     reset_rls_context_active,
@@ -64,12 +65,8 @@ def _resolve_user_guc_vars(
         }
     tenant_id = user.rls_tenant_id
     if tenant_id is None:
-        msg = (
-            f"Non-admin user has rls_tenant_id=None. "
-            f"Assign the user to a tenant or set is_tenant_admin=True. "
-            f"User type: {type(user).__name__}"
-        )
-        raise NoTenantContextError(msg)
+        msg = f"Non-admin user has rls_tenant_id=None (user type: {type(user).__name__})."
+        raise NoTenantContextError(msg, hint=HINT_USER_NO_TENANT)
     return {
         conf.GUC_IS_ADMIN: "false",
         conf.GUC_CURRENT_TENANT: str(tenant_id),
@@ -92,8 +89,8 @@ def tenant_context(
         NoTenantContextError: If ``tenant_id`` is ``None``.
     """
     if tenant_id is None:
-        msg = "tenant_id cannot be None. For admin access, use admin_context() instead."
-        raise NoTenantContextError(msg)
+        msg = "tenant_id cannot be None."
+        raise NoTenantContextError(msg, hint=HINT_TENANT_ID_NONE)
 
     conf = rls_tenants_config
     is_local = conf.USE_LOCAL_SET
@@ -251,12 +248,8 @@ def with_rls_context(
             elif as_user is not None:
                 tenant_id = as_user.rls_tenant_id
                 if tenant_id is None:
-                    msg = (
-                        f"Non-admin user passed to {fn.__qualname__} has "
-                        f"rls_tenant_id=None. Assign the user to a tenant "
-                        f"or set is_tenant_admin=True."
-                    )
-                    raise NoTenantContextError(msg)
+                    msg = f"Non-admin user passed to {fn.__qualname__} has rls_tenant_id=None."
+                    raise NoTenantContextError(msg, hint=HINT_USER_NO_TENANT)
                 ctx = tenant_context(tenant_id)
             else:
                 logger.warning(
