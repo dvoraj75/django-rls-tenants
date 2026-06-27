@@ -123,6 +123,22 @@ migration that assigns the correct tenant to each existing record.
 
 ## Upgrading django-rls-tenants
 
+### From 1.2.1 to 1.2.2
+
+A **drop-in upgrade** -- no breaking changes, and no code or data migration is
+required. The release is purely additive:
+
+- **New optional CLI flags**: `check_rls --verbose` and `setup_m2m_rls --verbose`
+  print each policy's SQL for auditing. Existing invocations behave exactly as
+  before.
+- **New system checks `W008` and `W009`**: `python manage.py check` now warns when
+  `RLS_TENANTS['TENANT_MODEL']` does not resolve to an installed model (`W008`) or
+  when an `RLSProtectedModel`'s RLS-policy tenant field is missing (`W009`). These
+  are **warnings, not errors** -- you may see new output if your configuration has
+  a latent issue, but nothing breaks.
+- **New [Celery Tasks](../guides/celery-tasks.md) guide** documenting how to set
+  RLS context in background tasks.
+
 ### From 1.2.0 to 1.2.1
 
 This release has **one breaking change**: internal helpers have been removed from
