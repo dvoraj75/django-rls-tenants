@@ -28,6 +28,35 @@
     poetry add django-rls-tenants
     ```
 
+## Optional Extras
+
+### Celery
+
+Native Celery integration (`@rls_task`, `RLSTask`, `install()`) ships behind the
+`celery` extra, so Celery itself stays an optional dependency:
+
+=== "pip"
+
+    ```bash
+    pip install "django-rls-tenants[celery]"
+    ```
+
+=== "uv"
+
+    ```bash
+    uv add "django-rls-tenants[celery]"
+    ```
+
+=== "poetry"
+
+    ```bash
+    poetry add "django-rls-tenants[celery]"
+    ```
+
+Without the extra the core library is unaffected; importing
+`django_rls_tenants.contrib.celery` without Celery installed raises a clear
+`ImportError`. See the [Celery Tasks guide](../guides/celery-tasks.md).
+
 ## Add to INSTALLED_APPS
 
 ```python title="settings.py"
