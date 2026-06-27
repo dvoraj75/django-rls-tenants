@@ -9,11 +9,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 from django.db import connections
 
 from django_rls_tenants.management.commands.check_rls import _collect_m2m_tables
-from django_rls_tenants.rls.constraints import _build_m2m_conditions, _build_m2m_create_sql
+from django_rls_tenants.rls.constraints import (
+    _build_m2m_conditions,
+    _build_m2m_create_sql,
+    _validate_guc_name_for_ddl,
+    _validate_pk_type,
+)
+from django_rls_tenants.rls.policy_sql import bool_flag_sql
+from django_rls_tenants.tenants.conf import RLSTenantsConfig
 
 
 class Command(BaseCommand):
@@ -55,6 +62,23 @@ class Command(BaseCommand):
             self.stdout.write("No M2M through tables found on RLS-protected models.")
             return
 
+        # Derive GUC names and the tenant PK cast from the live RLS_TENANTS
+        # settings instead of hardcoding "rls.*"/"int", so a custom GUC_PREFIX
+        # or TENANT_PK_TYPE is honoured. A fresh reader (not the cached
+        # module-level singleton) reflects settings overridden after startup.
+        conf = RLSTenantsConfig()
+
+        # These values flow straight into raw CREATE POLICY DDL. RLSConstraint
+        # and AddM2MRLSPolicy validate the equivalent arguments at construction;
+        # this command reads them from settings, so guard here too (a malformed
+        # GUC_PREFIX or TENANT_PK_TYPE otherwise surfaces as a cryptic SQL error).
+        try:
+            _validate_pk_type(conf.TENANT_PK_TYPE)
+            _validate_guc_name_for_ddl(conf.GUC_CURRENT_TENANT, "RLS_TENANTS['GUC_PREFIX']")
+            _validate_guc_name_for_ddl(conf.GUC_IS_ADMIN, "RLS_TENANTS['GUC_PREFIX']")
+        except ValueError as exc:
+            raise CommandError(str(exc)) from exc
+
         conn = connections[db_alias]
 
         # Check which tables already have policies
@@ -83,7 +107,7 @@ class Command(BaseCommand):
                 skipped += 1
                 continue
 
-            admin_check = "current_setting('rls.is_admin', true) = 'true'"
+            admin_check = bool_flag_sql(conf.GUC_IS_ADMIN)
             subquery_clause = _build_m2m_conditions(
                 from_fk=info["from_fk"],
                 from_table=info["from_table"],
@@ -91,8 +115,8 @@ class Command(BaseCommand):
                 to_fk=info["to_fk"],
                 to_table=info["to_table"],
                 to_tenant_fk=info["to_tenant_fk"],
-                guc_tenant_var="rls.current_tenant",
-                tenant_pk_type="int",
+                guc_tenant_var=conf.GUC_CURRENT_TENANT,
+                tenant_pk_type=conf.TENANT_PK_TYPE,
             )
             sql = _build_m2m_create_sql(
                 table=table, admin_check=admin_check, subquery_clause=subquery_clause

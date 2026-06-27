@@ -17,6 +17,7 @@ from django.db.backends.ddl_references import Statement
 from django.db.models import BaseConstraint
 
 from django_rls_tenants.rls.guc import _GUC_NAME_RE
+from django_rls_tenants.rls.policy_sql import bool_flag_sql, tenant_match_sql, tenant_value_sql
 
 if TYPE_CHECKING:
     from django.db.backends.base.schema import BaseDatabaseSchemaEditor
@@ -143,19 +144,15 @@ class RLSConstraint(BaseConstraint):
         table = model._meta.db_table  # type: ignore[union-attr]  # noqa: SLF001  -- Django's standard public API
         policy_name = f"{table}_tenant_isolation_policy"
 
-        tenant_match = (
-            f"{self.field}_id = nullif("
-            f"current_setting('{self.guc_tenant_var}', true), '')"
-            f"::{self.tenant_pk_type}"
+        tenant_match = tenant_match_sql(
+            f"{self.field}_id", self.guc_tenant_var, self.tenant_pk_type
         )
-        admin_check = f"current_setting('{self.guc_admin_var}', true) = 'true'"
+        admin_check = bool_flag_sql(self.guc_admin_var)
 
         # Build bypass conditions for CASE WHEN: admin is always first,
         # extra bypass flags are appended (USING only, NOT WITH CHECK).
         bypass_conditions_using = [admin_check]
-        bypass_conditions_using.extend(
-            f"current_setting('{flag}', true) = 'true'" for flag in self.extra_bypass_flags
-        )
+        bypass_conditions_using.extend(bool_flag_sql(flag) for flag in self.extra_bypass_flags)
 
         bypass_clause_using = "\n                              OR ".join(bypass_conditions_using)
         bypass_clause_check = admin_check  # only admin in WITH CHECK
@@ -311,7 +308,7 @@ def _build_m2m_conditions(
     which gives the PostgreSQL planner more optimisation flexibility
     than the equivalent ``IN (SELECT id ...)`` form.
     """
-    guc_expr = f"nullif(current_setting('{guc_tenant_var}', true), '')::{tenant_pk_type}"
+    guc_expr = tenant_value_sql(guc_tenant_var, tenant_pk_type)
     conditions: list[str] = []
 
     if from_tenant_fk is not None:
@@ -494,7 +491,7 @@ class RLSM2MConstraint(BaseConstraint):
     ) -> Statement:
         """Generate SQL to enable RLS and create the M2M isolation policy."""
         table = model._meta.db_table  # type: ignore[union-attr]  # noqa: SLF001
-        admin_check = f"current_setting('{self.guc_admin_var}', true) = 'true'"
+        admin_check = bool_flag_sql(self.guc_admin_var)
         subquery_clause = self._build_subquery_clause()
         return Statement(
             template="%(sql)s",

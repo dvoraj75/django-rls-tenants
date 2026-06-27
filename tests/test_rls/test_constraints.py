@@ -561,3 +561,85 @@ class TestM2MInputValidation:
         c = _make_m2m_constraint(to_tenant_fk=None)
         assert c.to_tenant_fk is None
         assert c.from_tenant_fk == "tenant"
+
+
+# ===========================================================================
+# Issue #57 -- InitPlan-wrapped GUC reads
+# ===========================================================================
+
+
+class TestInitPlanWrapping:
+    """RLSConstraint reads each policy GUC via (SELECT current_setting(...)).
+
+    The scalar sub-SELECT lets PostgreSQL evaluate the GUC once per statement
+    (InitPlan) instead of per row. Semantics are unchanged.
+    """
+
+    def test_admin_check_wrapped(self):
+        c = RLSConstraint(field="tenant", name="test_rls")
+        sql = _get_create_sql(c)
+        assert "(SELECT current_setting('rls.is_admin', true)) = 'true'" in sql
+
+    def test_tenant_match_wrapped(self):
+        c = RLSConstraint(field="tenant", name="test_rls")
+        sql = _get_create_sql(c)
+        assert (
+            "tenant_id = nullif((SELECT current_setting('rls.current_tenant', true)), '')::int"
+            in sql
+        )
+
+    def test_extra_bypass_flag_wrapped(self):
+        c = RLSConstraint(
+            field="tenant", name="test_rls", extra_bypass_flags=["rls.is_login_request"]
+        )
+        sql = _get_create_sql(c)
+        assert "(SELECT current_setting('rls.is_login_request', true)) = 'true'" in sql
+
+    def test_custom_guc_and_uuid_pk_wrapped(self):
+        c = RLSConstraint(
+            field="org",
+            name="test_rls",
+            guc_tenant_var="myco.current_tenant",
+            guc_admin_var="myco.is_admin",
+            tenant_pk_type="uuid",
+        )
+        sql = _get_create_sql(c)
+        assert (
+            "org_id = nullif((SELECT current_setting('myco.current_tenant', true)), '')::uuid"
+            in sql
+        )
+        assert "(SELECT current_setting('myco.is_admin', true)) = 'true'" in sql
+
+    def test_no_unwrapped_current_setting(self):
+        """Regression guard: none of the pre-#57 inline forms remain."""
+        c = RLSConstraint(
+            field="tenant", name="test_rls", extra_bypass_flags=["rls.is_login_request"]
+        )
+        sql = _get_create_sql(c)
+        assert "nullif(current_setting(" not in sql
+        assert "current_setting('rls.is_admin', true) = 'true'" not in sql
+        assert "current_setting('rls.is_login_request', true) = 'true'" not in sql
+
+
+class TestM2MInitPlanWrapping:
+    """RLSM2MConstraint wraps its GUC reads in scalar sub-SELECTs too (#57)."""
+
+    def test_admin_check_wrapped(self):
+        c = _make_m2m_constraint()
+        sql = _get_m2m_create_sql(c)
+        assert "(SELECT current_setting('rls.is_admin', true)) = 'true'" in sql
+
+    def test_tenant_value_wrapped(self):
+        c = _make_m2m_constraint()
+        sql = _get_m2m_create_sql(c)
+        assert (
+            "tenant_id = nullif((SELECT current_setting('rls.current_tenant', true)), '')::int"
+            in sql
+        )
+
+    def test_no_unwrapped_current_setting(self):
+        """Regression guard: none of the pre-#57 inline forms remain."""
+        c = _make_m2m_constraint()
+        sql = _get_m2m_create_sql(c)
+        assert "nullif(current_setting(" not in sql
+        assert "current_setting('rls.is_admin', true) = 'true'" not in sql

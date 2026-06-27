@@ -19,6 +19,11 @@ END
 -- tenant_id = NULL → always false → zero rows
 ```
 
+Since v1.3.0 each `current_setting()` read in a policy is wrapped in a scalar
+sub-SELECT -- `(SELECT current_setting(...))` -- so PostgreSQL evaluates it once
+per statement (an InitPlan) rather than per row. This is purely a planner
+optimization: the fail-closed semantics shown above are identical.
+
 This means:
 
 - Unauthenticated requests see zero rows (middleware does not set GUCs).
