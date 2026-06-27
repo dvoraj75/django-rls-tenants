@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   falling back to `TENANT_FK_FIELD`). Both surface the misconfiguration at
   startup via `manage.py check` instead of as a cryptic error at
   migrate/query time.
+- **Documentation: Celery quick-start guide** (#30): new Celery Tasks guide
+  showing how to wrap task bodies in `tenant_context()` so RLS context is set
+  for work that runs outside the request cycle. Interim pattern until native
+  Celery integration lands in v1.3.0.
 
 ## [1.2.1] - 2026-06-27
 

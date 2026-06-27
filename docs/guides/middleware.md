@@ -210,4 +210,4 @@ with admin_context():
     all_users = User.objects.all()
 ```
 
-See [Context Managers](context-managers.md) for details.
+See [Context Managers](context-managers.md) and [Celery Tasks](celery-tasks.md) for details.

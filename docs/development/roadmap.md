@@ -81,7 +81,7 @@ Better CLI tooling and earlier misconfiguration detection.
   *Why:* These misconfigurations currently fail at query time with cryptic
   errors instead of being caught at startup.
 
-- [ ] **Documentation: Celery quick-start** — Minimal pattern for wrapping Celery
+- [x] **Documentation: Celery quick-start** — Minimal pattern for wrapping Celery
   tasks with `tenant_context()` before full Celery integration lands in v1.3.0.
   *Why:* Celery is the most common question from new users — a docs page
   unblocks them immediately without waiting for library-level support.
