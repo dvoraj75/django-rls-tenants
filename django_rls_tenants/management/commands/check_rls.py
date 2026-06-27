@@ -13,6 +13,15 @@ from typing import Any
 from django.core.management.base import BaseCommand
 from django.db import connections
 
+# Maps ``pg_policy.polcmd`` codes to the SQL command each policy applies to.
+_POLCMD_LABELS = {
+    "r": "SELECT",
+    "a": "INSERT",
+    "w": "UPDATE",
+    "d": "DELETE",
+    "*": "ALL",
+}
+
 
 def _collect_rls_tables() -> dict[str, str]:
     """Return ``{db_table: ModelName}`` for all concrete ``RLSProtectedModel`` subclasses."""
@@ -114,11 +123,18 @@ class Command(BaseCommand):
             default=False,
             help="Suppress success output; only show errors. Useful for CI/CD pipelines.",
         )
+        parser.add_argument(
+            "--verbose",
+            action="store_true",
+            default=False,
+            help="Show each policy's full definition (USING / WITH CHECK SQL).",
+        )
 
     def handle(self, *args: Any, **options: Any) -> None:  # noqa: ARG002
         """Check each RLSProtectedModel subclass and M2M through tables."""
         db_alias: str = options["database"]
         quiet: bool = options["quiet"]
+        verbose: bool = options["verbose"]
         table_to_model = _collect_rls_tables()
         m2m_tables = _collect_m2m_tables()
 
@@ -133,7 +149,9 @@ class Command(BaseCommand):
         if table_to_model:
             tables = list(table_to_model.keys())
             self._check_rls_status(tables, table_to_model, errors, db_alias=db_alias)
-            self._check_policies(tables, table_to_model, errors, db_alias=db_alias, quiet=quiet)
+            self._check_policies(
+                tables, table_to_model, errors, db_alias=db_alias, quiet=quiet, verbose=verbose
+            )
 
         # Check M2M through tables
         if m2m_tables:
@@ -143,7 +161,12 @@ class Command(BaseCommand):
             m2m_table_list = list(m2m_table_to_desc.keys())
             self._check_rls_status(m2m_table_list, m2m_table_to_desc, errors, db_alias=db_alias)
             self._check_policies(
-                m2m_table_list, m2m_table_to_desc, errors, db_alias=db_alias, quiet=quiet
+                m2m_table_list,
+                m2m_table_to_desc,
+                errors,
+                db_alias=db_alias,
+                quiet=quiet,
+                verbose=verbose,
             )
 
         if errors:
@@ -196,8 +219,14 @@ class Command(BaseCommand):
         *,
         db_alias: str = "default",
         quiet: bool = False,
+        verbose: bool = False,
     ) -> None:
-        """Batch-check RLS policies via ``pg_policies``."""
+        """Batch-check RLS policies via ``pg_policies``.
+
+        With ``verbose`` (and not ``quiet``), additionally read each policy's
+        live ``USING`` / ``WITH CHECK`` expressions from the ``pg_policy``
+        catalog and print them indented under the policy-name line.
+        """
         conn = connections[db_alias]
         with conn.cursor() as cursor:
             placeholders = ", ".join(["%s"] * len(tables))
@@ -213,9 +242,59 @@ class Command(BaseCommand):
             for row in cursor.fetchall():
                 policies_by_table.setdefault(row[0], []).append(row[1])
 
+            definitions_by_table: dict[str, list[tuple[str, str, str | None, str | None]]] = {}
+            if verbose and not quiet:
+                # ``pg_policies`` exposes only policy names; the ``pg_policy``
+                # catalog holds the live expressions, read back via
+                # ``pg_get_expr`` (the definition Postgres actually enforces).
+                # Same parameterised-table safety as the query above.
+                cursor.execute(
+                    f"SELECT c.relname, p.polname, p.polcmd, "
+                    f"pg_get_expr(p.polqual, p.polrelid), "
+                    f"pg_get_expr(p.polwithcheck, p.polrelid) "
+                    f"FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid "
+                    f"WHERE c.relname IN ({placeholders})",
+                    tables,
+                )
+                for relname, polname, polcmd, using, with_check in cursor.fetchall():
+                    definitions_by_table.setdefault(relname, []).append(
+                        (polname, polcmd, using, with_check)
+                    )
+
         for table, model_name in table_to_model.items():
             policies = policies_by_table.get(table, [])
             if not policies:
                 errors.append(f"  {model_name} ({table}): no RLS policies found")
             elif not quiet:
                 self.stdout.write(f"  {model_name} ({table}): {', '.join(policies)}")
+                if verbose:
+                    self._write_policy_details(definitions_by_table.get(table, []))
+
+    def _write_policy_details(
+        self,
+        definitions: list[tuple[str, str, str | None, str | None]],
+    ) -> None:
+        """Print the indented ``USING`` / ``WITH CHECK`` block for each policy."""
+        for polname, polcmd, using, with_check in definitions:
+            command = _POLCMD_LABELS.get(polcmd, polcmd)
+            self.stdout.write(f"    {polname} [{command}]")
+            self._write_clause("USING", using)
+            self._write_clause("WITH CHECK", with_check)
+
+    def _write_clause(self, label: str, expr: str | None) -> None:
+        """Print one policy clause, indenting each line of its expression.
+
+        ``pg_get_expr`` pretty-prints non-trivial expressions across several
+        lines, so the label goes on its own line and the expression is indented
+        beneath it (preserving Postgres's own formatting) rather than appended
+        inline. A ``NULL`` expression (e.g. an INSERT policy has no ``USING``)
+        is skipped.
+        """
+        if expr is None:
+            return
+        self.stdout.write(f"      {label}:")
+        # ``pg_get_expr`` returns a leading newline before the expression;
+        # strip it so the block starts cleanly, and avoid emitting trailing
+        # whitespace on any blank lines.
+        for line in expr.strip().splitlines():
+            self.stdout.write(f"        {line}" if line else "")
