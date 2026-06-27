@@ -86,6 +86,7 @@ nav:
       - User Integration: guides/user-integration.md
       - Middleware: guides/middleware.md
       - Context Managers: guides/context-managers.md
+      - Celery Tasks: guides/celery-tasks.md
       - Bypass Mode: guides/bypass-mode.md
       - Testing: guides/testing.md
       - Management Commands: guides/management-commands.md
