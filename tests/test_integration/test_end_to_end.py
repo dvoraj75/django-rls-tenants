@@ -466,6 +466,23 @@ class TestCheckRlsCommand:
         assert "      USING:" in rendered
         assert "        CASE WHEN true THEN true END" in rendered
 
+    def test_verbose_preserves_internal_blank_lines(self):
+        """A blank line inside an expression stays blank, with no trailing indent.
+
+        ``pg_get_expr`` can wrap a complex expression across lines; ``_write_clause``
+        indents each content line but must emit an empty string (not eight spaces)
+        for a blank one. Drive the formatter directly with a blank middle line,
+        since the policies this package creates render without internal blanks.
+        """
+        out = StringIO()
+        cmd = CheckRlsCommand(stdout=out)
+        cmd._write_clause("USING", "first line\n\nthird line")
+        lines = out.getvalue().split("\n")
+        assert lines[0] == "      USING:"
+        assert lines[1] == "        first line"
+        assert lines[2] == ""  # blank line preserved without indentation/trailing space
+        assert lines[3] == "        third line"
+
 
 # ---------------------------------------------------------------------------
 # EXPLAIN-based index usage verification

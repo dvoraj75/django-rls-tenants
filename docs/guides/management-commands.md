@@ -73,7 +73,7 @@ M2M through tables are auto-discovered by scanning `RLSProtectedModel` subclasse
 |------|---------|-------------|
 | `--database` | `default` | Database alias to check RLS status on |
 | `--quiet` | off | Suppress success output; only print errors (exit 1 on failure). Ideal for CI. |
-| `--verbose` | off | Show each policy's full definition (USING / WITH CHECK SQL) from the catalog. |
+| `--verbose` | off | Show each policy's full definition (USING / WITH CHECK SQL) from the `pg_policies` view. |
 
 ### Quiet Mode
 
@@ -84,12 +84,12 @@ report to stderr and exits with status code 1.
 
 ### Verbose Mode
 
-`--verbose` prints the live policy definition from the `pg_policy` catalog (via
-`pg_get_expr()`) under each pass/fail line — the SQL expression PostgreSQL actually
-enforces, not a reconstruction. It complements the pass/fail check rather than replacing
-it: the exit code and error reporting are unchanged. `--quiet` and `--verbose` are
-logical opposites; `--quiet` takes precedence, so verbose detail only appears on a
-non-quiet run.
+`--verbose` prints the live policy definition from the `pg_policies` view (its `qual` /
+`with_check` columns, which are PostgreSQL's own `pg_get_expr()` output) under each
+pass/fail line — the SQL expression PostgreSQL actually enforces, not a reconstruction.
+It complements the pass/fail check rather than replacing it: the exit code and error
+reporting are unchanged. `--quiet` and `--verbose` are logical opposites; `--quiet`
+takes precedence, so verbose detail only appears on a non-quiet run.
 
 ```
   Order (myapp_order): myapp_order_tenant_isolation_policy

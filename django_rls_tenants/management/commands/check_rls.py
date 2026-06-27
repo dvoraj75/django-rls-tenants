@@ -13,15 +13,6 @@ from typing import Any
 from django.core.management.base import BaseCommand
 from django.db import connections
 
-# Maps ``pg_policy.polcmd`` codes to the SQL command each policy applies to.
-_POLCMD_LABELS = {
-    "r": "SELECT",
-    "a": "INSERT",
-    "w": "UPDATE",
-    "d": "DELETE",
-    "*": "ALL",
-}
-
 
 def _collect_rls_tables() -> dict[str, str]:
     """Return ``{db_table: ModelName}`` for all concrete ``RLSProtectedModel`` subclasses."""
@@ -223,9 +214,10 @@ class Command(BaseCommand):
     ) -> None:
         """Batch-check RLS policies via ``pg_policies``.
 
-        With ``verbose`` (and not ``quiet``), additionally read each policy's
-        live ``USING`` / ``WITH CHECK`` expressions from the ``pg_policy``
-        catalog and print them indented under the policy-name line.
+        With ``verbose`` (and not ``quiet``), additionally print each policy's
+        live ``USING`` / ``WITH CHECK`` expressions indented under the
+        policy-name line, taken from the ``pg_policies`` view's ``qual`` /
+        ``with_check`` columns.
         """
         conn = connections[db_alias]
         with conn.cursor() as cursor:
@@ -233,51 +225,44 @@ class Command(BaseCommand):
             # Safety: ``placeholders`` contains only literal ``%s`` tokens —
             # no user data is interpolated into the SQL string. Table names
             # are passed as parameterised values, preventing SQL injection.
+            #
+            # ``cmd``/``qual``/``with_check`` come straight from ``pg_policies``:
+            # the view already decodes ``polcmd`` to its command word and runs
+            # ``pg_get_expr`` over the live policy nodes (the definition Postgres
+            # enforces), so verbose mode needs no extra catalog round-trip.
             cursor.execute(
-                f"SELECT tablename, policyname "
+                f"SELECT tablename, policyname, cmd, qual, with_check "
                 f"FROM pg_policies WHERE tablename IN ({placeholders})",
                 tables,
             )
-            policies_by_table: dict[str, list[str]] = {}
-            for row in cursor.fetchall():
-                policies_by_table.setdefault(row[0], []).append(row[1])
-
-            definitions_by_table: dict[str, list[tuple[str, str, str | None, str | None]]] = {}
-            if verbose and not quiet:
-                # ``pg_policies`` exposes only policy names; the ``pg_policy``
-                # catalog holds the live expressions, read back via
-                # ``pg_get_expr`` (the definition Postgres actually enforces).
-                # Same parameterised-table safety as the query above.
-                cursor.execute(
-                    f"SELECT c.relname, p.polname, p.polcmd, "
-                    f"pg_get_expr(p.polqual, p.polrelid), "
-                    f"pg_get_expr(p.polwithcheck, p.polrelid) "
-                    f"FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid "
-                    f"WHERE c.relname IN ({placeholders})",
-                    tables,
+            policies_by_table: dict[str, list[tuple[str, str, str | None, str | None]]] = {}
+            for tablename, policyname, cmd, qual, with_check in cursor.fetchall():
+                policies_by_table.setdefault(tablename, []).append(
+                    (policyname, cmd, qual, with_check)
                 )
-                for relname, polname, polcmd, using, with_check in cursor.fetchall():
-                    definitions_by_table.setdefault(relname, []).append(
-                        (polname, polcmd, using, with_check)
-                    )
 
         for table, model_name in table_to_model.items():
             policies = policies_by_table.get(table, [])
             if not policies:
                 errors.append(f"  {model_name} ({table}): no RLS policies found")
             elif not quiet:
-                self.stdout.write(f"  {model_name} ({table}): {', '.join(policies)}")
+                names = ", ".join(policy[0] for policy in policies)
+                self.stdout.write(f"  {model_name} ({table}): {names}")
                 if verbose:
-                    self._write_policy_details(definitions_by_table.get(table, []))
+                    self._write_policy_details(policies)
 
     def _write_policy_details(
         self,
-        definitions: list[tuple[str, str, str | None, str | None]],
+        policies: list[tuple[str, str, str | None, str | None]],
     ) -> None:
-        """Print the indented ``USING`` / ``WITH CHECK`` block for each policy."""
-        for polname, polcmd, using, with_check in definitions:
-            command = _POLCMD_LABELS.get(polcmd, polcmd)
-            self.stdout.write(f"    {polname} [{command}]")
+        """Print the indented ``USING`` / ``WITH CHECK`` block for each policy.
+
+        Each tuple is ``(policyname, cmd, using, with_check)`` straight from the
+        ``pg_policies`` view, where ``cmd`` is already the command word
+        (``ALL`` / ``SELECT`` / ...).
+        """
+        for polname, cmd, using, with_check in policies:
+            self.stdout.write(f"    {polname} [{cmd}]")
             self._write_clause("USING", using)
             self._write_clause("WITH CHECK", with_check)
 
