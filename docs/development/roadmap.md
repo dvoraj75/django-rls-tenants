@@ -115,7 +115,7 @@ Highest adoption impact, no new dependencies.
   `tenant_context()`?") and make system check hints more actionable.
   *Why:* Reduces time-to-fix for new users hitting common misconfiguration.
 
-- [ ] **CODE_OF_CONDUCT.md** — Adopt the Contributor Covenant.
+- [x] **CODE_OF_CONDUCT.md** — Adopt the Contributor Covenant.
   *Why:* Standard open-source practice that signals project maturity and
   welcoming community.
 

@@ -3,6 +3,12 @@
 Thank you for considering a contribution to django-rls-tenants. This guide covers
 everything you need to get started.
 
+## Code of Conduct
+
+This project and everyone participating in it is governed by the
+[Contributor Covenant Code of Conduct](code-of-conduct.md). By participating, you are
+expected to uphold this code. Please report unacceptable behavior to dvoraj75@gmail.com.
+
 ## Prerequisites
 
 - Python 3.11+

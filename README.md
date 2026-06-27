@@ -86,6 +86,12 @@ Are you using `django-rls-tenants` in production? We'd love to hear about it.
 | Django     | >= 4.2  |
 | PostgreSQL | >= 15   |
 
+## Contributing
+
+Contributions are welcome! See the [contributing guide](.github/CONTRIBUTING.md) to get
+started. This project is governed by the
+[Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## License
 
 [MIT](LICENSE)
