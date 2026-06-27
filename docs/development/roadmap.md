@@ -62,7 +62,7 @@ Quick wins that improve the debugging and development experience.
 
 Better CLI tooling and earlier misconfiguration detection.
 
-- [ ] **`check_rls --verbose`** — Show full RLS policy SQL for each table, not
+- [x] **`check_rls --verbose`** — Show full RLS policy SQL for each table, not
   just pass/fail status.
   *Why:* When policies exist but behave unexpectedly, seeing the actual SQL
   is the fastest way to diagnose the issue.
