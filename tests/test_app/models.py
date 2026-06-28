@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from django.contrib.auth.models import AbstractUser
 from django.db import models
 
 from django_rls_tenants.rls.constraints import RLSConstraint
@@ -18,6 +19,44 @@ class Tenant(models.Model):
 
     def __str__(self) -> str:
         return self.name
+
+
+class AdminUser(AbstractUser):
+    """``AUTH_USER_MODEL`` for the admin tests; satisfies the ``TenantUser`` protocol.
+
+    Django's admin needs a real authenticatable user (``is_staff`` /
+    ``is_superuser`` / permissions), while ``RLSTenantModelAdmin`` reads the RLS
+    role off the same ``request.user`` via the ``TenantUser`` protocol. A
+    swapped-in auth user is the realistic way to have both on one object, exactly
+    as a downstream project would wire its own ``User`` model.
+
+    ``rls_admin`` is kept independent of ``is_superuser`` on purpose: a test user
+    can be a Django superuser (so it reaches every admin view without per-model
+    permission plumbing) while still being an RLS-scoped, non-admin tenant user,
+    which is what the scoping tests need to exercise.
+    """
+
+    tenant = models.ForeignKey(
+        Tenant,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="admin_users",
+    )
+    rls_admin = models.BooleanField(default=False)
+
+    class Meta:
+        db_table = "test_admin_user"
+
+    @property
+    def is_tenant_admin(self) -> bool:
+        """Cross-tenant RLS admin flag (decoupled from Django's ``is_superuser``)."""
+        return self.rls_admin
+
+    @property
+    def rls_tenant_id(self) -> int | None:
+        """Tenant PK for RLS filtering, or ``None`` for admins / unassigned users."""
+        return self.tenant_id  # type: ignore[return-value]
 
 
 class TenantUser(models.Model):

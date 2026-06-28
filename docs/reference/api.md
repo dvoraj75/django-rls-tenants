@@ -14,6 +14,7 @@ from django_rls_tenants import (
     RLSManager,
     RLSProtectedModel,
     RLSTenantMiddleware,
+    RLSTenantModelAdmin,
     TenantQuerySet,
     TenantUser,
     admin_context,
@@ -143,6 +144,15 @@ Helpers for scoping hand-written SQL to the current tenant. See the
 ### Middleware
 
 ::: django_rls_tenants.tenants.middleware.RLSTenantMiddleware
+
+### Admin
+
+Tenant-aware Django admin. See the [Admin guide](../guides/admin.md) for usage,
+the tenant switcher, and the middleware interaction.
+
+::: django_rls_tenants.tenants.admin.RLSTenantModelAdmin
+
+::: django_rls_tenants.tenants.admin.TenantSwitchListFilter
 
 ### Types
 

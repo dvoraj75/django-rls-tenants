@@ -88,6 +88,7 @@ nav:
       - Context Managers: guides/context-managers.md
       - Raw SQL: guides/raw-sql.md
       - Celery Tasks: guides/celery-tasks.md
+      - Admin: guides/admin.md
       - Bypass Mode: guides/bypass-mode.md
       - Testing: guides/testing.md
       - Management Commands: guides/management-commands.md
