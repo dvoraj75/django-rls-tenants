@@ -35,7 +35,7 @@ Open **<http://localhost:8000>** and log in with any demo account:
    Switch to Bob and see only Globex data. No `.filter()` in the view -- RLS
    does it all.
 
-2. **Admin bypass** -- Log in as `admin@example.com` and see every note across
+2. **Admin bypass** -- Log in as `admin` and see every note across
    all tenants.
 
 3. **Categories with `select_related()`** -- Notes display their category inline.
@@ -71,11 +71,11 @@ Open **<http://localhost:8000>** and log in with any demo account:
    Note.objects.count()  # -> raises NoTenantContextError
    ```
    This catches accidental unscoped queries during development. The
-   `note_delete` view in `notes/views.py` shows how to handle the error
+   `note_deleted` view in `notes/views.py` shows how to handle the error
    gracefully.
 
 8. **Django admin** -- Visit <http://localhost:8000/admin/>
-   (`admin@example.com` / `admin1234`).
+   (`admin` / `admin1234`).
 
 ## Library Features Demonstrated
 
@@ -83,6 +83,7 @@ Open **<http://localhost:8000>** and log in with any demo account:
 | ------- | ----- |
 | `RLSProtectedModel` | `notes/models.py` -- `Note` and `Category` |
 | `RLSTenantMiddleware` | `demo/settings.py` -- automatic per-request RLS context |
+| `RLSTenantModelAdmin` | `notes/admin.py` -- tenant-aware admin with automatic scoping and a tenant switcher |
 | `TenantUser` protocol | `accounts/models.py` -- `rls_tenant_id` + `is_tenant_admin` |
 | Auto-scoping (zero `.filter()`) | `notes/views.py` -- `Note.objects.all()` returns only tenant data |
 | `select_related()` propagation | `notes/views.py` -- tenant filter auto-propagates to joined `Category` |
