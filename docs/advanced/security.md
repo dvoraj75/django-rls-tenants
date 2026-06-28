@@ -10,19 +10,19 @@ returns zero rows.** This is the fail-closed default.
 
 ```sql
 -- When rls.current_tenant is empty or unset:
-CASE WHEN current_setting('rls.is_admin', true) = 'true'
+CASE WHEN (SELECT current_setting('rls.is_admin', true)) = 'true'
      THEN true
      ELSE tenant_id = nullif(
-         current_setting('rls.current_tenant', true), '')::int
+         (SELECT current_setting('rls.current_tenant', true)), '')::int
 END
 -- Admin not set → ELSE branch → nullif('', '') → NULL
 -- tenant_id = NULL → always false → zero rows
 ```
 
-Since v1.3.0 each `current_setting()` read in a policy is wrapped in a scalar
-sub-SELECT -- `(SELECT current_setting(...))` -- so PostgreSQL evaluates it once
-per statement (an InitPlan) rather than per row. This is purely a planner
-optimization: the fail-closed semantics shown above are identical.
+Since v1.3.0 each `current_setting()` read is wrapped in an uncorrelated scalar
+sub-SELECT -- `(SELECT current_setting(...))` -- which PostgreSQL evaluates once
+per statement (an InitPlan) rather than per row. This is a performance
+optimization; the fail-closed semantics are identical.
 
 This means:
 
