@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: 2026-06-27
+> Last updated: 2026-06-28
 >
 > Priorities may shift based on community feedback.
 > Have a suggestion? [Open an issue](https://github.com/dvoraj75/django-rls-tenants/issues).
@@ -92,25 +92,25 @@ Better CLI tooling and earlier misconfiguration detection.
 
 Highest adoption impact, no new dependencies.
 
-- [ ] **Tenant-aware Django Admin** — `RLSTenantModelAdmin` mixin that auto-sets
+- [x] **Tenant-aware Django Admin** — `RLSTenantModelAdmin` mixin that auto-sets
   tenant context from the admin user, hides the tenant FK field on forms,
   scopes changelists to the current tenant, and adds a tenant filter dropdown
   for admin users.
   *Why:* Every Django project uses the admin — tenant-unaware admin is a daily
   friction point.
 
-- [ ] **Celery task integration** — `@rls_task` decorator and `RLSTask` base class
+- [x] **Celery task integration** — `@rls_task` decorator and `RLSTask` base class
   that serialize tenant context into Celery task headers and restore it on the
   worker side. Supports task chains and groups.
   *Why:* Background tasks without tenant context are a data-leak risk. Users
   currently must manually wrap every task body in `tenant_context()`.
 
-- [ ] **Raw SQL helpers** — `safe_tenant_sql()` utility for injecting
+- [x] **Raw SQL helpers** — `safe_tenant_sql()` utility for injecting
   `current_setting()` calls into raw SQL strings safely.
   *Why:* Raw SQL is sometimes unavoidable (reports, bulk operations), and
   there is no safe, documented pattern for it today.
 
-- [ ] **Better error messages** — Add solution suggestions to
+- [x] **Better error messages** — Add solution suggestions to
   `NoTenantContextError` (e.g., "did you forget to wrap this in
   `tenant_context()`?") and make system check hints more actionable.
   *Why:* Reduces time-to-fix for new users hitting common misconfiguration.
