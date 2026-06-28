@@ -223,6 +223,11 @@ re-enter the context for that alias yourself. Pass `using="..."` to the context
 manager inside the task body to scope queries on a specific alias:
 
 ```python
+from django_rls_tenants import tenant_context
+from django_rls_tenants.contrib.celery import rls_task
+from django_rls_tenants.tenants.state import get_current_tenant_id
+
+
 @rls_task
 def replicate() -> None:
     with tenant_context(get_current_tenant_id(), using="replica"):

@@ -125,12 +125,12 @@ from `tenants/` into `rls/`.
 
 ## Pull Request Process
 
-1. Fork the repository and create a branch from `main`.
+1. Fork the repository and create a branch from `develop`.
 2. Add or update tests for your changes.
 3. Ensure the full test suite passes: `uv run pytest`.
 4. Ensure linting and type checks pass: `uv run ruff check . && uv run mypy django_rls_tenants`.
 5. Update the `[Unreleased]` section in `CHANGELOG.md`.
-6. Open a pull request with a clear description of the change.
+6. Open a pull request against `develop` with a clear description of the change.
 
 ## Commit Messages
 
