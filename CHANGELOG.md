@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Tenant-aware Django admin** (#31): a new `RLSTenantModelAdmin` mixin (subclass
+  it instead of `admin.ModelAdmin`) runs every admin DB operation inside the RLS
+  context implied by the logged-in user. It wraps the changelist/add/change/
+  delete/history views so the active context spans lazy querysets, forms, related
+  dropdowns, and saves; changelists and related dropdowns are scoped via the
+  existing manager auto-scoping (no `get_queryset` override). The tenant FK is
+  hidden from the form and from any explicit `fieldsets` layout, and auto-assigned
+  when the tenant is implicit; cross-tenant admins get a
+  session-backed tenant switcher (a changelist filter), and a non-admin user with
+  no tenant is denied with `PermissionDenied` (carrying the #34 hint) rather than
+  silently elevated. Behaviour is configured with class attributes only — no new
+  `RLS_TENANTS` keys. `RLSTenantModelAdmin` is re-exported from the top-level
+  package. Pair it with `RLSTenantMiddleware` so site-level admin views
+  (e.g. autocomplete) are scoped too. Sync only.
+
 - **Actionable error hints** (#34): `RLSTenantError` now accepts a keyword-only
   `hint=` argument and exposes `.message` / `.hint` attributes for programmatic
   access. The `NoTenantContextError` raised by `tenant_context()`,
