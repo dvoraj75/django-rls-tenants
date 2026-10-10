@@ -268,3 +268,5 @@ example/
 GitHub Actions runs lint + type-check, a strict mkdocs build (`mkdocs build --strict`),
 and a test matrix across
 Python {3.11, 3.12, 3.13, 3.14} × Django {4.2, 5.0, 5.1, 5.2, 6.0} on every push/PR.
+An `example-smoke` job runs `example/manage.py check` and `pytest --collect-only` with no
+database, so changes to `example/` must keep importing cleanly.

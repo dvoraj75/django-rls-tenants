@@ -2,7 +2,7 @@ from django.contrib.auth.decorators import login_required
 from django.http import HttpResponseServerError
 from django.shortcuts import get_object_or_404, redirect, render
 
-from django_rls_tenants import NoTenantContextError
+from django_rls_tenants.exceptions import NoTenantContextError
 
 from .models import Category, Note
 from .services import get_note_stats

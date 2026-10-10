@@ -11,7 +11,7 @@ RLS-protected models without an active tenant context raises
 
 import pytest
 
-from django_rls_tenants import NoTenantContextError
+from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.tenants.testing import (
     assert_rls_blocks_without_context,
     assert_rls_enabled,

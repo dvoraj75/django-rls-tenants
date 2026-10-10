@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Example app crashed at import** (#72): `example/notes/views.py` and
+  `example/tests/test_rls.py` imported `NoTenantContextError` from the package root,
+  which v1.2.1 intentionally stopped exporting. Both now use the canonical
+  `from django_rls_tenants.exceptions import NoTenantContextError`. A new
+  `example-smoke` CI job runs the example's `manage.py check` (and test collection)
+  without a database so an import-level break in `example/` can no longer ship.
 - `RLSM2MConstraint` docstring said FK references are verified via `IN (SELECT ...)`;
   the generated policies use `EXISTS (SELECT 1 ...)`. Docstring now matches the DDL. (#76)
 - `docs/guides/connection-pooling.md` now quotes the real `W007`/`W004` check messages
