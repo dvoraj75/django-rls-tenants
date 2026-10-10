@@ -98,12 +98,17 @@ RLS_TENANTS = {
 
 django-rls-tenants provides system checks for common pooling misconfigurations:
 
-### W003: USE_LOCAL_SET without ATOMIC_REQUESTS
+### W007: USE_LOCAL_SET without ATOMIC_REQUESTS
 
 ```
-(django_rls_tenants.W003) USE_LOCAL_SET is True but ATOMIC_REQUESTS is
-not enabled for database 'default'. SET LOCAL requires an active transaction.
+?: (django_rls_tenants.W007) USE_LOCAL_SET=True but DATABASES['default'] does not have
+ATOMIC_REQUESTS=True. SET LOCAL requires an active transaction. The middleware will crash
+at runtime when setting GUCs on 'default'.
+	HINT: Set DATABASES['default']['ATOMIC_REQUESTS'] = True.
 ```
+
+This warning fires once for every alias in `RLS_TENANTS["DATABASES"]` that lacks
+`ATOMIC_REQUESTS=True`; the alias name is interpolated into the message.
 
 **Fix:** Set `ATOMIC_REQUESTS = True` in your database config, or ensure all database
 access happens inside `transaction.atomic()` blocks.
@@ -111,10 +116,17 @@ access happens inside `transaction.atomic()` blocks.
 ### W004: CONN_MAX_AGE with session GUCs
 
 ```
-(django_rls_tenants.W004) CONN_MAX_AGE is set to a non-zero value for
-database 'default' and USE_LOCAL_SET is False. Session-scoped GUCs may
-persist across requests on reused connections.
+?: (django_rls_tenants.W004) DATABASES['default'] has CONN_MAX_AGE=600 with
+USE_LOCAL_SET=False. This risks GUC state leaking between requests on persistent
+connections. Consider USE_LOCAL_SET=True with ATOMIC_REQUESTS=True for safer connection
+pooling.
+	HINT: Set USE_LOCAL_SET=True and ATOMIC_REQUESTS=True, or set
+DATABASES['default']['CONN_MAX_AGE'] = 0.
 ```
+
+The alias and the configured `CONN_MAX_AGE` value (here `600`) are interpolated into the
+message. It fires once for every alias in `RLS_TENANTS["DATABASES"]` with a non-zero or
+`None` `CONN_MAX_AGE`.
 
 **Fix:** Either:
 

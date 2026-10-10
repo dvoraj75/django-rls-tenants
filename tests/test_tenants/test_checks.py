@@ -16,7 +16,6 @@ from django_rls_tenants.tenants.checks import (
     _check_superuser_connection,
     _check_tenant_fk_field_exists,
     _check_tenant_model_resolves,
-    _check_use_local_set_requires_atomic,
     check_rls_config,
 )
 from django_rls_tenants.tenants.conf import RLSTenantsConfig
@@ -36,6 +35,30 @@ class TestCheckRlsConfig:
         # Filter out W005 since test DB may run as superuser
         non_superuser_warnings = [w for w in warnings if w.id != "django_rls_tenants.W005"]
         assert non_superuser_warnings == []
+
+    def test_use_local_set_without_atomic_emits_single_w007(self):
+        """USE_LOCAL_SET without ATOMIC_REQUESTS yields exactly one warning (W007).
+
+        Pins the retirement of the duplicate W003 end-to-end.
+        """
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "USE_LOCAL_SET": True,
+                },
+                DATABASES={
+                    "default": {"ENGINE": "django.db.backends.postgresql", "NAME": "test"},
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+            patch(
+                "django_rls_tenants.tenants.checks._check_superuser_connection",
+                return_value=[],
+            ),
+        ):
+            warnings = check_rls_config()
+        assert [w.id for w in warnings] == ["django_rls_tenants.W007"]
 
 
 class TestCheckGucPrefixMismatch:
@@ -108,51 +131,6 @@ class TestCheckGucPrefixMismatch:
         ):
             warnings = _check_guc_prefix_mismatch()
         assert all(isinstance(w, CheckWarning) for w in warnings)
-
-
-class TestCheckUseLocalSetRequiresAtomic:
-    """Tests for _check_use_local_set_requires_atomic."""
-
-    def test_no_warning_when_use_local_set_false(self):
-        """No warning when USE_LOCAL_SET=False (default)."""
-        warnings = _check_use_local_set_requires_atomic()
-        assert warnings == []
-
-    def test_w003_use_local_set_without_atomic(self):
-        """W003 fires when USE_LOCAL_SET=True but ATOMIC_REQUESTS is not set."""
-        with (
-            override_settings(
-                RLS_TENANTS={
-                    "TENANT_MODEL": "test_app.Tenant",
-                    "USE_LOCAL_SET": True,
-                },
-            ),
-            patch(_CONF_PATCH, RLSTenantsConfig()),
-        ):
-            warnings = _check_use_local_set_requires_atomic()
-        ids = [w.id for w in warnings]
-        assert "django_rls_tenants.W003" in ids
-
-    def test_no_warning_when_atomic_requests_true(self):
-        """No W003 when ATOMIC_REQUESTS is True alongside USE_LOCAL_SET."""
-        with (
-            override_settings(
-                RLS_TENANTS={
-                    "TENANT_MODEL": "test_app.Tenant",
-                    "USE_LOCAL_SET": True,
-                },
-                DATABASES={
-                    "default": {
-                        "ENGINE": "django.db.backends.postgresql",
-                        "NAME": "test",
-                        "ATOMIC_REQUESTS": True,
-                    },
-                },
-            ),
-            patch(_CONF_PATCH, RLSTenantsConfig()),
-        ):
-            warnings = _check_use_local_set_requires_atomic()
-        assert warnings == []
 
 
 class TestCheckConnMaxAgeWithSessionGucs:
@@ -522,6 +500,32 @@ class TestCheckDatabasesAtomicRequests:
             warnings = _check_databases_atomic_requests()
         ids = [w.id for w in warnings]
         assert ids.count("django_rls_tenants.W007") == 2
+
+    def test_no_warning_for_unmanaged_default_alias(self):
+        """No warning for 'default' when it is not in RLS_TENANTS['DATABASES'].
+
+        Regression for the retired W003, which hardcoded DATABASES['default'].
+        """
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "USE_LOCAL_SET": True,
+                    "DATABASES": ["tenant_db"],
+                },
+                DATABASES={
+                    "default": {"ENGINE": "django.db.backends.postgresql", "NAME": "test"},
+                    "tenant_db": {
+                        "ENGINE": "django.db.backends.postgresql",
+                        "NAME": "tenant",
+                        "ATOMIC_REQUESTS": True,
+                    },
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_databases_atomic_requests()
+        assert warnings == []
 
 
 class TestCheckTenantModelResolves:

@@ -5,7 +5,6 @@ silent failures at runtime:
 
 - Superuser database connections (RLS is completely bypassed — warning).
 - ``GUC_PREFIX`` mismatch between runtime config and ``RLSConstraint`` defaults.
-- ``USE_LOCAL_SET=True`` without ``ATOMIC_REQUESTS=True``.
 - ``CONN_MAX_AGE > 0`` with ``USE_LOCAL_SET=False`` (connection-pool GUC leak risk).
 - ``DATABASES`` contains aliases not in ``settings.DATABASES``.
 - ``USE_LOCAL_SET=True`` without ``ATOMIC_REQUESTS`` on configured databases.
@@ -37,7 +36,6 @@ def check_rls_config(
     errors: list[CheckWarning] = []
     errors.extend(_check_superuser_connection())
     errors.extend(_check_guc_prefix_mismatch())
-    errors.extend(_check_use_local_set_requires_atomic())
     errors.extend(_check_conn_max_age_with_session_gucs())
     errors.extend(_check_databases_alias_exists())
     errors.extend(_check_databases_atomic_requests())
@@ -138,37 +136,6 @@ def _check_guc_prefix_mismatch() -> list[CheckWarning]:
                         id="django_rls_tenants.W002",
                     )
                 )
-    return warnings
-
-
-def _check_use_local_set_requires_atomic() -> list[CheckWarning]:
-    """Warn if ``USE_LOCAL_SET=True`` without ``ATOMIC_REQUESTS=True``.
-
-    ``SET LOCAL`` requires ``transaction.atomic()``. Without
-    ``ATOMIC_REQUESTS=True``, the middleware does not wrap requests in
-    transactions, causing runtime crashes.
-    """
-    from django.conf import settings  # noqa: PLC0415
-
-    from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
-
-    warnings: list[CheckWarning] = []
-    if not rls_tenants_config.USE_LOCAL_SET:
-        return warnings
-
-    databases = getattr(settings, "DATABASES", {})
-    default_db = databases.get("default", {})
-    if not default_db.get("ATOMIC_REQUESTS", False):
-        warnings.append(
-            CheckWarning(
-                "USE_LOCAL_SET=True requires ATOMIC_REQUESTS=True in "
-                "DATABASES['default']. SET LOCAL only works inside a "
-                "transaction. Without ATOMIC_REQUESTS, the middleware "
-                "will crash at runtime.",
-                hint="Set DATABASES['default']['ATOMIC_REQUESTS'] = True.",
-                id="django_rls_tenants.W003",
-            )
-        )
     return warnings
 
 

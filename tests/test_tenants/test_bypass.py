@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
+from django.db import transaction
 
 from django_rls_tenants.rls.guc import get_guc
 from django_rls_tenants.tenants.bypass import (
@@ -53,3 +56,24 @@ class TestImperativeBypass:
         """Clearing a flag that was never set does not error."""
         clear_bypass_flag("rls.never_set_flag")
         assert get_guc("rls.never_set_flag") is None
+
+    @pytest.mark.django_db(transaction=True)
+    def test_clear_bypass_flag_is_local_inside_atomic(self):
+        """clear_bypass_flag(is_local=True) clears a transaction-scoped flag."""
+        with transaction.atomic():
+            set_bypass_flag("rls.test_local_clear", is_local=True)
+            assert get_guc("rls.test_local_clear") == "true"
+            clear_bypass_flag("rls.test_local_clear", is_local=True)
+            assert get_guc("rls.test_local_clear") is None
+
+    @pytest.mark.django_db(transaction=True)
+    def test_clear_bypass_flag_is_local_outside_atomic_raises(self):
+        """clear_bypass_flag(is_local=True) outside atomic() raises RuntimeError."""
+        with pytest.raises(RuntimeError, match="Cannot use SET LOCAL"):
+            clear_bypass_flag("rls.test_local_clear", is_local=True)
+
+    def test_set_and_clear_share_keyword_signature(self):
+        """set_bypass_flag and clear_bypass_flag accept the same keyword-only params."""
+        set_params = inspect.signature(set_bypass_flag).parameters
+        clear_params = inspect.signature(clear_bypass_flag).parameters
+        assert set(set_params) == set(clear_params) == {"flag_name", "is_local", "using"}

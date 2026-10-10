@@ -385,7 +385,9 @@ class RLSM2MConstraint(BaseConstraint):
 
     Unlike ``RLSConstraint`` which checks a direct ``{field}_id`` column,
     this generates policies that verify both FK references point to rows
-    belonging to the current tenant via ``IN (SELECT ...)`` subqueries.
+    belonging to the current tenant via ``EXISTS (SELECT 1 ...)`` subqueries.
+    ``EXISTS`` is used rather than ``IN (SELECT ...)`` because it gives the
+    planner more optimisation freedom; see ``_build_m2m_conditions``.
 
     For join tables where only one side is RLS-protected, only that side's
     FK is checked. For both sides protected, both FKs are checked.

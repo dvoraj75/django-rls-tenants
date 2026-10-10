@@ -79,6 +79,10 @@ finally:
     clear_bypass_flag("rls.auth_bypass")
 ```
 
+Both imperative helpers accept `is_local=True` for a transaction-scoped `SET LOCAL`
+flag; this must run inside `transaction.atomic()`. Pass the same `is_local` value to
+`set_bypass_flag()` and `clear_bypass_flag()`.
+
 ### Use Case: Authentication
 
 During authentication, the user record must be read before the tenant context is known.

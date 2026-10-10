@@ -36,7 +36,25 @@ def set_bypass_flag(
 def clear_bypass_flag(
     flag_name: str,
     *,
+    is_local: bool = False,
     using: str = "default",
 ) -> None:
-    """Clear a bypass flag on the current database connection."""
-    clear_guc(flag_name, using=using)
+    """Clear a bypass flag on the current database connection.
+
+    Pass the same ``is_local`` that was used in ``set_bypass_flag`` so a
+    transaction-scoped flag is cleared transaction-locally too::
+
+        with transaction.atomic():
+            set_bypass_flag("rls.is_login_request", is_local=True)
+            ...
+            clear_bypass_flag("rls.is_login_request", is_local=True)
+
+    Args:
+        flag_name: GUC variable name (e.g., ``"rls.is_login_request"``).
+        is_local: If ``True``, use ``SET LOCAL`` (transaction-scoped).
+        using: Database alias. Default: ``"default"``.
+
+    Raises:
+        RuntimeError: If ``is_local=True`` outside ``transaction.atomic()``.
+    """
+    clear_guc(flag_name, is_local=is_local, using=using)

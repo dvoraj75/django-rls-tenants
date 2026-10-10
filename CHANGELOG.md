@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `clear_bypass_flag()` now accepts `is_local=True`, mirroring `set_bypass_flag()`, so a
+  transaction-scoped (`SET LOCAL`) bypass flag can be cleared the same way it was set.
+  Keyword-only, default `False`; no existing call changes. (#76)
+
+### Removed
+
+- System check `W003` (`USE_LOCAL_SET` without `ATOMIC_REQUESTS` on `default`). It only
+  looked at `DATABASES['default']`, duplicated `W007` on single-database projects and
+  fired spuriously when `default` is not an RLS-managed alias. `W007` covers every
+  configured alias; nothing to do unless you reference `W003` in a custom check, and
+  silencing it via `SILENCED_SYSTEM_CHECKS` remains harmless. (#76)
+
+### Fixed
+
+- `RLSM2MConstraint` docstring said FK references are verified via `IN (SELECT ...)`;
+  the generated policies use `EXISTS (SELECT 1 ...)`. Docstring now matches the DDL. (#76)
+- `docs/guides/connection-pooling.md` now quotes the real `W007`/`W004` check messages
+  and hints instead of approximate text. (#76)
+
 ## [1.3.0] - 2026-06-28
 
 ### Added
