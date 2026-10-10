@@ -143,6 +143,7 @@ class RLSTenantMiddleware(MiddlewareMixin):
                 reset_rls_context_active(active_token)
             else:
                 set_rls_context_active(False)
+            setattr(request, "_rls_state_reset", True)  # noqa: B010 -- tokens already reset
             _clear_gucs_on_all_databases(conf)
             raise
 
@@ -214,19 +215,24 @@ class RLSTenantMiddleware(MiddlewareMixin):
         Args:
             request: The Django HTTP request being finalised.
         """
-        token = getattr(request, "_rls_tenant_token", None)
-        if isinstance(token, Token):
-            reset_current_tenant_id(token)
-        else:
-            # Fallback: no token stored (unauthenticated request or error
-            # during process_request before token was saved).
-            set_current_tenant_id(None)
+        # Django runs process_response even after process_exception. Tokens are
+        # single-use, and resetting to defaults on a second pass would also lose
+        # any outer context restored by the first pass.
+        if getattr(request, "_rls_state_reset", False) is not True:
+            token = getattr(request, "_rls_tenant_token", None)
+            if isinstance(token, Token):
+                reset_current_tenant_id(token)
+            else:
+                # Fallback: no token stored (unauthenticated request or error
+                # during process_request before token was saved).
+                set_current_tenant_id(None)
 
-        active_token = getattr(request, "_rls_context_active_token", None)
-        if isinstance(active_token, Token):
-            reset_rls_context_active(active_token)
-        else:
-            set_rls_context_active(False)
+            active_token = getattr(request, "_rls_context_active_token", None)
+            if isinstance(active_token, Token):
+                reset_rls_context_active(active_token)
+            else:
+                set_rls_context_active(False)
+            setattr(request, "_rls_state_reset", True)  # noqa: B010 -- request cleanup marker
 
         if not _were_gucs_set():
             return

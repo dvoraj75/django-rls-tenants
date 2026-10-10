@@ -28,6 +28,14 @@ That's the whole integration. Subclass `RLSTenantModelAdmin` instead of
 - **A user with no tenant** is denied (`PermissionDenied`) instead of seeing
   everything.
 
+!!! tip "See it running"
+    The bundled
+    [example project](https://github.com/dvoraj75/django-rls-tenants/tree/main/example)
+    registers its `Note` and `Category` admins with `RLSTenantModelAdmin`. Run
+    `docker compose up` in `example/`, then open `/admin/` as `staff` /
+    `staff1234` (tenant-scoped: auto-scoped changelist, hidden tenant FK) or as
+    `admin` / `admin1234` (cross-tenant: every tenant plus the switcher).
+
 ## Requirements
 
 `RLSTenantModelAdmin` reads the logged-in user's RLS role from `request.user`,

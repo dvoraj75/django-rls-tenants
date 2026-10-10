@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Example admin now showcases `RLSTenantModelAdmin`** (#73). `example/notes/admin.py`
+  registers `Note` and `Category` with the v1.3.0 mixin instead of a plain
+  `admin.ModelAdmin` with a hand-rolled `tenant` list filter. `seed_demo` adds a
+  tenant-scoped staff account (`staff` / `staff1234`: Acme Corp, `is_staff=True`,
+  `is_tenant_admin=False`, permissions on the notes app) so the auto-scoped changelist and
+  the hidden + auto-assigned tenant FK can be seen at `/admin/`; the existing `admin`
+  account demonstrates the tenant switcher. New `example/tests/test_admin.py` drives both
+  paths through the test client. Existing demo volumes gain the missing staff account
+  when the seed command runs again, without resetting their data.
 - CI now runs `mkdocs build --strict` on every pull request (#77), so broken
   links and stale `mkdocstrings` references fail before merge instead of
   after. Deploy is still only on `main`.
@@ -33,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Middleware cleanup now resets context tokens only once when Django calls both
+  exception and response hooks, preserving the expected 403 for denied admin pages.
 - **Example app crashed at import** (#72): `example/notes/views.py` and
   `example/tests/test_rls.py` imported `NoTenantContextError` from the package root,
   which v1.2.1 intentionally stopped exporting. Both now use the canonical

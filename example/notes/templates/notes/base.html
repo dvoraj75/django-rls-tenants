@@ -25,6 +25,9 @@
                     {% if user.tenant %}{{ user.tenant.name }}{% else %}Admin{% endif %}
                 </span>
                 {{ user.email }}
+                {% if user.is_staff %}
+                    <a href="{% url 'admin:index' %}" class="btn" style="background:#1565c0">Admin</a>
+                {% endif %}
                 <a href="{% url 'logout' %}" class="btn">Log out</a>
             {% endif %}
         </div>

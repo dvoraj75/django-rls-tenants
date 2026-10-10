@@ -59,8 +59,27 @@ jobs:
         run: uv run mkdocs build --strict
 
   example-smoke:
-    name: Example smoke (manage.py check)
+    name: Example checks & PostgreSQL tests
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: demo
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_DB: demo
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
     steps:
       - uses: actions/checkout@v6
 
@@ -77,20 +96,30 @@ jobs:
       - name: Django system check (imports URLconf -> views -> admin)
         working-directory: example
         env:
-          # No Postgres in this job. The library's W005 superuser check opens a
-          # connection inside try/except and skips silently when the DB is down,
-          # so `check` passes without a database. Point at localhost so the
-          # failure is a fast connection-refused rather than a DNS lookup of "db".
+          # Keep verifying that imports work without a database connection.
           POSTGRES_HOST: 127.0.0.1
           POSTGRES_PORT: "1"
         run: uv run --project .. python manage.py check
 
-      - name: Collect example tests (imports tests/test_rls.py, no DB needed)
+      - name: Collect example tests (no DB needed)
         working-directory: example
         env:
           POSTGRES_HOST: 127.0.0.1
           POSTGRES_PORT: "1"
         run: uv run --project .. python -m pytest tests/ --collect-only -q
+
+      - name: Create a non-superuser role for RLS enforcement
+        env:
+          PGPASSWORD: postgres
+        run: >-
+          psql -h 127.0.0.1 -U postgres -d demo -v ON_ERROR_STOP=1
+          -c "CREATE ROLE app LOGIN PASSWORD 'app' CREATEDB"
+
+      - name: Run example tests with PostgreSQL RLS enforced
+        working-directory: example
+        run: |
+          uv run --project .. python manage.py makemigrations
+          uv run --project .. python -m pytest tests/ -v
 
   test:
     name: Test (Python ${{ matrix.python-version }}, Django ${{ matrix.django-version }})

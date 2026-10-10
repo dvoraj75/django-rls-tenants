@@ -1,3 +1,4 @@
+from django.contrib.auth.models import Permission
 from django.core.management.base import BaseCommand
 from django_rls_tenants import admin_context, tenant_context
 
@@ -7,11 +8,60 @@ TENANTS = [
     {"name": "Initech", "slug": "initech"},
 ]
 
+# Demo accounts. ``tenant`` and ``is_tenant_admin`` drive the RLS role (the
+# ``TenantUser`` protocol); ``is_staff`` / ``is_superuser`` are plain Django
+# admin permissions and are independent of it.
 USERS = [
-    {"email": "alice@acme.com", "tenant_slug": "acme", "is_admin": False},
-    {"email": "bob@globex.com", "tenant_slug": "globex", "is_admin": False},
-    {"email": "carol@initech.com", "tenant_slug": "initech", "is_admin": False},
-    {"email": "admin@example.com", "tenant_slug": None, "is_admin": True},
+    # Tenant users: see only their own tenant's data; no admin access.
+    {
+        "username": "alice",
+        "email": "alice@acme.com",
+        "password": "demo1234",
+        "tenant_slug": "acme",
+        "is_tenant_admin": False,
+        "is_staff": False,
+        "is_superuser": False,
+    },
+    {
+        "username": "bob",
+        "email": "bob@globex.com",
+        "password": "demo1234",
+        "tenant_slug": "globex",
+        "is_tenant_admin": False,
+        "is_staff": False,
+        "is_superuser": False,
+    },
+    {
+        "username": "carol",
+        "email": "carol@initech.com",
+        "password": "demo1234",
+        "tenant_slug": "initech",
+        "is_tenant_admin": False,
+        "is_staff": False,
+        "is_superuser": False,
+    },
+    # Tenant-scoped staff: may log into /admin/ (is_staff + permissions on the
+    # notes app) but is NOT a tenant admin, so RLSTenantModelAdmin scopes the
+    # changelists to Acme and hides + auto-assigns the tenant FK on the forms.
+    {
+        "username": "staff",
+        "email": "staff@acme.com",
+        "password": "staff1234",
+        "tenant_slug": "acme",
+        "is_tenant_admin": False,
+        "is_staff": True,
+        "is_superuser": False,
+    },
+    # Cross-tenant admin: sees every tenant and gets the admin tenant switcher.
+    {
+        "username": "admin",
+        "email": "admin@example.com",
+        "password": "admin1234",
+        "tenant_slug": None,
+        "is_tenant_admin": True,
+        "is_staff": True,
+        "is_superuser": True,
+    },
 ]
 
 # Per-tenant categories
@@ -53,13 +103,36 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument("--no-input", action="store_true")
 
+    def _create_user(self, user_data, tenant):
+        from accounts.models import User
+
+        user = User.objects.create_user(
+            username=user_data["username"],
+            email=user_data["email"],
+            password=user_data["password"],
+            tenant=tenant,
+            is_tenant_admin=user_data["is_tenant_admin"],
+            is_staff=user_data["is_staff"],
+            is_superuser=user_data["is_superuser"],
+        )
+        if user.is_staff and not user.is_superuser:
+            # Only grant access to the RLS-protected app. User and Tenant admins
+            # are global and must not be accessible to tenant-scoped staff.
+            user.user_permissions.set(Permission.objects.filter(content_type__app_label="notes"))
+        self.stdout.write(f"  Created user: {user_data['email']}")
+
     def handle(self, **options):
         from accounts.models import User
         from notes.models import Category, Note
         from tenants.models import Tenant
 
         if User.objects.filter(email="admin@example.com").exists():
-            self.stdout.write("Demo data already exists, skipping.")
+            # Upgrade older demo volumes without deleting or replacing their data.
+            staff_data = next(user for user in USERS if user["username"] == "staff")
+            tenant = Tenant.objects.filter(slug=staff_data["tenant_slug"]).first()
+            if tenant is not None and not User.objects.filter(username="staff").exists():
+                self._create_user(staff_data, tenant)
+            self.stdout.write("Demo data already exists, preserving existing accounts and notes.")
             return
 
         with admin_context():
@@ -71,17 +144,7 @@ class Command(BaseCommand):
 
             # Create users
             for u in USERS:
-                tenant = tenants.get(u["tenant_slug"])
-                User.objects.create_user(
-                    username=u["email"].split("@")[0],
-                    email=u["email"],
-                    password="demo1234" if not u["is_admin"] else "admin1234",
-                    tenant=tenant,
-                    is_tenant_admin=u["is_admin"],
-                    is_staff=u["is_admin"],
-                    is_superuser=u["is_admin"],
-                )
-                self.stdout.write(f"  Created user: {u['email']}")
+                self._create_user(u, tenants.get(u["tenant_slug"]))
 
             # Create categories (per-tenant, RLS-protected)
             cat_objects = {}  # (slug, cat_name) -> Category instance
@@ -131,4 +194,5 @@ class Command(BaseCommand):
         self.stdout.write("  alice / demo1234   (Acme Corp)")
         self.stdout.write("  bob   / demo1234   (Globex Inc)")
         self.stdout.write("  carol / demo1234   (Initech)")
-        self.stdout.write("  admin / admin1234  (Admin -- sees all)")
+        self.stdout.write("  staff / staff1234  (Acme Corp staff -- /admin/ scoped to Acme)")
+        self.stdout.write("  admin / admin1234  (Admin -- sees all, /admin/ tenant switcher)")

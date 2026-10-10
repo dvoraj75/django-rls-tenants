@@ -27,7 +27,8 @@ Open **<http://localhost:8000>** and log in with any demo account:
 | `alice`  | `demo1234`  | Acme Corp  | Only Acme notes   |
 | `bob`    | `demo1234`  | Globex Inc | Only Globex notes |
 | `carol`  | `demo1234`  | Initech    | Only Initech notes|
-| `admin`  | `admin1234` | _(admin)_  | **All notes**     |
+| `staff`  | `staff1234` | Acme Corp  | Only Acme notes, also in `/admin/` |
+| `admin`  | `admin1234` | _(admin)_  | **All notes**, with a tenant switcher in `/admin/` |
 
 ## What to Try
 
@@ -35,7 +36,7 @@ Open **<http://localhost:8000>** and log in with any demo account:
    Switch to Bob and see only Globex data. No `.filter()` in the view -- RLS
    does it all.
 
-2. **Admin bypass** -- Log in as `admin@example.com` and see every note across
+2. **Admin bypass** -- Log in as `admin` and see every note across
    all tenants.
 
 3. **Categories with `select_related()`** -- Notes display their category inline.
@@ -74,8 +75,35 @@ Open **<http://localhost:8000>** and log in with any demo account:
    `note_delete` view in `notes/views.py` shows how to handle the error
    gracefully.
 
-8. **Django admin** -- Visit <http://localhost:8000/admin/>
-   (`admin@example.com` / `admin1234`).
+8. **Tenant-aware Django admin** -- `notes/admin.py` registers `Note` and
+   `Category` with `RLSTenantModelAdmin` instead of `admin.ModelAdmin`. That is
+   the whole integration; try it at <http://localhost:8000/admin/>:
+
+   - Log in as `staff` / `staff1234` (Acme staff: `is_staff=True`,
+     `is_tenant_admin=False`). The Notes and Categories changelists show only
+     Acme rows with no `tenant` filter and no `.filter()` anywhere. Open
+     "Add note": the `tenant` field is not on the form, and the Category
+     dropdown lists only Acme categories. Save a note and it is stamped with
+     Acme automatically.
+   - Log in as `admin` / `admin1234` (`is_tenant_admin=True`). The changelists
+     show every tenant, and a **"By tenant"** switcher appears in the filter
+     sidebar. Pick *Acme Corp*: the list is scoped and, because the choice is
+     kept in the session, "Add note" now hides and auto-assigns `tenant` too.
+     Pick *All* to go back to every tenant (and get the `tenant` field back).
+
+   > **Note:** an account made with `createsuperuser` has `tenant=None` and
+   > `is_tenant_admin=False`, which is neither role. In this demo
+   > `RLSTenantMiddleware` rejects such a user on every authenticated request
+   > with `NoTenantContextError` (and `RLSTenantModelAdmin` alone would answer
+   > `403`), so either assign it a tenant or set `is_tenant_admin=True`:
+   >
+   > ```bash
+   > docker compose exec web python manage.py shell -c \
+   >   "from accounts.models import User; User.objects.filter(username='me').update(is_tenant_admin=True)"
+   > ```
+   >
+   > For an existing demo, rebuild with `docker compose up --build`. The seed
+   > command adds the missing `staff` account while preserving existing data.
 
 ## Library Features Demonstrated
 
@@ -84,6 +112,7 @@ Open **<http://localhost:8000>** and log in with any demo account:
 | `RLSProtectedModel` | `notes/models.py` -- `Note` and `Category` |
 | `RLSTenantMiddleware` | `demo/settings.py` -- automatic per-request RLS context |
 | `TenantUser` protocol | `accounts/models.py` -- `rls_tenant_id` + `is_tenant_admin` |
+| `RLSTenantModelAdmin` | `notes/admin.py` -- auto-scoped changelists, hidden + auto-assigned tenant FK, tenant switcher |
 | Auto-scoping (zero `.filter()`) | `notes/views.py` -- `Note.objects.all()` returns only tenant data |
 | `select_related()` propagation | `notes/views.py` -- tenant filter auto-propagates to joined `Category` |
 | `@with_rls_context` decorator | `notes/services.py` -- `get_note_stats(as_user=...)` |
@@ -93,6 +122,7 @@ Open **<http://localhost:8000>** and log in with any demo account:
 | `STRICT_MODE` | `demo/settings.py` -- raises `NoTenantContextError` on unscoped queries |
 | `NoTenantContextError` handling | `notes/views.py` -- graceful handling in view code |
 | Testing utilities | `tests/test_rls.py` -- `rls_bypass`, `rls_as_tenant`, assert helpers |
+| Admin tests | `tests/test_admin.py` -- the tenant-aware admin driven through the test client |
 | Strict mode tests | `tests/test_rls.py` -- `TestStrictMode` class |
 
 ## How It Works
@@ -123,6 +153,7 @@ example/
 │                        templates, admin, seed command
 └── tests/               Example tests using django-rls-tenants testing utilities
     ├── conftest.py      Fixtures using rls_bypass for test data setup
+    ├── test_admin.py    RLSTenantModelAdmin scoping, FK hiding and switcher tests
     └── test_rls.py      RLS policy verification and tenant isolation tests
 ```
 
@@ -138,6 +169,7 @@ docker compose exec web python -m pytest tests/ -v
 # Or locally (with PostgreSQL running):
 cd example/
 pip install pytest pytest-django
+python manage.py makemigrations
 python -m pytest tests/ -v
 ```
 

@@ -14,7 +14,14 @@ from django_rls_tenants.tenants.middleware import (
     _clear_gucs_set_flag,
     _were_gucs_set,
 )
-from django_rls_tenants.tenants.state import get_current_tenant_id
+from django_rls_tenants.tenants.state import (
+    get_current_tenant_id,
+    get_rls_context_active,
+    reset_current_tenant_id,
+    reset_rls_context_active,
+    set_current_tenant_id,
+    set_rls_context_active,
+)
 
 pytestmark = pytest.mark.django_db
 
@@ -85,6 +92,31 @@ class TestProcessResponse:
         mw.process_response(request, response)
         assert get_guc("rls.is_admin") is None
         assert get_guc("rls.current_tenant") is None
+
+    @pytest.mark.parametrize(("outer_tenant", "outer_active"), [(None, False), (999, True)])
+    def test_response_after_exception_restores_context_once(
+        self, tenant_a_user, outer_tenant, outer_active
+    ):
+        """An error response must not reuse tokens or erase the restored context."""
+        tenant_token = set_current_tenant_id(outer_tenant)
+        active_token = set_rls_context_active(outer_active)
+        try:
+            mw = RLSTenantMiddleware(get_response=lambda r: MagicMock())
+            request = _make_request(user=tenant_a_user)
+            mw.process_request(request)
+            mw.process_exception(request, RuntimeError("view failed"))
+            assert get_current_tenant_id() == outer_tenant
+            assert get_rls_context_active() is outer_active
+
+            response = MagicMock()
+            assert mw.process_response(request, response) is response
+            assert get_current_tenant_id() == outer_tenant
+            assert get_rls_context_active() is outer_active
+            assert get_guc("rls.is_admin") is None
+            assert get_guc("rls.current_tenant") is None
+        finally:
+            reset_current_tenant_id(tenant_token)
+            reset_rls_context_active(active_token)
 
     def test_returns_response(self, tenant_a_user):
         """process_response returns the response object."""
