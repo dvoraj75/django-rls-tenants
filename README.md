@@ -23,6 +23,31 @@ returns zero rows, never leaked data.
 
 [Learn more about the RLS approach →](https://dvoraj75.github.io/django-rls-tenants/why-rls/)
 
+## Features
+
+- **Database-enforced isolation** -- RLS policies protect tenant tables across ORM
+  queries, raw SQL, `dbshell`, and data migrations when using a database role subject
+  to RLS.
+- **Fail-closed by default** -- missing tenant context returns zero rows; optional
+  `STRICT_MODE` raises `NoTenantContextError` on unscoped `TenantQuerySet` evaluation.
+- **Automatic query scoping** -- `RLSProtectedModel` adds the tenant FK, the RLS policy,
+  and a tenant-scoped manager.
+- **Tenant-aware Django admin** -- `RLSTenantModelAdmin` scopes changelists, forms, and
+  related dropdowns to the current tenant, with a tenant switcher for cross-tenant
+  admins.
+  [Admin guide →](https://dvoraj75.github.io/django-rls-tenants/guides/admin/)
+- **Native Celery integration** -- `@rls_task` carries the active tenant context from
+  enqueue to worker, including across chains, groups, and chords
+  (`pip install "django-rls-tenants[celery]"`).
+  [Celery guide →](https://dvoraj75.github.io/django-rls-tenants/guides/celery-tasks/)
+- **Raw SQL helpers** -- `safe_tenant_sql()` builds a tenant-filter predicate;
+  `current_tenant_value_sql()` returns the current tenant ID expression for inserts
+  and projections. Both reuse the expressions used by RLS policies.
+  [Raw SQL guide →](https://dvoraj75.github.io/django-rls-tenants/guides/raw-sql/)
+- **M2M isolation** -- auto-detected subquery-based RLS policies on M2M through tables.
+- **Single schema, single database** -- no schema-per-tenant overhead, no connection
+  routing.
+
 ## Quick Start
 
 ```bash

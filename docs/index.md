@@ -32,6 +32,9 @@ policy. The database itself becomes the trust boundary.
 - **Single schema, single database** -- no schema-per-tenant overhead.
 - **API-agnostic** -- works with Django REST Framework, GraphQL, async views, management commands.
 - **M2M isolation** -- auto-detected subquery-based RLS policies on M2M through tables.
+- **Tenant-aware Django admin** -- `RLSTenantModelAdmin` scopes changelists, forms, and related dropdowns to the current tenant, with a tenant switcher for cross-tenant admins. See the [Admin guide](guides/admin.md).
+- **Native Celery integration** -- `@rls_task` carries the active tenant context from enqueue to the worker, across chains, groups, and chords. See the [Celery Tasks guide](guides/celery-tasks.md).
+- **Raw SQL helpers** -- `safe_tenant_sql()` builds a tenant-filter predicate; `current_tenant_value_sql()` returns the current tenant ID expression for inserts and projections. Both reuse the expressions used by RLS policies. See the [Raw SQL guide](guides/raw-sql.md).
 - **Clean internal layering** -- generic `rls/` primitives separate from `tenants/` conveniences.
 - **Configurable escape hatches** -- bypass flags for authentication, admin, migrations.
 - **Drop-in for new projects** -- abstract model, middleware, and test helpers included.

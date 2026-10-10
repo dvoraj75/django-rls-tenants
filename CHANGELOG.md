@@ -42,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The README and the docs landing page now list the v1.3.0 features (tenant-aware
+  admin, native Celery integration, raw SQL helpers) with links to their guides, and
+  `SECURITY.md` "Supported Versions" now includes the current `1.3.x` series. (#75)
 - Middleware cleanup now resets context tokens only once when Django calls both
   exception and response hooks, preserving the expected 403 for denied admin pages.
 - **Example app crashed at import** (#72): `example/notes/views.py` and
