@@ -47,16 +47,20 @@ Open **<http://localhost:8000>** and log in with any demo account:
    page is powered by a service function decorated with `@with_rls_context`,
    demonstrating automatic RLS context from function arguments.
 
-5. **Database-level proof** -- Open a raw database shell and verify RLS is
-   active:
+5. **Database-level proof** -- Connect to PostgreSQL as `app`, the
+   non-superuser role the demo runs as (see `docker/init-db.sql`), and query a
+   protected table with no tenant context:
    ```bash
-   docker compose exec web python manage.py dbshell
+   docker compose exec db psql -U app -d demo -c 'SELECT count(*) FROM notes_note;'
+   # -> 0 (no tenant context)
    ```
-   ```sql
-   -- Without tenant context, RLS returns zero rows:
-   SELECT count(*) FROM notes_note;
-   -- -> 0
+   Compare with the `demo` superuser, again from your host terminal:
+   ```bash
+   docker compose exec db psql -U demo -d demo -c 'SELECT count(*) FROM notes_note;'
+   # -> 15 on a freshly seeded database
    ```
+   Superusers bypass RLS and see every row, which is why the app must never
+   connect as one. The total changes if you add or delete notes.
 
 6. **RLS policy verification** -- The `check_rls` management command verifies
    all RLS policies are correctly applied:
@@ -123,6 +127,7 @@ Open **<http://localhost:8000>** and log in with any demo account:
 | `NoTenantContextError` handling | `notes/views.py` -- graceful handling in view code |
 | Testing utilities | `tests/test_rls.py` -- `rls_bypass`, `rls_as_tenant`, assert helpers |
 | Admin tests | `tests/test_admin.py` -- the tenant-aware admin driven through the test client |
+| Seed command tests | `tests/test_seed_demo.py` -- `staff` account permissions and idempotent re-seeding |
 | Strict mode tests | `tests/test_rls.py` -- `TestStrictMode` class |
 
 ## How It Works
@@ -154,7 +159,8 @@ example/
 └── tests/               Example tests using django-rls-tenants testing utilities
     ├── conftest.py      Fixtures using rls_bypass for test data setup
     ├── test_admin.py    RLSTenantModelAdmin scoping, FK hiding and switcher tests
-    └── test_rls.py      RLS policy verification and tenant isolation tests
+    ├── test_rls.py      RLS policy verification and tenant isolation tests
+    └── test_seed_demo.py  Seeded staff account and idempotent re-seeding tests
 ```
 
 ## Running Tests

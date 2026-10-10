@@ -57,6 +57,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the generated policies use `EXISTS (SELECT 1 ...)`. Docstring now matches the DDL. (#76)
 - `docs/guides/connection-pooling.md` now quotes the real `W007`/`W004` check messages
   and hints instead of approximate text. (#76)
+- **Example README** (#74): the "Database-level proof" step told you to run
+  `manage.py dbshell` inside the `web` container, which has no `psql` and fails with
+  `CommandError`. It now connects through the `db` container as the non-superuser `app`
+  role, with complete host-terminal commands for both the `app` and `demo` superuser
+  queries. The expected 15-note total is qualified as a freshly seeded database.
+  The features table and project tree also list `tests/test_seed_demo.py`.
 
 ## [1.3.0] - 2026-06-28
 
