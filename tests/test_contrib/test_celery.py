@@ -10,6 +10,9 @@ The suite splits into:
   and the signal handlers (no row access);
 * eager round-trip tests proving an ``@rls_task`` body runs under the propagated
   ``tenant_context()`` / ``admin_context()``, including across a chain and a group;
+* eager round-trip tests proving ``install()`` really wires ``task_prerun`` /
+  ``task_postrun``: a plain ``@shared_task`` dispatched through Celery's tracer is
+  scoped only while the handlers are connected;
 * one ``@pytest.mark.integration`` test proving end-to-end row isolation under
   ``enforce_rls``.
 
@@ -24,11 +27,12 @@ from types import SimpleNamespace
 
 import pytest
 from celery import Celery, chain, chord, group, shared_task
-from celery.signals import before_task_publish
+from celery.signals import before_task_publish, task_postrun, task_prerun
 
 from django_rls_tenants.contrib import celery as celery_mod
 from django_rls_tenants.contrib.celery import (
     _ADMIN_HEADER,
+    _DISPATCH_UID,
     _TENANT_HEADER,
     RLSTask,
     _capture,
@@ -109,6 +113,32 @@ def report_headers(self) -> dict[str, object]:
     """
     headers = self.request.headers or {}
     return {_TENANT_HEADER: headers.get(_TENANT_HEADER), _ADMIN_HEADER: headers.get(_ADMIN_HEADER)}
+
+
+@shared_task
+def plain_report_context() -> tuple[object, bool]:
+    """Plain (non-RLSTask) task: returns the context the signal handlers established."""
+    return get_current_tenant_id(), get_rls_context_active()
+
+
+@shared_task
+def plain_boom() -> None:
+    """Plain task that fails after confirming the handlers scoped it."""
+    assert get_current_tenant_id() is not None
+    raise ValueError("kaboom")
+
+
+@rls_task
+def report_signal_stack() -> tuple[object, dict[str, int]]:
+    """RLSTask body: returns its tenant and the signal-handler stack depth per task id.
+
+    Depths rather than the context managers themselves: the eager result is
+    stored through the JSON result serializer, and a non-empty stack would then
+    fail with an opaque ``EncodeError`` instead of the assertion it guards.
+    """
+    return get_current_tenant_id(), {
+        task_id: len(stack) for task_id, stack in celery_mod._signal_contexts.items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -527,8 +557,34 @@ class TestPrerunPostrunSignals:
         assert "x" not in celery_mod._signal_contexts
 
 
+@pytest.fixture
+def installed():
+    """Connect the signal handlers for one test and always disconnect afterwards.
+
+    Starts from a clean baseline so a leaked connection from an earlier test can
+    never mask a missing ``.connect()``; the ``finally`` guarantees no handler
+    outlives a failing test.
+    """
+    uninstall()
+    install()
+    try:
+        yield
+    finally:
+        uninstall()
+
+
+def _is_wired(signal) -> bool:
+    """True when install()'s handler (by ``dispatch_uid``) is connected to ``signal``."""
+    return any(key[0] == _DISPATCH_UID for key, _ in signal.receivers)
+
+
 class TestInstallUninstall:
-    """install() wires the publish signal; uninstall() removes it."""
+    """install() connects the three signal handlers; uninstall() removes them.
+
+    The publish side is checked here via ``before_task_publish.send()``; the
+    prerun/postrun side is checked through real eager dispatch in
+    ``TestInstallEagerRoundTrip``.
+    """
 
     def test_install_connects_and_uninstall_disconnects(self):
         uninstall()  # ensure a clean baseline
@@ -564,6 +620,81 @@ class TestInstallUninstall:
     def test_uninstall_is_safe_without_install(self):
         uninstall()
         uninstall()
+
+
+@pytest.mark.django_db
+class TestInstallEagerRoundTrip:
+    """install() wires task_prerun/task_postrun for real: a plain shared_task is scoped.
+
+    ``TestPrerunPostrunSignals`` calls the handlers directly, which proves their
+    logic but not that ``install()`` connected them. These tests go through
+    Celery's eager tracer, which fires ``task_prerun``/``task_postrun`` exactly as
+    a worker would, so dropping a ``.connect()`` line fails here.
+
+    Eager mode never publishes, so ``before_task_publish`` stays covered by the
+    ``.send()`` test above. Each test starts with no outer context and passes the
+    header explicitly; an outer ``tenant_context()`` would leak into the eager
+    body and mask the handlers.
+    """
+
+    def test_not_installed_runs_unscoped(self, tenant_a):
+        """Baseline: without install() the header is ignored (nothing enters a context)."""
+        uninstall()
+        result = plain_report_context.apply(headers={_TENANT_HEADER: tenant_a.pk}).get()
+        assert result == (None, False)
+
+    def test_prerun_restores_tenant_from_header(self, installed, tenant_a):
+        """task_prerun enters tenant_context() from the header; task_postrun exits it."""
+        assert get_current_tenant_id() is None
+        result = plain_report_context.apply(
+            headers={_TENANT_HEADER: tenant_a.pk, _ADMIN_HEADER: False}
+        ).get()
+        assert result == (tenant_a.pk, True)
+        assert get_current_tenant_id() is None  # postrun exited it
+        assert celery_mod._signal_contexts == {}  # stack entry popped
+
+    def test_prerun_restores_admin_from_header(self, installed):
+        """An admin header makes the plain task body run under admin_context()."""
+        result = plain_report_context.apply(
+            headers={_TENANT_HEADER: None, _ADMIN_HEADER: True}
+        ).get()
+        assert result == (None, True)
+        assert get_rls_context_active() is False
+        assert celery_mod._signal_contexts == {}
+
+    def test_apply_async_path_is_covered_too(self, installed, tenant_a):
+        """Eager apply_async() redirects to apply(); the handlers fire on that path as well."""
+        result = plain_report_context.apply_async(headers={_TENANT_HEADER: tenant_a.pk}).get()
+        assert result == (tenant_a.pk, True)
+        assert get_current_tenant_id() is None
+
+    def test_postrun_unwinds_after_exception(self, installed, tenant_a):
+        """task_postrun fires from the tracer's finally, so a failing body still exits."""
+        with pytest.raises(ValueError, match="kaboom"):
+            plain_boom.apply(headers={_TENANT_HEADER: tenant_a.pk}).get()
+        assert get_current_tenant_id() is None
+        assert celery_mod._signal_contexts == {}
+
+    def test_rlstask_is_not_double_entered(self, installed, tenant_a):
+        """An RLSTask under install() is scoped by __call__ only; the handlers skip it."""
+        tenant_id, stack = report_signal_stack.apply(headers={_TENANT_HEADER: tenant_a.pk}).get()
+        assert tenant_id == tenant_a.pk
+        assert stack == {}
+
+    def test_uninstall_disconnects_prerun_and_postrun(self, tenant_a):
+        """After uninstall() the handlers are gone (structurally) and inert (behaviourally)."""
+        signals = (before_task_publish, task_prerun, task_postrun)
+        uninstall()
+        install()
+        try:
+            assert all(_is_wired(s) for s in signals)
+            result = plain_report_context.apply(headers={_TENANT_HEADER: tenant_a.pk}).get()
+            assert result == (tenant_a.pk, True)
+        finally:
+            uninstall()
+        assert not any(_is_wired(s) for s in signals)
+        result = plain_report_context.apply(headers={_TENANT_HEADER: tenant_a.pk}).get()
+        assert result == (None, False)
 
 
 # ---------------------------------------------------------------------------
