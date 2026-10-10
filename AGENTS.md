@@ -10,7 +10,7 @@ Python 3.11+, Django 4.2+, PostgreSQL 15+. Uses `uv` for dependency management a
 ## Build & Dependencies
 
 ```bash
-uv sync --group dev --group test   # install all deps (dev + test)
+uv sync --group dev --group test --group docs   # install all deps (dev + test + docs)
 uv run pre-commit install          # install pre-commit hooks
 ```
 
@@ -22,9 +22,11 @@ uv run ruff check --fix .          # lint with auto-fix
 uv run ruff format .               # format (Black-compatible)
 uv run ruff format --check .       # format check only (CI mode)
 uv run mypy django_rls_tenants     # strict type-check (production code only)
+uv run mkdocs build --strict       # docs build (needs --group docs; CI runs this on PRs)
 ```
 
-Pre-commit hooks run ruff check, ruff format, and mypy automatically on every commit.
+Pre-commit hooks run ruff check, ruff format, and mypy automatically on every commit,
+all via `uv run`, so they match the versions pinned in `uv.lock`.
 
 ## Testing
 
@@ -263,5 +265,6 @@ example/
 
 ## CI
 
-GitHub Actions runs lint + type-check and a test matrix across
+GitHub Actions runs lint + type-check, a strict mkdocs build (`mkdocs build --strict`),
+and a test matrix across
 Python {3.11, 3.12, 3.13, 3.14} × Django {4.2, 5.0, 5.1, 5.2, 6.0} on every push/PR.

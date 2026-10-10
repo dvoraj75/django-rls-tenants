@@ -13,6 +13,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transaction-scoped (`SET LOCAL`) bypass flag can be cleared the same way it was set.
   Keyword-only, default `False`; no existing call changes. (#76)
 
+### Changed
+
+- CI now runs `mkdocs build --strict` on every pull request (#77), so broken
+  links and stale `mkdocstrings` references fail before merge instead of
+  after. Deploy is still only on `main`.
+- Pre-commit ruff hooks now run `uv run ruff` (local hooks, like mypy) so
+  they always use the ruff version pinned in `uv.lock` -- the same one CI
+  runs (#77). Previously the hook was pinned independently (`v0.15.5` vs
+  `0.15.20` in the lockfile) and local autofix/format could disagree with CI.
+
 ### Removed
 
 - System check `W003` (`USE_LOCAL_SET` without `ATOMIC_REQUESTS` on `default`). It only

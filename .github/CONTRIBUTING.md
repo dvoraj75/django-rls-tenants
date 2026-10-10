@@ -22,8 +22,8 @@ expected to uphold this code. Please report unacceptable behavior to dvoraj75@gm
 git clone https://github.com/dvoraj75/django-rls-tenants.git
 cd django-rls-tenants
 
-# Install dependencies (including dev + test groups)
-uv sync --group dev --group test
+# Install dependencies (dev + test + docs groups)
+uv sync --group dev --group test --group docs
 
 # Install pre-commit hooks
 uv run pre-commit install
@@ -51,7 +51,21 @@ uv run ruff format .
 uv run mypy django_rls_tenants
 ```
 
-Pre-commit hooks run these automatically on every commit.
+Pre-commit hooks run these automatically on every commit. The hooks invoke Ruff and mypy
+through `uv run`, so they use the exact versions pinned in `uv.lock` -- the same versions
+CI runs.
+
+## Documentation
+
+Build the documentation locally before opening a pull request (requires the `docs`
+dependency group):
+
+```bash
+uv run mkdocs build --strict
+```
+
+CI runs this exact command on every pull request. `--strict` turns broken links and
+missing `mkdocstrings` symbols into build failures.
 
 ## Testing
 
@@ -89,8 +103,9 @@ tests/
 2. Add or update tests for your changes.
 3. Ensure the full test suite passes: `uv run pytest`.
 4. Ensure linting and type checks pass: `uv run ruff check . && uv run mypy django_rls_tenants`.
-5. Update the `[Unreleased]` section in `CHANGELOG.md`.
-6. Open a pull request against `develop` with a clear description of the change.
+5. Ensure the docs build cleanly: `uv run mkdocs build --strict`.
+6. Update the `[Unreleased]` section in `CHANGELOG.md`.
+7. Open a pull request against `develop` with a clear description of the change.
 
 ## Commit Messages
 

@@ -55,7 +55,9 @@ uv run ruff format .
 uv run mypy django_rls_tenants
 ```
 
-Pre-commit hooks run Ruff and mypy automatically on every commit.
+Pre-commit hooks run Ruff and mypy automatically on every commit. The hooks invoke both
+tools through `uv run`, so they use the exact versions pinned in `uv.lock` -- the same
+versions CI runs.
 
 ### Key Style Rules
 
@@ -113,6 +115,20 @@ tests/
 - **Fixtures**: descriptive nouns (`tenant_a`, `admin_user`).
 - **DB access**: `pytestmark = pytest.mark.django_db` at module level.
 
+## Documentation
+
+The documentation site is built with [MkDocs](https://www.mkdocs.org/) and
+[mkdocstrings](https://mkdocstrings.github.io/). Build it locally before opening a pull
+request (requires the `docs` dependency group):
+
+```bash
+uv run mkdocs build --strict
+```
+
+CI runs this exact command on every pull request. `--strict` turns warnings such as broken
+links and missing `mkdocstrings` symbols (for example, after renaming or removing a public
+API) into build failures.
+
 ## Architecture
 
 The library has two internal layers with a strict import boundary:
@@ -129,8 +145,9 @@ from `tenants/` into `rls/`.
 2. Add or update tests for your changes.
 3. Ensure the full test suite passes: `uv run pytest`.
 4. Ensure linting and type checks pass: `uv run ruff check . && uv run mypy django_rls_tenants`.
-5. Update the `[Unreleased]` section in `CHANGELOG.md`.
-6. Open a pull request against `develop` with a clear description of the change.
+5. Ensure the docs build cleanly: `uv run mkdocs build --strict`.
+6. Update the `[Unreleased]` section in `CHANGELOG.md`.
+7. Open a pull request against `develop` with a clear description of the change.
 
 ## Commit Messages
 

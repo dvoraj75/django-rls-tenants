@@ -1,13 +1,21 @@
 repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.5
-    hooks:
-      - id: ruff
-        args: [--fix]
-      - id: ruff-format
-
   - repo: local
     hooks:
+      # Ruff runs from the uv-managed environment so the hook always uses the
+      # exact version pinned in uv.lock -- the same one CI runs via `uv run ruff`.
+      - id: ruff
+        name: ruff
+        entry: uv run ruff check --force-exclude
+        args: [--fix]
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+      - id: ruff-format
+        name: ruff-format
+        entry: uv run ruff format --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
       - id: mypy
         name: mypy
         entry: uv run mypy django_rls_tenants
