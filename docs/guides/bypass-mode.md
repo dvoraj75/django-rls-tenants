@@ -87,7 +87,7 @@ flag; this must run inside `transaction.atomic()`. Pass the same `is_local` valu
 
 During authentication, the user record must be read before the tenant context is known.
 A bypass flag allows the auth backend to read user records without setting a full admin
-context:
+context.
 
 The backend must cover both credential authentication and `get_user()`, which Django
 uses to reload the user from a session on subsequent requests. Subclassing

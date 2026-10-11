@@ -35,8 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Docs: the Quick Start and User Integration guides no longer make `User`
   RLS-protected** (#82). `class User(AbstractUser, RLSProtectedModel)` silently
   registers `RLSM2MConstraint` on the inherited `groups` and `user_permissions` through
-  tables, so `check_rls` printed an extra `M2M through tables:` section and
-  `All 4 RLS-protected tables verified.` where the Quick Start promised 2. Both guides
+  tables, so `check_rls` lists them under an extra `M2M through tables:` section and
+  reports 4 tables, not the 2 the Quick Start promised. Worse, the snippet declared no
+  `Meta`, so `AbstractUser.Meta` won and the user table itself had no `RLSConstraint`:
+  `check_rls` failed on the missing policy instead of printing the documented output.
+  Both guides
   now use a plain `AbstractUser` with a nullable `tenant` FK (the shape the example
   project and test app use), the Quick Start output matches a real run, and a new
   *Protecting the User Model* section in the Protecting Models guide documents the
