@@ -59,8 +59,8 @@ Open **<http://localhost:8000>** and log in with any demo account:
    docker compose exec db psql -U demo -d demo -c 'SELECT count(*) FROM notes_note;'
    # -> 15 on a freshly seeded database
    ```
-   Superusers bypass RLS and see every row, which is why the app must never
-   connect as one. The total changes if you add or delete notes.
+   Superusers (and roles with `BYPASSRLS`) bypass RLS and see every row, which is
+   why the app must never connect as one. The total changes if you add or delete notes.
 
 6. **RLS policy verification** -- The `check_rls` management command verifies
    all RLS policies are correctly applied:
@@ -193,7 +193,8 @@ pip install -e ..
 pip install psycopg2-binary
 
 # Configure database (PostgreSQL required -- SQLite will not work)
-# IMPORTANT: Use a non-superuser role -- superusers bypass RLS entirely.
+# IMPORTANT: Use a NOSUPERUSER NOBYPASSRLS role -- superusers and BYPASSRLS roles
+# bypass RLS entirely.
 # See docker/init-db.sql for the recommended role setup.
 export POSTGRES_DB=demo POSTGRES_USER=app POSTGRES_PASSWORD=app
 export POSTGRES_HOST=localhost POSTGRES_PORT=5432
@@ -206,9 +207,9 @@ python manage.py seed_demo --no-input
 python manage.py runserver
 ```
 
-> **Important:** The PostgreSQL user must **not** be a superuser -- superusers
-> bypass RLS entirely. If running PostgreSQL locally (without Docker), create a
-> non-superuser role as shown in `docker/init-db.sql`.
+> **Important:** The PostgreSQL user must **not** be a superuser or have
+> `BYPASSRLS` -- both bypass RLS entirely. If running PostgreSQL locally
+> (without Docker), create a plain role as shown in `docker/init-db.sql`.
 
 ## Learn More
 

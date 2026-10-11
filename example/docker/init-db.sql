@@ -1,6 +1,7 @@
 -- Create a non-superuser role for the Django application.
--- PostgreSQL superusers bypass RLS entirely, so the app must connect
--- with a regular role for tenant isolation to work.
+-- PostgreSQL superusers and roles with BYPASSRLS bypass RLS entirely, so the
+-- app must connect with a regular (NOSUPERUSER NOBYPASSRLS) role for tenant
+-- isolation to work. CREATE ROLE defaults to both, which is what this relies on.
 CREATE ROLE app WITH LOGIN PASSWORD 'app' CREATEDB;
 GRANT ALL PRIVILEGES ON DATABASE demo TO app;
 

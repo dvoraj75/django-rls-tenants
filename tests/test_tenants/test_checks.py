@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from django.core.checks import Warning as CheckWarning
+from django.db import connection
 from django.test import override_settings
 
 from django_rls_tenants.tenants.checks import (
@@ -258,38 +259,69 @@ class TestCheckConnMaxAgeWithSessionGucs:
         assert "600" in warnings[0].msg
 
 
+def _run_superuser_check_with_row(row):
+    """Run ``_check_superuser_connection`` against a mocked ``pg_roles`` row."""
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = row
+    mock_cursor.__enter__ = lambda self: self
+    mock_cursor.__exit__ = MagicMock(return_value=False)
+    with patch("django_rls_tenants.tenants.checks.connection") as mock_conn:
+        mock_conn.cursor.return_value = mock_cursor
+        mock_conn.ops.quote_name.side_effect = connection.ops.quote_name
+        warnings = _check_superuser_connection()
+    return warnings, mock_cursor
+
+
+def _is_superuser():
+    """Return whether the live test connection's role is a superuser."""
+    with connection.cursor() as cur:
+        cur.execute("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+        return bool(cur.fetchone()[0])
+
+
 class TestCheckSuperuserConnection:
-    """Tests for _check_superuser_connection."""
+    """Tests for _check_superuser_connection (W005)."""
+
+    def test_queries_pg_roles_for_both_attributes(self):
+        """The check reads rolsuper and rolbypassrls from pg_roles."""
+        _, cursor = _run_superuser_check_with_row(("app", False, False))
+        sql = cursor.execute.call_args.args[0]
+        assert "pg_roles" in sql
+        assert "rolsuper" in sql
+        assert "rolbypassrls" in sql
 
     def test_w005_when_superuser(self):
         """W005 fires when connected as a PostgreSQL superuser."""
-        mock_cursor = MagicMock()
-        mock_cursor.fetchone.return_value = (True,)
-        mock_cursor.__enter__ = lambda self: self
-        mock_cursor.__exit__ = MagicMock(return_value=False)
-
-        with patch(
-            "django_rls_tenants.tenants.checks.connection",
-        ) as mock_conn:
-            mock_conn.cursor.return_value = mock_cursor
-            warnings = _check_superuser_connection()
-        ids = [w.id for w in warnings]
-        assert "django_rls_tenants.W005" in ids
-        assert "superuser" in warnings[0].msg.lower()
+        warnings, _ = _run_superuser_check_with_row(("postgres", True, False))
+        assert [w.id for w in warnings] == ["django_rls_tenants.W005"]
         assert isinstance(warnings[0], CheckWarning)
+        assert "is a PostgreSQL superuser" in warnings[0].msg
+        assert "has the BYPASSRLS attribute" not in warnings[0].msg
+        assert "'postgres'" in warnings[0].msg
 
-    def test_no_warning_when_not_superuser(self):
-        """No W005 when connected as a regular user."""
-        mock_cursor = MagicMock()
-        mock_cursor.fetchone.return_value = (False,)
-        mock_cursor.__enter__ = lambda self: self
-        mock_cursor.__exit__ = MagicMock(return_value=False)
+    def test_w005_when_bypassrls(self):
+        """W005 fires for a non-superuser role with BYPASSRLS."""
+        warnings, _ = _run_superuser_check_with_row(("app", False, True))
+        assert [w.id for w in warnings] == ["django_rls_tenants.W005"]
+        assert "has the BYPASSRLS attribute" in warnings[0].msg
+        assert "is a PostgreSQL superuser" not in warnings[0].msg
+        assert "NOBYPASSRLS" in warnings[0].hint
+        assert 'ALTER ROLE "app" NOSUPERUSER NOBYPASSRLS' in warnings[0].hint
 
-        with patch(
-            "django_rls_tenants.tenants.checks.connection",
-        ) as mock_conn:
-            mock_conn.cursor.return_value = mock_cursor
-            warnings = _check_superuser_connection()
+    def test_w005_hint_quotes_role_identifier(self):
+        """The ALTER ROLE hint quotes the role so mixed-case names stay valid SQL."""
+        warnings, _ = _run_superuser_check_with_row(("App-RW", False, True))
+        assert 'ALTER ROLE "App-RW" NOSUPERUSER NOBYPASSRLS' in warnings[0].hint
+
+    def test_w005_when_superuser_and_bypassrls(self):
+        """A role with both attributes yields one W005 naming both."""
+        warnings, _ = _run_superuser_check_with_row(("postgres", True, True))
+        assert len(warnings) == 1
+        assert "is a PostgreSQL superuser and has the BYPASSRLS attribute" in warnings[0].msg
+
+    def test_no_warning_when_plain_role(self):
+        """No W005 when the role is neither superuser nor BYPASSRLS."""
+        warnings, _ = _run_superuser_check_with_row(("app", False, False))
         assert warnings == []
 
     def test_no_warning_when_db_unavailable(self):
@@ -301,19 +333,37 @@ class TestCheckSuperuserConnection:
             warnings = _check_superuser_connection()
         assert warnings == []
 
-    def test_no_warning_when_user_not_in_pg_user(self):
-        """No W005 when current_user is not found in pg_user (e.g., role-based)."""
-        mock_cursor = MagicMock()
-        mock_cursor.fetchone.return_value = None
-        mock_cursor.__enter__ = lambda self: self
-        mock_cursor.__exit__ = MagicMock(return_value=False)
-
-        with patch(
-            "django_rls_tenants.tenants.checks.connection",
-        ) as mock_conn:
-            mock_conn.cursor.return_value = mock_cursor
-            warnings = _check_superuser_connection()
+    def test_no_warning_when_role_not_found(self):
+        """No W005 when no pg_roles row comes back (defensive guard)."""
+        warnings, _ = _run_superuser_check_with_row(None)
         assert warnings == []
+
+    @pytest.mark.integration
+    def test_no_w005_for_real_plain_role(self, enforce_rls):
+        """Against live PostgreSQL, a NOLOGIN role (NOBYPASSRLS default) passes."""
+        assert _check_superuser_connection() == []
+
+    @pytest.mark.integration
+    def test_w005_for_real_bypassrls_role(self):
+        """Against live PostgreSQL, a non-superuser BYPASSRLS role triggers W005.
+
+        ``CREATE ROLE`` is transactional, so the role disappears when the
+        test transaction rolls back.
+        """
+        if not _is_superuser():
+            pytest.skip("creating a BYPASSRLS role requires a superuser test connection")
+        role = "rls_w005_bypass_role"
+        with connection.cursor() as cur:
+            cur.execute(f"CREATE ROLE {role} NOLOGIN NOSUPERUSER BYPASSRLS")
+            cur.execute(f"SET ROLE {role}")
+        try:
+            warnings = _check_superuser_connection()
+        finally:
+            with connection.cursor() as cur:
+                cur.execute("RESET ROLE")
+        assert [w.id for w in warnings] == ["django_rls_tenants.W005"]
+        assert f"'{role}' has the BYPASSRLS attribute" in warnings[0].msg
+        assert "superuser and" not in warnings[0].msg
 
 
 class TestCheckDatabasesAliasExists:

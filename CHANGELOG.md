@@ -32,6 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs (#77). Previously the hook was pinned independently (`v0.15.5` vs
   `0.15.20` in the lockfile) and local autofix/format could disagree with CI.
 
+- System check `W005` now also flags a database role with the `BYPASSRLS` attribute,
+  which bypasses every RLS policy exactly like a superuser. It reads `rolsuper` and
+  `rolbypassrls` from `pg_roles` (previously only `pg_user.usesuper`), names the role and
+  the offending attribute in the message, and recommends `NOSUPERUSER NOBYPASSRLS` in the
+  hint (with a ready-to-run, identifier-quoted `ALTER ROLE` for the current role). Projects
+  already connecting as a plain role see no change. (#99)
+
 ### Removed
 
 - System check `W003` (`USE_LOCAL_SET` without `ATOMIC_REQUESTS` on `default`). It only
@@ -63,6 +70,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   role, with complete host-terminal commands for both the `app` and `demo` superuser
   queries. The expected 15-note total is qualified as a freshly seeded database.
   The features table and project tree also list `tests/test_seed_demo.py`.
+- **Security guide threat model** (#99): "Tenant impersonation via SQL" was listed as
+  protected against, but any SQL running on the application connection (an injection,
+  compromised code, a `dbshell` with the app credentials) can call `set_config()` to
+  change the tenant or admin GUC. The guide now scopes the guarantee to *omitted tenant
+  scoping*, moves arbitrary SQL execution to "Not Protected Against", and explains that
+  PostgreSQL exempts referential-integrity checks and unique indexes from RLS, so FK
+  targets and per-tenant uniqueness need their own validation. The architecture page no
+  longer claims `FORCE ROW LEVEL SECURITY` stops superuser bypass.
 
 ## [1.3.0] - 2026-06-28
 

@@ -3,6 +3,28 @@
 This page documents the security guarantees of django-rls-tenants, what it protects
 against, and what falls outside its scope.
 
+## Scope of the Guarantee
+
+django-rls-tenants protects against **omitted tenant scoping**: code that reads or
+writes tenant data without restricting it to the current tenant. Typical cases are a
+forgotten `.filter(tenant=...)`, a raw SQL query, a third-party library that issues its
+own SQL, or a background job that runs without tenant context. In every one of those,
+PostgreSQL applies the policy anyway, and with no context the query returns zero rows.
+
+It does **not** protect against an attacker who can execute arbitrary SQL on the
+application's database connection. The tenant and admin GUCs are ordinary session
+variables, and any SQL running as the application role can change them:
+
+```sql
+SELECT set_config('rls.is_admin', 'true', false);  -- now sees every tenant
+```
+
+That includes SQL injection, compromised application code or dependencies, and a
+`dbshell` or `psql` session opened with the application's credentials. RLS is a
+defense against mistakes in correct code, not a sandbox for untrusted SQL. Keep
+using parameterized queries, keep dependencies audited, and protect the database
+credentials as you would without RLS.
+
 ## Fail-Closed Design
 
 The most important security property: **if no GUC variable is set, the RLS policy
@@ -40,7 +62,8 @@ is filtered, including:
 
 - ORM queries (`Model.objects.all()`)
 - Raw SQL (`cursor.execute("SELECT * FROM ...")`)
-- `dbshell` sessions (`python manage.py dbshell`)
+- `dbshell` sessions (`python manage.py dbshell`) -- filtered by default, but the
+  user can set the GUCs themselves (see [Scope of the Guarantee](#scope-of-the-guarantee))
 - Migration data operations
 - Third-party libraries that issue SQL directly
 - Database functions and triggers
@@ -82,6 +105,27 @@ tables, indexes, and sequences. This means:
 - **Indexes are shared**: a unique constraint applies across all tenants unless
   it includes the tenant FK.
 
+### Referential Integrity and Unique Indexes
+
+PostgreSQL exempts referential-integrity checks and unique indexes from RLS: foreign
+key checks and uniqueness checks always see every row, in every tenant. RLS is
+therefore **not** a substitute for tenant-aware FK validation or tenant-aware
+uniqueness.
+
+- **Foreign keys can point across tenants.** The `WITH CHECK` clause validates the
+  tenant FK of the row being written, not the tenant of the rows it references. A
+  tenant that knows or guesses another tenant's primary key can save an `Order`
+  whose `customer_id` belongs to someone else, and the FK check accepts it. Resolve
+  referenced objects through the tenant-scoped manager before assigning them (an
+  RLS-filtered lookup raises `DoesNotExist` for another tenant's row), or enforce it
+  in the schema with a composite foreign key on `(tenant_id, customer_id)` that
+  references a unique `(tenant_id, id)` pair. Many-to-many through tables are the
+  exception: `RLSM2MConstraint` policies check both ends with `EXISTS` subqueries.
+- **Unique indexes span all tenants.** A global unique constraint rejects a value
+  that exists only in another tenant, and the resulting `IntegrityError` tells the
+  writer that the value exists. Django's `validate_unique()` queries through RLS, so
+  it cannot see the conflicting row and lets the save reach the database.
+
 ### Cross-Tenant Unique Constraints
 
 If you need uniqueness within a tenant (e.g., unique invoice numbers per tenant),
@@ -106,18 +150,28 @@ RLS prevents row-level access, but metadata can leak through side channels:
 
 - **Timing**: query time may reveal data volume.
 - **Sequence values**: auto-increment gaps reveal other tenants' activity.
-- **Error messages**: unique constraint violations may reveal cross-tenant data.
+- **Error messages**: unique constraint violations may reveal cross-tenant data
+  (see [Referential Integrity and Unique Indexes](#referential-integrity-and-unique-indexes)).
 
 For high-security environments, consider UUIDs instead of auto-increment IDs.
 
-### Superuser Access
+### Superuser and BYPASSRLS Roles
 
-PostgreSQL superusers bypass **all** RLS policies. The `FORCE` keyword applies to
-the table owner, not to superusers.
+PostgreSQL superusers bypass **all** RLS policies, and so does any role created with
+the `BYPASSRLS` attribute, superuser or not. The `FORCE` keyword applies to the table
+owner, not to these roles.
 
 !!! warning
-    Never use a PostgreSQL superuser as your Django `DATABASES` user in production.
-    Use a regular user that owns the application tables.
+    Never connect Django as a superuser or a `BYPASSRLS` role in production. Use a
+    regular role with `NOSUPERUSER NOBYPASSRLS` that owns the application tables.
+    System check `W005` warns at startup when the default connection's role has
+    either attribute.
+
+```sql
+CREATE ROLE app LOGIN PASSWORD '...' NOSUPERUSER NOBYPASSRLS;
+-- or fix an existing role:
+ALTER ROLE app NOSUPERUSER NOBYPASSRLS;
+```
 
 ### Connection-Level State
 
@@ -144,7 +198,7 @@ See [Connection Pooling](../guides/connection-pooling.md) for details.
 | Third-party library bypasses ORM | RLS policy applies at database level |
 | Missing middleware (misconfiguration) | Fail-closed: zero rows returned |
 | Unauthenticated access | No GUCs set → zero rows |
-| Tenant impersonation via SQL | GUC values are set server-side, not by the client |
+| Background job without tenant context | Fail-closed: zero rows returned |
 | INSERT/UPDATE to wrong tenant | `WITH CHECK` clause validates writes |
 | M2M link to wrong tenant's records | `EXISTS`-based subquery policies on M2M through tables |
 
@@ -152,7 +206,10 @@ See [Connection Pooling](../guides/connection-pooling.md) for details.
 
 | Threat | Explanation |
 |--------|-------------|
-| PostgreSQL superuser access | Superusers bypass all RLS |
+| Arbitrary SQL on the application connection | SQL injection, compromised code, or a `dbshell` with the app credentials can call `set_config()` to change the tenant or admin GUC |
+| Superuser or `BYPASSRLS` role | These roles bypass all RLS (`W005` warns) |
+| Cross-tenant FK references | Referential-integrity checks are exempt from RLS |
+| Cross-tenant uniqueness probes | Unique indexes are exempt from RLS and span all tenants |
 | Schema-level information leaks | Shared tables, sequences, indexes |
 | Timing side channels | Query duration may reveal data volume |
 | GUC leak via connection pooling | Mitigated but not eliminated (see above) |
@@ -196,11 +253,13 @@ See [Configuration](../getting-started/configuration.md#strict_mode) for setup.
 
 ## Recommendations
 
-1. **Use a non-superuser database role** in production.
+1. **Connect as a `NOSUPERUSER NOBYPASSRLS` role** in production, and keep `W005` unsilenced.
 2. **Enable `STRICT_MODE`** in development and staging to catch missing context early.
 3. **Enable `USE_LOCAL_SET`** if using connection pooling.
 4. **Use UUIDs** for tenant PKs if sequence-based leaks are a concern.
 5. **Include tenant FK in unique constraints** that should be per-tenant.
-6. **Run `check_rls`** in CI to verify policies exist.
-7. **Audit bypass usage** (`admin_context`, `bypass_flag`) regularly.
-8. **Test fail-closed behavior** with `assert_rls_blocks_without_context`.
+6. **Validate FK targets through tenant-scoped managers** (or composite FKs) -- RLS
+   does not check the tenant of referenced rows.
+7. **Run `check_rls`** in CI to verify policies exist.
+8. **Audit bypass usage** (`admin_context`, `bypass_flag`) regularly.
+9. **Test fail-closed behavior** with `assert_rls_blocks_without_context`.

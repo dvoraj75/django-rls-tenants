@@ -6,7 +6,7 @@
 |------------|------------|------------------------------------------|
 | Python     | >= 3.11    | Uses modern type syntax (`X \| Y`)       |
 | Django     | >= 4.2     | LTS and latest supported                 |
-| PostgreSQL | >= 15      | RLS with `FORCE` requires superuser or table owner |
+| PostgreSQL | >= 15      | Creating policies requires the table owner (or a superuser) |
 
 ## Install from PyPI
 
@@ -87,6 +87,16 @@ setting must have permission to:
 In most setups the database owner (the user who created the database) already has these
 permissions. If you are using a restricted role, grant ownership of the relevant tables
 or use a superuser for migrations.
+
+!!! warning
+    Superusers and roles with the `BYPASSRLS` attribute skip every RLS policy. The role
+    your application **runs as** must be `NOSUPERUSER NOBYPASSRLS`, otherwise tenant
+    isolation is silently disabled. A superuser is fine for running migrations only.
+    System check `W005` warns when the default connection's role has either attribute.
+
+    ```sql
+    CREATE ROLE myproject_user LOGIN PASSWORD '...' NOSUPERUSER NOBYPASSRLS;
+    ```
 
 ```python title="settings.py"
 DATABASES = {

@@ -257,7 +257,7 @@ django-rls-tenants registers Django system checks that warn about common misconf
 | `W002` | Warning | `RLSConstraint.guc_admin_var` doesn't match `GUC_PREFIX`-derived name |
 | `W003` | — | *Retired in 1.3.1; superseded by `W007`, which checks every configured alias* |
 | `W004` | Warning | `CONN_MAX_AGE > 0` with `USE_LOCAL_SET=False` (session GUCs may leak) |
-| `W005` | Warning | Database connection uses a PostgreSQL superuser (RLS bypassed) |
+| `W005` | Warning | Default database connection role is a superuser or has `BYPASSRLS` (RLS bypassed) |
 | `W006` | Warning | `DATABASES` contains an alias not defined in `settings.DATABASES` |
 | `W007` | Warning | `USE_LOCAL_SET=True` without `ATOMIC_REQUESTS` on a configured alias |
 | `W008` | Warning | `RLS_TENANTS['TENANT_MODEL']` does not resolve to an installed model |

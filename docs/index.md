@@ -21,7 +21,9 @@ SQL, tenant data leaks silently.
 **django-rls-tenants** pushes isolation into the **database** using PostgreSQL
 [Row-Level Security](https://www.postgresql.org/docs/current/ddl-rowsecurity.html) policies.
 Every query -- ORM, raw SQL, `dbshell`, migration scripts -- is subject to the same
-policy. The database itself becomes the trust boundary.
+policy, provided the application connects as a role without `SUPERUSER` or `BYPASSRLS`.
+The database itself becomes the trust boundary for forgotten filters and unscoped queries; see
+the [Security Model](advanced/security.md) for what that does and does not cover.
 
 ## Key Features
 

@@ -3,7 +3,7 @@
 Detects configuration issues at startup that would otherwise cause
 silent failures at runtime:
 
-- Superuser database connections (RLS is completely bypassed — warning).
+- Superuser or ``BYPASSRLS`` database connections (RLS is completely bypassed — warning).
 - ``GUC_PREFIX`` mismatch between runtime config and ``RLSConstraint`` defaults.
 - ``CONN_MAX_AGE > 0`` with ``USE_LOCAL_SET=False`` (connection-pool GUC leak risk).
 - ``DATABASES`` contains aliases not in ``settings.DATABASES``.
@@ -45,39 +45,59 @@ def check_rls_config(
 
 
 def _check_superuser_connection() -> list[CheckWarning]:
-    """Warn if the default database connection uses a PostgreSQL superuser.
+    """Warn if the default database connection uses a role that bypasses RLS.
 
-    PostgreSQL superusers bypass ALL Row-Level Security policies, even
-    with ``FORCE ROW LEVEL SECURITY``. If the Django application connects
-    as a superuser, tenant isolation is completely disabled -- every query
-    returns all rows regardless of GUC settings.
+    Two role attributes make PostgreSQL skip Row-Level Security entirely,
+    even with ``FORCE ROW LEVEL SECURITY``:
+
+    - ``SUPERUSER`` -- superusers bypass every policy.
+    - ``BYPASSRLS`` -- a non-superuser role with this attribute bypasses
+      every policy exactly like a superuser.
+
+    If the Django application connects as such a role, tenant isolation is
+    completely disabled -- every query returns all rows regardless of GUC
+    settings. Both attributes are read from ``pg_roles`` (which, unlike
+    ``pg_user``, also lists ``NOLOGIN`` roles reached via ``SET ROLE``).
     """
     warnings: list[CheckWarning] = []
     try:
         with connection.cursor() as cursor:
-            cursor.execute("SELECT usesuper FROM pg_user WHERE usename = current_user")
+            cursor.execute(
+                "SELECT rolname, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user"
+            )
             row = cursor.fetchone()
-            if row is not None and row[0]:
-                warnings.append(
-                    CheckWarning(
-                        "The default database connection uses a PostgreSQL "
-                        "superuser. Superusers bypass ALL Row-Level Security "
-                        "policies, completely disabling tenant isolation.",
-                        hint=(
-                            "Create a non-superuser role for the Django "
-                            "application and set it in DATABASES['default']. "
-                            "Example: CREATE ROLE app LOGIN PASSWORD 'secret'; "
-                            "GRANT ALL ON ALL TABLES IN SCHEMA public TO app;"
-                        ),
-                        id="django_rls_tenants.W005",
+            if row is not None:
+                role, is_superuser, bypasses_rls = row
+                reasons: list[str] = []
+                if is_superuser:
+                    reasons.append("is a PostgreSQL superuser")
+                if bypasses_rls:
+                    reasons.append("has the BYPASSRLS attribute")
+                if reasons:
+                    quoted_role = connection.ops.quote_name(role)
+                    warnings.append(
+                        CheckWarning(
+                            f"The default database connection role {role!r} "
+                            f"{' and '.join(reasons)}. Superusers and BYPASSRLS "
+                            "roles bypass ALL Row-Level Security policies, "
+                            "completely disabling tenant isolation.",
+                            hint=(
+                                "Connect Django as a role with NOSUPERUSER and "
+                                "NOBYPASSRLS and set it in DATABASES['default']. "
+                                "Example: CREATE ROLE app LOGIN PASSWORD 'secret' "
+                                "NOSUPERUSER NOBYPASSRLS; GRANT ALL ON ALL TABLES "
+                                "IN SCHEMA public TO app; -- or fix the existing "
+                                f"role: ALTER ROLE {quoted_role} NOSUPERUSER NOBYPASSRLS;"
+                            ),
+                            id="django_rls_tenants.W005",
+                        )
                     )
-                )
     except Exception:
         # Database may not be available at check time (e.g., during
         # collectstatic or other commands that don't need a DB).
         # Skip the check silently -- it will be caught at runtime.
         logger.debug(
-            "Could not check superuser status (database may be unavailable).",
+            "Could not check RLS-bypass role attributes (database may be unavailable).",
             exc_info=True,
         )
     return warnings

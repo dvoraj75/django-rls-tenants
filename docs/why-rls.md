@@ -78,6 +78,8 @@ Key properties:
 - **Every query is filtered** — ORM, raw SQL, `cursor.execute()`, `dbshell`.
 - **INSERT and UPDATE are checked** — the `WITH CHECK` clause validates writes.
 - **FORCE ROW LEVEL SECURITY** — even the table owner is subject to the policy.
+  Superusers and roles with the `BYPASSRLS` attribute are the exception, so the
+  application must connect as a `NOSUPERUSER NOBYPASSRLS` role.
 
 ## The "Missing Context = Zero Rows" Guarantee
 
@@ -112,8 +114,10 @@ enforces the boundary.
 ## When RLS Is the Right Choice
 
 - You are building a multi-tenant SaaS on a **shared database**.
-- You want **database-enforced isolation** that cannot be bypassed by
-  application code.
+- You want **database-enforced isolation** that still applies when application
+  code forgets to scope a query. (It does not defend against arbitrary SQL
+  running on the application connection; see
+  [Security Model](advanced/security.md#scope-of-the-guarantee).)
 - Developers on your team use raw SQL, `dbshell`, or management commands.
 - You have **10+ tenants** and want to avoid schema-per-tenant overhead.
 - You want standard Django migrations that run once, not once per tenant.
