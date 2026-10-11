@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 from django_rls_tenants.exceptions import NoTenantContextError
+from django_rls_tenants.rls.context import restore_gucs
 from django_rls_tenants.rls.guc import clear_guc, get_guc, set_guc
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.errors import HINT_TENANT_ID_NONE, HINT_USER_NO_TENANT
@@ -81,6 +82,12 @@ def tenant_context(
 ) -> Iterator[None]:
     """Set RLS context to a specific tenant. Supports nesting.
 
+    The previous GUC values are saved on entry and restored on exit in both
+    GUC modes. With ``USE_LOCAL_SET=True`` the restore is issued with
+    ``SET LOCAL`` so an enclosing block keeps its database scope for the
+    rest of the transaction (see :func:`django_rls_tenants.rls.context.restore_gucs`
+    for the behaviour when the block exits with an aborted transaction).
+
     Args:
         tenant_id: The tenant PK to scope queries to.
         using: Database alias. Default: ``"default"``.
@@ -95,15 +102,13 @@ def tenant_context(
     conf = rls_tenants_config
     is_local = conf.USE_LOCAL_SET
 
-    # Save previous state for nesting support
-    prev_admin: str | None = None
-    prev_tenant: str | None = None
-    if not is_local:
-        prev_admin = get_guc(conf.GUC_IS_ADMIN, using=using)
-        prev_tenant = get_guc(conf.GUC_CURRENT_TENANT, using=using)
+    # Save previous state for nesting support (both modes: a SET LOCAL made
+    # by an enclosing block is visible here and must be re-issued on exit).
+    previous = _snapshot_gucs(conf, using=using)
 
     active_token = set_rls_context_active(True)
     token = set_current_tenant_id(tenant_id)
+    exc_pending = False
     try:
         set_guc(conf.GUC_IS_ADMIN, "false", is_local=is_local, using=using)
         set_guc(
@@ -114,12 +119,13 @@ def tenant_context(
         )
         logger.debug("tenant_context entered: tenant_id=%s, using=%s", tenant_id, using)
         yield
+    except BaseException:
+        exc_pending = True
+        raise
     finally:
         reset_current_tenant_id(token)
         reset_rls_context_active(active_token)
-        if not is_local:
-            _restore_guc(conf.GUC_IS_ADMIN, prev_admin, using=using)
-            _restore_guc(conf.GUC_CURRENT_TENANT, prev_tenant, using=using)
+        restore_gucs(previous, is_local=is_local, using=using, exc_pending=exc_pending)
         logger.debug("tenant_context exited: tenant_id=%s, using=%s", tenant_id, using)
 
 
@@ -130,21 +136,22 @@ def admin_context(
 ) -> Iterator[None]:
     """Set RLS context to admin mode. Supports nesting.
 
+    The previous GUC values are saved on entry and restored on exit in both
+    GUC modes, so an inner ``admin_context()`` never leaks the admin bypass
+    into the enclosing block (see :func:`tenant_context`).
+
     Args:
         using: Database alias. Default: ``"default"``.
     """
     conf = rls_tenants_config
     is_local = conf.USE_LOCAL_SET
 
-    # Save previous state for nesting support
-    prev_admin: str | None = None
-    prev_tenant: str | None = None
-    if not is_local:
-        prev_admin = get_guc(conf.GUC_IS_ADMIN, using=using)
-        prev_tenant = get_guc(conf.GUC_CURRENT_TENANT, using=using)
+    # Save previous state for nesting support (both modes).
+    previous = _snapshot_gucs(conf, using=using)
 
     active_token = set_rls_context_active(True)
     token = set_current_tenant_id(None)
+    exc_pending = False
     try:
         set_guc(conf.GUC_IS_ADMIN, "true", is_local=is_local, using=using)
         # Clear tenant GUC for admin mode; the admin_bypass clause in the
@@ -153,26 +160,22 @@ def admin_context(
         clear_guc(conf.GUC_CURRENT_TENANT, is_local=is_local, using=using)
         logger.debug("admin_context entered: using=%s", using)
         yield
+    except BaseException:
+        exc_pending = True
+        raise
     finally:
         reset_current_tenant_id(token)
         reset_rls_context_active(active_token)
-        if not is_local:
-            _restore_guc(conf.GUC_IS_ADMIN, prev_admin, using=using)
-            _restore_guc(conf.GUC_CURRENT_TENANT, prev_tenant, using=using)
+        restore_gucs(previous, is_local=is_local, using=using, exc_pending=exc_pending)
         logger.debug("admin_context exited: using=%s", using)
 
 
-def _restore_guc(
-    name: str,
-    previous: str | None,
-    *,
-    using: str = "default",
-) -> None:
-    """Restore a GUC to its previous value, or clear if none."""
-    if previous is not None:
-        set_guc(name, previous, using=using)
-    else:
-        clear_guc(name, using=using)
+def _snapshot_gucs(conf: RLSTenantsConfig, *, using: str) -> dict[str, str | None]:
+    """Read the admin and tenant GUCs so a context block can restore them on exit."""
+    return {
+        conf.GUC_IS_ADMIN: get_guc(conf.GUC_IS_ADMIN, using=using),
+        conf.GUC_CURRENT_TENANT: get_guc(conf.GUC_CURRENT_TENANT, using=using),
+    }
 
 
 def _get_arg_from_signature(

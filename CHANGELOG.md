@@ -29,6 +29,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is now walked segment by segment and the `isnull` escape hatch is added when **any**
   hop is nullable. Fully non-null chains keep their INNER JOIN. Single-hop behaviour
   is unchanged.
+- **Nested context managers now restore the outer database scope under
+  `USE_LOCAL_SET=True`** (#94). `tenant_context()`, `admin_context()`, `rls_context()`
+  and `bypass_flag()` skipped the GUC save/restore in `SET LOCAL` mode and relied on the
+  transaction end, so an inner block's scope outlived the block: after an inner
+  `admin_context()` exited, the connection kept `rls.is_admin = 'true'` for the rest of
+  the transaction while `get_current_tenant_id()` still reported the outer tenant. Raw
+  SQL, `update()` / `delete()` on plain managers and models without `RLSManager` saw
+  every tenant. All four context managers now read the previous values on entry and
+  re-issue them with the same scope on exit, in both GUC modes. New
+  `django_rls_tenants.rls.guc.restore_guc()` and `rls.context.restore_gucs()` are the
+  shared primitives. `rls_context()` also restores earlier settings when a later
+  setting fails during entry, preventing a partially applied admin bypass from leaking
+  in autocommit mode.
+- **Context managers no longer mask the real database error** (#102). Exiting a block
+  after a failed statement (`IntegrityError`, `DataError`, ...) ran the GUC restore on an
+  aborted transaction, and the resulting `InternalError: current transaction is aborted`
+  replaced the original exception (default `set_config` mode; `SET LOCAL` mode was only
+  unaffected because of #94). When the block exits with a pending exception, a
+  `DatabaseError` raised by the restore itself is now logged at DEBUG and swallowed; the
+  transaction or savepoint rollback restores the GUCs. A clean exit still propagates
+  restore failures.
 
 ## [1.3.1] - 2026-10-11
 

@@ -97,3 +97,29 @@ def clear_guc(name: str, *, is_local: bool = False, using: str = "default") -> N
         using: Database alias. Default: ``"default"``.
     """
     set_guc(name, "", is_local=is_local, using=using)
+
+
+def restore_guc(
+    name: str,
+    previous: str | None,
+    *,
+    is_local: bool = False,
+    using: str = "default",
+) -> None:
+    """Put a GUC back to a value previously read with :func:`get_guc`.
+
+    ``None`` (unset or empty before) clears the variable. ``is_local`` must
+    match the scope the value was changed with: a ``SET LOCAL`` change is
+    undone with another ``SET LOCAL`` so the outer transaction-local value
+    is reinstated, while a session-level change is undone with ``set_config``.
+
+    Args:
+        name: Variable name to restore.
+        previous: Value returned by ``get_guc`` before the change.
+        is_local: If ``True``, use ``SET LOCAL`` (transaction-scoped).
+        using: Database alias. Default: ``"default"``.
+    """
+    if previous is not None:
+        set_guc(name, previous, is_local=is_local, using=using)
+    else:
+        clear_guc(name, is_local=is_local, using=using)

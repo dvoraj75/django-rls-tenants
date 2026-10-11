@@ -43,7 +43,12 @@ RLS_TENANTS = {
 | **Cleared when** | Explicitly by middleware | Automatically at `COMMIT`/`ROLLBACK` |
 | **Connection pooling safe** | Only with cleanup | Yes |
 | **Requires `ATOMIC_REQUESTS`** | No | Yes |
-| **Nesting support** | Full save/restore | PostgreSQL handles it |
+| **Nesting support** | Full save/restore | Full save/restore with `SET LOCAL` |
+
+Context managers restore the previous values when each block exits in both modes.
+With `SET LOCAL`, transaction end also discards the transaction-local values. See
+[Context Managers](context-managers.md#exceptions-inside-a-context-block) for how
+restoration works after a failed statement or savepoint rollback.
 
 ### Why ATOMIC_REQUESTS Is Required
 

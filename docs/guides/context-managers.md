@@ -91,10 +91,43 @@ with admin_context():
     assert Order.objects.count() == all_count
 ```
 
-!!! note
-    Nesting only saves/restores when `USE_LOCAL_SET` is `False` (the default).
-    With `USE_LOCAL_SET=True`, GUC values are transaction-scoped and PostgreSQL
-    handles cleanup at transaction boundaries.
+Save and restore happen in **both** GUC modes. With `USE_LOCAL_SET=True` the previous
+values are re-issued with `SET LOCAL` when the inner block exits, so the enclosing block
+keeps its own scope for the rest of the transaction; PostgreSQL then drops everything at
+`COMMIT` / `ROLLBACK` as usual.
+
+!!! warning "Before 1.3.2"
+    With `USE_LOCAL_SET=True`, versions up to 1.3.1 did not restore on block exit at all.
+    An inner `admin_context()` left `rls.is_admin = 'true'` on the connection until the
+    transaction ended, while `get_current_tenant_id()` still reported the outer tenant.
+    Raw SQL and plain managers saw every tenant for the rest of the transaction (#94).
+
+## Exceptions Inside a Context Block
+
+An exception raised inside a block resets the Python state and attempts to restore the
+previous GUC values. Restoration depends on the transaction state:
+
+- **A Python exception** (`ValueError`, a failed assertion, ...) leaves the database
+  transaction healthy, so the outer scope is restored normally and the enclosing block
+  continues with its own tenant.
+- **A failed SQL statement** (`IntegrityError`, `DataError`, ...) puts the PostgreSQL
+  transaction into the aborted state, where every further statement is rejected. The
+  library suppresses database errors from the restore and lets *your* exception propagate instead of
+  replacing it with `InternalError: current transaction is aborted`. Nothing is lost:
+  PostgreSQL rolls back `set_config()` and `SET LOCAL` changes together with the
+  transaction, or with the savepoint when the block sits inside a nested
+  `transaction.atomic()`, so the outer scope is reinstated by the rollback itself.
+
+```python
+with transaction.atomic(), tenant_context(tenant_id=1):
+    try:
+        with transaction.atomic(), admin_context():
+            Order.objects.create(...)   # raises IntegrityError
+    except IntegrityError:
+        ...                             # the real error, not "transaction is aborted"
+    # Back to tenant 1: the savepoint rollback restored the GUCs.
+    Order.objects.count()
+```
 
 ## @with_rls_context Decorator
 

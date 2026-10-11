@@ -374,3 +374,122 @@ class TestIsLocalMode:
                 assert get_guc("rls.is_admin") == "true"
             # After transaction, SET LOCAL values are gone
             assert get_guc("rls.is_admin") is None
+
+
+@pytest.fixture(params=[False, True], ids=["set_config", "set_local"])
+def guc_mode(request):
+    """Run a test under both GUC modes; the config reloads on ``setting_changed``."""
+    from django.test import override_settings  # noqa: PLC0415
+
+    with override_settings(
+        RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant", "USE_LOCAL_SET": request.param},
+    ):
+        yield request.param
+
+
+@pytest.mark.django_db(transaction=True)
+class TestNestedContextRestore:
+    """Nested blocks restore the outer *database* scope in both modes (#94, #102).
+
+    Every assertion reads the GUC with ``current_setting()`` (``get_guc``),
+    never through ``RLSManager``, because the ORM auto-scope filter would hide
+    a leaked database scope.
+    """
+
+    def test_tenant_in_tenant_restores_outer_tenant(self, guc_mode):
+        """tenant -> tenant: the outer tenant id is back after the inner block."""
+        from django.db import transaction  # noqa: PLC0415
+
+        with transaction.atomic(), tenant_context(101):
+            with tenant_context(202):
+                assert get_guc("rls.current_tenant") == "202"
+            assert get_guc("rls.current_tenant") == "101"
+            assert get_guc("rls.is_admin") == "false"
+            assert get_current_tenant_id() == 101
+
+    def test_admin_in_tenant_does_not_leak_bypass(self, guc_mode):
+        """tenant -> admin: the admin bypass must not outlive its block (the #94 leak)."""
+        from django.db import transaction  # noqa: PLC0415
+
+        with transaction.atomic(), tenant_context(101):
+            with admin_context():
+                assert get_guc("rls.is_admin") == "true"
+                assert get_guc("rls.current_tenant") is None
+            assert get_guc("rls.is_admin") == "false"
+            assert get_guc("rls.current_tenant") == "101"
+            assert get_current_tenant_id() == 101
+
+    def test_tenant_in_admin_restores_admin(self, guc_mode):
+        """admin -> tenant: admin scope is reinstated after the inner tenant block."""
+        from django.db import transaction  # noqa: PLC0415
+
+        with transaction.atomic(), admin_context():
+            with tenant_context(303):
+                assert get_guc("rls.is_admin") == "false"
+                assert get_guc("rls.current_tenant") == "303"
+            assert get_guc("rls.is_admin") == "true"
+            assert get_guc("rls.current_tenant") is None
+            assert get_current_tenant_id() is None
+
+    def test_outermost_block_clears_everything(self, guc_mode):
+        """With nothing set before, exiting the outermost block clears both GUCs."""
+        from django.db import transaction  # noqa: PLC0415
+
+        with transaction.atomic():
+            with tenant_context(101):
+                pass
+            assert get_guc("rls.is_admin") is None
+            assert get_guc("rls.current_tenant") is None
+
+    def test_python_exception_restores_outer_scope(self, guc_mode):
+        """A non-DB exception leaves the transaction healthy; the outer scope is restored."""
+        from django.db import transaction  # noqa: PLC0415
+
+        with transaction.atomic(), tenant_context(101):
+            with pytest.raises(ValueError, match="boom"), admin_context():
+                raise ValueError("boom")
+            assert get_guc("rls.is_admin") == "false"
+            assert get_guc("rls.current_tenant") == "101"
+
+    def test_db_error_surfaces_original_exception(self, guc_mode):
+        """A failed statement is reported as itself, not as 'transaction is aborted' (#102)."""
+        from django.db import DataError, connection, transaction  # noqa: PLC0415
+
+        with (
+            pytest.raises(DataError, match="division by zero"),
+            transaction.atomic(),
+            tenant_context(101),
+            connection.cursor() as cur,
+        ):
+            cur.execute("SELECT 1/0")
+        assert get_guc("rls.current_tenant") is None
+        assert get_current_tenant_id() is None
+
+    def test_db_error_inside_savepoint_surfaces_original_and_rollback_restores(self, guc_mode):
+        """Inside a nested atomic(): the savepoint rollback reinstates the outer scope."""
+        from django.db import DataError, connection, transaction  # noqa: PLC0415
+
+        with transaction.atomic(), tenant_context(101):
+            with (
+                pytest.raises(DataError, match="division by zero"),
+                transaction.atomic(),
+                admin_context(),
+                connection.cursor() as cur,
+            ):
+                cur.execute("SELECT 1/0")
+            assert get_guc("rls.is_admin") == "false"
+            assert get_guc("rls.current_tenant") == "101"
+            assert get_current_tenant_id() == 101
+
+    def test_integrity_error_is_not_masked(self, guc_mode, tenant_a):
+        """The realistic case: a constraint violation inside a tenant block stays visible."""
+        from django.db import IntegrityError, transaction  # noqa: PLC0415
+
+        from tests.test_app.models import Tenant  # noqa: PLC0415
+
+        with (
+            pytest.raises(IntegrityError),
+            transaction.atomic(),
+            tenant_context(tenant_a.pk),
+        ):
+            Tenant.objects.create(pk=tenant_a.pk, name="duplicate pk")

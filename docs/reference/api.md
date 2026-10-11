@@ -65,6 +65,8 @@ from `tenants/`.
 
 ::: django_rls_tenants.rls.guc.clear_guc
 
+::: django_rls_tenants.rls.guc.restore_guc
+
 ### Constraints
 
 ::: django_rls_tenants.rls.constraints.RLSConstraint

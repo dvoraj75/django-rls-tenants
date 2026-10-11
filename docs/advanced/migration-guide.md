@@ -138,6 +138,14 @@ A **drop-in upgrade** -- no code or data migration is required.
   whose `a` or `a.b` was `NULL` when `b` points at an RLS-protected model. If you worked
   around that with a separate query or `prefetch_related()`, the workaround can go; no
   settings or migrations change.
+- **Nested context managers restore the outer scope in `SET LOCAL` mode.** With
+  `USE_LOCAL_SET=True`, exiting an inner `tenant_context()` / `admin_context()` /
+  `rls_context()` / `bypass_flag()` now re-issues the previous values with `SET LOCAL`
+  instead of leaving the inner scope active until the transaction ends. Code that relied
+  on the inner value persisting after the block (a latent isolation defect, #94) must
+  keep the block open for as long as the scope is needed. A failed statement inside a
+  block now surfaces as its own exception rather than `InternalError: current transaction
+  is aborted` (#102); see [Context Managers](../guides/context-managers.md#exceptions-inside-a-context-block).
 
 ### From 1.3.0 to 1.3.1
 
