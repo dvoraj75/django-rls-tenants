@@ -2,11 +2,12 @@
 
 The most common scaling question about RLS is "what does the policy cost, and how do I
 index for it?" This page answers it with measured `EXPLAIN` output rather than theory.
-Every plan below was captured on PostgreSQL 16 against a 1,000,000-row `orders` table
+The plan excerpts below were captured on PostgreSQL 16 against a 1,000,000-row `orders` table
 spread evenly over 200 tenants (5,000 rows each), with one `order_items` row per order,
 running as a `NOSUPERUSER NOBYPASSRLS` role with the policy exactly as `RLSConstraint`
 generates it. Timings are warm-cache and single-run; they are there to show the *shape* of
-the difference, not to benchmark your hardware.
+the difference, not to benchmark your hardware. Repeated InitPlan nodes and some buffer
+statistics are omitted from the excerpts for readability.
 
 The short version:
 
@@ -16,17 +17,18 @@ The short version:
   what reaches the index. That is why the library runs **both**.
 - A composite index with `tenant_id` first turns per-tenant "hot" queries into a handful
   of index page reads.
-- Partial indexes keep working; just put `tenant_id` in the key columns, never in the
-  index predicate.
+- For partial indexes shared by all tenants, put `tenant_id` in the key columns and
+  a fixed application condition, such as `status = 'open'`, in the index predicate.
 
 ## Two filters, one query
 
-Inside a tenant context, every query on an `RLSProtectedModel` carries two tenant checks.
-The ORM adds one, PostgreSQL appends the other:
+A queryset built through `RLSManager` inside a tenant context carries two tenant checks.
+The manager adds one at queryset construction; PostgreSQL applies the other at execution.
+Build and evaluate the queryset inside the context:
 
 ```python
 with tenant_context(tenant_id=42):
-    Order.objects.all()
+    orders = list(Order.objects.all())
 ```
 
 ```sql
@@ -44,9 +46,9 @@ CASE WHEN (SELECT current_setting('rls.is_admin', true)) = 'true'
 END
 ```
 
-The two are redundant for correctness and complementary for performance. The policy is the
-guarantee: it applies to raw SQL, `dbshell`, migrations and anything else that skips the
-ORM (see [Security Model](../advanced/security.md)). The ORM predicate is the fast path:
+For this query, both checks enforce the same tenant match and complement each other for
+performance. The policy is the guarantee: it applies to raw SQL, `dbshell`, migrations
+and anything else that skips the ORM (see [Security Model](../advanced/security.md)). The ORM predicate is the fast path:
 it is the only one of the two the planner can use to pick an index. The rest of this page
 explains why, and what to build on top of it.
 
@@ -197,10 +199,12 @@ selects this index; the policy rides along as a filter that never rejects anythi
 
 Rules of thumb:
 
-- **Tenant first, always.** The ORM predicate is an equality on `tenant_id` in every
-  scoped query, and a B-tree can only use leading equality columns to narrow the scan.
-  `(created_at, tenant_id)` would force the planner to read every tenant's rows in date
-  order.
+- **Tenant first is a useful default for per-tenant queries.** Leading equality columns
+  followed by a range column narrow a B-tree scan. With `(created_at, tenant_id)`, a date
+  range can still narrow the scan, and the index can check the tenant before fetching
+  heap rows, but the scanned date range spans all tenants. Choose the order for your
+  actual filters and ordering; see PostgreSQL's
+  [multicolumn index rules](https://www.postgresql.org/docs/16/indexes-multicolumn.html).
 - **Then the columns your query filters on with equality, then the one it orders or
   ranges on.** `(tenant, status, -created_at)` would also absorb the `status = 'open'`
   filter above and remove the 22 discarded rows; whether that is worth a wider index
@@ -219,11 +223,10 @@ Rules of thumb:
 
 ### Partial indexes
 
-Partial indexes and RLS do not interfere with each other, with one caveat about *where*
-the tenant goes. The planner matches a partial index's `WHERE` clause against the
-**query's** predicates; the policy is never consulted for that match. So a partial index
-on a status flag works exactly as it would without RLS, as long as `tenant_id` is in the
-key columns so the ORM predicate can drive the scan:
+A partial index is usable when the planner can prove that the query's restrictions imply
+the index predicate. RLS policy clauses can contribute to that proof, but this library's
+admin-bypass `CASE` does not imply any fixed tenant value. For an index shared by all
+tenants, keep `tenant_id` in the key columns and use a fixed application condition:
 
 ```python
 class Meta(RLSProtectedModel.Meta):
@@ -248,24 +251,30 @@ Execution Time: 0.125 ms
 23 buffer hits; the `status = 'open'` condition has disappeared from the `Filter:` because
 the index predicate already proves it.
 
-What does **not** work is putting the tenant in the index predicate. An index such as
-`CREATE INDEX ... ON orders (created_at DESC) WHERE tenant_id = 42` is only chosen when
-the *query* contains `tenant_id = 42`. A policy-only query (raw SQL without an explicit
-predicate, with the GUC set to `42`) ignores it and falls back to a full scan and sort --
+A per-tenant partial index such as
+`CREATE INDEX ... ON orders (created_at DESC) WHERE tenant_id = 42` can work when the
+query explicitly contains `tenant_id = 42`. The library's policy alone cannot establish
+that condition: it also allows other tenants in admin mode, and its GUC value is a runtime
+parameter. In the measured policy-only query, PostgreSQL falls back to a full scan and sort --
 measured at 44 ms versus 0.07 ms for the same statement with the explicit `WHERE`. The GUC
-value is not a constant the planner can match against an index predicate. Per-tenant
-partial indexes are rarely a good idea anyway; a leading-tenant composite serves every
-tenant from one index.
+value is not a constant the planner can match against an index predicate. Prefer a
+leading-tenant composite for a shared workload; one index can serve every tenant.
+
+Prepared statements add another caveat: a generic plan for `status = $1` cannot assume
+that `$1` is always `'open'`, so it cannot use the status partial index above. A custom
+plan with the value available may use it. Check the plan with your production driver and
+preparation settings; see PostgreSQL's
+[partial index documentation](https://www.postgresql.org/docs/16/indexes-partial.html).
 
 ## The InitPlan: evaluating the GUC once per statement
 
 Since v1.3.0 (#57) the policy reads each GUC through an uncorrelated scalar sub-SELECT,
 `(SELECT current_setting('rls.current_tenant', true))`, instead of calling
 `current_setting()` inline. PostgreSQL hoists such a sub-SELECT into an **InitPlan**: a
-node that runs once before the scan starts and exposes its result as a parameter (`$0`,
-`$1`) to the filter. That is what the `InitPlan 1 (returns $0)` lines in every plan on
-this page are, and why the filter reads `$0 = 'true'` rather than
-`current_setting(...) = 'true'`.
+node evaluated at most once when its result is needed, exposing that result as a
+parameter (`$0`, `$1`) to the filter. An unused branch may leave an InitPlan unexecuted.
+That is what the `InitPlan 1 (returns $0)` lines in the plans represent, and why the filter
+reads `$0 = 'true'` rather than `current_setting(...) = 'true'`.
 
 The difference only shows when the policy filter actually runs on many rows -- a
 policy-only scan, an admin query, or a raw statement without its own tenant predicate.
@@ -308,9 +317,10 @@ Existing deployments keep their pre-1.3.0 policy until it is recreated; the
 ### `select_related()`
 
 The policy applies to every RLS-protected table in a join, and each one gets its own
-post-scan filter. If the ORM predicate only covered the outer table, the planner would
-have no indexable clause for the inner one. `TenantQuerySet.select_related()` therefore
-adds the tenant predicate to every named relation that targets an RLS-protected model:
+post-scan filter. Join keys can already provide indexable clauses, such as a lookup by
+primary key. Adding explicit tenant predicates also makes tenant indexes available when
+choosing the join order. `TenantQuerySet.select_related()` adds a tenant predicate to the
+RLS-protected model at the end of each explicitly named relation path:
 
 ```python
 with tenant_context(tenant_id=42):
@@ -361,7 +371,9 @@ other by primary or foreign key -- a nested loop over 5,000 rows. Without them i
 estimates 250,000 result rows (the 50 % guess, squared across two tables), sequentially
 scans both tables and builds an eight-batch hash that spills to temp files. Which side
 the planner starts from is its own choice; what the injected predicates buy is that
-*either* side can be entered through an index and that the row estimates are sane.
+*either* side can be entered through a tenant index. Estimates can still be inaccurate:
+the scoped plan estimates six joined rows but returns 5,000. The explicit predicates do
+not teach the planner the cross-table correlation between the two tenant columns.
 
 For nullable relations the injected predicate keeps the join a `LEFT OUTER JOIN`, so rows
 whose FK is `NULL` are not dropped (fixed for nested paths in 1.3.2, #79):
@@ -374,14 +386,17 @@ WHERE ("order_notes"."tenant_id" = 42
        AND ("orders"."tenant_id" = 42 OR "order_notes"."order_id" IS NULL))
 ```
 
-Only *named* relations get the predicate: `select_related()` with no arguments falls
-through to Django's default and relies on the policy alone for the joined tables.
+Only explicitly named paths get the predicate: to scope both `order` and
+`order__customer`, name both paths. `select_related()` with no arguments falls through
+to Django's default and relies on the policy for tenant filtering on the joined tables;
+primary-key join lookups can still use indexes.
 
 ### `prefetch_related()`
 
-`prefetch_related()` issues a separate query per relation, and each one goes through the
-related model's `RLSManager`. Under an active context that manager scopes the prefetch
-query the same way it scopes any other:
+`prefetch_related()` fetches related objects in separate queries. Reverse foreign-key
+and many-to-many prefetches normally use the related model's default manager. When that
+is `RLSManager` and a tenant context is active, the prefetch receives a tenant predicate.
+For example, prefetching an order's items produces:
 
 ```sql
 SELECT ... FROM "orders" WHERE "orders"."tenant_id" = 42
@@ -389,19 +404,39 @@ SELECT ... FROM "order_items"
 WHERE ("order_items"."tenant_id" = 42 AND "order_items"."order_id" IN (1, 2, 3, ...))
 ```
 
-Index the prefetched side as `(tenant, <fk>)` if the `IN` list gets long; the FK's own
-single-column index is usually sufficient because the `IN` on `order_id` is already highly
-selective.
+Forward foreign-key and one-to-one prefetches use Django's base manager by default,
+which is unscoped on `RLSProtectedModel`. Those queries remain RLS-protected and can use
+their primary-key `IN` lookup, but do not automatically add a tenant predicate. Supply
+an explicit queryset when you want one:
+
+```python
+from django.db.models import Prefetch
+
+with tenant_context(tenant_id=42):
+    items = list(
+        OrderItem.objects.prefetch_related(
+            Prefetch("order", queryset=Order.objects.all()),
+        )
+    )
+```
+
+The queryset passed to `Prefetch` must also be built inside the tenant context. See
+[Django's base manager behavior](https://docs.djangoproject.com/en/5.2/topics/db/managers/#base-managers).
+
+Consider indexing the prefetched side as `(tenant, <fk>)` if the `IN` list gets long;
+the FK's own single-column index is often sufficient when the `IN` on `order_id` is
+already highly selective.
 
 ### M2M through tables
 
-Through tables have no `tenant_id` column, so their policy is an `EXISTS` subquery
+Auto-created through tables have no `tenant_id` column, so their policy is an `EXISTS` subquery
 against each protected side (see
 [M2M Policy Generation](../advanced/architecture.md#m2m-policy-generation)). The subquery
-looks up the parent row by primary key and checks its `tenant_id`, which is a PK index
-probe per through-table row. The ORM predicate on the parent table still narrows the join
-from the parent side; there is nothing extra to index on the through table beyond the FK
-indexes Django already creates.
+matches the parent primary key and checks its `tenant_id`. PostgreSQL may use repeated
+PK probes or a hashed subplan; inspect the actual plan. Start with the FK indexes and
+unique pair index Django creates, then measure any additional indexes against the
+queries you run. Explicit through models can instead inherit `RLSProtectedModel` and
+have their own tenant column and indexes.
 
 ## Raw SQL
 
@@ -450,18 +485,23 @@ Execution Time: 0.038 ms
 `include_admin=False` matches nothing inside `admin_context()` (the tenant GUC is empty,
 so the fragment is `tenant_id = NULL`), which is the right behaviour for a tenant-scoped
 code path and the wrong one for an admin report. Admin reports want every tenant and
-therefore no tenant predicate at all; the policy's admin branch lets them through, and
-they pay the full-scan cost by design. Keep the default `include_admin=True` for
-statements that must behave identically in both contexts and are not on a hot path. See
+therefore no tenant predicate; the policy's admin branch lets them through. Other report
+filters can still use indexes, while a report over every row may need a full scan. Keep
+the default `include_admin=True` for statements that must behave identically in both
+contexts and are not on a hot path. See
 the [Raw SQL guide](raw-sql.md) for the helpers' full contract.
 
 ## How to measure
 
 1. **Connect as the application role.** `EXPLAIN` from a superuser session shows no
    policy at all. If `python manage.py check` reports `W005`, fix the role before
-   trusting any plan. In `psql`:
+   trusting any plan. `W005` checks only the default alias and skips unavailable
+   connections, so its absence alone is not proof. On the connection being measured,
+   verify that both role flags are false. In `psql`:
 
     ```sql
+    SELECT current_user, rolsuper, rolbypassrls
+    FROM pg_roles WHERE rolname = current_user;
     SELECT set_config('rls.current_tenant', '42', false);
     SELECT set_config('rls.is_admin', '', false);
     EXPLAIN (ANALYZE, BUFFERS) SELECT ... ;
@@ -479,29 +519,34 @@ the [Raw SQL guide](raw-sql.md) for the helpers' full contract.
         print(qs.explain(analyze=True, buffers=True))
     ```
 
-2. **Read the plan for three lines.** `Index Cond:` should contain `tenant_id = <value>`;
-   if it is missing, the ORM predicate did not reach the index (no context active, or no
-   index with `tenant_id` leading). `Filter:` holds the policy; a large
-   `Rows Removed by Filter:` under it means the policy is doing the narrowing and the
-   index is not. `InitPlan 1 (returns $0)` confirms the v1.3.0 policy form.
+2. **Read the access path and the full filter.** For the tenant-index examples above,
+   `Index Cond:` contains `tenant_id = <value>`. Its absence is not automatically a
+   problem: the planner may prefer a selective primary-key lookup, a partial index that
+   already implies the tenant, or a sequential scan for a large result set. Check the
+   generated SQL to confirm scoping, then compare rows examined and buffer usage.
+   `Rows Removed by Filter:` counts rejections by the entire filter, including status
+   and other application conditions, not just RLS. An InitPlan reading the GUC and
+   referenced by the policy confirms the v1.3.0 form.
 3. **Check the live policy body** with `python manage.py check_rls --verbose`, which
    prints each table's `USING` / `WITH CHECK` from `pg_policies`. A policy that still
    calls `current_setting()` inline predates v1.3.0 (see
    [Management Commands](management-commands.md#verbose-mode)).
-4. **Use realistic data.** With a few hundred rows PostgreSQL prefers a sequential scan
-   over any index and every plan looks the same. The plans on this page needed a
-   million rows to show the difference.
+4. **Use realistic data.** With a few hundred rows PostgreSQL may prefer a sequential scan
+   over an index. Match production row counts, tenant skew, selectivity and statistics;
+   the million-row dataset here is an example, not a minimum requirement.
 
 ## Checklist
 
-- [ ] The application connects as a `NOSUPERUSER NOBYPASSRLS` role (`W005` is quiet), so
+- [ ] The measured connection uses a verified `NOSUPERUSER NOBYPASSRLS` role, so
       the plans you measure are the plans production runs.
-- [ ] Every query on a protected model runs inside a context (middleware,
-      `tenant_context()`, `for_user()`), so the ORM adds `WHERE tenant_id = X`.
-      `STRICT_MODE=True` turns a forgotten context into an error instead of a full scan.
+- [ ] Tenant-scoped querysets are built and evaluated inside the tenant context, or
+      explicitly scoped with `for_user()`, so the ORM adds `WHERE tenant_id = X`.
+      `STRICT_MODE=True` rejects evaluation without a context; it does not add a missing
+      tenant predicate to a queryset built earlier.
 - [ ] Hot per-tenant queries have a composite index with `tenant` first, then the
       equality columns, then the sort column.
-- [ ] Partial indexes put `tenant` in the key columns, never in the `condition`.
+- [ ] Partial indexes shared by tenants put `tenant` in the key columns and use a
+      condition the planner can prove for the production query.
 - [ ] Per-tenant unique rules are `UniqueConstraint(fields=["tenant", ...])`.
 - [ ] `select_related()` names its relations; the joined RLS tables have their own
       `tenant` index.

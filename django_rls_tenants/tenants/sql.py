@@ -3,8 +3,9 @@
 Sometimes the ORM is not enough -- a hand-written report, a bulk ``UPDATE``, or
 a query against a view -- yet the query must still respect tenant isolation.
 RLS already enforces isolation at the database level, but adding the *same*
-predicate to a raw query makes the intent explicit, lets the planner use a
-tenant index, and keeps admin-bypass behaviour identical to the live policies.
+predicate to a raw query makes the intent explicit. The default fragment keeps
+admin-bypass behaviour identical to the live policies. Use ``include_admin=False``
+for a bare, indexable tenant match without the admin bypass.
 
 :func:`safe_tenant_sql` returns a ``WHERE``-clause fragment and
 :func:`current_tenant_value_sql` returns the current-tenant value expression.

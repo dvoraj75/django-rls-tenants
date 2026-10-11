@@ -4,12 +4,12 @@ Sometimes the ORM isn't the right tool: a hand-tuned analytics query, a bulk
 `UPDATE`, a report against a database view. Row-Level Security still protects
 those queries — RLS is enforced by PostgreSQL regardless of how the SQL is
 written — but it's good practice to *also* scope the query explicitly. Adding
-the tenant predicate yourself makes the intent obvious in code review and keeps
-admin-bypass behaviour identical to the live policies. It can also let the planner
-use a tenant index, but only in the bare `include_admin=False` form (or with the
-tenant id as a bind parameter); the admin-inclusive default is a post-scan filter,
-exactly like the policy. See [Raw SQL](performance.md#raw-sql) in the Performance &
-Indexing guide for the measured plans.
+the tenant predicate yourself makes the intent obvious in code review. The default
+`safe_tenant_sql()` fragment preserves admin-bypass behaviour, but its `OR` expression
+does not provide a tenant index condition. Use the bare `include_admin=False` form
+(or the tenant id as a bind parameter) for an indexable tenant match; this deliberately
+omits the admin bypass and keeps the statement scoped to one tenant. See
+[Raw SQL](performance.md#raw-sql) in the Performance & Indexing guide for the measured plans.
 
 `django-rls-tenants` gives you two helpers for this, built from the **exact same
 expression** the RLS policies use, so what you write by hand stays **semantically
