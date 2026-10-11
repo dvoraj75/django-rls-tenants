@@ -58,16 +58,11 @@ class TestFailClosed:
     def _disable_strict_mode(self, settings):
         """Disable strict mode so database-layer RLS is tested in isolation.
 
-        Clears the config cache so ``RLSTenantsConfig`` re-reads the
-        overridden setting, and restores it after the test.
+        The library re-reads ``RLS_TENANTS`` whenever Django's
+        ``setting_changed`` signal fires, so the pytest-django ``settings``
+        fixture is all that is needed (django-rls-tenants 1.3.2+).
         """
-        from django_rls_tenants.tenants.conf import rls_tenants_config
-
-        old_cache = rls_tenants_config._config_cache  # noqa: SLF001
         settings.RLS_TENANTS = {**settings.RLS_TENANTS, "STRICT_MODE": False}
-        rls_tenants_config._config_cache = None  # noqa: SLF001
-        yield
-        rls_tenants_config._config_cache = old_cache  # noqa: SLF001
 
     def test_notes_blocked_without_context(self, tenant_acme):
         from notes.models import Note
@@ -155,15 +150,6 @@ class TestStrictMode:
     ``NoTenantContextError`` instead of silently returning zero rows.
     This catches accidental unscoped queries during development.
     """
-
-    @pytest.fixture(autouse=True)
-    def _ensure_strict_mode(self):
-        """Clear config cache so STRICT_MODE=True is read from settings."""
-        from django_rls_tenants.tenants.conf import rls_tenants_config
-
-        rls_tenants_config._config_cache = None  # noqa: SLF001
-        yield
-        rls_tenants_config._config_cache = None  # noqa: SLF001
 
     def test_query_without_context_raises(self):
         """Querying without tenant context raises NoTenantContextError."""

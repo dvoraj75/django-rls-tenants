@@ -12,7 +12,6 @@ from django.test import override_settings
 
 from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.guc import get_guc
-from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import admin_context, tenant_context
 from django_rls_tenants.tenants.managers import _is_rls_protected, _resolve_related_model
 from django_rls_tenants.tenants.middleware import RLSTenantMiddleware
@@ -468,15 +467,9 @@ def _strict_settings():
 
 @pytest.fixture
 def _strict_mode():
-    """Enable strict mode and reset config cache for the test."""
+    """Enable strict mode for the test (the config reloads on ``setting_changed``)."""
     with _strict_settings():
-        rls_tenants_config._config_cache = None
-        rls_tenants_config._unknown_keys_checked = False
-        try:
-            yield
-        finally:
-            rls_tenants_config._config_cache = None
-            rls_tenants_config._unknown_keys_checked = False
+        yield
 
 
 class TestStrictModeDisabled:

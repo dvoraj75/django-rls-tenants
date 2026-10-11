@@ -351,21 +351,12 @@ class TestIsLocalMode:
                 "USE_LOCAL_SET": True,
             }
         ):
-            # Reset config cache so override is picked up
-            from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
-
-            rls_tenants_config._config_cache = None
-            rls_tenants_config._unknown_keys_checked = False
-            try:
-                with transaction.atomic(), tenant_context(tenant_a.pk):
-                    assert get_guc("rls.is_admin") == "false"
-                    assert get_guc("rls.current_tenant") == str(tenant_a.pk)
-                # After transaction, SET LOCAL values are gone
-                assert get_guc("rls.is_admin") is None
-                assert get_guc("rls.current_tenant") is None
-            finally:
-                rls_tenants_config._config_cache = None
-                rls_tenants_config._unknown_keys_checked = False
+            with transaction.atomic(), tenant_context(tenant_a.pk):
+                assert get_guc("rls.is_admin") == "false"
+                assert get_guc("rls.current_tenant") == str(tenant_a.pk)
+            # After transaction, SET LOCAL values are gone
+            assert get_guc("rls.is_admin") is None
+            assert get_guc("rls.current_tenant") is None
 
     @pytest.mark.django_db(transaction=True)
     def test_admin_context_is_local(self):
@@ -379,15 +370,7 @@ class TestIsLocalMode:
                 "USE_LOCAL_SET": True,
             }
         ):
-            from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
-
-            rls_tenants_config._config_cache = None
-            rls_tenants_config._unknown_keys_checked = False
-            try:
-                with transaction.atomic(), admin_context():
-                    assert get_guc("rls.is_admin") == "true"
-                # After transaction, SET LOCAL values are gone
-                assert get_guc("rls.is_admin") is None
-            finally:
-                rls_tenants_config._config_cache = None
-                rls_tenants_config._unknown_keys_checked = False
+            with transaction.atomic(), admin_context():
+                assert get_guc("rls.is_admin") == "true"
+            # After transaction, SET LOCAL values are gone
+            assert get_guc("rls.is_admin") is None

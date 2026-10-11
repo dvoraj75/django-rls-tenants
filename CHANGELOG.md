@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`override_settings(RLS_TENANTS=...)` was silently ignored** (#100).
+  `RLSTenantsConfig` cached `settings.RLS_TENANTS` on first read and never
+  invalidated it, so `override_settings` (context manager or decorator),
+  `SimpleTestCase.settings()` and pytest-django's `settings` fixture had no effect on
+  the library once any setting had been read: a test flipping `STRICT_MODE` or
+  `USE_LOCAL_SET` ran with the original value and passed for the wrong reason. The app
+  config now connects Django's `setting_changed` signal and reloads the config whenever
+  `RLS_TENANTS` changes (the unknown-key typo check re-runs too). A public
+  `rls_tenants_config.reload()` exposes the same hook. The library's own tests and the
+  example suite drop their manual `_config_cache = None` workarounds.
+
 ## [1.3.1] - 2026-10-11
 
 ### Added

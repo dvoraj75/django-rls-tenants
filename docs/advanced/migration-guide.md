@@ -123,6 +123,17 @@ migration that assigns the correct tenant to each existing record.
 
 ## Upgrading django-rls-tenants
 
+### From 1.3.1 to 1.3.2
+
+A **drop-in upgrade** -- no code or data migration is required.
+
+- **Per-test overrides of `RLS_TENANTS` now work.** The config reloads on Django's
+  `setting_changed` signal, so `override_settings(RLS_TENANTS=...)` and pytest-django's
+  `settings` fixture take effect immediately. Earlier versions cached the dict for the
+  life of the process; if your tests cleared `rls_tenants_config._config_cache` by hand
+  to get around that, delete the workaround. See
+  [Testing](../guides/testing.md#overriding-rls_tenants-per-test).
+
 ### From 1.3.0 to 1.3.1
 
 A **drop-in upgrade** -- no code or data migration is required. The release fixes the

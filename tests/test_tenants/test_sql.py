@@ -24,21 +24,14 @@ if TYPE_CHECKING:
 
 @contextlib.contextmanager
 def _override_rls_tenants(**rls_tenants: object) -> Iterator[None]:
-    """``override_settings(RLS_TENANTS=...)`` that also resets the cached config.
+    """``override_settings(RLS_TENANTS=...)`` with the test ``TENANT_MODEL`` filled in.
 
-    ``rls_tenants_config`` caches the settings dict on first read and has no
-    settings-changed hook, so the cache must be cleared before and after the
-    override for the new values to take effect (same pattern as test_context.py).
+    No cache handling is needed: ``rls_tenants_config`` reloads itself on
+    Django's ``setting_changed`` signal (#100).
     """
     rls_tenants.setdefault("TENANT_MODEL", "test_app.Tenant")
     with override_settings(RLS_TENANTS=rls_tenants):
-        rls_tenants_config._config_cache = None
-        rls_tenants_config._unknown_keys_checked = False
-        try:
-            yield
-        finally:
-            rls_tenants_config._config_cache = None
-            rls_tenants_config._unknown_keys_checked = False
+        yield
 
 
 # Default test settings: GUC_PREFIX="rls", TENANT_PK_TYPE="int".

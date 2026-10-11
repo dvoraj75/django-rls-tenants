@@ -120,11 +120,24 @@ class RLSTenantsConfig:
         self._config_cache: dict[str, Any] | None = None
         self._unknown_keys_checked: bool = False
 
+    def reload(self) -> None:
+        """Discard the cached ``RLS_TENANTS`` dict so the next read hits ``settings``.
+
+        The app config connects this to Django's ``setting_changed`` signal, so
+        ``override_settings(RLS_TENANTS=...)``, ``@override_settings`` on a test
+        class and pytest-django's ``settings`` fixture all take effect without
+        touching the cache by hand. The unknown-key check runs again on the
+        next read as well, so a typo introduced by an override is still reported.
+        """
+        self._config_cache = None
+        self._unknown_keys_checked = False
+
     def _get(self, key: str, default: Any = None) -> Any:
         """Read a key from ``settings.RLS_TENANTS``.
 
         Caches the config dict on first access so repeated property
-        reads don't call ``getattr(settings, ...)`` each time.
+        reads don't call ``getattr(settings, ...)`` each time. The cache
+        is dropped by :meth:`reload`, which fires on ``setting_changed``.
         On first access, warns about any unrecognized keys (likely typos).
 
         Raises:

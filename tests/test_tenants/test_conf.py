@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import warnings as w
+from unittest.mock import patch
 
 import pytest
 from django.test import override_settings
 
-from django_rls_tenants.exceptions import RLSConfigurationError
-from django_rls_tenants.tenants.conf import RLSTenantsConfig
+from django_rls_tenants.exceptions import NoTenantContextError, RLSConfigurationError
+from django_rls_tenants.tenants.conf import RLSTenantsConfig, rls_tenants_config
+from tests.test_app.models import Order
 
 
 class TestRLSTenantsConfig:
@@ -132,3 +134,105 @@ class TestRLSTenantsConfig:
                 w.simplefilter("always")
                 _ = conf.TENANT_MODEL  # triggers _warn_unknown_keys
             assert any("BOGUS_KEY" in str(warning.message) for warning in caught)
+
+
+class TestSettingChangedReload:
+    """The module-level singleton follows ``override_settings`` (#100).
+
+    Before 1.3.2 ``RLSTenantsConfig`` cached ``settings.RLS_TENANTS`` on first
+    read and never invalidated it, so every per-test override of the setting
+    was silently ignored. The app config now reloads the singleton whenever
+    Django's ``setting_changed`` signal fires for ``RLS_TENANTS``.
+    """
+
+    def test_override_settings_is_seen_by_singleton(self):
+        """A context-manager override takes effect and is undone on exit."""
+        assert rls_tenants_config.STRICT_MODE is False
+        with override_settings(
+            RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant", "STRICT_MODE": True},
+        ):
+            assert rls_tenants_config.STRICT_MODE is True
+        assert rls_tenants_config.STRICT_MODE is False
+
+    @override_settings(
+        RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant", "USE_LOCAL_SET": True},
+    )
+    def test_decorator_override_is_seen_by_singleton(self):
+        """The decorator form fires ``setting_changed`` on enter as well."""
+        assert rls_tenants_config.USE_LOCAL_SET is True
+
+    def test_pytest_django_settings_fixture_is_seen_by_singleton(self, settings):
+        """pytest-django's ``settings`` fixture goes through the same signal."""
+        settings.RLS_TENANTS = {"TENANT_MODEL": "test_app.Tenant", "GUC_PREFIX": "other"}
+        assert rls_tenants_config.GUC_PREFIX == "other"
+        assert rls_tenants_config.GUC_CURRENT_TENANT == "other.current_tenant"
+
+    def test_nested_overrides_restore_each_level(self):
+        """Exiting an inner override restores the outer value, not the original."""
+        outer = {"TENANT_MODEL": "test_app.Tenant", "GUC_PREFIX": "outer"}
+        inner = {"TENANT_MODEL": "test_app.Tenant", "GUC_PREFIX": "inner"}
+        with override_settings(RLS_TENANTS=outer):
+            assert rls_tenants_config.GUC_PREFIX == "outer"
+            with override_settings(RLS_TENANTS=inner):
+                assert rls_tenants_config.GUC_PREFIX == "inner"
+            assert rls_tenants_config.GUC_PREFIX == "outer"
+        assert rls_tenants_config.GUC_PREFIX == "rls"
+
+    def test_unrelated_setting_change_keeps_cache(self):
+        """Only ``RLS_TENANTS`` triggers a reload; other settings leave the cache alone."""
+        _ = rls_tenants_config.TENANT_MODEL  # prime the cache
+        cached = rls_tenants_config._config_cache
+        assert cached is not None
+        with override_settings(DEBUG=True):
+            assert rls_tenants_config._config_cache is cached
+
+    def test_app_registry_repopulation_does_not_duplicate_reload(self, settings):
+        """Repeated app setup must keep one reload per settings-change signal."""
+        # Isolate the unrelated handlers that ready() also connects.
+        with (
+            patch("django.core.signals.request_finished.connect"),
+            patch("django.db.backends.signals.connection_created.connect"),
+        ):
+            for _ in range(2):
+                with override_settings(INSTALLED_APPS=settings.INSTALLED_APPS):
+                    pass
+
+        with patch.object(rls_tenants_config, "reload", wraps=rls_tenants_config.reload) as reload:
+            with override_settings(
+                RLS_TENANTS={**settings.RLS_TENANTS, "STRICT_MODE": True},
+            ):
+                assert rls_tenants_config.STRICT_MODE is True
+                assert reload.call_count == 1
+            assert rls_tenants_config.STRICT_MODE is False
+            assert reload.call_count == 2
+
+    def test_unknown_key_warning_fires_again_after_override(self):
+        """The typo check re-runs after a reload instead of staying silenced forever."""
+        _ = rls_tenants_config.TENANT_MODEL  # first read: unknown-key check already ran
+        with (
+            override_settings(RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant", "TYPO_KEY": 1}),
+            w.catch_warnings(record=True) as caught,
+        ):
+            w.simplefilter("always")
+            _ = rls_tenants_config.TENANT_MODEL
+        assert any("TYPO_KEY" in str(warning.message) for warning in caught)
+
+    def test_reload_discards_cache(self):
+        """``reload()`` is the public hook the signal handler uses."""
+        conf = RLSTenantsConfig()
+        _ = conf.TENANT_MODEL
+        assert conf._config_cache is not None
+        conf.reload()
+        assert conf._config_cache is None
+        assert conf._unknown_keys_checked is False
+
+    @pytest.mark.django_db
+    def test_strict_mode_guard_fires_through_override_settings(self):
+        """End to end: the documented testing-guide pattern now actually raises."""
+        with (
+            override_settings(
+                RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant", "STRICT_MODE": True},
+            ),
+            pytest.raises(NoTenantContextError, match="strict mode"),
+        ):
+            Order.objects.count()

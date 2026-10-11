@@ -19,7 +19,7 @@ class DjangoRlsTenantsConfig(AppConfig):
 
     def ready(self) -> None:
         """Connect signal handlers and validate configuration on startup."""
-        from django.core.signals import request_finished  # noqa: PLC0415
+        from django.core.signals import request_finished, setting_changed  # noqa: PLC0415
         from django.db.backends.signals import connection_created  # noqa: PLC0415
 
         from django_rls_tenants.rls.guc import clear_guc, set_guc  # noqa: PLC0415
@@ -123,6 +123,26 @@ class DjangoRlsTenantsConfig(AppConfig):
                 )
 
         connection_created.connect(_set_guc_on_new_connection, weak=False)
+
+        # ``RLSTenantsConfig`` caches ``settings.RLS_TENANTS`` after the first
+        # read. Without this hook, ``override_settings(RLS_TENANTS=...)`` and
+        # pytest-django's ``settings`` fixture would be silently ignored for
+        # the rest of the process (#100). Django sends ``setting_changed`` on
+        # both enter and exit of an override, so the cache is rebuilt both ways.
+        def _reload_config_on_setting_changed(
+            sender: object,  # noqa: ARG001  -- Django signal API
+            setting: str,
+            **kwargs: object,  # noqa: ARG001  -- Django signal API
+        ) -> None:
+            if setting == "RLS_TENANTS":
+                rls_tenants_config.reload()
+
+        # Tests that override INSTALLED_APPS can call ready() more than once.
+        setting_changed.connect(
+            _reload_config_on_setting_changed,
+            weak=False,
+            dispatch_uid="django_rls_tenants.reload_config_on_setting_changed",
+        )
 
         # Import checks module so @register decorators are activated.
         import django_rls_tenants.tenants.checks  # noqa: PLC0415, F401

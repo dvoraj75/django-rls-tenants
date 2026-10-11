@@ -9,7 +9,6 @@ from django.db.backends.signals import connection_created
 from django.test import override_settings
 
 from django_rls_tenants.rls.guc import get_guc, set_guc
-from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.middleware import (
     _clear_gucs_set_flag,
     _mark_gucs_set,
@@ -73,8 +72,7 @@ class TestRequestFinishedSafetyNet:
         """Handler does NOT clear GUCs when USE_LOCAL_SET=True.
 
         The closure captures the ``rls_tenants_config`` singleton, which
-        reads settings dynamically. We must invalidate the config cache
-        so the singleton re-reads from the overridden settings.
+        reloads itself when ``override_settings`` fires ``setting_changed``.
         """
         set_guc("rls.is_admin", "true")
         set_guc("rls.current_tenant", "42")
@@ -86,14 +84,10 @@ class TestRequestFinishedSafetyNet:
                 "USE_LOCAL_SET": True,
             },
         ):
-            rls_tenants_config._config_cache = None
             request_finished.send(sender=self.__class__)
             # Assert inside override context — GUCs should still be set
             assert get_guc("rls.is_admin") == "true"
             assert get_guc("rls.current_tenant") == "42"
-
-        # Restore cache so other tests see the real settings
-        rls_tenants_config._config_cache = None
 
     def test_still_clears_flag_when_use_local_set_true(self):
         """Flag is cleared even when USE_LOCAL_SET=True skips GUC cleanup."""
@@ -105,10 +99,8 @@ class TestRequestFinishedSafetyNet:
                 "USE_LOCAL_SET": True,
             },
         ):
-            rls_tenants_config._config_cache = None
             request_finished.send(sender=self.__class__)
 
-        rls_tenants_config._config_cache = None
         assert _were_gucs_set() is False
 
     def test_clears_flag_even_on_exception(self):

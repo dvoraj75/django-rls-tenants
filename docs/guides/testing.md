@@ -217,6 +217,35 @@ def test_strict_mode_raises_without_context():
         Order.objects.count()
 ```
 
+## Overriding `RLS_TENANTS` Per Test
+
+Any of Django's override mechanisms works for `RLS_TENANTS`: the `override_settings`
+context manager or decorator, `SimpleTestCase.settings()`, and pytest-django's
+`settings` fixture. The library listens for Django's `setting_changed` signal and
+re-reads the dict the next time a setting is accessed, so a test can flip runtime
+options such as `STRICT_MODE` or `USE_LOCAL_SET` without manually clearing the config
+cache. Assign a new dict, preserving any other required settings:
+
+```python
+def test_local_set_mode(settings, tenant_a):
+    settings.RLS_TENANTS = {**settings.RLS_TENANTS, "USE_LOCAL_SET": True}
+    with transaction.atomic(), rls_as_tenant(tenant_id=tenant_a.pk):
+        ...
+```
+
+Reloading the config does not rebuild model fields or database RLS policies.
+Overrides of schema-related options such as `TENANT_MODEL`, `TENANT_FK_FIELD`,
+`TENANT_PK_TYPE` or `GUC_PREFIX` require matching models and policies. In particular,
+changing `GUC_PREFIX` alone makes the library set different variables from those
+read by the existing policies; see the
+[`GUC_PREFIX` configuration guidance](../getting-started/configuration.md#guc_prefix).
+
+!!! warning "Before 1.3.2"
+    Versions up to 1.3.1 cached `RLS_TENANTS` on first read and never invalidated it,
+    so these overrides were silently ignored and the test ran with the original
+    values. If a test suite worked around that by clearing
+    `rls_tenants_config._config_cache`, the workaround can be removed.
+
 ## Multi-Database Testing
 
 All test helpers accept a `using` parameter:
