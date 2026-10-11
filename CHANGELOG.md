@@ -41,7 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project and test app use), the Quick Start output matches a real run, and a new
   *Protecting the User Model* section in the Protecting Models guide documents the
   opt-in case: the auth through tables get RLS, `RLSM2MConstraint` has no
-  `extra_bypass_flags`, and group/permission lookups need a tenant or admin context.
+  `extra_bypass_flags`, and fresh group/permission queries need a tenant or admin
+  context. Protected auth users explicitly inherit the RLS `Meta` constraint, the
+  authentication backend covers session reloads via `get_user()`, and the guide notes
+  Django's permission cache and superuser behavior.
 - **Docs: the roadmap is reachable from the site nav** (#82). `development/roadmap.md`
   was committed but missing from the Development section of `mkdocs.yml`. It is now
   listed after the changelog and gains a `v1.3.x — Patch cycle` entry so the public

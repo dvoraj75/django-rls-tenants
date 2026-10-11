@@ -89,24 +89,39 @@ During authentication, the user record must be read before the tenant context is
 A bypass flag allows the auth backend to read user records without setting a full admin
 context:
 
+The backend must cover both credential authentication and `get_user()`, which Django
+uses to reload the user from a session on subsequent requests. Subclassing
+`ModelBackend` preserves Django's password checks, inactive-user rejection, and
+permission methods:
+
 ```python title="myapp/auth.py"
+from django.contrib.auth.backends import ModelBackend
 from django_rls_tenants.tenants.bypass import bypass_flag
 
 
-class RLSAuthBackend:
-    def authenticate(self, request, username=None, password=None):
-        from myapp.models import User
-
+class RLSAuthBackend(ModelBackend):
+    def authenticate(self, request, username=None, password=None, **kwargs):
         with bypass_flag("rls.auth_bypass"):
-            try:
-                user = User.objects.get(username=username)
-            except User.DoesNotExist:
-                return None
+            return super().authenticate(request, username, password, **kwargs)
 
-        if user.check_password(password):
-            return user
-        return None
+    def get_user(self, user_id):
+        with bypass_flag("rls.auth_bypass"):
+            return super().get_user(user_id)
 ```
+
+Configure it in your settings:
+
+```python title="settings.py"
+AUTHENTICATION_BACKENDS = ["myapp.auth.RLSAuthBackend"]
+```
+
+The user model's `RLSConstraint` must include `extra_bypass_flags=["rls.auth_bypass"]`.
+This handles user reads only. Authentication can also write to the user table (for
+example, password hash upgrades and the `last_login` update triggered by `login()`).
+Those operations need an explicit tenant or admin context. Group and permission
+queries have separate context requirements when the user model inherits
+`RLSProtectedModel`; see
+[Protecting the User Model](protecting-models.md#protecting-the-user-model).
 
 ## Security Implications
 

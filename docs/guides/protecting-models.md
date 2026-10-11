@@ -79,6 +79,9 @@ class User(AbstractUser, RLSProtectedModel):
         related_name="users",
     )
 
+    class Meta(AbstractUser.Meta, RLSProtectedModel.Meta):
+        pass
+
     @property
     def is_tenant_admin(self) -> bool:
         return self.is_superuser
@@ -210,10 +213,17 @@ be included and RLS will not be applied to the table.
 The [Quick Start](../getting-started/quickstart.md) and the
 [User Integration](user-integration.md) guide keep `User` a plain `AbstractUser`. The
 `TenantUser` protocol only needs the two properties, and Django reads user rows itself
-(login, session loading, permission checks) before any tenant context exists.
+during login and session loading before the request's tenant context is established.
 
 Inheriting from `RLSProtectedModel` as well, `class User(AbstractUser, RLSProtectedModel)`,
-is supported but is an opt-in with consequences beyond the `User` table:
+requires explicit `Meta` inheritance, as in the [Custom ForeignKey](#custom-foreignkey)
+example above. Without `class Meta(AbstractUser.Meta, RLSProtectedModel.Meta)`, Django
+inherits `AbstractUser.Meta` alone, so the user table has no `RLSConstraint` and remains
+unprotected even though the auth through tables are registered for RLS. The model keeps
+Django's `UserManager`; its user queries rely on database RLS rather than the automatic
+ORM scoping provided by `RLSManager`.
+
+This is an opt-in with consequences beyond the `User` table:
 
 !!! warning "An RLS-protected `User` also protects Django's auth through tables"
     `AbstractUser` declares the `groups` and `user_permissions` many-to-many fields.
@@ -229,20 +239,30 @@ is supported but is an opt-in with consequences beyond the `User` table:
 
 What this means in practice:
 
-1. **Reads of `User` before the request context is set need a bypass.** The auth backend
-   loads the user row before `RLSTenantMiddleware` runs. Add `extra_bypass_flags` to the
-   `RLSConstraint` (next section) and set the flag in your backend, as shown in
-   [Use Case: Authentication](bypass-mode.md#use-case-authentication).
+1. **Reads of `User` before the request context is set need a bypass.** Evaluating
+   Django's lazy `request.user` calls the auth backend before `RLSTenantMiddleware` can
+   establish the tenant context. Add `extra_bypass_flags` to the `RLSConstraint` (next
+   section) and set the flag in both `authenticate()` and `get_user()`, as shown in
+   [Use Case: Authentication](bypass-mode.md#use-case-authentication). Auth writes such
+   as `last_login` updates also need a tenant or admin context; a read bypass does not
+   allow them.
 2. **Group and permission lookups need a tenant or admin context.** `RLSM2MConstraint`
    has no `extra_bypass_flags` option; its policy only passes for the admin GUC or when
-   the referenced user belongs to the current tenant. Outside a context
-   `user.has_perm()` is therefore `False` and `user.groups` is empty. Inside a request the
-   middleware provides one; in scripts, shells and Celery tasks wrap the call in
-   `tenant_context()` or `admin_context()`. Users with `tenant=None` who are not
-   `is_tenant_admin` never see their own groups or permissions.
+   the referenced user belongs to the current tenant. Fresh database queries for group
+   membership and direct permissions return no rows without that context. Inside an
+   authenticated request the middleware provides one; in scripts, shells and Celery
+   tasks evaluate the queries inside `tenant_context()` or `admin_context()`. Users
+   with `tenant=None` need an admin context to read those relations.
+3. **Permission results can outlive the RLS context.** Django's `ModelBackend` caches
+   permissions on the user instance. A lookup before entering a context can cache an
+   empty result, and a result loaded inside a context can remain available after it
+   exits. Use a fresh user instance when changing contexts. Also, active Django
+   superusers pass `has_perm()` without querying these tables, and custom backends may
+   grant permissions independently of them.
 
-The library's own `example/` project and `tests/test_app` keep `User` a plain
-`AbstractUser`; the test app's separate `ProtectedUser` model covers the opt-in case.
+The library's `example/` user and `tests/test_app.AdminUser` keep a plain `AbstractUser`.
+The test app's separate `ProtectedUser` exercises extra bypass flags on an ordinary
+RLS-protected model; it does not inherit Django's auth fields.
 
 ## Extra Bypass Flags
 
@@ -253,10 +273,10 @@ the tenant context is set), you can add custom bypass flags to the RLS policy:
 from django_rls_tenants.rls import RLSConstraint
 
 
-class User(RLSProtectedModel):
-    # ...
+class User(AbstractUser, RLSProtectedModel):
+    # Keep the nullable tenant FK and protocol properties from Custom ForeignKey.
 
-    class Meta(RLSProtectedModel.Meta):
+    class Meta(AbstractUser.Meta, RLSProtectedModel.Meta):
         constraints = [
             RLSConstraint(
                 field="tenant",
