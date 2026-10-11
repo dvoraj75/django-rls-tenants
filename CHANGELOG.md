@@ -55,23 +55,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connection-pooling guide recommended. Django's `ATOMIC_REQUESTS` wraps only the view
   callable, so `process_request` ran in autocommit and `SET LOCAL` raised
   `RuntimeError: Cannot use SET LOCAL ... outside a transaction`. The middleware now
-  owns the transaction when `USE_LOCAL_SET=True`: it opens `transaction.atomic()` on
-  every alias in `RLS_TENANTS["DATABASES"]` around the rest of the chain and the view
-  for authenticated requests, so the GUCs cover the whole request and vanish at
-  commit/rollback. A view that raises rolls that transaction back (an explicit error
-  response commits). Exception-handling middleware and function-based middleware
-  factories must precede `RLSTenantMiddleware`;
-  unsafe ordering raises `RLSConfigurationError` instead of allowing handled exceptions
-  to commit partial writes. Rollback is deferred until transaction exit so error handlers
-  can query after non-database exceptions; their writes also roll back. Directly escaping
-  exceptions clean up request state in `finally`. Async detection supports Django 4.2
-  and 5.0 as well as newer versions. `ATOMIC_REQUESTS` is no longer required
-  (it nests as a savepoint if kept). The default `USE_LOCAL_SET=False` path is unchanged.
-  Under ASGI the mode is
-  refused with a clear `RLSConfigurationError` instead of the opaque `RuntimeError`
-  (native async support is v1.4.0). System check `W004` no longer recommends
-  `ATOMIC_REQUESTS`. New end-to-end tests drive `django.test.Client` through the real
-  middleware stack with and without `ATOMIC_REQUESTS`.
+  owns the transaction when `USE_LOCAL_SET=True`: for authenticated requests it opens
+  `transaction.atomic()` on every alias in `RLS_TENANTS["DATABASES"]` around the rest of
+  the chain and the view, so the GUCs cover the whole request and vanish at
+  commit/rollback. `ATOMIC_REQUESTS` is no longer required (it nests as a savepoint if
+  kept); the default `USE_LOCAL_SET=False` path is unchanged.
+    - A view that raises rolls the request transaction back; an explicit error response
+      commits. The rollback is applied when the transaction exits, not in
+      `process_exception`, so error handlers can still query after a non-database
+      exception such as `Http404` (their writes roll back too). An exception that
+      escapes the middleware chain directly still cleans up the request state.
+    - Exception-handling middleware, and function-based middleware factories, must be
+      listed *before* `RLSTenantMiddleware`: Django runs `process_exception` hooks in
+      reverse order, and a later handler that returns a response would skip the
+      rollback hook and commit partial writes. Unsafe ordering raises
+      `RLSConfigurationError` when the middleware is loaded.
+    - Under ASGI the mode is refused with a clear `RLSConfigurationError` instead of the
+      opaque `RuntimeError` (native async support is v1.4.0). Async detection no longer
+      relies on `MiddlewareMixin.async_mode`, which Django 4.2 and 5.0 do not have.
+    - System check `W004` no longer recommends `ATOMIC_REQUESTS`.
+    - New end-to-end tests drive `django.test.Client` through the real middleware stack
+      with and without `ATOMIC_REQUESTS`, including database-backed error handlers,
+      handled view failures, unsafe middleware ordering and raw-SQL tenant isolation.
 
 ### Removed
 

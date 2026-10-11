@@ -69,7 +69,7 @@ transaction simply nests as a savepoint inside the middleware's.
     the request ends; and `@non_atomic_requests` has no effect, because the middleware's
     transaction encloses the view anyway. A streaming response iterates its body after
     the transaction has ended, so queries made while streaming run without tenant
-    context (fail-closed: no rows) -- establish a context inside the generator. The
+    context (fail-closed: no rows) -- establish a context inside the generator.
     Place middleware implementing `process_exception` before `RLSTenantMiddleware`,
     so handled view exceptions cannot bypass rollback; unsafe ordering raises
     `RLSConfigurationError`. Error handling runs inside the transaction too, and writes
