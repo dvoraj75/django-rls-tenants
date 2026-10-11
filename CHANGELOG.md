@@ -29,6 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state the real cause. The Raw SQL guide now says that only the
   `safe_tenant_sql(include_admin=False)` fragment (or a bind parameter) reaches the
   index; the admin-inclusive default plans as a sequential scan like the policy. (#83)
+- **Test-coverage backfill for v1.3.0 code paths** (#84). Regression guards for wiring
+  that the existing suite would not have caught if removed: the three error-hint
+  constants are pinned verbatim (`tests/test_tenants/test_errors.py`); `check_rls_config()`
+  is tested at the orchestrator level (every `_check_*` helper is aggregated, and W006 /
+  W008 / W009 surface from a broken config); `RLSTenantModelAdmin.save_model` tenant-id
+  normalisation is pinned DB-free for int and UUID primary keys; custom
+  `rls_session_key` / `rls_tenant_query_param` names round-trip through selection sync,
+  effective-tenant resolution, the view context and the switcher filter; and Celery
+  canvas propagation (chain / group / chord) is covered under `admin_context()` plus the
+  current-task fallback with a tenant header but no admin key. No library code changed.
 
 ### Fixed
 

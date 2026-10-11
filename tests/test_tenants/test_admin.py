@@ -20,14 +20,17 @@ independently drive the RLS role the mixin reads.
 
 from __future__ import annotations
 
+import uuid
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any, ClassVar
+from unittest.mock import patch
 
 import django
 import pytest
 from django.contrib import admin
 from django.core.exceptions import PermissionDenied
+from django.db import models
 from django.test import RequestFactory, override_settings
 
 from django_rls_tenants.tenants import admin as admin_mod
@@ -305,6 +308,128 @@ class TestSyncTenantSelectionNoDb:
         request = _request(_admin_user(), session={"rls_admin_tenant": "1"})
         _order_admin()._sync_tenant_selection(request)
         assert request.session["rls_admin_tenant"] == "1"
+
+
+# ---------------------------------------------------------------------------
+# save_model tenant stamping (no DB)
+# ---------------------------------------------------------------------------
+
+
+# Stub out the real save so no row is written; the tests only inspect the
+# in-memory stamping that happens before the base ``save_model`` runs.
+_BASE_SAVE_MODEL = "django.contrib.admin.ModelAdmin.save_model"
+
+
+class TestSaveModel:
+    """save_model normalises the effective tenant to the FK target's Python type."""
+
+    def test_session_selection_is_coerced_to_int_pk(self):
+        """The switcher persists a string; the stamped value is the pk's int type."""
+        request = _request(_admin_user(), session={"rls_admin_tenant": "9"})
+        obj = Order(product="p", amount=1)
+        with patch(_BASE_SAVE_MODEL) as base_save:
+            _order_admin().save_model(request, obj, form=None, change=False)
+        assert obj.tenant_id == 9
+        assert isinstance(obj.tenant_id, int)
+        base_save.assert_called_once_with(request, obj, None, False)
+
+    def test_scoped_user_tenant_is_stamped(self):
+        """A scoped user's own tenant id is stamped onto the object."""
+        request = _request(_scoped_user(7))
+        obj = Order(product="p", amount=1)
+        with patch(_BASE_SAVE_MODEL):
+            _order_admin().save_model(request, obj, form=None, change=False)
+        assert obj.tenant_id == 7
+
+    def test_uuid_pk_is_coerced_via_target_field(self):
+        """A UUID tenant pk comes back as ``uuid.UUID`` (not the raw session string)."""
+        tenant_uuid = uuid.uuid4()
+        request = _request(_admin_user(), session={"rls_admin_tenant": str(tenant_uuid)})
+        obj = Order(product="p", amount=1)
+        fake_fk = SimpleNamespace(target_field=models.UUIDField(), attname="tenant_id")
+        with (
+            patch.object(Order._meta, "get_field", return_value=fake_fk) as get_field,
+            patch(_BASE_SAVE_MODEL),
+        ):
+            _order_admin().save_model(request, obj, form=None, change=False)
+        get_field.assert_called_once_with("tenant")
+        assert obj.tenant_id == tenant_uuid
+        assert isinstance(obj.tenant_id, uuid.UUID)
+
+    def test_admin_without_selection_leaves_field_untouched(self):
+        """A global admin viewing all keeps whatever the form set (here: nothing)."""
+        request = _request(_admin_user())
+        obj = Order(product="p", amount=1)
+        with patch(_BASE_SAVE_MODEL) as base_save:
+            _order_admin().save_model(request, obj, form=None, change=True)
+        assert obj.tenant_id is None
+        base_save.assert_called_once_with(request, obj, None, True)
+
+
+# ---------------------------------------------------------------------------
+# Custom rls_session_key / rls_tenant_query_param round-trip
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+class TestCustomKeysRoundTrip:
+    """Non-default key names drive _sync_tenant_selection and _effective_tenant_id."""
+
+    def _custom_admin(self) -> RLSTenantModelAdmin:
+        return _order_admin(rls_session_key="x_tenant", rls_tenant_query_param="org")
+
+    def test_custom_param_stores_under_custom_session_key(self, tenant_a):
+        adm = self._custom_admin()
+        request = _request(_admin_user(), get={"org": str(tenant_a.pk)})
+        adm._sync_tenant_selection(request)
+        assert request.session == {"x_tenant": str(tenant_a.pk)}
+        assert adm._effective_tenant_id(request) == str(tenant_a.pk)
+
+    def test_default_param_is_ignored_with_custom_param(self, tenant_a):
+        """The default ``rls_tenant`` query param does nothing once the param is renamed."""
+        adm = self._custom_admin()
+        request = _request(_admin_user(), get={"rls_tenant": str(tenant_a.pk)})
+        adm._sync_tenant_selection(request)
+        assert request.session == {}
+        assert adm._effective_tenant_id(request) is None
+
+    def test_default_session_key_is_ignored_with_custom_key(self):
+        """A selection under the default session key is invisible to a renamed key."""
+        adm = self._custom_admin()
+        request = _request(_admin_user(), session={"rls_admin_tenant": "9"})
+        assert adm._effective_tenant_id(request) is None
+
+    def test_empty_custom_param_clears_custom_key(self):
+        adm = self._custom_admin()
+        request = _request(
+            _admin_user(), session={"x_tenant": "1", "rls_admin_tenant": "2"}, get={"org": ""}
+        )
+        adm._sync_tenant_selection(request)
+        assert request.session == {"rls_admin_tenant": "2"}
+        assert adm._effective_tenant_id(request) is None
+
+    def test_all_sentinel_clears_custom_key(self):
+        adm = self._custom_admin()
+        request = _request(_admin_user(), session={"x_tenant": "1"}, get={"org": _ALL_TENANTS})
+        adm._sync_tenant_selection(request)
+        assert "x_tenant" not in request.session
+
+    def test_rls_context_uses_custom_selection(self, tenant_a):
+        """The selection stored under the custom key drives the view's context."""
+        adm = self._custom_admin()
+        request = _request(_admin_user(), session={"x_tenant": str(tenant_a.pk)})
+        with patch.object(admin_mod, "tenant_context") as tenant_context_mock:
+            adm._rls_context(request)
+        tenant_context_mock.assert_called_once_with(str(tenant_a.pk))
+
+    def test_switcher_filter_reads_custom_session_key(self, tenant_a):
+        """The bound filter falls back to the selection under the custom session key."""
+        adm = self._custom_admin()
+        request = _request(_admin_user(), session={"x_tenant": str(tenant_a.pk)})
+        filter_cls = adm.get_list_filter(request)[0]
+        assert filter_cls.parameter_name == "org"
+        flt = filter_cls(request, {}, Order, adm)
+        assert flt.value() == str(tenant_a.pk)
 
 
 # ---------------------------------------------------------------------------

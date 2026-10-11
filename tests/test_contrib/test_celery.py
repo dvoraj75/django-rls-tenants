@@ -83,6 +83,12 @@ def follow_task(_prev: object = None) -> object:
     return get_current_tenant_id()
 
 
+@rls_task
+def follow_report_context(_prev: object = None) -> tuple[object, bool]:
+    """Downstream canvas step; returns the RLS context it inherited."""
+    return get_current_tenant_id(), get_rls_context_active()
+
+
 class StrictRLSTask(RLSTask):
     """RLSTask variant that refuses to run without a propagated context."""
 
@@ -192,6 +198,12 @@ class TestCapture:
         fake = SimpleNamespace(request=SimpleNamespace(headers={_TENANT_HEADER: 42}))
         monkeypatch.setattr(celery_mod, "current_task", fake)
         assert _capture() == {_TENANT_HEADER: 7, _ADMIN_HEADER: False}
+
+    def test_current_task_tenant_header_without_admin_key(self, monkeypatch):
+        """A tenant header with no admin key is inherited with admin defaulting to False."""
+        fake = SimpleNamespace(request=SimpleNamespace(headers={_TENANT_HEADER: 42}))
+        monkeypatch.setattr(celery_mod, "current_task", fake)
+        assert _capture() == {_TENANT_HEADER: 42, _ADMIN_HEADER: False}
 
     def test_zero_tenant_id_is_captured(self):
         """tenant_id=0 is falsy but not None -- it must be captured, not skipped."""
@@ -442,6 +454,24 @@ class TestCanvasPropagation:
         with tenant_context(tenant_a.pk):
             result = chord([seed_task.s(), seed_task.s()])(follow_task.s())
         assert result.get() == tenant_a.pk
+
+    def test_chain_propagates_admin(self):
+        """Every step of a chain enqueued under admin_context() runs as admin."""
+        with admin_context():
+            result = chain(report_context.s(), follow_report_context.s()).apply_async()
+        assert result.get() == (None, True)
+
+    def test_group_propagates_admin(self):
+        """Every member of a group enqueued under admin_context() runs as admin."""
+        with admin_context():
+            result = group(report_context.s(), report_context.s()).apply_async()
+        assert result.get() == [(None, True), (None, True)]
+
+    def test_chord_propagates_admin(self):
+        """A chord's callback runs under the propagated admin context."""
+        with admin_context():
+            result = chord([report_context.s(), report_context.s()])(follow_report_context.s())
+        assert result.get() == (None, True)
 
 
 # ---------------------------------------------------------------------------

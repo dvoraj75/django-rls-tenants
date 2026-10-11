@@ -62,6 +62,83 @@ class TestCheckRlsConfig:
             warnings = check_rls_config()
         assert warnings == []
 
+    # Every helper the orchestrator must aggregate. A helper missing from this
+    # list -- or an ``errors.extend(...)`` line dropped from ``check_rls_config``
+    # -- fails ``test_aggregates_every_helper``.
+    _HELPERS = (
+        "_check_superuser_connection",
+        "_check_guc_prefix_mismatch",
+        "_check_conn_max_age_with_session_gucs",
+        "_check_databases_alias_exists",
+        "_check_tenant_model_resolves",
+        "_check_tenant_fk_field_exists",
+    )
+
+    def test_aggregates_every_helper(self):
+        """Each ``_check_*`` helper's warnings reach the aggregated result, in order."""
+        patches = [
+            patch(
+                f"django_rls_tenants.tenants.checks.{name}",
+                return_value=[CheckWarning(name, id=f"django_rls_tenants.T{index:03d}")],
+            )
+            for index, name in enumerate(self._HELPERS)
+        ]
+        for p in patches:
+            p.start()
+        try:
+            warnings = check_rls_config()
+        finally:
+            for p in patches:
+                p.stop()
+        assert [w.id for w in warnings] == [
+            f"django_rls_tenants.T{index:03d}" for index in range(len(self._HELPERS))
+        ]
+
+    def test_w008_surfaces_from_real_config(self):
+        """An unresolvable TENANT_MODEL reaches the aggregated result as W008."""
+        with (
+            override_settings(RLS_TENANTS={"TENANT_MODEL": "nope.Nope"}),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+            patch(
+                "django_rls_tenants.tenants.checks._check_superuser_connection",
+                return_value=[],
+            ),
+        ):
+            warnings = check_rls_config()
+        assert [w.id for w in warnings] == ["django_rls_tenants.W008"]
+
+    def test_w009_surfaces_from_orchestrator(self):
+        """A policy field no model defines reaches the aggregated result as W009."""
+        with (
+            patch(
+                "django_rls_tenants.tenants.models._get_tenant_fk_field",
+                return_value="nonexistent",
+            ),
+            patch(
+                "django_rls_tenants.tenants.checks._check_superuser_connection",
+                return_value=[],
+            ),
+        ):
+            warnings = check_rls_config()
+        ids = {w.id for w in warnings}
+        assert ids == {"django_rls_tenants.W009"}
+        assert len(warnings) >= 2  # one per concrete RLSProtectedModel subclass
+
+    def test_w006_surfaces_from_real_config(self):
+        """An unknown alias in RLS_TENANTS['DATABASES'] reaches the result as W006."""
+        with (
+            override_settings(
+                RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant", "DATABASES": ["default", "nope"]}
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+            patch(
+                "django_rls_tenants.tenants.checks._check_superuser_connection",
+                return_value=[],
+            ),
+        ):
+            warnings = check_rls_config()
+        assert [w.id for w in warnings] == ["django_rls_tenants.W006"]
+
 
 class TestCheckGucPrefixMismatch:
     """Tests for _check_guc_prefix_mismatch."""
