@@ -71,6 +71,15 @@ RLS_TENANTS = {
     # "USE_LOCAL_SET": False,       # Use SET LOCAL instead of set_config (default: False)
 }
 
+# Celery -- broker-free demo. Tasks run inline in the calling process (eager
+# mode), so ``.delay()`` needs neither Redis/RabbitMQ nor a worker process. The
+# RLS context is still captured into the task headers and restored around the
+# task body (see notes/tasks.py), exactly as it would be on a real worker. A
+# redis-broker + worker-service variant of the demo is deliberately out of scope.
+CELERY_BROKER_URL = "memory://"
+CELERY_TASK_ALWAYS_EAGER = True
+CELERY_TASK_EAGER_PROPAGATES = True
+
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",

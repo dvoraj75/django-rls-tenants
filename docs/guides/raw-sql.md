@@ -70,6 +70,13 @@ from your [`RLS_TENANTS` settings](../getting-started/configuration.md) —
 `GUC_PREFIX` and `TENANT_PK_TYPE` — so a custom prefix or a `uuid` PK is honoured
 automatically.
 
+!!! tip "See it running"
+    The bundled
+    [example project](https://github.com/dvoraj75/django-rls-tenants/tree/main/example)
+    uses `safe_tenant_sql()` for a raw aggregate in `notes/services.py`, shown on
+    its Stats page next to the ORM figure it must equal; `tests/test_services.py`
+    checks that parity for a tenant user and for an admin.
+
 ## `current_tenant_value_sql()`
 
 Returns just the current-tenant *value* expression — useful in an `INSERT`

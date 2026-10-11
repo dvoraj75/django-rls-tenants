@@ -256,10 +256,10 @@ example/
 ├── docker-compose.yml   Docker Compose (db + web)
 ├── Dockerfile           Installs library from source + example app
 ├── manage.py            Django management script
-├── demo/                Project settings, urls, wsgi/asgi
+├── demo/                Project settings, urls, wsgi/asgi, Celery app (eager mode)
 ├── tenants/             Tenant model (shared, not RLS-protected)
 ├── accounts/            Custom User with TenantUser protocol
-├── notes/               RLS-protected Note model, views, templates, seed command
+├── notes/               RLS-protected Note model, views, services, tasks, templates, seed command
 └── docker/              PostgreSQL init (creates non-superuser role for RLS)
 ```
 

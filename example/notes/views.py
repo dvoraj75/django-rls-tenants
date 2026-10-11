@@ -6,6 +6,7 @@ from django_rls_tenants.exceptions import NoTenantContextError
 
 from .models import Category, Note
 from .services import get_note_stats
+from .tasks import count_notes
 
 
 @login_required
@@ -61,4 +62,14 @@ def note_delete(request, pk):
 def note_stats(request):
     """Show per-category statistics using @with_rls_context service."""
     stats = get_note_stats(as_user=request.user)
-    return render(request, "notes/note_stats.html", {"stats": stats})
+    # Enqueue a Celery task. The request's RLS context (set by
+    # RLSTenantMiddleware) is captured into the task headers by @rls_task, so
+    # the task body counts the same notes this user sees -- with no
+    # tenant_context() call of its own. The demo runs Celery in eager mode, so
+    # .delay() executes inline and .get() returns the result immediately.
+    task_total = count_notes.delay().get()
+    return render(
+        request,
+        "notes/note_stats.html",
+        {"stats": stats, "task_total": task_total},
+    )

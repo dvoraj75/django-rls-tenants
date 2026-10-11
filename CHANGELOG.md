@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Example demos for `@rls_task`, `safe_tenant_sql()` and `check_rls --verbose`** (#80).
+  The example now ships a broker-free Celery app (`demo/celery.py`, eager mode) and
+  `notes/tasks.py` with a plain `@rls_task` driven from the Stats page plus a
+  `rls_require_context = True` task that fails fast without a context; `get_note_stats`
+  adds a raw aggregate scoped with `safe_tenant_sql()` that the page shows next to the
+  ORM figure it equals for tenant users and admins alike. `tests/test_tasks.py` and
+  `tests/test_services.py` run both round-trips against a non-superuser role in CI.
+  The README walks through `check_rls --verbose` output and `manage.py check`
+  (W005 / W008 / W009), and the Celery and Raw SQL guides point at the example.
+
 - **Performance & Indexing guide** (`docs/guides/performance.md`, #83). One page for the
   "what does RLS cost and how do I index for it" question, built from measured
   `EXPLAIN (ANALYZE, BUFFERS)` plans on a 1,000,000-row table as a non-superuser role:

@@ -45,7 +45,9 @@ Open **<http://localhost:8000>** and log in with any demo account:
 
 4. **Statistics page** -- Click "Stats" to see per-category note counts. This
    page is powered by a service function decorated with `@with_rls_context`,
-   demonstrating automatic RLS context from function arguments.
+   demonstrating automatic RLS context from function arguments. The same page
+   shows a raw-SQL figure (item 10) and a count computed by a Celery task
+   (item 9).
 
 5. **Database-level proof** -- Connect to PostgreSQL as `app`, the
    non-superuser role the demo runs as (see `docker/init-db.sql`), and query a
@@ -63,9 +65,41 @@ Open **<http://localhost:8000>** and log in with any demo account:
    why the app must never connect as one. The total changes if you add or delete notes.
 
 6. **RLS policy verification** -- The `check_rls` management command verifies
-   all RLS policies are correctly applied:
+   all RLS policies are correctly applied. `--verbose` also prints each
+   policy's live `USING` / `WITH CHECK` expression, read back from
+   `pg_policies`:
    ```bash
-   docker compose exec web python manage.py check_rls
+   docker compose exec web python manage.py check_rls --verbose
+   ```
+   ```text
+     Category (notes_category): notes_category_tenant_isolation_policy
+       notes_category_tenant_isolation_policy [ALL]
+         USING:
+           CASE
+               WHEN (( SELECT current_setting('rls.is_admin'::text, true) AS current_setting) = 'true'::text) THEN true
+               ELSE (tenant_id = (NULLIF(( SELECT current_setting('rls.current_tenant'::text, true) AS current_setting), ''::text))::integer)
+           END
+         WITH CHECK:
+           CASE
+               ...
+           END
+     Note (notes_note): notes_note_tenant_isolation_policy
+       ...
+
+   All 2 RLS-protected tables verified.
+   ```
+   That is the policy the committed migration created: the admin GUC bypasses,
+   otherwise `tenant_id` must equal the session's `rls.current_tenant` GUC.
+
+   Separately, plain `python manage.py check` runs the library's Django system
+   checks (`django_rls_tenants.W001`-`W009`) against your configuration, for
+   example `W008` when `RLS_TENANTS["TENANT_MODEL"]` does not resolve to an
+   installed model, `W009` when a protected model has no tenant FK field, and
+   `W005` when the connection role is a superuser or has `BYPASSRLS`. See the
+   last one fire by pointing the demo at its `demo` superuser:
+   ```bash
+   docker compose exec -e DATABASE_URL=postgres://demo:demo@db:5432/demo web python manage.py check
+   # -> WARNINGS: ?: (django_rls_tenants.W005) The default database connection role 'demo' is a PostgreSQL superuser ...
    ```
 
 7. **Strict mode** -- The demo has `STRICT_MODE=True` in `RLS_TENANTS`. Try
@@ -109,6 +143,47 @@ Open **<http://localhost:8000>** and log in with any demo account:
    > For an existing demo, rebuild with `docker compose up --build`. The seed
    > command adds the missing `staff` account while preserving existing data.
 
+9. **Background tasks with `@rls_task`** -- The Stats page also enqueues a
+   Celery task, `count_notes` in `notes/tasks.py`, whose body is just
+   `Note.objects.count()` with no `tenant_context()` anywhere in it. The
+   decorator captures the request's RLS context into the task headers and
+   restores it around the task body, so the task counts exactly the notes the
+   logged-in user sees. The demo runs Celery in eager mode
+   (`CELERY_TASK_ALWAYS_EAGER` in `demo/settings.py`): `.delay()` runs the task
+   inline, so there is no Redis and no worker process to start. Try the
+   fail-fast variant in a shell:
+   ```bash
+   docker compose exec web python manage.py shell
+   ```
+   ```python
+   from notes.tasks import export_notes
+   export_notes.delay()
+   # -> NoTenantContextError: Task 'notes.tasks.export_notes' ran without an RLS context.
+
+   from django_rls_tenants import tenant_context
+   from tenants.models import Tenant
+   with tenant_context(Tenant.objects.get(slug="acme").pk):
+       export_notes.delay().get()
+   # -> [{'title': ..., 'category': ...}, ...]  (Acme's notes only)
+   ```
+   `export_notes` uses a task base with `rls_require_context = True`, so it
+   refuses to run tenant-blind even when `STRICT_MODE` is off, instead of
+   silently exporting zero rows. `tests/test_tasks.py` runs both tasks
+   caller-to-worker under the non-superuser role.
+
+10. **Raw SQL with `safe_tenant_sql()`** -- The Stats page's "Raw count" and
+    average content length come from a hand-written `SELECT` in
+    `notes/services.py` whose `WHERE` clause is `safe_tenant_sql()`. RLS would
+    filter the rows anyway (the app role is a non-superuser); the fragment
+    makes the tenant predicate explicit in the statement and is built from the
+    exact expression the policy uses, admin bypass included, so the raw count
+    equals the ORM count for tenant users and admins alike
+    (`tests/test_services.py`). For an index-friendly tenant-only match use
+    `safe_tenant_sql(include_admin=False)` -- see the
+    [Raw SQL](https://dvoraj75.github.io/django-rls-tenants/guides/raw-sql/) and
+    [Performance & Indexing](https://dvoraj75.github.io/django-rls-tenants/guides/performance/)
+    guides.
+
 ## Library Features Demonstrated
 
 | Feature | Where |
@@ -121,15 +196,21 @@ Open **<http://localhost:8000>** and log in with any demo account:
 | Auto-scoping (zero `.filter()`) | `notes/views.py` -- `Note.objects.all()` returns only tenant data |
 | `select_related()` propagation | `notes/views.py` -- tenant filter auto-propagates to joined `Category` |
 | `@with_rls_context` decorator | `notes/services.py` -- `get_note_stats(as_user=...)` |
+| `safe_tenant_sql()` | `notes/services.py` -- `get_raw_note_stats()`, a raw aggregate scoped like the policy |
+| `@rls_task` (Celery) | `notes/tasks.py` -- `count_notes` inherits the caller's context; `demo/celery.py` is the eager-mode app |
+| `rls_require_context` | `notes/tasks.py` -- `export_notes` fails fast instead of running tenant-blind |
 | `admin_context()` | `seed_demo.py` -- bulk data creation bypassing RLS |
 | `tenant_context()` | `seed_demo.py` -- programmatic tenant scoping for verification |
-| `check_rls` command | `docker-compose.yml` -- runs after migrations |
+| `check_rls` command | `docker-compose.yml` -- runs after migrations; `--verbose` prints the live policy SQL (item 6) |
+| System checks (`manage.py check`) | W001-W009 configuration checks, e.g. W005 superuser role, W008/W009 tenant model and FK (item 6) |
 | `STRICT_MODE` | `demo/settings.py` -- raises `NoTenantContextError` on unscoped queries |
 | `NoTenantContextError` handling | `notes/views.py` -- graceful handling in view code |
 | Testing utilities | `tests/test_rls.py` -- `rls_bypass`, `rls_as_tenant`, assert helpers |
 | Admin tests | `tests/test_admin.py` -- the tenant-aware admin driven through the test client |
 | Seed command tests | `tests/test_seed_demo.py` -- `staff` account permissions and idempotent re-seeding |
 | Strict mode tests | `tests/test_rls.py` -- `TestStrictMode` class |
+| Celery task tests | `tests/test_tasks.py` -- eager-mode round-trips for `count_notes` and `export_notes` |
+| Raw SQL tests | `tests/test_services.py` -- raw figures equal the ORM's for a tenant user and for admin |
 
 ## How It Works
 
@@ -159,17 +240,20 @@ example/
 ├── docker-compose.yml   Docker Compose for db + web
 ├── Dockerfile           Builds from library source + example app
 ├── manage.py            Django management script
-├── demo/                Django project: settings, urls, wsgi/asgi
+├── demo/                Django project: settings, urls, wsgi/asgi, Celery app (eager mode)
 ├── tenants/             Tenant model (shared, not RLS-protected)
 ├── accounts/            Custom User model with tenant FK + TenantUser protocol
-├── notes/               RLS-protected Note + Category models, views, services,
-│                        templates, admin, seed command, committed migrations
-│                        (0001_initial.py carries the RLS policy DDL)
+├── notes/               RLS-protected Note + Category models, views, services
+│                        (safe_tenant_sql), tasks (@rls_task), templates, admin,
+│                        seed command, committed migrations (0001_initial.py
+│                        carries the RLS policy DDL)
 └── tests/               Example tests using django-rls-tenants testing utilities
     ├── conftest.py      Fixtures using rls_bypass for test data setup
     ├── test_admin.py    RLSTenantModelAdmin scoping, FK hiding and switcher tests
     ├── test_rls.py      RLS policy verification and tenant isolation tests
-    └── test_seed_demo.py  Seeded staff account and idempotent re-seeding tests
+    ├── test_seed_demo.py  Seeded staff account and idempotent re-seeding tests
+    ├── test_services.py   safe_tenant_sql() raw aggregate vs. the ORM
+    └── test_tasks.py    @rls_task context propagation in eager mode
 ```
 
 ## Running Tests
@@ -196,8 +280,9 @@ cd example/
 python -m venv .venv
 source .venv/bin/activate
 
-# Install the library from the parent directory
-pip install -e ..
+# Install the library from the parent directory ([celery] adds Celery for
+# the @rls_task demo in notes/tasks.py)
+pip install -e "..[celery]"
 pip install psycopg2-binary
 
 # Configure database (PostgreSQL required -- SQLite will not work)

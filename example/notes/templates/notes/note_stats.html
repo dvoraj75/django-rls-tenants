@@ -26,6 +26,30 @@
         </div>
     {% endif %}
 
+    <h3>Raw SQL with <code>safe_tenant_sql()</code></h3>
+    <p>
+        The figures below come from a hand-written <code>SELECT</code> in
+        <code>notes/services.py</code> whose <code>WHERE</code> clause is
+        <code>safe_tenant_sql()</code> -- the same tenant predicate the RLS
+        policy uses, admin bypass included. The count always matches the ORM
+        total above, for tenant users and for admins alike.
+    </p>
+    <div class="note" style="padding:0.5rem 1rem">
+        <strong>Raw count</strong>: {{ stats.raw_total }} note{{ stats.raw_total|pluralize }},
+        average content length {{ stats.avg_content_length }} character{{ stats.avg_content_length|pluralize }}
+    </div>
+
+    <h3>Celery task with <code>@rls_task</code></h3>
+    <p>
+        <code>count_notes.delay()</code> in <code>notes/tasks.py</code> ran as a
+        Celery task (eager mode, no broker). Its body is just
+        <code>Note.objects.count()</code>: the request's RLS context travelled
+        in the task headers, so it counted the same notes you see.
+    </p>
+    <div class="note" style="padding:0.5rem 1rem">
+        <strong>Counted by the task</strong>: {{ task_total }} note{{ task_total|pluralize }}
+    </div>
+
     <br>
     <a href="{% url 'note_list' %}" class="btn">Back to Notes</a>
 {% endblock %}
