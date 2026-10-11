@@ -146,6 +146,20 @@ A **drop-in upgrade** -- no code or data migration is required.
   keep the block open for as long as the scope is needed. A failed statement inside a
   block now surfaces as its own exception rather than `InternalError: current transaction
   is aborted` (#102); see [Context Managers](../guides/context-managers.md#exceptions-inside-a-context-block).
+- **`USE_LOCAL_SET=True` works through the middleware, and no longer needs
+  `ATOMIC_REQUESTS`.** `RLSTenantMiddleware` now opens `transaction.atomic()` on every
+  configured alias around each authenticated request (previously every such request
+  crashed, because `ATOMIC_REQUESTS` only wraps the view). You may drop
+  `ATOMIC_REQUESTS=True` from `DATABASES` if you only had it for RLS; keeping it is
+  harmless. The transaction-per-request rules of `ATOMIC_REQUESTS` now apply to this
+  mode (catch database errors inside `atomic()`, `on_commit` runs at request end,
+  `@non_atomic_requests` has no effect). ASGI deployments cannot use this mode yet; the
+  middleware raises `RLSConfigurationError`. See
+  [Middleware](../guides/middleware.md#transaction-per-request-use_local_settrue).
+- **System check `W007` is retired.** It flagged `USE_LOCAL_SET=True` without
+  `ATOMIC_REQUESTS`, which is now a supported configuration. `W004` no longer mentions
+  `ATOMIC_REQUESTS` in its hint. Nothing to do; a leftover `SILENCED_SYSTEM_CHECKS`
+  entry is harmless.
 
 ### From 1.3.0 to 1.3.1
 

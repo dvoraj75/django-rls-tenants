@@ -226,19 +226,17 @@ When `True`, uses `SET LOCAL` (transaction-scoped) instead of `set_config()`
 - `SET LOCAL` ensures GUCs are automatically cleared at transaction end,
   preventing cross-request leaks through pooled connections.
 
-**Requirements when enabled:**
+**What changes when enabled:**
 
-- Django's `ATOMIC_REQUESTS` should be `True`, or you must wrap all database
-  operations in `transaction.atomic()` blocks.
+- `RLSTenantMiddleware` opens `transaction.atomic()` on every configured alias around
+  each authenticated request, so the `SET LOCAL` GUCs cover the whole request and are
+  cleared at commit/rollback. `ATOMIC_REQUESTS` is not required (it nests as a
+  savepoint if you keep it).
+- Outside a request (Celery tasks, management commands, scripts) you must wrap the
+  context manager in `transaction.atomic()` yourself.
+- Not supported under ASGI; the middleware raises `RLSConfigurationError` there.
 
 ```python
-DATABASES = {
-    "default": {
-        # ...
-        "ATOMIC_REQUESTS": True,
-    }
-}
-
 RLS_TENANTS = {
     "TENANT_MODEL": "myapp.Tenant",
     "USE_LOCAL_SET": True,
@@ -255,11 +253,11 @@ django-rls-tenants registers Django system checks that warn about common misconf
 |-------|----------|-------------|
 | `W001` | Warning | `RLSConstraint.guc_tenant_var` doesn't match `GUC_PREFIX`-derived name |
 | `W002` | Warning | `RLSConstraint.guc_admin_var` doesn't match `GUC_PREFIX`-derived name |
-| `W003` | — | *Retired in 1.3.1; superseded by `W007`, which checks every configured alias* |
+| `W003` | — | *Retired in 1.3.1 (duplicate of `W007`)* |
 | `W004` | Warning | `CONN_MAX_AGE > 0` with `USE_LOCAL_SET=False` (session GUCs may leak) |
 | `W005` | Warning | Default database connection role is a superuser or has `BYPASSRLS` (RLS bypassed) |
 | `W006` | Warning | `DATABASES` contains an alias not defined in `settings.DATABASES` |
-| `W007` | Warning | `USE_LOCAL_SET=True` without `ATOMIC_REQUESTS` on a configured alias |
+| `W007` | — | *Retired in 1.3.2; the middleware opens its own transaction, so `ATOMIC_REQUESTS` is no longer required for `USE_LOCAL_SET`* |
 | `W008` | Warning | `RLS_TENANTS['TENANT_MODEL']` does not resolve to an installed model |
 | `W009` | Warning | Tenant field referenced by an `RLSProtectedModel`'s RLS policy is missing |
 

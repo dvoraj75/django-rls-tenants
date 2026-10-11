@@ -25,7 +25,6 @@ DATABASES = {
         "OPTIONS": {
             # PgBouncer connection
         },
-        "ATOMIC_REQUESTS": True,  # Required for SET LOCAL
     }
 }
 
@@ -42,7 +41,7 @@ RLS_TENANTS = {
 | **Scope** | Session (connection) | Transaction |
 | **Cleared when** | Explicitly by middleware | Automatically at `COMMIT`/`ROLLBACK` |
 | **Connection pooling safe** | Only with cleanup | Yes |
-| **Requires `ATOMIC_REQUESTS`** | No | Yes |
+| **Transaction per request** | No (autocommit around the view) | Yes, opened by the middleware |
 | **Nesting support** | Full save/restore | Full save/restore with `SET LOCAL` |
 
 Context managers restore the previous values when each block exits in both modes.
@@ -50,13 +49,32 @@ With `SET LOCAL`, transaction end also discards the transaction-local values. Se
 [Context Managers](context-managers.md#exceptions-inside-a-context-block) for how
 restoration works after a failed statement or savepoint rollback.
 
-### Why ATOMIC_REQUESTS Is Required
+### Where the Transaction Comes From
 
-`SET LOCAL` only works inside a transaction. With `ATOMIC_REQUESTS=True`, Django wraps
-each view in `transaction.atomic()`, ensuring GUCs are active for the entire request
-and automatically cleared at the end.
+`SET LOCAL` only works inside a transaction. Django's `ATOMIC_REQUESTS` is **not** the
+answer: it wraps only the view callable, and the middleware sets the GUCs before the view
+runs. So when `USE_LOCAL_SET=True`, `RLSTenantMiddleware` opens `transaction.atomic()`
+itself, on every alias in `RLS_TENANTS["DATABASES"]`, around the rest of the middleware
+chain and the view. The GUCs are in force for the whole request and disappear at the
+commit or rollback that ends it. Unauthenticated requests set no GUCs and get no
+transaction.
 
-Without `ATOMIC_REQUESTS`, you must manually wrap all database operations:
+`ATOMIC_REQUESTS=True` remains optional. If you enable it as well, Django's per-view
+transaction simply nests as a savepoint inside the middleware's.
+
+!!! note "Consequences of a transaction per request"
+    This is the same shape as `ATOMIC_REQUESTS`, with the same rules: catch database
+    errors inside your own `transaction.atomic()` block or the rest of the request fails
+    with "current transaction is aborted"; `transaction.on_commit()` callbacks run when
+    the request ends; and `@non_atomic_requests` has no effect, because the middleware's
+    transaction encloses the view anyway. A streaming response iterates its body after
+    the transaction has ended, so queries made while streaming run without tenant
+    context (fail-closed: no rows) -- establish a context inside the generator. The
+    middleware raises `RLSConfigurationError` if the mode is used under ASGI (see
+    [Middleware](middleware.md#use_local_set-and-asgi)).
+
+Outside a request (management commands, Celery tasks, scripts), you still provide the
+transaction yourself:
 
 ```python
 from django.db import transaction
@@ -101,31 +119,16 @@ RLS_TENANTS = {
 
 ## System Checks
 
-django-rls-tenants provides system checks for common pooling misconfigurations:
-
-### W007: USE_LOCAL_SET without ATOMIC_REQUESTS
-
-```
-?: (django_rls_tenants.W007) USE_LOCAL_SET=True but DATABASES['default'] does not have
-ATOMIC_REQUESTS=True. SET LOCAL requires an active transaction. The middleware will crash
-at runtime when setting GUCs on 'default'.
-	HINT: Set DATABASES['default']['ATOMIC_REQUESTS'] = True.
-```
-
-This warning fires once for every alias in `RLS_TENANTS["DATABASES"]` that lacks
-`ATOMIC_REQUESTS=True`; the alias name is interpolated into the message.
-
-**Fix:** Set `ATOMIC_REQUESTS = True` in your database config, or ensure all database
-access happens inside `transaction.atomic()` blocks.
+django-rls-tenants provides a system check for the most common pooling misconfiguration:
 
 ### W004: CONN_MAX_AGE with session GUCs
 
 ```
 ?: (django_rls_tenants.W004) DATABASES['default'] has CONN_MAX_AGE=600 with
 USE_LOCAL_SET=False. This risks GUC state leaking between requests on persistent
-connections. Consider USE_LOCAL_SET=True with ATOMIC_REQUESTS=True for safer connection
-pooling.
-	HINT: Set USE_LOCAL_SET=True and ATOMIC_REQUESTS=True, or set
+connections. Consider USE_LOCAL_SET=True, which scopes the GUCs to a transaction the
+middleware opens per request.
+	HINT: Set RLS_TENANTS['USE_LOCAL_SET'] = True, or set
 DATABASES['default']['CONN_MAX_AGE'] = 0.
 ```
 
@@ -135,8 +138,13 @@ message. It fires once for every alias in `RLS_TENANTS["DATABASES"]` with a non-
 
 **Fix:** Either:
 
-- Set `USE_LOCAL_SET = True` and `ATOMIC_REQUESTS = True`, or
+- Set `USE_LOCAL_SET = True`, or
 - Set `CONN_MAX_AGE = 0` (Django default, closes connections after each request).
+
+!!! info "Retired checks"
+    `W003` (1.3.1) and `W007` (1.3.2) warned about `USE_LOCAL_SET=True` without
+    `ATOMIC_REQUESTS`. Since the middleware opens its own transaction, that combination
+    is valid and the checks no longer exist. Check IDs are never reused.
 
 ## Django's Persistent Connections (CONN_MAX_AGE)
 
@@ -155,7 +163,6 @@ DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.postgresql",
         "CONN_MAX_AGE": 600,  # 10 minutes
-        "ATOMIC_REQUESTS": True,
     }
 }
 

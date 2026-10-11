@@ -43,6 +43,39 @@ MIDDLEWARE = [
    by strict mode to distinguish "middleware set context" from "no context at all".
 7. Marks a `ContextVar` flag that GUCs were set (used by the safety-net signal handler).
 
+### Transaction Per Request (`USE_LOCAL_SET=True`)
+
+With `RLS_TENANTS["USE_LOCAL_SET"] = True` the GUCs are set with `SET LOCAL`, which only
+exists inside a transaction. Django's `ATOMIC_REQUESTS` wraps the view callable only, so
+it cannot cover `process_request`. The middleware therefore opens the transaction
+itself: for every authenticated request it enters `transaction.atomic(using=alias)` for
+each alias in `RLS_TENANTS["DATABASES"]` *before* `process_request` and leaves it
+*after* `process_response`. The GUCs live exactly as long as the request and vanish at
+the commit (or rollback) that ends it. Unauthenticated requests get no transaction.
+
+Consequences, all shared with `ATOMIC_REQUESTS`:
+
+- A database error must be caught inside your own `transaction.atomic()` block, or the
+  rest of the request fails with *current transaction is aborted*.
+- `transaction.on_commit()` callbacks run when the request finishes.
+- `@non_atomic_requests` has no effect -- the middleware's transaction encloses the view.
+- Keeping `ATOMIC_REQUESTS=True` is harmless; Django's per-view transaction becomes a
+  savepoint inside the middleware's.
+- A `StreamingHttpResponse` iterates its body after the transaction has ended, so
+  queries made while streaming see no tenant context (fail-closed). Open a context
+  inside the generator.
+
+With the default `USE_LOCAL_SET=False` nothing changes: the view runs in autocommit (or
+under `ATOMIC_REQUESTS`, if you enable it) exactly as before.
+
+### `USE_LOCAL_SET` and ASGI
+
+The async middleware path cannot hold a synchronous `transaction.atomic()` open across
+the awaited downstream chain, so `USE_LOCAL_SET=True` is not available under ASGI. The
+middleware raises `RLSConfigurationError` for authenticated requests in that setup
+instead of failing deep inside `SET LOCAL`. Serve the application through WSGI, or use
+the default session-scoped mode. Native async support is tracked for v1.4.0.
+
 ### Response Phase (`process_response`)
 
 1. Resets the `_rls_context_active` flag (via saved token) to prevent cross-request leaks.
@@ -83,6 +116,9 @@ Request arrives
 AuthenticationMiddleware
     │ sets request.user
     ▼
+RLSTenantMiddleware.__call__()
+    │ USE_LOCAL_SET == True and authenticated → BEGIN (atomic per alias)
+    ▼
 RLSTenantMiddleware.process_request()
     │
     ├── user.is_authenticated == False → no-op (fail-closed)
@@ -109,7 +145,7 @@ RLSTenantMiddleware.process_response()  (or process_exception on error)
     ├── RESET _rls_context_active (via saved token)
     ├── RESET auto-scope ContextVar (via saved token)
     ├── USE_LOCAL_SET == False → CLEAR both GUCs
-    └── USE_LOCAL_SET == True  → no-op (transaction handles cleanup)
+    └── USE_LOCAL_SET == True  → no-op, then COMMIT/ROLLBACK drops the SET LOCAL values
 ```
 
 ## Multi-Database Support
@@ -148,7 +184,7 @@ The middleware is API-agnostic. It works identically for:
 - Django views and templates
 - Django REST Framework
 - GraphQL (Graphene, Strawberry, Ariadne)
-- Async views (GUC setting uses sync database calls)
+- Async views (GUC setting uses sync database calls; `USE_LOCAL_SET=True` is WSGI-only)
 - Any other Django-compatible request handler
 
 The only requirement is that `request.user` satisfies the `TenantUser` protocol.

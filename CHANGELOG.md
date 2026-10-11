@@ -50,6 +50,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DatabaseError` raised by the restore itself is now logged at DEBUG and swallowed; the
   transaction or savepoint rollback restores the GUCs. A clean exit still propagates
   restore failures.
+- **`RLSTenantMiddleware` crashed on every authenticated request with
+  `USE_LOCAL_SET=True`** (#95), including the `ATOMIC_REQUESTS=True` setup the
+  connection-pooling guide recommended. Django's `ATOMIC_REQUESTS` wraps only the view
+  callable, so `process_request` ran in autocommit and `SET LOCAL` raised
+  `RuntimeError: Cannot use SET LOCAL ... outside a transaction`. The middleware now
+  owns the transaction when `USE_LOCAL_SET=True`: it opens `transaction.atomic()` on
+  every alias in `RLS_TENANTS["DATABASES"]` around the rest of the chain and the view
+  for authenticated requests, so the GUCs cover the whole request and vanish at
+  commit/rollback. `ATOMIC_REQUESTS` is no longer required (it nests as a savepoint if
+  kept). The default `USE_LOCAL_SET=False` path is unchanged. Under ASGI the mode is
+  refused with a clear `RLSConfigurationError` instead of the opaque `RuntimeError`
+  (native async support is v1.4.0). System check `W004` no longer recommends
+  `ATOMIC_REQUESTS`. New end-to-end tests drive `django.test.Client` through the real
+  middleware stack with and without `ATOMIC_REQUESTS`.
+
+### Removed
+
+- System check `W007` (`USE_LOCAL_SET=True` without `ATOMIC_REQUESTS`) is retired (#95).
+  The combination it warned about is now valid, because the middleware opens its own
+  transaction. Check IDs are not reused; leaving `django_rls_tenants.W007` in
+  `SILENCED_SYSTEM_CHECKS` is harmless.
 
 ## [1.3.1] - 2026-10-11
 

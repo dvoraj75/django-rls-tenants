@@ -7,11 +7,15 @@ and sets GUC variables for the duration of each request.
 from __future__ import annotations
 
 import logging
+from contextlib import ExitStack
 from contextvars import ContextVar, Token
 from typing import TYPE_CHECKING, Any
 
+from asgiref.sync import sync_to_async
+from django.db import transaction
 from django.utils.deprecation import MiddlewareMixin
 
+from django_rls_tenants.exceptions import RLSConfigurationError
 from django_rls_tenants.rls.guc import clear_guc, set_guc
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import _resolve_user_guc_vars
@@ -49,6 +53,15 @@ def _were_gucs_set() -> bool:
     return _gucs_set_var.get()
 
 
+def _is_authenticated(request: HttpRequest) -> bool:
+    """Return ``True`` when the request carries an authenticated user.
+
+    Evaluates the lazy ``request.user`` set by ``AuthenticationMiddleware``,
+    which may hit the session store and the database.
+    """
+    return hasattr(request, "user") and bool(request.user.is_authenticated)
+
+
 def _clear_gucs_on_all_databases(conf: Any) -> None:
     """Best-effort clear of GUCs on all configured database aliases.
 
@@ -84,7 +97,58 @@ class RLSTenantMiddleware(MiddlewareMixin):
             ...
             "django_rls_tenants.tenants.middleware.RLSTenantMiddleware",
         ]
+
+    With ``USE_LOCAL_SET=True`` the middleware owns a database transaction
+    for every authenticated request: ``transaction.atomic()`` is opened on
+    each alias in ``RLS_TENANTS["DATABASES"]`` around the rest of the
+    middleware chain and the view, so the ``SET LOCAL`` GUCs are in force
+    for the whole request and vanish at commit/rollback. ``ATOMIC_REQUESTS``
+    is not required (and is harmless -- it nests as a savepoint). This
+    transaction-per-request mode is only available on the synchronous
+    (WSGI) code path.
     """
+
+    def __call__(self, request: HttpRequest) -> Any:
+        """Run the request, inside a transaction per alias when ``USE_LOCAL_SET``.
+
+        Django's ``ATOMIC_REQUESTS`` wraps only the view callable, never
+        ``process_request``, so ``SET LOCAL`` issued there would run in
+        autocommit and fail. The middleware therefore opens the transaction
+        itself, around ``process_request`` -> downstream chain ->
+        ``process_response``. Unauthenticated requests get no transaction
+        (no GUCs are set for them either).
+        """
+        if self.async_mode:
+            return self.__acall__(request)
+        conf = rls_tenants_config
+        if not conf.USE_LOCAL_SET or not _is_authenticated(request):
+            return super().__call__(request)
+        with ExitStack() as stack:
+            for db_alias in conf.DATABASES:
+                stack.enter_context(transaction.atomic(using=db_alias))
+            return super().__call__(request)
+
+    async def __acall__(self, request: HttpRequest) -> Any:
+        """Async entry point; ``USE_LOCAL_SET=True`` is not supported here.
+
+        The async middleware path cannot hold a synchronous
+        ``transaction.atomic()`` open across the awaited downstream chain,
+        so ``SET LOCAL`` would have no transaction to live in. Raise a
+        configuration error instead of the opaque ``RuntimeError`` that
+        ``set_guc(is_local=True)`` would produce.
+        """
+        if rls_tenants_config.USE_LOCAL_SET and await sync_to_async(
+            _is_authenticated,
+            thread_sensitive=True,
+        )(request):
+            msg = (
+                "RLSTenantMiddleware cannot use RLS_TENANTS['USE_LOCAL_SET'] = True "
+                "under ASGI: SET LOCAL needs a transaction held open across the whole "
+                "request, which the async middleware path cannot provide. Serve the "
+                "application through WSGI, or set USE_LOCAL_SET=False."
+            )
+            raise RLSConfigurationError(msg)
+        return await super().__acall__(request)
 
     def process_request(self, request: HttpRequest) -> None:
         """Set GUC variables on all configured databases.
@@ -93,7 +157,7 @@ class RLSTenantMiddleware(MiddlewareMixin):
         alias. If setting GUCs on one database fails, clears all GUCs on
         databases that were already set, then re-raises.
         """
-        if not hasattr(request, "user") or not request.user.is_authenticated:
+        if not _is_authenticated(request):
             return
 
         conf = rls_tenants_config

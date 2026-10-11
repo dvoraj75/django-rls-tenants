@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
+from asgiref.sync import async_to_sync
+from django.db import connection
 from django.test import override_settings
 
+from django_rls_tenants.exceptions import RLSConfigurationError
 from django_rls_tenants.rls.guc import get_guc, set_guc
 from django_rls_tenants.tenants.conf import RLSTenantsConfig
 from django_rls_tenants.tenants.middleware import (
@@ -409,3 +412,133 @@ class TestMultiDatabaseGUC:
         # Should have cleared GUCs on 'default'
         default_clears = [c for c in clear_calls if c["using"] == "default"]
         assert len(default_clears) == 2  # is_admin + current_tenant
+
+
+# ---- USE_LOCAL_SET=True: middleware-owned transaction (#95) ----
+
+_LOCAL_SET = {"TENANT_MODEL": "test_app.Tenant", "USE_LOCAL_SET": True}
+
+
+@pytest.mark.django_db(transaction=True)
+class TestLocalSetTransaction:
+    """``__call__`` opens ``transaction.atomic()`` per alias when ``USE_LOCAL_SET=True``.
+
+    Django's ``ATOMIC_REQUESTS`` wraps only the view, never ``process_request``,
+    so ``SET LOCAL`` issued there used to raise ``RuntimeError`` on every
+    authenticated request (#95). ``transaction=True`` so there is no outer test
+    transaction masking ``in_atomic_block``.
+    """
+
+    @override_settings(RLS_TENANTS=_LOCAL_SET)
+    def test_authenticated_request_runs_inside_transaction(self, tenant_a_user):
+        """SET LOCAL succeeds, is visible to the view, and is gone afterwards."""
+        seen = {}
+
+        def view(request):
+            seen["in_atomic_block"] = connection.in_atomic_block
+            seen["tenant"] = get_guc("rls.current_tenant")
+            seen["is_admin"] = get_guc("rls.is_admin")
+            return MagicMock()
+
+        mw = RLSTenantMiddleware(get_response=view)
+        assert connection.in_atomic_block is False
+        mw(_make_request(user=tenant_a_user))
+
+        assert seen == {
+            "in_atomic_block": True,
+            "tenant": str(tenant_a_user.tenant_id),
+            "is_admin": "false",
+        }
+        # The transaction committed: SET LOCAL values are gone, no block left open.
+        assert connection.in_atomic_block is False
+        assert get_guc("rls.current_tenant") is None
+        assert get_guc("rls.is_admin") is None
+        # ContextVars reset by process_response.
+        assert get_current_tenant_id() is None
+        assert get_rls_context_active() is False
+
+    @override_settings(RLS_TENANTS=_LOCAL_SET)
+    def test_unauthenticated_request_opens_no_transaction(self):
+        """Health checks and anonymous requests pay for no transaction."""
+        seen = {}
+
+        def view(request):
+            seen["in_atomic_block"] = connection.in_atomic_block
+            return MagicMock()
+
+        RLSTenantMiddleware(get_response=view)(_make_request())
+        assert seen == {"in_atomic_block": False}
+
+    def test_session_mode_opens_no_transaction(self, tenant_a_user):
+        """``USE_LOCAL_SET=False`` (default) is unchanged: autocommit around the view."""
+        seen = {}
+
+        def view(request):
+            seen["in_atomic_block"] = connection.in_atomic_block
+            seen["tenant"] = get_guc("rls.current_tenant")
+            return MagicMock()
+
+        RLSTenantMiddleware(get_response=view)(_make_request(user=tenant_a_user))
+        assert seen == {"in_atomic_block": False, "tenant": str(tenant_a_user.tenant_id)}
+        assert get_guc("rls.current_tenant") is None  # cleared by process_response
+
+    @override_settings(RLS_TENANTS=_LOCAL_SET)
+    def test_exception_from_chain_rolls_back_and_propagates(self, tenant_a_user):
+        """An exception escaping the chain rolls the transaction back; nothing leaks."""
+
+        def view(request):
+            assert get_guc("rls.current_tenant") == str(tenant_a_user.tenant_id)
+            raise RuntimeError("boom")
+
+        mw = RLSTenantMiddleware(get_response=view)
+        request = _make_request(user=tenant_a_user)
+        with pytest.raises(RuntimeError, match="boom"):
+            mw(request)
+        assert connection.in_atomic_block is False
+        assert get_guc("rls.current_tenant") is None
+        assert get_guc("rls.is_admin") is None
+        # process_response did not run; in a real request cycle Django's handler
+        # calls process_exception (or the request_finished safety net fires).
+        mw.process_exception(request, RuntimeError("boom"))
+        assert get_current_tenant_id() is None
+        assert get_rls_context_active() is False
+
+    @override_settings(RLS_TENANTS={**_LOCAL_SET, "DATABASES": ["default", "replica"]})
+    def test_opens_one_transaction_per_configured_alias(self, tenant_a_user):
+        """Every alias in RLS_TENANTS['DATABASES'] gets its own atomic() block."""
+        with (
+            patch("django_rls_tenants.tenants.middleware.transaction.atomic") as atomic,
+            patch.object(RLSTenantMiddleware, "process_request", return_value=None),
+            patch.object(
+                RLSTenantMiddleware, "process_response", side_effect=lambda r, resp: resp
+            ),
+        ):
+            RLSTenantMiddleware(get_response=lambda r: MagicMock())(
+                _make_request(user=tenant_a_user),
+            )
+        assert atomic.call_args_list == [call(using="default"), call(using="replica")]
+        assert atomic.return_value.__enter__.call_count == 2
+        assert atomic.return_value.__exit__.call_count == 2
+
+
+class TestLocalSetUnderAsgi:
+    """The async path refuses ``USE_LOCAL_SET=True`` with a clear configuration error."""
+
+    @staticmethod
+    def _async_middleware():
+        async def aget_response(request):
+            return MagicMock(name="response")
+
+        return RLSTenantMiddleware(get_response=aget_response)
+
+    @override_settings(RLS_TENANTS=_LOCAL_SET)
+    def test_authenticated_request_raises_configuration_error(self, tenant_a_user):
+        mw = self._async_middleware()
+        assert mw.async_mode is True
+        with pytest.raises(RLSConfigurationError, match="under ASGI"):
+            async_to_sync(mw)(_make_request(user=tenant_a_user))
+
+    @override_settings(RLS_TENANTS=_LOCAL_SET)
+    def test_unauthenticated_request_passes_through(self):
+        response = async_to_sync(self._async_middleware())(_make_request())
+        assert response._mock_name == "response"
