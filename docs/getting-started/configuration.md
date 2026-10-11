@@ -234,6 +234,9 @@ When `True`, uses `SET LOCAL` (transaction-scoped) instead of `set_config()`
   savepoint if you keep it).
 - Outside a request (Celery tasks, management commands, scripts) you must wrap the
   context manager in `transaction.atomic()` yourself.
+- Middleware implementing `process_exception`, and function-based middleware factories,
+  must precede `RLSTenantMiddleware`; unsafe ordering raises `RLSConfigurationError`
+  when the middleware is loaded. See [middleware ordering](../guides/middleware.md#setup).
 - Not supported under ASGI; the middleware raises `RLSConfigurationError` there.
 
 ```python

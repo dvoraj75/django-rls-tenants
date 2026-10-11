@@ -11,9 +11,11 @@ from contextlib import ExitStack
 from contextvars import ContextVar, Token
 from typing import TYPE_CHECKING, Any
 
-from asgiref.sync import sync_to_async
-from django.db import transaction
+from asgiref.sync import iscoroutinefunction, sync_to_async
+from django.conf import settings
+from django.db import connections, transaction
 from django.utils.deprecation import MiddlewareMixin
+from django.utils.module_loading import import_string
 
 from django_rls_tenants.exceptions import RLSConfigurationError
 from django_rls_tenants.rls.guc import clear_guc, set_guc
@@ -27,6 +29,8 @@ from django_rls_tenants.tenants.state import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from django.http import HttpRequest, HttpResponse
 
 logger = logging.getLogger("django_rls_tenants")
@@ -108,6 +112,33 @@ class RLSTenantMiddleware(MiddlewareMixin):
     (WSGI) code path.
     """
 
+    def __init__(self, get_response: Callable[..., Any]) -> None:
+        super().__init__(get_response)
+        if rls_tenants_config.USE_LOCAL_SET:
+            self._validate_exception_middleware_order()
+
+    def _validate_exception_middleware_order(self) -> None:
+        """Reject handlers that could consume an exception before our rollback hook."""
+        after_rls = False
+        for path in settings.MIDDLEWARE:
+            middleware = import_string(path)
+            if isinstance(middleware, type) and isinstance(self, middleware):
+                after_rls = True
+            elif after_rls and not isinstance(middleware, type):
+                # A factory can attach process_exception to the returned instance;
+                # inspecting the factory itself cannot establish hook ordering.
+                raise RLSConfigurationError(
+                    f"USE_LOCAL_SET=True cannot verify exception hooks for middleware "
+                    f"factory {path!r}. Place it before RLSTenantMiddleware in MIDDLEWARE, "
+                    f"or use a middleware class with inspectable hooks."
+                )
+            elif after_rls and hasattr(middleware, "process_exception"):
+                raise RLSConfigurationError(
+                    f"USE_LOCAL_SET=True requires exception-handling middleware {path!r} "
+                    f"to appear before RLSTenantMiddleware in MIDDLEWARE, so a handled "
+                    f"view exception cannot skip the request transaction rollback."
+                )
+
     def __call__(self, request: HttpRequest) -> Any:
         """Run the request, inside a transaction per alias when ``USE_LOCAL_SET``.
 
@@ -118,7 +149,8 @@ class RLSTenantMiddleware(MiddlewareMixin):
         ``process_response``. Unauthenticated requests get no transaction
         (no GUCs are set for them either).
         """
-        if self.async_mode:
+        # Django 4.2/5.0 mark the instance but do not expose async_mode.
+        if iscoroutinefunction(self):
             return self.__acall__(request)
         conf = rls_tenants_config
         if not conf.USE_LOCAL_SET or not _is_authenticated(request):
@@ -126,7 +158,20 @@ class RLSTenantMiddleware(MiddlewareMixin):
         with ExitStack() as stack:
             for db_alias in conf.DATABASES:
                 stack.enter_context(transaction.atomic(using=db_alias))
-            return super().__call__(request)
+            # Lets process_exception tell "our" transaction apart from one
+            # opened by someone else (another middleware, a test wrapper).
+            setattr(request, "_rls_owns_transaction", True)  # noqa: B010  -- dynamic attr on HttpRequest
+            try:
+                return super().__call__(request)
+            finally:
+                try:
+                    if getattr(request, "_rls_rollback_transaction", False) is True:
+                        for db_alias in conf.DATABASES:
+                            if connections[db_alias].in_atomic_block:
+                                transaction.set_rollback(True, using=db_alias)
+                    self._cleanup_rls_state(request)
+                finally:
+                    setattr(request, "_rls_owns_transaction", False)  # noqa: B010 -- dynamic request marker
 
     async def __acall__(self, request: HttpRequest) -> Any:
         """Async entry point; ``USE_LOCAL_SET=True`` is not supported here.
@@ -225,13 +270,19 @@ class RLSTenantMiddleware(MiddlewareMixin):
         request: HttpRequest,
         exception: Exception,  # noqa: ARG002  -- required by MiddlewareMixin
     ) -> None:
-        """Clear RLS state on unhandled exceptions to prevent ContextVar leaks.
+        """Record a view failure before Django converts it to an error response.
 
-        Without this, a view exception that prevents ``process_response``
-        from running would leave the ContextVar set for the remainder of
-        the thread (WSGI) or async task (ASGI).
+        Defer ``set_rollback(True)`` until the chain returns to ``__call__``.
+        Setting it here would prevent error handlers and response middleware
+        from querying even after a non-database exception such as ``Http404``.
+        All writes, including those made by error handlers, are rolled back
+        when the middleware-owned transaction exits. An explicit error
+        response without an exception still commits.
         """
-        self._cleanup_rls_state(request)
+        if getattr(request, "_rls_owns_transaction", False) is True:
+            setattr(request, "_rls_rollback_transaction", True)  # noqa: B010 -- dynamic request marker
+        else:
+            self._cleanup_rls_state(request)
 
     @staticmethod
     def _set_gucs_on_all_databases(guc_vars: dict[str, str], conf: Any) -> None:

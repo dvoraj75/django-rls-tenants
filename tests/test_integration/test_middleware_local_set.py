@@ -9,12 +9,15 @@ Before 1.3.2 every authenticated request in this configuration failed with
 from __future__ import annotations
 
 import pytest
-from django.db import connection
+from django.db import connection, transaction
 from django.test import Client, override_settings
 
+from django_rls_tenants.exceptions import RLSConfigurationError
 from django_rls_tenants.rls.guc import get_guc
+from django_rls_tenants.tenants.context import admin_context
 from django_rls_tenants.tenants.state import get_current_tenant_id, get_rls_context_active
-from tests.test_app.models import AdminUser
+from tests import admin_urls
+from tests.test_app.models import AdminUser, Order
 
 _MIDDLEWARE_WITH_RLS = [
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -97,6 +100,7 @@ class TestMiddlewareLocalSetRequestCycle:
         assert response.status_code == 200
         body = response.json()
         assert body["products"] == ["Widget A1", "Widget A2"]
+        assert body["database_products"] == ["Widget A1", "Widget A2"]
         assert body["tenant_guc"] == str(tenant_a.pk)
         assert body["is_admin_guc"] == "false"
         assert body["in_atomic_block"] is True
@@ -113,6 +117,39 @@ class TestMiddlewareLocalSetRequestCycle:
         assert response.status_code == 500
         _assert_request_left_nothing_behind()
 
+    def test_view_exception_rolls_back_the_request_transaction(
+        self, atomic_requests, scoped_web_user, local_set_middleware
+    ):
+        """A raising view loses its writes, exactly like ATOMIC_REQUESTS.
+
+        Django converts the exception into a 500 response inside the chain, so
+        the middleware's ``atomic()`` would otherwise commit the partial write;
+        ``process_exception`` marks the transaction for rollback.
+        """
+        client = Client(raise_request_exception=False)
+        client.force_login(scoped_web_user)
+
+        response = client.get("/rls/write-then-boom/")
+
+        assert response.status_code == 500
+        _assert_request_left_nothing_behind()
+        with transaction.atomic(), admin_context():
+            assert not Order.objects.filter(product="Doomed").exists()
+
+    def test_explicit_error_response_commits(
+        self, atomic_requests, scoped_web_user, local_set_middleware
+    ):
+        """Returning a 500 without raising commits (ATOMIC_REQUESTS parity)."""
+        client = Client()
+        client.force_login(scoped_web_user)
+
+        response = client.get("/rls/write-then-500/")
+
+        assert response.status_code == 500
+        _assert_request_left_nothing_behind()
+        with transaction.atomic(), admin_context():
+            assert Order.objects.filter(product="Survivor").exists()
+
     def test_anonymous_request_is_fail_closed_without_transaction(
         self, atomic_requests, sample_orders, local_set_middleware
     ):
@@ -121,6 +158,8 @@ class TestMiddlewareLocalSetRequestCycle:
         assert response.status_code == 200
         body = response.json()
         assert body["tenant_guc"] is None
+        assert body["products"] == []
+        assert body["database_products"] == []
         # No tenant context: only Django's own ATOMIC_REQUESTS wraps the view.
         assert body["in_atomic_block"] is atomic_requests
         _assert_request_left_nothing_behind()
@@ -137,3 +176,57 @@ class TestMiddlewareLocalSetRequestCycle:
         assert client_a.get("/rls/orders/").json()["products"] == ["Widget A1", "Widget A2"]
         assert client_b.get("/rls/orders/").json()["products"] == ["Gadget B1"]
         _assert_request_left_nothing_behind()
+
+    def test_404_handler_can_query_before_request_rollback(
+        self, atomic_requests, scoped_web_user, local_set_middleware, monkeypatch
+    ):
+        monkeypatch.setattr(
+            admin_urls, "handler404", "tests.rls_views.database_404_handler", raising=False
+        )
+        client = Client(raise_request_exception=False)
+        client.force_login(scoped_web_user)
+
+        response = client.get("/rls/write-then-404/")
+
+        assert response.status_code == 404
+        assert response.json()["tenants"] == 1
+        _assert_request_left_nothing_behind()
+        with transaction.atomic(), admin_context():
+            assert not Order.objects.filter(product="Doomed").exists()
+
+    @pytest.mark.parametrize("handler_after_rls", [False, True])
+    @pytest.mark.parametrize(
+        "handler_path",
+        [
+            "tests.rls_views.DatabaseExceptionMiddleware",
+            "tests.rls_views.exception_middleware_factory",
+        ],
+    )
+    def test_handled_view_exception_rolls_back(
+        self,
+        atomic_requests,
+        scoped_web_user,
+        local_set_middleware,
+        handler_after_rls,
+        handler_path,
+    ):
+        middleware = list(_MIDDLEWARE_WITH_RLS)
+        middleware.insert(
+            len(middleware) if handler_after_rls else 0,
+            handler_path,
+        )
+        client = Client(raise_request_exception=False)
+        client.force_login(scoped_web_user)
+        with override_settings(MIDDLEWARE=middleware):
+            if handler_after_rls:
+                with pytest.raises(RLSConfigurationError, match="before RLSTenantMiddleware"):
+                    client.get("/rls/write-then-boom/")
+                _assert_request_left_nothing_behind()
+                return
+            response = client.get("/rls/write-then-boom/")
+
+        assert response.status_code == 409
+        assert response.json()["tenants"] == 1
+        _assert_request_left_nothing_behind()
+        with transaction.atomic(), admin_context():
+            assert not Order.objects.filter(product="Doomed").exists()

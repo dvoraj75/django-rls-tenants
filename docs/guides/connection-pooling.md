@@ -63,13 +63,17 @@ transaction.
 transaction simply nests as a savepoint inside the middleware's.
 
 !!! note "Consequences of a transaction per request"
-    This is the same shape as `ATOMIC_REQUESTS`, with the same rules: catch database
+    As with `ATOMIC_REQUESTS`, catch database
     errors inside your own `transaction.atomic()` block or the rest of the request fails
     with "current transaction is aborted"; `transaction.on_commit()` callbacks run when
     the request ends; and `@non_atomic_requests` has no effect, because the middleware's
     transaction encloses the view anyway. A streaming response iterates its body after
     the transaction has ended, so queries made while streaming run without tenant
     context (fail-closed: no rows) -- establish a context inside the generator. The
+    Place middleware implementing `process_exception` before `RLSTenantMiddleware`,
+    so handled view exceptions cannot bypass rollback; unsafe ordering raises
+    `RLSConfigurationError`. Error handling runs inside the transaction too, and writes
+    by error handlers are rolled back along with the failed view's writes. The
     middleware raises `RLSConfigurationError` if the mode is used under ASGI (see
     [Middleware](middleware.md#use_local_set-and-asgi)).
 

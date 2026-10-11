@@ -153,7 +153,10 @@ A **drop-in upgrade** -- no code or data migration is required.
   `ATOMIC_REQUESTS=True` from `DATABASES` if you only had it for RLS; keeping it is
   harmless. The transaction-per-request rules of `ATOMIC_REQUESTS` now apply to this
   mode (catch database errors inside `atomic()`, `on_commit` runs at request end,
-  `@non_atomic_requests` has no effect). ASGI deployments cannot use this mode yet; the
+  `@non_atomic_requests` has no effect). Middleware implementing `process_exception`
+  and function-based middleware factories must precede `RLSTenantMiddleware`;
+  unsafe ordering raises `RLSConfigurationError`
+  when the middleware is loaded. ASGI deployments cannot use this mode yet; the
   middleware raises `RLSConfigurationError`. See
   [Middleware](../guides/middleware.md#transaction-per-request-use_local_settrue).
 - **System check `W007` is retired.** It flagged `USE_LOCAL_SET=True` without

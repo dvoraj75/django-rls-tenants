@@ -58,8 +58,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   owns the transaction when `USE_LOCAL_SET=True`: it opens `transaction.atomic()` on
   every alias in `RLS_TENANTS["DATABASES"]` around the rest of the chain and the view
   for authenticated requests, so the GUCs cover the whole request and vanish at
-  commit/rollback. `ATOMIC_REQUESTS` is no longer required (it nests as a savepoint if
-  kept). The default `USE_LOCAL_SET=False` path is unchanged. Under ASGI the mode is
+  commit/rollback. A view that raises rolls that transaction back (an explicit error
+  response commits). Exception-handling middleware and function-based middleware
+  factories must precede `RLSTenantMiddleware`;
+  unsafe ordering raises `RLSConfigurationError` instead of allowing handled exceptions
+  to commit partial writes. Rollback is deferred until transaction exit so error handlers
+  can query after non-database exceptions; their writes also roll back. Directly escaping
+  exceptions clean up request state in `finally`. Async detection supports Django 4.2
+  and 5.0 as well as newer versions. `ATOMIC_REQUESTS` is no longer required
+  (it nests as a savepoint if kept). The default `USE_LOCAL_SET=False` path is unchanged.
+  Under ASGI the mode is
   refused with a clear `RLSConfigurationError` instead of the opaque `RuntimeError`
   (native async support is v1.4.0). System check `W004` no longer recommends
   `ATOMIC_REQUESTS`. New end-to-end tests drive `django.test.Client` through the real

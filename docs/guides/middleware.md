@@ -25,6 +25,14 @@ MIDDLEWARE = [
     The middleware reads `request.user`, which is set by `AuthenticationMiddleware`.
     Placing it before authentication will result in no tenant context being set.
 
+When `USE_LOCAL_SET=True`, also place middleware implementing `process_exception`
+**before** `RLSTenantMiddleware`. Django calls exception hooks in reverse order and
+stops when one returns a response. The RLS hook must run first to record the failed
+view and roll back its writes. An unsafe ordering raises `RLSConfigurationError`
+when the middleware is loaded. Middleware classes without exception hooks can still
+follow it. Function-based middleware factories must precede it too: their returned
+instances can expose exception hooks that cannot be inspected before construction.
+
 ## How It Works
 
 ### Request Phase (`process_request`)
@@ -53,10 +61,19 @@ each alias in `RLS_TENANTS["DATABASES"]` *before* `process_request` and leaves i
 *after* `process_response`. The GUCs live exactly as long as the request and vanish at
 the commit (or rollback) that ends it. Unauthenticated requests get no transaction.
 
-Consequences, all shared with `ATOMIC_REQUESTS`:
+Transaction behavior and limitations:
 
+- A view that **raises** rolls the whole request transaction back. The middleware
+  records the failure in `process_exception`, then marks each transaction for rollback
+  just before leaving it. This lets error handlers query after non-database exceptions
+  such as `Http404`; the tenant context stays active until response cleanup. Writes by
+  those handlers are rolled back too. A view that **returns** an error response without
+  raising commits. These view outcomes match `ATOMIC_REQUESTS`, but error handling and
+  downstream middleware also run inside this transaction.
 - A database error must be caught inside your own `transaction.atomic()` block, or the
-  rest of the request fails with *current transaction is aborted*.
+  rest of the request (including error handlers) cannot query the broken transaction.
+  Keeping `ATOMIC_REQUESTS=True` provides a savepoint around the view, allowing error
+  handlers to query after a database exception escapes that view.
 - `transaction.on_commit()` callbacks run when the request finishes.
 - `@non_atomic_requests` has no effect -- the middleware's transaction encloses the view.
 - Keeping `ATOMIC_REQUESTS=True` is harmless; Django's per-view transaction becomes a

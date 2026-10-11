@@ -5,7 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, call, patch
 
 import pytest
-from asgiref.sync import async_to_sync
+from asgiref.sync import async_to_sync, iscoroutinefunction
 from django.db import connection
 from django.test import override_settings
 
@@ -497,9 +497,10 @@ class TestLocalSetTransaction:
         assert connection.in_atomic_block is False
         assert get_guc("rls.current_tenant") is None
         assert get_guc("rls.is_admin") is None
-        # process_response did not run; in a real request cycle Django's handler
-        # calls process_exception (or the request_finished safety net fires).
-        mw.process_exception(request, RuntimeError("boom"))
+        # Even a directly escaping exception must clean up without relying on
+        # process_exception or request_finished.
+        assert request._rls_owns_transaction is False
+        assert _were_gucs_set() is False
         assert get_current_tenant_id() is None
         assert get_rls_context_active() is False
 
@@ -534,7 +535,7 @@ class TestLocalSetUnderAsgi:
     @override_settings(RLS_TENANTS=_LOCAL_SET)
     def test_authenticated_request_raises_configuration_error(self, tenant_a_user):
         mw = self._async_middleware()
-        assert mw.async_mode is True
+        assert iscoroutinefunction(mw) is True
         with pytest.raises(RLSConfigurationError, match="under ASGI"):
             async_to_sync(mw)(_make_request(user=tenant_a_user))
 
@@ -542,3 +543,50 @@ class TestLocalSetUnderAsgi:
     def test_unauthenticated_request_passes_through(self):
         response = async_to_sync(self._async_middleware())(_make_request())
         assert response._mock_name == "response"
+
+
+class TestProcessExceptionRollback:
+    """Rollback is deferred until the middleware-owned transactions exit."""
+
+    @override_settings(RLS_TENANTS={**_LOCAL_SET, "DATABASES": ["default", "replica"]})
+    def test_marks_every_alias_only_after_the_chain_returns(self, tenant_a_user):
+        request = _make_request(user=tenant_a_user)
+        conn = MagicMock(in_atomic_block=True)
+        with (
+            patch("django_rls_tenants.tenants.middleware.connections") as connections,
+            patch("django_rls_tenants.tenants.middleware.transaction.atomic"),
+            patch("django_rls_tenants.tenants.middleware.transaction.set_rollback") as set_rb,
+            patch.object(RLSTenantMiddleware, "process_request", return_value=None),
+            patch.object(RLSTenantMiddleware, "_cleanup_rls_state"),
+        ):
+            connections.__getitem__.return_value = conn
+
+            def view(request):
+                mw.process_exception(request, RuntimeError("boom"))
+                set_rb.assert_not_called()
+                return MagicMock()
+
+            mw = RLSTenantMiddleware(get_response=view)
+            mw(request)
+
+        assert set_rb.call_args_list == [call(True, using="default"), call(True, using="replica")]
+        assert request._rls_owns_transaction is False
+
+    @override_settings(RLS_TENANTS=_LOCAL_SET)
+    def test_no_rollback_when_middleware_did_not_open_the_transaction(self):
+        request = _make_request()
+        del request._rls_owns_transaction
+        with patch("django_rls_tenants.tenants.middleware.transaction.set_rollback") as set_rb:
+            RLSTenantMiddleware(get_response=lambda r: MagicMock()).process_exception(
+                request, RuntimeError("boom")
+            )
+        set_rb.assert_not_called()
+
+    @override_settings(
+        MIDDLEWARE=[
+            "django_rls_tenants.RLSTenantMiddleware",
+            "tests.rls_views.DatabaseExceptionMiddleware",
+        ],
+    )
+    def test_session_mode_allows_downstream_exception_handlers(self):
+        RLSTenantMiddleware(get_response=lambda r: MagicMock())
