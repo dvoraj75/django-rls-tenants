@@ -83,10 +83,15 @@ def follow_task(_prev: object = None) -> object:
     return get_current_tenant_id()
 
 
-@rls_task
-def follow_report_context(_prev: object = None) -> tuple[object, bool]:
-    """Downstream canvas step; returns the RLS context it inherited."""
-    return get_current_tenant_id(), get_rls_context_active()
+@rls_task(bind=True)
+def check_admin_canvas_context(self, _prev: object = None) -> tuple[object, bool]:
+    """Check both the propagated headers and the context at each canvas step."""
+    # Eager tasks run inside the caller's admin_context(), so the active flag
+    # alone would still pass if header capture were completely removed.
+    assert self.request.headers == {_TENANT_HEADER: None, _ADMIN_HEADER: True}
+    context = get_current_tenant_id(), get_rls_context_active()
+    assert context == (None, True)
+    return context
 
 
 class StrictRLSTask(RLSTask):
@@ -458,19 +463,25 @@ class TestCanvasPropagation:
     def test_chain_propagates_admin(self):
         """Every step of a chain enqueued under admin_context() runs as admin."""
         with admin_context():
-            result = chain(report_context.s(), follow_report_context.s()).apply_async()
+            result = chain(
+                check_admin_canvas_context.s(), check_admin_canvas_context.s()
+            ).apply_async()
         assert result.get() == (None, True)
 
     def test_group_propagates_admin(self):
         """Every member of a group enqueued under admin_context() runs as admin."""
         with admin_context():
-            result = group(report_context.s(), report_context.s()).apply_async()
+            result = group(
+                check_admin_canvas_context.s(), check_admin_canvas_context.s()
+            ).apply_async()
         assert result.get() == [(None, True), (None, True)]
 
     def test_chord_propagates_admin(self):
-        """A chord's callback runs under the propagated admin context."""
+        """Both chord members and the callback receive the propagated admin context."""
         with admin_context():
-            result = chord([report_context.s(), report_context.s()])(follow_report_context.s())
+            result = chord([check_admin_canvas_context.s(), check_admin_canvas_context.s()])(
+                check_admin_canvas_context.s()
+            )
         assert result.get() == (None, True)
 
 

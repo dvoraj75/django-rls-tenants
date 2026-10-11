@@ -37,8 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   normalisation is pinned DB-free for int and UUID primary keys; custom
   `rls_session_key` / `rls_tenant_query_param` names round-trip through selection sync,
   effective-tenant resolution, the view context and the switcher filter; and Celery
-  canvas propagation (chain / group / chord) is covered under `admin_context()` plus the
-  current-task fallback with a tenant header but no admin key. No library code changed.
+  canvas propagation (chain / group / chord) checks admin headers and context at every
+  step under `admin_context()`, plus the current-task fallback with a tenant header but
+  no admin key. No library code changed.
 
 ### Fixed
 

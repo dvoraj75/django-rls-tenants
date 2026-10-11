@@ -356,13 +356,14 @@ class TestSaveModel:
         assert obj.tenant_id == tenant_uuid
         assert isinstance(obj.tenant_id, uuid.UUID)
 
-    def test_admin_without_selection_leaves_field_untouched(self):
-        """A global admin viewing all keeps whatever the form set (here: nothing)."""
+    @pytest.mark.parametrize("tenant_id", [None, 9])
+    def test_admin_without_selection_leaves_field_untouched(self, tenant_id):
+        """A global admin viewing all keeps whatever tenant the form set."""
         request = _request(_admin_user())
-        obj = Order(product="p", amount=1)
+        obj = Order(product="p", amount=1, tenant_id=tenant_id)
         with patch(_BASE_SAVE_MODEL) as base_save:
             _order_admin().save_model(request, obj, form=None, change=True)
-        assert obj.tenant_id is None
+        assert obj.tenant_id == tenant_id
         base_save.assert_called_once_with(request, obj, None, True)
 
 

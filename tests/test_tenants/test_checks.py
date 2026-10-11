@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -62,9 +63,8 @@ class TestCheckRlsConfig:
             warnings = check_rls_config()
         assert warnings == []
 
-    # Every helper the orchestrator must aggregate. A helper missing from this
-    # list -- or an ``errors.extend(...)`` line dropped from ``check_rls_config``
-    # -- fails ``test_aggregates_every_helper``.
+    # Dropping any of these helpers from ``check_rls_config`` must fail the
+    # aggregation test, even when the real helper would return no warnings.
     _HELPERS = (
         "_check_superuser_connection",
         "_check_guc_prefix_mismatch",
@@ -83,13 +83,10 @@ class TestCheckRlsConfig:
             )
             for index, name in enumerate(self._HELPERS)
         ]
-        for p in patches:
-            p.start()
-        try:
+        with ExitStack() as stack:
+            for helper_patch in patches:
+                stack.enter_context(helper_patch)
             warnings = check_rls_config()
-        finally:
-            for p in patches:
-                p.stop()
         assert [w.id for w in warnings] == [
             f"django_rls_tenants.T{index:03d}" for index in range(len(self._HELPERS))
         ]
