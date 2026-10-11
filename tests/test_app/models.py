@@ -140,6 +140,46 @@ class OrderNote(RLSProtectedModel):
         db_table = "test_order_note"
 
 
+class OrderNoteAttachment(RLSProtectedModel):
+    """RLS-protected model two hops away from ``Order`` via *nullable* FKs.
+
+    Used to test ``select_related()`` on nested paths (#79):
+
+    - ``note__order``: nullable intermediate (``note``) and nullable leaf
+      (``OrderNote.order``).
+    - ``item__order``: nullable intermediate (``item``) and non-null leaf
+      (``OrderItem.order``).
+
+    Both paths must keep LEFT OUTER JOIN semantics so rows whose chain is
+    broken by a ``NULL`` at any hop are not dropped.
+    """
+
+    note = models.ForeignKey(OrderNote, on_delete=models.SET_NULL, null=True, blank=True)
+    item = models.ForeignKey(OrderItem, on_delete=models.SET_NULL, null=True, blank=True)
+    filename = models.CharField(max_length=255)
+
+    class Meta(RLSProtectedModel.Meta):
+        db_table = "test_order_note_attachment"
+
+
+class NoteRevision(RLSProtectedModel):
+    """RLS-protected model two hops away from ``Order`` via *non-null* first hops.
+
+    Used to test ``select_related()`` on nested paths (#79):
+
+    - ``note__order``: non-null intermediate (``note``) and nullable leaf
+      (``OrderNote.order``) -- must stay a LEFT OUTER JOIN on the leaf.
+    - ``item__order``: fully non-null chain -- an INNER JOIN is correct.
+    """
+
+    note = models.ForeignKey(OrderNote, on_delete=models.CASCADE)
+    item = models.ForeignKey(OrderItem, on_delete=models.CASCADE)
+    summary = models.CharField(max_length=255)
+
+    class Meta(RLSProtectedModel.Meta):
+        db_table = "test_note_revision"
+
+
 class ProtectedUser(RLSProtectedModel):
     """RLS-protected user model with extra bypass flags."""
 

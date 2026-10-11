@@ -133,6 +133,11 @@ A **drop-in upgrade** -- no code or data migration is required.
   life of the process; if your tests cleared `rls_tenants_config._config_cache` by hand
   to get around that, delete the workaround. See
   [Testing](../guides/testing.md#overriding-rls_tenants-per-test).
+- **`select_related()` on nested nullable paths returns the missing rows again.**
+  `Model.objects.select_related("a__b")` inside a tenant context used to drop every row
+  whose `a` or `a.b` was `NULL` when `b` points at an RLS-protected model. If you worked
+  around that with a separate query or `prefetch_related()`, the workaround can go; no
+  settings or migrations change.
 
 ### From 1.3.0 to 1.3.1
 

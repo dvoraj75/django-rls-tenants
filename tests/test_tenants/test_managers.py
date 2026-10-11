@@ -13,7 +13,11 @@ from django.test import override_settings
 from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.guc import get_guc
 from django_rls_tenants.tenants.context import admin_context, tenant_context
-from django_rls_tenants.tenants.managers import _is_rls_protected, _resolve_related_model
+from django_rls_tenants.tenants.managers import (
+    _is_rls_protected,
+    _resolve_related_model,
+    _resolve_related_path,
+)
 from django_rls_tenants.tenants.middleware import RLSTenantMiddleware
 from django_rls_tenants.tenants.state import (
     get_current_tenant_id,
@@ -21,7 +25,14 @@ from django_rls_tenants.tenants.state import (
     reset_current_tenant_id,
     set_current_tenant_id,
 )
-from tests.test_app.models import Order, OrderItem, OrderNote, Tenant
+from tests.test_app.models import (
+    NoteRevision,
+    Order,
+    OrderItem,
+    OrderNote,
+    OrderNoteAttachment,
+    Tenant,
+)
 
 pytestmark = pytest.mark.django_db
 
@@ -416,6 +427,164 @@ class TestSelectRelated:
             b_notes = list(OrderNote.objects.select_related("order"))
             assert len(b_notes) == 1
             assert b_notes[0].body == "Linked to order B1"
+
+
+class TestSelectRelatedNestedNullable:
+    """``select_related()`` on nested paths with a nullable hop (#79).
+
+    Before the fix the ``__isnull`` escape hatch was only added when the
+    *full dotted path* resolved via ``get_field()``, which never happens for
+    ``a__b`` paths, so the tenant filter on the leaf forced an INNER JOIN and
+    silently dropped every row whose chain had a NULL at any hop.
+    """
+
+    @pytest.fixture(autouse=True, params=[False, True], ids=["orm", "rls"])
+    def _rls_enforcement(self, request, _rls_role):
+        """Exercise ORM filtering both with and without database RLS enforcement."""
+        if request.param:
+            request.getfixturevalue("enforce_rls")
+
+    def test_nullable_intermediate_and_nullable_leaf_keeps_all_rows(
+        self, sample_nested_rows, tenant_a
+    ):
+        """``note__order``: NULL at the first hop and NULL at the leaf both survive."""
+        with tenant_context(tenant_a.pk):
+            rows = list(OrderNoteAttachment.objects.select_related("note__order"))
+        assert sorted(r.filename for r in rows) == ["full.txt", "leaf-null.txt", "orphan.txt"]
+        by_name = {r.filename: r for r in rows}
+        assert by_name["orphan.txt"].note is None
+        assert by_name["leaf-null.txt"].note is not None
+        assert by_name["leaf-null.txt"].note.order is None
+        assert by_name["full.txt"].note.order.tenant_id == tenant_a.pk
+
+    def test_nullable_intermediate_and_non_null_leaf_keeps_all_rows(
+        self, sample_nested_rows, tenant_a
+    ):
+        """``item__order``: a nullable first hop alone must keep the LEFT JOIN.
+
+        ``OrderItem.order`` is NOT nullable, so a leaf-only nullability check
+        would still drop the two attachments without an item.
+        """
+        with tenant_context(tenant_a.pk):
+            rows = list(OrderNoteAttachment.objects.select_related("item__order"))
+        assert sorted(r.filename for r in rows) == ["full.txt", "leaf-null.txt", "orphan.txt"]
+        by_name = {r.filename: r for r in rows}
+        assert by_name["orphan.txt"].item is None
+        assert by_name["full.txt"].item.order.tenant_id == tenant_a.pk
+
+    def test_non_null_intermediate_and_nullable_leaf_keeps_all_rows(
+        self, sample_nested_rows, tenant_a
+    ):
+        """``note__order`` from ``NoteRevision``: only the leaf is nullable."""
+        with tenant_context(tenant_a.pk):
+            rows = list(NoteRevision.objects.select_related("note__order"))
+        assert sorted(r.summary for r in rows) == ["full", "leaf-null"]
+        by_name = {r.summary: r for r in rows}
+        assert by_name["leaf-null"].note.order is None
+        assert by_name["full"].note.order.tenant_id == tenant_a.pk
+
+    def test_fully_non_null_path_uses_inner_join(self, sample_nested_rows, tenant_a):
+        """``item__order`` from ``NoteRevision``: no nullable hop, INNER JOIN is right."""
+        with tenant_context(tenant_a.pk):
+            qs = NoteRevision.objects.select_related("item__order")
+            sql = str(qs.query)
+            rows = list(qs)
+        assert sorted(r.summary for r in rows) == ["full", "leaf-null"]
+        assert "LEFT OUTER JOIN" not in sql
+        assert "INNER JOIN" in sql
+        assert '"test_order"."tenant_id"' in sql
+
+    def test_nested_nullable_sql_shape(self, sample_nested_rows, tenant_a):
+        """The leaf keeps the tenant predicate and the joins stay LEFT OUTER."""
+        with tenant_context(tenant_a.pk):
+            sql = str(OrderNoteAttachment.objects.select_related("note__order").query)
+        assert sql.count("LEFT OUTER JOIN") == 2
+        assert "INNER JOIN" not in sql
+        assert '"test_order"."tenant_id"' in sql
+        assert "IS NULL" in sql
+
+    def test_nested_nullable_isolation(self, sample_nested_rows, tenant_a, tenant_b):
+        """The preserved rows are still scoped to the active tenant."""
+        with tenant_context(tenant_b.pk):
+            atts = list(OrderNoteAttachment.objects.select_related("note__order"))
+            revs = list(NoteRevision.objects.select_related("note__order"))
+        assert [a.filename for a in atts] == ["b.txt"]
+        assert atts[0].note.order.tenant_id == tenant_b.pk
+        assert [r.summary for r in revs] == ["b"]
+
+    def test_nested_nullable_excludes_cross_tenant_leaf(
+        self, sample_nested_rows, sample_orders, tenant_a
+    ):
+        """A root in the active tenant must not expose another tenant's leaf."""
+        with admin_context():
+            cross_tenant_note = OrderNote.objects.create(
+                tenant=tenant_a,
+                order=sample_orders["b1"],
+                body="Cross-tenant order",
+            )
+            attachment = OrderNoteAttachment.objects.create(
+                tenant=tenant_a,
+                note=cross_tenant_note,
+                filename="cross-tenant.txt",
+            )
+        with tenant_context(tenant_a.pk):
+            # The root and intermediate object are visible. Only the predicate
+            # on the joined leaf can exclude this attachment in the ORM case.
+            assert OrderNoteAttachment.objects.filter(pk=attachment.pk).exists()
+            rows = list(OrderNoteAttachment.objects.select_related("note__order"))
+        assert sorted(r.filename for r in rows) == ["full.txt", "leaf-null.txt", "orphan.txt"]
+
+    def test_nested_nullable_with_for_user(self, sample_nested_rows, tenant_a_user):
+        """Deferred user scoping preserves missing relations at either hop."""
+        rows = list(
+            OrderNoteAttachment.objects.for_user(tenant_a_user).select_related("note__order")
+        )
+        assert sorted(r.filename for r in rows) == ["full.txt", "leaf-null.txt", "orphan.txt"]
+
+    def test_nested_path_to_non_rls_leaf_adds_no_filter(self, sample_nested_rows, tenant_a):
+        """``note__tenant`` ends at a non-RLS model: no extra predicate, no crash."""
+        with tenant_context(tenant_a.pk):
+            qs = OrderNoteAttachment.objects.select_related("note__tenant")
+            # Compare the predicates directly: Django renders table aliases,
+            # not lookup strings such as "tenant__tenant_id", in SQL.
+            assert qs.query.where == OrderNoteAttachment.objects.all().query.where
+            rows = list(qs)
+        assert len(rows) == 3
+
+    def test_single_segment_behaviour_unchanged(self, sample_order_notes, tenant_a):
+        """The pre-existing single-hop nullable case still gets its ``IS NULL`` clause."""
+        with tenant_context(tenant_a.pk):
+            sql = str(OrderNote.objects.select_related("order").query)
+        assert "LEFT OUTER JOIN" in sql
+        assert "IS NULL" in sql
+
+
+class TestResolveRelatedPath:
+    """Tests for the _resolve_related_path() helper (model + nullability)."""
+
+    def test_single_non_null_fk(self):
+        assert _resolve_related_path(OrderItem, "order") == (Order, False)
+
+    def test_single_nullable_fk(self):
+        assert _resolve_related_path(OrderNote, "order") == (Order, True)
+
+    def test_nullable_intermediate_non_null_leaf(self):
+        assert _resolve_related_path(OrderNoteAttachment, "item__order") == (Order, True)
+
+    def test_non_null_intermediate_nullable_leaf(self):
+        assert _resolve_related_path(NoteRevision, "note__order") == (Order, True)
+
+    def test_fully_non_null_chain(self):
+        assert _resolve_related_path(NoteRevision, "item__order") == (Order, False)
+
+    def test_both_hops_nullable(self):
+        assert _resolve_related_path(OrderNoteAttachment, "note__order") == (Order, True)
+
+    def test_invalid_path_returns_none(self):
+        assert _resolve_related_path(OrderNoteAttachment, "note__nope") == (None, False)
+
+    def test_non_relation_field_returns_none(self):
+        assert _resolve_related_path(Order, "product") == (None, False)
 
 
 class TestResolveRelatedModel:

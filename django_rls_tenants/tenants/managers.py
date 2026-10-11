@@ -196,19 +196,17 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         conf = rls_tenants_config
         fk_field_id = f"{conf.TENANT_FK_FIELD}_id"
         for field_path in fields:
-            related_model = _resolve_related_model(self.model, field_path)
+            related_model, nullable = _resolve_related_path(self.model, field_path)
             if related_model is not None and _is_rls_protected(related_model):
                 tenant_filter = Q(**{f"{field_path}__{fk_field_id}": tenant_id})
-                # For nullable FKs, preserve LEFT OUTER JOIN semantics:
-                # include rows where the FK is NULL (no related object).
+                # Preserve LEFT OUTER JOIN semantics when *any* hop of the
+                # path is nullable: include rows whose chain ends in NULL.
                 # Without this, .filter() forces an INNER JOIN which
-                # silently drops rows with NULL FKs.
-                try:
-                    fk_field = self.model._meta.get_field(field_path)  # noqa: SLF001
-                    if getattr(fk_field, "null", False):
-                        tenant_filter = tenant_filter | Q(**{f"{field_path}__isnull": True})
-                except FieldDoesNotExist:
-                    pass
+                # silently drops those rows. The check must cover every
+                # segment, not just the first or the last one -- a nullable
+                # intermediate FK breaks the chain just as well (#79).
+                if nullable:
+                    tenant_filter = tenant_filter | Q(**{f"{field_path}__isnull": True})
                 qs = qs.filter(tenant_filter)
         return qs
 
@@ -382,11 +380,11 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
             super()._fetch_all()
 
 
-def _resolve_related_model(
+def _resolve_related_path(
     model: type[models.Model],
     field_path: str,
-) -> type[models.Model] | None:
-    """Walk a dotted field path to find the target model.
+) -> tuple[type[models.Model] | None, bool]:
+    """Walk a dotted field path to find the target model and its nullability.
 
     For ``"category__parent"``, starts at ``model``, follows ``category``
     to its related model, then follows ``parent`` to the final model.
@@ -397,20 +395,41 @@ def _resolve_related_model(
             or ``"order__customer"``).
 
     Returns:
-        The target model class, or ``None`` if the path is invalid.
+        A ``(target_model, nullable)`` pair. ``target_model`` is ``None``
+        if the path is invalid. ``nullable`` is ``True`` when **any**
+        segment of the path can be ``NULL`` (a nullable forward FK or a
+        reverse one-to-one), i.e. when a join along the path must stay a
+        LEFT OUTER JOIN to keep rows whose chain is broken by a ``NULL``.
     """
     current: type[models.Model] = model
+    nullable = False
     for part in field_path.split("__"):
         try:
             field = current._meta.get_field(part)  # noqa: SLF001
         except FieldDoesNotExist:
-            return None
+            return None, False
         related = getattr(field, "related_model", None)
         if related is None or isinstance(related, str):
             # str means lazy reference like "self" -- skip
-            return None
+            return None, False
+        nullable = nullable or bool(getattr(field, "null", False))
         current = related
-    return current
+    return current, nullable
+
+
+def _resolve_related_model(
+    model: type[models.Model],
+    field_path: str,
+) -> type[models.Model] | None:
+    """Walk a dotted field path to find the target model.
+
+    Thin wrapper around :func:`_resolve_related_path` for callers that
+    only need the model.
+
+    Returns:
+        The target model class, or ``None`` if the path is invalid.
+    """
+    return _resolve_related_path(model, field_path)[0]
 
 
 # Type ignore explanation: Same as TenantQuerySet: Manager is generic at runtime

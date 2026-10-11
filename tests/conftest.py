@@ -13,9 +13,11 @@ from django_rls_tenants.tenants.context import admin_context
 from django_rls_tenants.tenants.state import set_current_tenant_id, set_rls_context_active
 from tests.test_app.models import (
     Document,
+    NoteRevision,
     Order,
     OrderItem,
     OrderNote,
+    OrderNoteAttachment,
     Project,
     ProtectedUser,
     SelfRefModel,
@@ -202,6 +204,77 @@ def sample_order_notes(db, sample_orders, tenant_a, tenant_b):
         "a_linked": note_a_linked,
         "a_orphan": note_a_orphan,
         "b_linked": note_b_linked,
+    }
+
+
+@pytest.fixture
+def sample_nested_rows(db, sample_order_items, sample_order_notes, tenant_a, tenant_b):
+    """Rows two hops away from ``Order`` with NULLs at different hops (#79).
+
+    Tenant A attachments (nullable first hop):
+
+    - ``full``: note -> order A1 and item -> order A1 (whole chain non-NULL)
+    - ``leaf_null``: note -> orphan note (``note.order`` is NULL), no item
+    - ``orphan``: no note, no item (first hop NULL)
+
+    Tenant A revisions (non-null first hop):
+
+    - ``full``: note -> order A1, item -> order A1
+    - ``leaf_null``: note -> orphan note (``note.order`` is NULL), item -> order A2
+
+    Tenant B gets one fully linked row of each kind.
+    """
+    with admin_context():
+        att_full = OrderNoteAttachment.objects.create(
+            note=sample_order_notes["a_linked"],
+            item=sample_order_items["a1"],
+            filename="full.txt",
+            tenant=tenant_a,
+        )
+        att_leaf_null = OrderNoteAttachment.objects.create(
+            note=sample_order_notes["a_orphan"],
+            item=None,
+            filename="leaf-null.txt",
+            tenant=tenant_a,
+        )
+        att_orphan = OrderNoteAttachment.objects.create(
+            note=None,
+            item=None,
+            filename="orphan.txt",
+            tenant=tenant_a,
+        )
+        att_b = OrderNoteAttachment.objects.create(
+            note=sample_order_notes["b_linked"],
+            item=sample_order_items["b1"],
+            filename="b.txt",
+            tenant=tenant_b,
+        )
+        rev_full = NoteRevision.objects.create(
+            note=sample_order_notes["a_linked"],
+            item=sample_order_items["a1"],
+            summary="full",
+            tenant=tenant_a,
+        )
+        rev_leaf_null = NoteRevision.objects.create(
+            note=sample_order_notes["a_orphan"],
+            item=sample_order_items["a2"],
+            summary="leaf-null",
+            tenant=tenant_a,
+        )
+        rev_b = NoteRevision.objects.create(
+            note=sample_order_notes["b_linked"],
+            item=sample_order_items["b1"],
+            summary="b",
+            tenant=tenant_b,
+        )
+    return {
+        "att_full": att_full,
+        "att_leaf_null": att_leaf_null,
+        "att_orphan": att_orphan,
+        "att_b": att_b,
+        "rev_full": rev_full,
+        "rev_leaf_null": rev_leaf_null,
+        "rev_b": rev_b,
     }
 
 

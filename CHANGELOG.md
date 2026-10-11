@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RLS_TENANTS` changes (the unknown-key typo check re-runs too). A public
   `rls_tenants_config.reload()` exposes the same hook. The library's own tests and the
   example suite drop their manual `_config_cache = None` workarounds.
+- **`select_related()` silently dropped rows on nested nullable paths** (#79).
+  `TenantQuerySet.select_related("a__b")` adds a tenant predicate on the joined
+  RLS-protected table, and for nullable relations it ORs in `a__b__isnull=True` so the
+  join stays a LEFT OUTER JOIN. The nullability check looked up the *whole dotted path*
+  with `get_field()`, which never resolves for multi-hop paths, so no `isnull` clause was
+  added and the predicate forced an INNER JOIN: rows whose chain had a `NULL` at any hop
+  (a missing intermediate object or a missing leaf) vanished from the result. The path
+  is now walked segment by segment and the `isnull` escape hatch is added when **any**
+  hop is nullable. Fully non-null chains keep their INNER JOIN. Single-hop behaviour
+  is unchanged.
 
 ## [1.3.1] - 2026-10-11
 
