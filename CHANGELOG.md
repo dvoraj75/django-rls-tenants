@@ -40,6 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   canvas propagation (chain / group / chord) checks admin headers and context at every
   step under `admin_context()`, plus the current-task fallback with a tenant header but
   no admin key. No library code changed.
+- **Example app: migrations are committed and `.env.example` is gone** (#81). The three
+  example apps now ship `0001_initial.py` instead of relying on a runtime
+  `makemigrations` in `docker-compose.yml`, the README and CI. The notes migration
+  carries the `AddConstraint(RLSConstraint(...))` operations that emit the RLS policy DDL,
+  which is the most instructive artifact of the demo and was previously only ever
+  generated inside the container. `migrate` alone now brings up the policies, and the CI
+  example job runs `makemigrations --check --dry-run` so model/migration drift fails the
+  build. The orphaned `example/.env.example` is deleted: nothing read it (compose injects
+  `DATABASE_URL` and the README's local-development section uses `export`).
 
 ### Fixed
 

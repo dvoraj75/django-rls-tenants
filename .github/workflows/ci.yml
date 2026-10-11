@@ -118,7 +118,7 @@ jobs:
       - name: Run example tests with PostgreSQL RLS enforced
         working-directory: example
         run: |
-          uv run --project .. python manage.py makemigrations
+          uv run --project .. python manage.py makemigrations --check --dry-run
           uv run --project .. python -m pytest tests/ -v
 
   test:

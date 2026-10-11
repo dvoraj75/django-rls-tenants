@@ -114,6 +114,7 @@ Open **<http://localhost:8000>** and log in with any demo account:
 | Feature | Where |
 | ------- | ----- |
 | `RLSProtectedModel` | `notes/models.py` -- `Note` and `Category` |
+| `RLSConstraint` migration | `notes/migrations/0001_initial.py` -- committed `AddConstraint` ops that emit the RLS DDL |
 | `RLSTenantMiddleware` | `demo/settings.py` -- automatic per-request RLS context |
 | `TenantUser` protocol | `accounts/models.py` -- `rls_tenant_id` + `is_tenant_admin` |
 | `RLSTenantModelAdmin` | `notes/admin.py` -- auto-scoped changelists, hidden + auto-assigned tenant FK, tenant switcher |
@@ -144,6 +145,13 @@ Request
   -> PostgreSQL RLS policy provides defense-in-depth at database level
 ```
 
+The database-level policies come from the committed migration
+`notes/migrations/0001_initial.py`. Its two `AddConstraint(RLSConstraint(...))`
+operations for `Note` and `Category` are what emit the
+`ALTER TABLE ... ENABLE/FORCE ROW LEVEL SECURITY` and `CREATE POLICY` DDL when you
+run `migrate`. Nothing is generated at runtime: if you change a model, run
+`python manage.py makemigrations` and commit the result (CI fails on drift).
+
 ## Project Structure
 
 ```
@@ -155,7 +163,8 @@ example/
 ├── tenants/             Tenant model (shared, not RLS-protected)
 ├── accounts/            Custom User model with tenant FK + TenantUser protocol
 ├── notes/               RLS-protected Note + Category models, views, services,
-│                        templates, admin, seed command
+│                        templates, admin, seed command, committed migrations
+│                        (0001_initial.py carries the RLS policy DDL)
 └── tests/               Example tests using django-rls-tenants testing utilities
     ├── conftest.py      Fixtures using rls_bypass for test data setup
     ├── test_admin.py    RLSTenantModelAdmin scoping, FK hiding and switcher tests
@@ -175,7 +184,6 @@ docker compose exec web python -m pytest tests/ -v
 # Or locally (with PostgreSQL running):
 cd example/
 pip install pytest pytest-django
-python manage.py makemigrations
 python -m pytest tests/ -v
 ```
 
@@ -199,8 +207,7 @@ pip install psycopg2-binary
 export POSTGRES_DB=demo POSTGRES_USER=app POSTGRES_PASSWORD=app
 export POSTGRES_HOST=localhost POSTGRES_PORT=5432
 
-# Run migrations, verify policies, seed data, and start the server
-python manage.py makemigrations
+# Apply the committed migrations, verify policies, seed data, and start the server
 python manage.py migrate
 python manage.py check_rls
 python manage.py seed_demo --no-input
