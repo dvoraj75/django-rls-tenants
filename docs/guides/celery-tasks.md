@@ -134,8 +134,9 @@ with tenant_context(tenant.pk):
 !!! tip "See it running"
     The bundled
     [example project](https://github.com/dvoraj75/django-rls-tenants/tree/main/example)
-    ships two `@rls_task` functions in `notes/tasks.py` -- one plain, one with
-    `rls_require_context = True` -- driven from its Stats page and covered by
+    ships two `@rls_task` functions in `notes/tasks.py`: `count_notes`, driven
+    from its Stats page, and `export_notes`, with `rls_require_context = True`,
+    demonstrated in the README's shell walkthrough. Both are covered by
     `tests/test_tasks.py`. It runs Celery in eager mode, so `docker compose up`
     in `example/` is all it takes: no broker, no worker.
 
