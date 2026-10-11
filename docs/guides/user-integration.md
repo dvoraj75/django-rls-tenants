@@ -28,15 +28,21 @@ import `TenantUser` or register your model anywhere.
 
 ## Implementing on Your User Model
 
+All three variants below keep `User` a plain `AbstractUser` with a nullable `tenant`
+foreign key. The user model does not need to be RLS-protected for the protocol to work,
+and the library's own example project and test app use exactly this shape. If you want
+user rows isolated per tenant as well, read
+[Protecting the User Model](protecting-models.md#protecting-the-user-model) first:
+inheriting from `RLSProtectedModel` also puts RLS on Django's auth through tables.
+
 ### Simple Implementation
 
 ```python title="myapp/models.py"
 from django.contrib.auth.models import AbstractUser
 from django.db import models
-from django_rls_tenants import RLSProtectedModel
 
 
-class User(AbstractUser, RLSProtectedModel):
+class User(AbstractUser):
     tenant = models.ForeignKey(
         "myapp.Tenant",
         on_delete=models.CASCADE,
@@ -56,7 +62,7 @@ class User(AbstractUser, RLSProtectedModel):
 ### Role-Based Implementation
 
 ```python title="myapp/models.py"
-class User(AbstractUser, RLSProtectedModel):
+class User(AbstractUser):
     tenant = models.ForeignKey(
         "myapp.Tenant",
         on_delete=models.CASCADE,
@@ -89,7 +95,7 @@ class User(AbstractUser, RLSProtectedModel):
 ```python title="myapp/models.py"
 import uuid
 
-class User(AbstractUser, RLSProtectedModel):
+class User(AbstractUser):
     tenant = models.ForeignKey(
         "myapp.Tenant",
         on_delete=models.CASCADE,

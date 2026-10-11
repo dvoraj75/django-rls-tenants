@@ -59,9 +59,12 @@ validates `INSERT` and `UPDATE` operations.
 
 If you need to customize the tenant FK (e.g., nullable for admin users, custom
 `on_delete`, or a different related name), declare it directly on your model.
-The `class_prepared` handler detects the existing field and skips the auto-generation:
+The `class_prepared` handler detects the existing field and skips the auto-generation.
+This example uses an RLS-protected `User`, the opt-in case described in
+[Protecting the User Model](#protecting-the-user-model):
 
 ```python
+from django.contrib.auth.models import AbstractUser
 from django.db import models
 from django_rls_tenants import RLSProtectedModel
 
@@ -201,6 +204,45 @@ class Order(RLSProtectedModel):
 
 If you do not inherit from `RLSProtectedModel.Meta`, the `RLSConstraint` will not
 be included and RLS will not be applied to the table.
+
+## Protecting the User Model
+
+The [Quick Start](../getting-started/quickstart.md) and the
+[User Integration](user-integration.md) guide keep `User` a plain `AbstractUser`. The
+`TenantUser` protocol only needs the two properties, and Django reads user rows itself
+(login, session loading, permission checks) before any tenant context exists.
+
+Inheriting from `RLSProtectedModel` as well, `class User(AbstractUser, RLSProtectedModel)`,
+is supported but is an opt-in with consequences beyond the `User` table:
+
+!!! warning "An RLS-protected `User` also protects Django's auth through tables"
+    `AbstractUser` declares the `groups` and `user_permissions` many-to-many fields.
+    Their auto-generated through tables, `<app>_user_groups` and
+    `<app>_user_user_permissions`, are M2M relations on an RLS-protected model, so
+    `register_m2m_rls()` adds an `RLSM2MConstraint` to both at startup (see
+    [Many-to-Many Relationships](#many-to-many-relationships)) and `check_rls` expects a
+    policy on each of them. It lists them under an extra `M2M through tables:` section,
+    counts them in the total (the Quick Start project reports
+    `All 4 RLS-protected tables verified.` instead of `All 1 ...`), and exits non-zero
+    until you apply the policies with an `AddM2MRLSPolicy` migration or
+    `setup_m2m_rls`.
+
+What this means in practice:
+
+1. **Reads of `User` before the request context is set need a bypass.** The auth backend
+   loads the user row before `RLSTenantMiddleware` runs. Add `extra_bypass_flags` to the
+   `RLSConstraint` (next section) and set the flag in your backend, as shown in
+   [Use Case: Authentication](bypass-mode.md#use-case-authentication).
+2. **Group and permission lookups need a tenant or admin context.** `RLSM2MConstraint`
+   has no `extra_bypass_flags` option; its policy only passes for the admin GUC or when
+   the referenced user belongs to the current tenant. Outside a context
+   `user.has_perm()` is therefore `False` and `user.groups` is empty. Inside a request the
+   middleware provides one; in scripts, shells and Celery tasks wrap the call in
+   `tenant_context()` or `admin_context()`. Users with `tenant=None` who are not
+   `is_tenant_admin` never see their own groups or permissions.
+
+The library's own `example/` project and `tests/test_app` keep `User` a plain
+`AbstractUser`; the test app's separate `ProtectedUser` model covers the opt-in case.
 
 ## Extra Bypass Flags
 

@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: 2026-06-28
+> Last updated: 2026-10-11
 >
 > Priorities may shift based on community feedback.
 > Have a suggestion? [Open an issue](https://github.com/dvoraj75/django-rls-tenants/issues).
@@ -118,6 +118,32 @@ Highest adoption impact, no new dependencies.
 - [x] **CODE_OF_CONDUCT.md** — Adopt the Contributor Covenant.
   *Why:* Standard open-source practice that signals project maturity and
   welcoming community.
+
+---
+
+## v1.3.x — Patch cycle
+
+No new library features; each patch tightens what v1.3.0 shipped. Details for every
+item are in the [changelog](changelog.md).
+
+- [x] **1.3.1 — Example project and docs front door** — the `example/` admin
+  showcases `RLSTenantModelAdmin`, the README and docs landing page list the v1.3.0
+  features, `W005` also flags `BYPASSRLS` roles, and CI builds the docs with
+  `mkdocs build --strict`. See [1.3.1](changelog.md#131-2026-10-11).
+  *Why:* The first thing a new user opens must match what the library does.
+
+- [x] **1.3.2 — Bug fixes** — `override_settings(RLS_TENANTS=...)` is honoured (#100),
+  nested-nullable `select_related()` keeps its rows (#79), nested context managers
+  restore the outer scope and preserve database errors (#94, #102), and the middleware
+  owns the `SET LOCAL` transaction and the request rollback (#95).
+  See [1.3.2](changelog.md#132-2026-10-11).
+  *Why:* Each one let a test or a request pass for the wrong reason.
+
+- [~] **1.3.3 — Demos, docs accuracy, test backfill, CI gates** — committed example
+  migrations and a Celery demo (#80, #81), docs accuracy fixes and this roadmap in the
+  site nav (#82), a performance guide (#83), a troubleshooting page (#109), v1.3.0 test
+  backfill (#84) and a PostgreSQL matrix with release gates in CI (#110).
+  *Why:* Closes the gap between what is documented and what is verified.
 
 ---
 

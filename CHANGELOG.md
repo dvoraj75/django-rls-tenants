@@ -30,6 +30,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `safe_tenant_sql(include_admin=False)` fragment (or a bind parameter) reaches the
   index; the admin-inclusive default plans as a sequential scan like the policy. (#83)
 
+### Fixed
+
+- **Docs: the Quick Start and User Integration guides no longer make `User`
+  RLS-protected** (#82). `class User(AbstractUser, RLSProtectedModel)` silently
+  registers `RLSM2MConstraint` on the inherited `groups` and `user_permissions` through
+  tables, so `check_rls` printed an extra `M2M through tables:` section and
+  `All 4 RLS-protected tables verified.` where the Quick Start promised 2. Both guides
+  now use a plain `AbstractUser` with a nullable `tenant` FK (the shape the example
+  project and test app use), the Quick Start output matches a real run, and a new
+  *Protecting the User Model* section in the Protecting Models guide documents the
+  opt-in case: the auth through tables get RLS, `RLSM2MConstraint` has no
+  `extra_bypass_flags`, and group/permission lookups need a tenant or admin context.
+- **Docs: the roadmap is reachable from the site nav** (#82). `development/roadmap.md`
+  was committed but missing from the Development section of `mkdocs.yml`. It is now
+  listed after the changelog and gains a `v1.3.x — Patch cycle` entry so the public
+  roadmap no longer jumps from v1.3.0 to v1.4.0.
+
 ## [1.3.2] - 2026-10-11
 
 ### Fixed

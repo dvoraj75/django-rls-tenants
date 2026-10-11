@@ -52,8 +52,8 @@ belongs to and whether they are an admin:
 from django.contrib.auth.models import AbstractUser
 
 
-class User(AbstractUser, RLSProtectedModel):
-    # Override the auto-generated tenant FK to allow null (for admins)
+class User(AbstractUser):
+    # Nullable: admin users belong to no tenant
     tenant = models.ForeignKey(
         Tenant,
         on_delete=models.CASCADE,
@@ -71,6 +71,12 @@ class User(AbstractUser, RLSProtectedModel):
         """Return the tenant PK for RLS filtering."""
         return self.tenant_id if self.tenant_id else None
 ```
+
+`User` stays a plain `AbstractUser`. The protocol is structural, so the user model does
+not need to be RLS-protected, and the library's own example project keeps it that way.
+Want `User` rows themselves isolated per tenant? Read
+[Protecting the User Model](../guides/protecting-models.md#protecting-the-user-model)
+first: it also puts RLS on Django's auth tables.
 
 See [User Integration](../guides/user-integration.md) for details on the `TenantUser` protocol.
 
@@ -145,10 +151,14 @@ Expected output:
 
 ```
   Order (myapp_order): myapp_order_tenant_isolation_policy
-  User (myapp_user): myapp_user_tenant_isolation_policy
 
-All 2 RLS-protected tables verified.
+All 1 RLS-protected tables verified.
 ```
+
+Only `Order` is listed: `User` is not RLS-protected in this tutorial. If you make it
+RLS-protected, the output also gains an `M2M through tables:` section for Django's auth
+through tables, which need policies of their own, and the total rises to 4 (see
+[Protecting the User Model](../guides/protecting-models.md#protecting-the-user-model)).
 
 If any policies are missing, the command exits with a non-zero status and lists the issues.
 
