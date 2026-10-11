@@ -60,7 +60,8 @@ the [Security Model](advanced/security.md) for what that does and does not cover
 
 1. **Middleware** reads `request.user` and extracts tenant identity via the `TenantUser` protocol.
 2. **GUC variables** (`rls.current_tenant`, `rls.is_admin`) are set on the PostgreSQL connection.
-3. **Auto-scoping** adds `WHERE tenant_id = X` at the ORM level, enabling composite index usage.
+3. **Auto-scoping** adds `WHERE tenant_id = X` at the ORM level, enabling composite index usage
+   (see the [Performance & Indexing guide](guides/performance.md)).
 4. **RLS policies** (created automatically via Django migrations) filter every query at the database level as a safety net.
 5. **Fail-closed**: if no GUC is set, the policy returns zero rows -- no data leak is possible.
 

@@ -124,7 +124,9 @@ Key design decisions in the policy:
   true))`` -- which PostgreSQL evaluates once per statement (an InitPlan) instead
   of per row; the predicate is otherwise identical. The larger performance benefit
   still comes from auto-scoping (``WHERE tenant_id = X`` in ``get_queryset()``),
-  which enables composite index usage.
+  which enables composite index usage. The ``CASE`` form is also why the policy is
+  never an index condition: see
+  [What the planner sees](../guides/performance.md#what-the-planner-sees).
 - **`current_setting(..., true)`**: the `true` parameter returns empty string instead
   of raising an error when the GUC is not set. This enables fail-closed behavior.
 - **`nullif(..., '')`**: converts empty string to `NULL`, making the

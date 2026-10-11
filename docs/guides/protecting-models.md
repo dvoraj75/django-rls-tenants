@@ -118,10 +118,12 @@ def list_orders(request):
     return render(request, "orders/list.html", {"orders": orders})
 ```
 
-**Why this matters:** PostgreSQL's `current_setting()` function used in RLS policies
-is not leakproof, so the planner cannot push the RLS predicate into index scans.
-The automatic ORM-level `WHERE tenant_id = X` filter enables composite indexes,
-eliminating sequential scan penalties at scale.
+**Why this matters:** the RLS policy is a `CASE WHEN <admin> THEN true ELSE
+tenant_id = ... END` expression, which PostgreSQL can only apply as a post-scan
+filter, never as an index condition. The automatic ORM-level `WHERE tenant_id = X`
+filter is a plain indexable clause, so it is what lets the planner use the tenant
+FK index and any composite index you add. See the
+[Performance & Indexing guide](performance.md) for the measured plans.
 
 ## Strict Mode Guard
 

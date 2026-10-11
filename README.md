@@ -34,6 +34,10 @@ returns zero rows, never leaked data.
   `STRICT_MODE` raises `NoTenantContextError` on unscoped `TenantQuerySet` evaluation.
 - **Automatic query scoping** -- `RLSProtectedModel` adds the tenant FK, the RLS policy,
   and a tenant-scoped manager.
+- **Index-friendly by design** -- the manager's `WHERE tenant_id = X` is what reaches the
+  planner; the policy alone is a post-scan filter. Composite `(tenant, ...)` indexes,
+  partial indexes, joins and the v1.3.0 InitPlan form, with measured `EXPLAIN` plans.
+  [Performance guide →](https://dvoraj75.github.io/django-rls-tenants/guides/performance/)
 - **Tenant-aware Django admin** -- `RLSTenantModelAdmin` scopes changelists, forms, and
   related dropdowns to the current tenant, with a tenant switcher for cross-tenant
   admins.

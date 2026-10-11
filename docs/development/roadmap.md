@@ -313,5 +313,11 @@ No committed timeline. Community interest drives prioritization.
 - [ ] GraphQL integration helpers (Strawberry, Graphene)
 - [ ] Django Ninja integration
 - [ ] Benchmarking suite (100k+ rows, 1000+ tenants)
+- [ ] Index-friendly policy shape -- the `CASE WHEN <admin> THEN true ELSE tenant_id = ...`
+  policy can only be a post-scan filter; a bare `tenant_id = current_setting(...)::int`
+  predicate is indexable (see the [Performance & Indexing guide](../guides/performance.md)).
+  A shape that keeps the admin bypass yet stays indexable would only help policy-only
+  scans (raw SQL without its own predicate), would need every deployment to recreate its
+  policies, and risks mis-estimated admin scans. Not planned unless a concrete case appears.
 - [ ] PostgreSQL 17+ RLS feature adoption
 - [ ] Citus distributed table compatibility

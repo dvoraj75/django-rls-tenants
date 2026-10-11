@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Performance & Indexing guide** (`docs/guides/performance.md`, #83). One page for the
+  "what does RLS cost and how do I index for it" question, built from measured
+  `EXPLAIN (ANALYZE, BUFFERS)` plans on a 1,000,000-row table as a non-superuser role:
+  why the policy is always a post-scan `Filter` while the ORM's `WHERE tenant_id = X`
+  becomes the `Index Cond`, composite `(tenant, ...)` indexes via `Meta.indexes`,
+  partial-index interaction, the v1.3.0 InitPlan form side by side with the inline
+  form, `select_related()` / `prefetch_related()` / M2M join plans, which
+  `safe_tenant_sql()` form is indexable, how to measure, and a checklist. Linked from
+  the README, the home page, Protecting Models, Raw SQL, Architecture and Security Model.
+
+### Changed
+
+- Docs no longer claim the planner skips the policy because `current_setting()` is not
+  `LEAKPROOF`. Measured plans show a bare `tenant_id = current_setting(...)::int`
+  policy *is* used as an index condition; what makes the library's policy a post-scan
+  filter is its `CASE WHEN <admin> THEN true ELSE ... END` shape (and an `OR`-split
+  into two permissive policies is no better). `protecting-models.md` and the new guide
+  state the real cause. The Raw SQL guide now says that only the
+  `safe_tenant_sql(include_admin=False)` fragment (or a bind parameter) reaches the
+  index; the admin-inclusive default plans as a sequential scan like the policy. (#83)
+
 ## [1.3.2] - 2026-10-11
 
 ### Fixed

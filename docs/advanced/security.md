@@ -44,7 +44,8 @@ END
 Since v1.3.0 each `current_setting()` read is wrapped in an uncorrelated scalar
 sub-SELECT -- `(SELECT current_setting(...))` -- which PostgreSQL evaluates once
 per statement (an InitPlan) rather than per row. This is a performance
-optimization; the fail-closed semantics are identical.
+optimization; the fail-closed semantics are identical. Measured plans are in the
+[Performance & Indexing guide](../guides/performance.md#the-initplan-evaluating-the-guc-once-per-statement).
 
 This means:
 
