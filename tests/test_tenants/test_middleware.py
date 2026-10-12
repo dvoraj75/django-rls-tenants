@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import logging
 from functools import partial
@@ -622,6 +623,50 @@ class TestTokenResetAcrossContexts:
         assert seen["is_admin_guc"] == "true"
         assert response._mock_name == "response"
         self._assert_nothing_left_behind()
+
+    @pytest.mark.parametrize("user_fixture", ["tenant_a_user", "admin_user"])
+    def test_cancelled_request_cleans_up(self, user_fixture, request):
+        """Cancellation bypasses Django's response and exception hooks."""
+        user = request.getfixturevalue(user_fixture)
+        seen = {}
+
+        async def run():
+            started = asyncio.Event()
+
+            async def aget_response(request):
+                assert get_rls_context_active() is True
+                started.set()
+                await asyncio.Event().wait()
+
+            mw = RLSTenantMiddleware(get_response=aget_response)
+
+            async def serve_request():
+                try:
+                    await mw(_make_request(user=user))
+                finally:
+                    # Inspect the cancelled task's own ContextVars and the same
+                    # thread-sensitive connection used by process_request.
+                    seen["tenant_id"] = get_current_tenant_id()
+                    seen["active"] = get_rls_context_active()
+                    seen["gucs_set"] = _were_gucs_set()
+                    seen["tenant_guc"] = await sync_to_async(get_guc)("rls.current_tenant")
+                    seen["admin_guc"] = await sync_to_async(get_guc)("rls.is_admin")
+
+            task = asyncio.create_task(serve_request())
+            await asyncio.wait_for(started.wait(), timeout=5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        async_to_sync(run)()
+
+        assert seen == {
+            "tenant_id": None,
+            "active": False,
+            "gucs_set": False,
+            "tenant_guc": None,
+            "admin_guc": None,
+        }
 
     def test_process_exception_in_another_context_falls_back(self, tenant_a_user):
         """process_exception, then the second pass in process_response, both succeed."""

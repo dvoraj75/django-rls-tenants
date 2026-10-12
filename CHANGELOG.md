@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   skipped. Cleanup now clears the `ContextVar`s to their defaults when `reset()` rejects a
   token from another context (logged at `DEBUG`), still resets via the token on WSGI, and
   clears the GUCs in a `finally` block so a reset failure can never skip them. A token
-  reused twice still raises. `USE_LOCAL_SET=True` remains WSGI-only.
+  reused twice still raises. Cleanup also runs when an async view is cancelled and
+  Django skips the response and exception hooks. `USE_LOCAL_SET=True` remains WSGI-only.
 
 ## [1.3.3] - 2026-10-12
 

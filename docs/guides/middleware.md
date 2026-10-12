@@ -101,11 +101,13 @@ the default session-scoped mode. Native async support is tracked for v1.4.0.
 Under ASGI, Django runs the middleware's hooks through `sync_to_async` on the request's
 thread-sensitive connection (each ASGI request gets its own). The GUCs, auto-scope state
 and strict-mode flag they set are visible to async views. Each hook runs in its own copy
-of the request's `contextvars.Context`, so since 1.3.4 cleanup clears the `ContextVar`s
-when their tokens belong to another context, instead of failing (#58). Keep one RLS
-context per request task: do not `asyncio.gather` work for different tenants inside one
-request, since it shares the request's connection. A native async middleware path is
-tracked in [#38](https://github.com/dvoraj75/django-rls-tenants/issues/38).
+of the request's `contextvars.Context`. In the unreleased fix for #58, cleanup clears
+the `ContextVar`s when their tokens belong to another context, instead of failing.
+Cleanup also runs if an async view is cancelled before the response or exception hooks
+run. Keep one RLS context per request task: do not `asyncio.gather` work for different
+tenants inside one request, since it shares the request's connection. A native async
+middleware path is tracked in
+[#38](https://github.com/dvoraj75/django-rls-tenants/issues/38).
 
 ### Response Phase (`process_response`)
 

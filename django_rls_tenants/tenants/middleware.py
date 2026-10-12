@@ -237,7 +237,14 @@ class RLSTenantMiddleware(MiddlewareMixin):
                 "application through WSGI, or set USE_LOCAL_SET=False."
             )
             raise RLSConfigurationError(msg)
-        return await super().__acall__(request)
+        try:
+            return await super().__acall__(request)
+        finally:
+            # A cancelled async view bypasses both process_exception and
+            # process_response. Clean up in the request task so asgiref copies
+            # the cleared ContextVars back as well as clearing the connection.
+            if getattr(request, "_rls_state_reset", False) is not True or _were_gucs_set():
+                await sync_to_async(self._cleanup_rls_state, thread_sensitive=True)(request)
 
     def process_request(self, request: HttpRequest) -> None:
         """Set GUC variables on all configured databases.

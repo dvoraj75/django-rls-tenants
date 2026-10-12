@@ -1,7 +1,7 @@
 """End-to-end tests for ``RLSTenantMiddleware`` under ASGI (#58).
 
 Drives real requests through the full middleware stack with ``django.test.AsyncClient``.
-Before 1.3.4 every authenticated request failed with ``ValueError: <Token ...> was
+Before the #58 fix every authenticated request failed with ``ValueError: <Token ...> was
 created in a different Context``: ``MiddlewareMixin.__acall__`` runs ``process_request``
 and ``process_response`` / ``process_exception`` in separate ``sync_to_async`` hops,
 each in its own copy of the request's ``contextvars.Context``, so the tokens saved by
