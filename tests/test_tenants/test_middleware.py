@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import contextvars
+import logging
+from functools import partial
 from unittest.mock import MagicMock, call, patch
 
 import pytest
-from asgiref.sync import async_to_sync, iscoroutinefunction
+from asgiref.sync import async_to_sync, iscoroutinefunction, sync_to_async
 from django.db import connection
 from django.test import override_settings
 
@@ -15,6 +18,7 @@ from django_rls_tenants.tenants.conf import RLSTenantsConfig
 from django_rls_tenants.tenants.middleware import (
     RLSTenantMiddleware,
     _clear_gucs_set_flag,
+    _reset_or_clear,
     _were_gucs_set,
 )
 from django_rls_tenants.tenants.state import (
@@ -543,6 +547,141 @@ class TestLocalSetUnderAsgi:
     def test_unauthenticated_request_passes_through(self):
         response = async_to_sync(self._async_middleware())(_make_request())
         assert response._mock_name == "response"
+
+
+def _hop(func, *args):
+    """Run ``func`` like one ``sync_to_async`` hop of ``MiddlewareMixin.__acall__``.
+
+    The call runs in a copy of the current context; afterwards every changed
+    value is copied back with a fresh ``set()``, exactly like asgiref's
+    ``_restore_context()``. Tokens created inside the hop therefore belong to a
+    context that no longer exists.
+    """
+    ctx = contextvars.copy_context()
+    try:
+        return ctx.run(func, *args)
+    finally:
+        for var, value in ctx.items():
+            try:
+                changed = var.get() is not value
+            except LookupError:
+                changed = True
+            if changed:
+                var.set(value)
+
+
+class TestTokenResetAcrossContexts:
+    """#58: tokens created in one sync_to_async hop are reset in another under ASGI."""
+
+    @staticmethod
+    def _run_async_middleware(user):
+        seen = {}
+
+        async def aget_response(request):
+            seen["tenant_id"] = get_current_tenant_id()
+            seen["active"] = get_rls_context_active()
+            seen["tenant_guc"] = await sync_to_async(get_guc, thread_sensitive=True)(
+                "rls.current_tenant"
+            )
+            seen["is_admin_guc"] = await sync_to_async(get_guc, thread_sensitive=True)(
+                "rls.is_admin"
+            )
+            return MagicMock(name="response")
+
+        mw = RLSTenantMiddleware(get_response=aget_response)
+        assert iscoroutinefunction(mw) is True
+        response = async_to_sync(mw)(_make_request(user=user))
+        return response, seen
+
+    @staticmethod
+    def _assert_nothing_left_behind():
+        assert get_current_tenant_id() is None
+        assert get_rls_context_active() is False
+        assert get_guc("rls.current_tenant") is None
+        assert get_guc("rls.is_admin") is None
+        assert _were_gucs_set() is False
+
+    def test_async_path_tenant_request_sets_state_and_cleans_up(self, tenant_a_user):
+        response, seen = self._run_async_middleware(tenant_a_user)
+
+        # The state set by process_request crosses the hop into the async view.
+        assert seen == {
+            "tenant_id": tenant_a_user.rls_tenant_id,
+            "active": True,
+            "tenant_guc": str(tenant_a_user.rls_tenant_id),
+            "is_admin_guc": "false",
+        }
+        assert response._mock_name == "response"
+        self._assert_nothing_left_behind()
+
+    def test_async_path_admin_request_sets_state_and_cleans_up(self, admin_user):
+        response, seen = self._run_async_middleware(admin_user)
+
+        assert seen["tenant_id"] is None
+        assert seen["active"] is True
+        assert seen["is_admin_guc"] == "true"
+        assert response._mock_name == "response"
+        self._assert_nothing_left_behind()
+
+    def test_process_exception_in_another_context_falls_back(self, tenant_a_user):
+        """process_exception, then the second pass in process_response, both succeed."""
+        mw = RLSTenantMiddleware(get_response=lambda r: MagicMock())
+        request = _make_request(user=tenant_a_user)
+
+        _hop(mw.process_request, request)
+        assert get_current_tenant_id() == tenant_a_user.rls_tenant_id
+        _hop(mw.process_exception, request, RuntimeError("boom"))
+        _hop(mw.process_response, request, MagicMock())
+
+        assert request._rls_state_reset is True
+        self._assert_nothing_left_behind()
+
+    def test_fallback_logs_at_debug(self, tenant_a_user, caplog):
+        mw = RLSTenantMiddleware(get_response=lambda r: MagicMock())
+        request = _make_request(user=tenant_a_user)
+        _hop(mw.process_request, request)
+
+        with caplog.at_level(logging.DEBUG, logger="django_rls_tenants"):
+            _hop(mw.process_response, request, MagicMock())
+
+        assert any("clearing rls_current_tenant_id" in msg for msg in caplog.messages)
+        assert any("clearing rls_context_active" in msg for msg in caplog.messages)
+
+    def test_runtime_error_from_double_reset_is_not_swallowed(self):
+        token = set_current_tenant_id(5)
+        clear = partial(set_current_tenant_id, None)
+        _reset_or_clear(token, reset_current_tenant_id, clear)
+        with pytest.raises(RuntimeError, match="already been used"):
+            _reset_or_clear(token, reset_current_tenant_id, clear)
+
+    def test_same_context_reset_uses_token(self):
+        """On WSGI the token is valid: the previous value is restored, not cleared."""
+        outer = set_current_tenant_id(7)
+        try:
+            token = set_current_tenant_id(8)
+            _reset_or_clear(token, reset_current_tenant_id, partial(set_current_tenant_id, None))
+            assert get_current_tenant_id() == 7
+        finally:
+            reset_current_tenant_id(outer)
+
+    def test_missing_token_clears(self):
+        set_rls_context_active(True)
+        _reset_or_clear(None, reset_rls_context_active, partial(set_rls_context_active, False))
+        assert get_rls_context_active() is False
+
+    def test_guc_clearing_survives_a_failing_reset(self, tenant_a_user):
+        """A reset error must not skip the GUC clear (it still propagates)."""
+        mw = RLSTenantMiddleware(get_response=lambda r: MagicMock())
+        request = _make_request(user=tenant_a_user)
+        mw.process_request(request)
+        reset_current_tenant_id(request._rls_tenant_token)  # token now spent
+
+        with pytest.raises(RuntimeError, match="already been used"):
+            mw.process_response(request, MagicMock())
+
+        assert get_guc("rls.current_tenant") is None
+        assert get_guc("rls.is_admin") is None
+        assert _were_gucs_set() is False
 
 
 class TestProcessExceptionRollback:

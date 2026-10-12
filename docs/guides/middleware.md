@@ -96,9 +96,22 @@ middleware raises `RLSConfigurationError` for authenticated requests in that set
 instead of failing deep inside `SET LOCAL`. Serve the application through WSGI, or use
 the default session-scoped mode. Native async support is tracked for v1.4.0.
 
+### Running under ASGI
+
+Under ASGI, Django runs the middleware's hooks through `sync_to_async` on the request's
+thread-sensitive connection (each ASGI request gets its own). The GUCs, auto-scope state
+and strict-mode flag they set are visible to async views. Each hook runs in its own copy
+of the request's `contextvars.Context`, so since 1.3.4 cleanup clears the `ContextVar`s
+when their tokens belong to another context, instead of failing (#58). Keep one RLS
+context per request task: do not `asyncio.gather` work for different tenants inside one
+request, since it shares the request's connection. A native async middleware path is
+tracked in [#38](https://github.com/dvoraj75/django-rls-tenants/issues/38).
+
 ### Response Phase (`process_response`)
 
-1. Resets the `_rls_context_active` flag (via saved token) to prevent cross-request leaks.
+1. Resets the `_rls_context_active` flag (via saved token or, under ASGI where the token
+   belongs to another `contextvars.Context`, by clearing the variable, #58) to prevent
+   cross-request leaks.
 2. Clears the `ContextVar` auto-scope state to prevent cross-request leaks.
 3. If `USE_LOCAL_SET` is `False` (default): clears both GUC variables on **all
    configured database aliases** to prevent cross-request leaks on persistent connections.
@@ -111,9 +124,13 @@ the default session-scoped mode. Native async support is tracked for v1.4.0.
 If a view raises an unhandled exception, `process_response` may not run (depending
 on middleware ordering). The `process_exception` handler ensures cleanup still happens:
 
-1. Resets the `_rls_context_active` flag (via saved token or fallback to `False`).
-2. Resets the `ContextVar` auto-scope state (via the saved token or fallback to `None`).
-3. Clears GUC variables (same logic as `process_response`).
+1. Resets the `_rls_context_active` flag (via saved token or fallback to `False`; under
+   ASGI, where the token belongs to another `contextvars.Context`, by clearing the
+   variable, #58).
+2. Resets the `ContextVar` auto-scope state (via the saved token or fallback to `None`;
+   cleared the same way under ASGI).
+3. Clears GUC variables (same logic as `process_response`). The GUCs are cleared even if
+   resetting a `ContextVar` fails.
 
 This prevents `ContextVar` leaks that could affect subsequent requests on the same
 thread (WSGI) or async task (ASGI).
@@ -162,8 +179,8 @@ View executes (queries auto-scoped + filtered by RLS)
     ▼
 RLSTenantMiddleware.process_response()  (or process_exception on error)
     │
-    ├── RESET _rls_context_active (via saved token)
-    ├── RESET auto-scope ContextVar (via saved token)
+    ├── RESET _rls_context_active (via saved token; cleared under ASGI)
+    ├── RESET auto-scope ContextVar (via saved token; cleared under ASGI)
     ├── USE_LOCAL_SET == False → CLEAR both GUCs
     └── USE_LOCAL_SET == True  → no-op, then COMMIT/ROLLBACK drops the SET LOCAL values
 ```
@@ -204,7 +221,8 @@ The middleware is API-agnostic. It works identically for:
 - Django views and templates
 - Django REST Framework
 - GraphQL (Graphene, Strawberry, Ariadne)
-- Async views (GUC setting uses sync database calls; `USE_LOCAL_SET=True` is WSGI-only)
+- Async views and ASGI servers (the hooks run through `sync_to_async`; `USE_LOCAL_SET=True`
+  is WSGI-only)
 - Any other Django-compatible request handler
 
 The only requirement is that `request.user` satisfies the `TenantUser` protocol.

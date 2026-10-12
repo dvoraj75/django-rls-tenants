@@ -9,7 +9,8 @@ from __future__ import annotations
 import logging
 from contextlib import ExitStack
 from contextvars import ContextVar, Token
-from typing import TYPE_CHECKING, Any
+from functools import partial
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from asgiref.sync import iscoroutinefunction, sync_to_async
 from django.conf import settings
@@ -35,6 +36,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("django_rls_tenants")
 
+_T = TypeVar("_T")
+
 # Flag indicating whether GUCs were set during this request.
 # Uses ``ContextVar`` for proper isolation in both WSGI (threaded)
 # and ASGI (async task) deployments. Previous versions used
@@ -55,6 +58,41 @@ def _clear_gucs_set_flag() -> None:
 def _were_gucs_set() -> bool:
     """Check whether GUCs were set in the current context."""
     return _gucs_set_var.get()
+
+
+def _reset_or_clear(
+    token: Token[_T] | None,
+    reset: Callable[[Token[_T]], None],
+    clear: Callable[[], object],
+) -> None:
+    """Restore a ``ContextVar`` through its token, or clear it when the token is unusable.
+
+    Under ASGI, ``MiddlewareMixin.__acall__`` runs ``process_request`` and
+    ``process_response`` / ``process_exception`` through separate ``sync_to_async``
+    hops, each in a copy of the request's ``contextvars.Context``. asgiref copies the
+    values set by one hop back into the request context, but the ``Token`` belongs to
+    the discarded copy and ``ContextVar.reset()`` rejects it with ``ValueError`` (#58).
+    Clearing the variable restores the same "no context" baseline the token would
+    have restored, because the middleware is the outermost context setter of a request.
+    A ``RuntimeError`` (token used twice) is a real bug and is not caught.
+
+    Args:
+        token: The token from the matching ``set_*`` call, or ``None`` if the value
+            was never set.
+        reset: The ``state.reset_*`` function for the variable.
+        clear: Callable that sets the variable to its default.
+    """
+    if isinstance(token, Token):
+        try:
+            reset(token)
+        except ValueError:
+            logger.debug(
+                "ContextVar token belongs to another Context (ASGI hop); clearing %s instead",
+                token.var.name,
+            )
+            clear()
+        return
+    clear()
 
 
 def _is_authenticated(request: HttpRequest) -> bool:
@@ -110,6 +148,12 @@ class RLSTenantMiddleware(MiddlewareMixin):
     is not required (and is harmless -- it nests as a savepoint). This
     transaction-per-request mode is only available on the synchronous
     (WSGI) code path.
+
+    Under ASGI, Django runs the three hooks through separate ``sync_to_async``
+    hops on the request's thread-sensitive connection; the tenant state they
+    set is visible to async views, and cleanup clears the ``ContextVar``
+    values instead of resetting tokens that belong to another
+    ``contextvars.Context``. ``USE_LOCAL_SET=True`` stays WSGI-only.
     """
 
     def __init__(self, get_response: Callable[..., Any]) -> None:
@@ -242,16 +286,18 @@ class RLSTenantMiddleware(MiddlewareMixin):
         except Exception:
             logger.exception("Failed to set RLS GUC variables, clearing to prevent leak")
             # Reset via token when available to avoid stacking unreset
-            # ContextVar values; fall back to set() when the token was
-            # never created (error occurred before set call).
-            if isinstance(tenant_token, Token):
-                reset_current_tenant_id(tenant_token)
-            else:
-                set_current_tenant_id(None)
-            if isinstance(active_token, Token):
-                reset_rls_context_active(active_token)
-            else:
-                set_rls_context_active(False)
+            # ContextVar values; _reset_or_clear falls back to clearing when
+            # the token was never created (error occurred before set call).
+            _reset_or_clear(
+                tenant_token,
+                reset_current_tenant_id,
+                partial(set_current_tenant_id, None),
+            )
+            _reset_or_clear(
+                active_token,
+                reset_rls_context_active,
+                partial(set_rls_context_active, False),
+            )
             setattr(request, "_rls_state_reset", True)  # noqa: B010 -- tokens already reset
             _clear_gucs_on_all_databases(conf)
             raise
@@ -321,40 +367,42 @@ class RLSTenantMiddleware(MiddlewareMixin):
 
     @staticmethod
     def _cleanup_rls_state(request: HttpRequest) -> None:
-        """Reset ContextVars (via tokens if available) and clear GUCs.
+        """Reset ContextVars and clear GUCs.
 
-        Clears GUCs on all configured database aliases. Skips database
+        ContextVars are reset via their tokens, or cleared when the token
+        comes from another ``contextvars.Context`` (ASGI, see
+        ``_reset_or_clear``). Clears GUCs on all configured database aliases;
+        the GUC clearing runs even if a reset fails. Skips database
         round-trips for requests where GUCs were never set (e.g.,
         unauthenticated requests, health checks).
 
         Args:
             request: The Django HTTP request being finalised.
         """
-        # Django runs process_response even after process_exception. Tokens are
-        # single-use, and resetting to defaults on a second pass would also lose
-        # any outer context restored by the first pass.
-        if getattr(request, "_rls_state_reset", False) is not True:
-            token = getattr(request, "_rls_tenant_token", None)
-            if isinstance(token, Token):
-                reset_current_tenant_id(token)
-            else:
-                # Fallback: no token stored (unauthenticated request or error
-                # during process_request before token was saved).
-                set_current_tenant_id(None)
-
-            active_token = getattr(request, "_rls_context_active_token", None)
-            if isinstance(active_token, Token):
-                reset_rls_context_active(active_token)
-            else:
-                set_rls_context_active(False)
-            setattr(request, "_rls_state_reset", True)  # noqa: B010 -- request cleanup marker
-
-        if not _were_gucs_set():
-            return
-        conf = rls_tenants_config
-        if not conf.USE_LOCAL_SET:
-            for db_alias in conf.DATABASES:
-                clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
-                clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
-            logger.debug("Middleware cleared GUCs on databases=%s", conf.DATABASES)
-        _clear_gucs_set_flag()
+        try:
+            # Django runs process_response even after process_exception. Tokens are
+            # single-use, and resetting to defaults on a second pass would also lose
+            # any outer context restored by the first pass.
+            if getattr(request, "_rls_state_reset", False) is not True:
+                # No token stored means an unauthenticated request or an error
+                # during process_request before the token was saved: clear.
+                _reset_or_clear(
+                    getattr(request, "_rls_tenant_token", None),
+                    reset_current_tenant_id,
+                    partial(set_current_tenant_id, None),
+                )
+                _reset_or_clear(
+                    getattr(request, "_rls_context_active_token", None),
+                    reset_rls_context_active,
+                    partial(set_rls_context_active, False),
+                )
+                setattr(request, "_rls_state_reset", True)  # noqa: B010 -- request cleanup marker
+        finally:
+            if _were_gucs_set():
+                conf = rls_tenants_config
+                if not conf.USE_LOCAL_SET:
+                    for db_alias in conf.DATABASES:
+                        clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
+                        clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
+                    logger.debug("Middleware cleared GUCs on databases=%s", conf.DATABASES)
+                _clear_gucs_set_flag()

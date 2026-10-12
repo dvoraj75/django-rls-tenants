@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`RLSTenantMiddleware` crashed with `Token was created in a different Context` under
+  ASGI** (#58). Django runs a sync middleware's hooks through `MiddlewareMixin.__acall__`,
+  which calls `process_request` and `process_response` / `process_exception` in separate
+  `sync_to_async` hops, each in its own copy of the request's `contextvars.Context`. The
+  tenant state reached the view, but the tokens saved by `process_request` belonged to a
+  discarded context, so every authenticated ASGI request ended in a 500 (a view exception
+  was masked by the same `ValueError`), and the GUC clear after the failed reset was
+  skipped. Cleanup now clears the `ContextVar`s to their defaults when `reset()` rejects a
+  token from another context (logged at `DEBUG`), still resets via the token on WSGI, and
+  clears the GUCs in a `finally` block so a reset failure can never skip them. A token
+  reused twice still raises. `USE_LOCAL_SET=True` remains WSGI-only.
+
 ## [1.3.3] - 2026-10-12
 
 ### Added

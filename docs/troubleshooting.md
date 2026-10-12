@@ -118,18 +118,20 @@ support is tracked for v1.4.0.
 
 ### `ValueError: ... Token was created in a different Context` under ASGI
 
-**Symptom:** Intermittent `ValueError` from `ContextVar.reset()` in the middleware's
-response or exception hook when running under ASGI.
+**Symptom:** Authenticated requests fail with a 500 and a `ValueError` from
+`ContextVar.reset()` in the middleware's response or exception hook when running under
+ASGI. A view's own exception is masked by the same error.
 
-**Cause:** Known bug [#58](https://github.com/dvoraj75/django-rls-tenants/issues/58).
-Django runs each hook of a sync middleware through its own `sync_to_async` thread hop, so
-the token created in `process_request` can be reset in a different `contextvars.Context`.
-Scheduled for v1.4.0 together with native async support.
+**Cause:** Bug [#58](https://github.com/dvoraj75/django-rls-tenants/issues/58), fixed in
+1.3.4. Django runs each hook of a sync middleware through its own `sync_to_async` thread
+hop, so the token created in `process_request` was reset in a different
+`contextvars.Context`.
 
-**Fix:** Run the middleware under WSGI, or leave it out of `MIDDLEWARE` and set the
-context explicitly in a synchronous view (`tenant_context()` / `.for_user()`). For
-an async view, put both the context and query evaluation in one synchronous function
-called with `sync_to_async(..., thread_sensitive=True)`.
+**Fix:** Upgrade to 1.3.4 or later. On 1.3.3 and earlier: run the middleware under WSGI,
+or leave it out of `MIDDLEWARE` and set the context explicitly in a synchronous view
+(`tenant_context()` / `.for_user()`). For an async view, put both the context and query
+evaluation in one synchronous function called with
+`sync_to_async(..., thread_sensitive=True)`.
 
 **See:** [Using Without Middleware](guides/middleware.md#using-without-middleware).
 
