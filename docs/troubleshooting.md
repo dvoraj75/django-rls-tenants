@@ -123,18 +123,18 @@ support is tracked for v1.4.0.
 ASGI. A view's own exception is masked by the same error.
 
 **Cause:** Bug [#58](https://github.com/dvoraj75/django-rls-tenants/issues/58), fixed in
-the unreleased development version. Django runs each hook of a sync middleware through
-its own `sync_to_async` thread hop, so the token created in `process_request` was reset
-in a different `contextvars.Context`.
+1.3.4. Django runs each hook of a sync middleware through its own `sync_to_async` thread
+hop, so the token created in `process_request` was reset in a different
+`contextvars.Context`.
 
-**Fix:** The development version clears the context when a token cannot be reset.
-Until a release includes this fix, on 1.3.3 and earlier run the middleware under WSGI,
-or leave it out of `MIDDLEWARE` and set the context explicitly in a synchronous view
-(`tenant_context()` / `.for_user()`). For an async view, put both the context and query
-evaluation in one synchronous function called with
-`sync_to_async(..., thread_sensitive=True)`.
+**Fix:** Upgrade to 1.3.4 or later; the middleware now clears the context when a token
+cannot be reset. On 1.3.3 and earlier, run the middleware under WSGI, or leave it out of
+`MIDDLEWARE` and set the context explicitly in a synchronous view (`tenant_context()` /
+`.for_user()`). For an async view, put both the context and query evaluation in one
+synchronous function called with `sync_to_async(..., thread_sensitive=True)`.
 
-**See:** [Using Without Middleware](guides/middleware.md#using-without-middleware).
+**See:** [Running under ASGI](guides/middleware.md#running-under-asgi),
+[Using Without Middleware](guides/middleware.md#using-without-middleware).
 
 ### `RuntimeError: ... Token ... has already been used once`
 

@@ -225,6 +225,11 @@ class RLSTenantMiddleware(MiddlewareMixin):
         so ``SET LOCAL`` would have no transaction to live in. Raise a
         configuration error instead of the opaque ``RuntimeError`` that
         ``set_guc(is_local=True)`` would produce.
+
+        A cancelled request (client disconnect, server shutdown) unwinds the
+        chain with ``CancelledError`` and skips ``process_exception`` and
+        ``process_response``, so the ``finally`` block runs
+        ``_cleanup_rls_state`` itself when the request still holds state.
         """
         if rls_tenants_config.USE_LOCAL_SET and await sync_to_async(
             _is_authenticated,
