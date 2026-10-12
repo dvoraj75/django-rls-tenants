@@ -115,6 +115,24 @@ tests/
 - **Fixtures**: descriptive nouns (`tenant_a`, `admin_user`).
 - **DB access**: `pytestmark = pytest.mark.django_db` at module level.
 
+### Skipped tests and the `superuser_only` marker
+
+CI treats a skipped test as a failure. Every PostgreSQL leg sets `RLS_FAIL_ON_SKIPPED=1`,
+and a `pytest_sessionfinish` hook in `tests/conftest.py` (mirrored in
+`example/tests/conftest.py`) fails the session when anything was skipped. A skipped RLS
+test is indistinguishable from a leg whose database role never materialised, so the suite
+contains no runtime `pytest.skip()` calls. Put the intent on the command line instead:
+tests that need a PostgreSQL superuser (for example to create a `BYPASSRLS` role) carry
+`@pytest.mark.superuser_only` and **fail** with an explanatory message on a plain role.
+Deselect them when your test database role is not a superuser:
+
+```bash
+uv run pytest -m "not superuser_only"
+```
+
+Locally `RLS_FAIL_ON_SKIPPED` is unset and skips behave as usual. New markers must be
+registered in `pyproject.toml` (`--strict-markers` is on).
+
 ## Documentation
 
 The documentation site is built with [MkDocs](https://www.mkdocs.org/) and
@@ -138,6 +156,32 @@ The library has two internal layers with a strict import boundary:
 
 This boundary is enforced by `tests/test_layering.py`. Do not introduce imports
 from `tenants/` into `rls/`.
+
+## Continuous Integration
+
+Every push and pull request runs:
+
+- **Lint & Type Check** -- `uv lock --check`, Ruff (check + format) and mypy.
+- **Docs** -- `mkdocs build --strict`.
+- **Test matrix** -- Python 3.11-3.14 x Django 4.2-6.0 on PostgreSQL 16.
+- **PostgreSQL 15 and 17 legs** -- the oldest and newest supported Django (4.2 on
+  Python 3.12, 6.0 on Python 3.14) on both, so the "PostgreSQL >= 15" requirement is
+  verified at each end rather than assumed.
+- **Example app against the built wheel** -- `uv build`, an assertion on the wheel's
+  file list (only `django_rls_tenants/` and `*.dist-info/`, every package directory has
+  an `__init__.py`, `py.typed`, the management commands and `contrib.celery` are present,
+  no `tests/` or `example/`), then an install into a clean virtualenv -- never editable,
+  never with the source tree on `sys.path` -- followed by `manage.py check`,
+  `makemigrations --check --dry-run` and the example test suite as a non-superuser role.
+  A packaging defect fails here instead of at a user's `pip install`.
+
+All PostgreSQL legs run with `RLS_FAIL_ON_SKIPPED=1` (see
+[Skipped tests](#skipped-tests-and-the-superuser_only-marker)).
+
+Publishing a GitHub release runs a **preflight** job before anything else: the tag must
+be `vX.Y.Z`, `X.Y.Z` must equal `version` in `pyproject.toml`, and `CHANGELOG.md` must
+contain a `## [X.Y.Z]` heading. Make the release commit (version bump + changelog
+heading) first, then create the release.
 
 ## Pull Request Process
 

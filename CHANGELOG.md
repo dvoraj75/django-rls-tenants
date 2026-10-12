@@ -59,6 +59,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   example job runs `makemigrations --check --dry-run` so model/migration drift fails the
   build. The orphaned `example/.env.example` is deleted: nothing read it (compose injects
   `DATABASE_URL` and the README's local-development section uses `export`).
+- **CI now proves what the README claims** (#110). A `test-postgres` job runs the suite on
+  PostgreSQL 15 and 17 with the oldest and newest supported Django (4.2 / 6.0) alongside
+  the PostgreSQL 16 matrix, so "PostgreSQL >= 15" is verified at both ends. Every
+  PostgreSQL leg sets `RLS_FAIL_ON_SKIPPED=1`: a `pytest_sessionfinish` hook in
+  `tests/conftest.py` (mirrored in the example suite) fails the session on any skipped
+  test, and the one runtime `pytest.skip()` in the suite is now a registered
+  `superuser_only` marker that fails on a plain role and is deselected with
+  `-m "not superuser_only"`. The example job builds the wheel with `uv build`, asserts it
+  contains only `django_rls_tenants/` and `*.dist-info/` (with `py.typed`, an
+  `__init__.py` in every package directory, the management commands and
+  `contrib.celery`), installs it into a clean virtualenv at the locked Django version and
+  runs `manage.py check`, `makemigrations --check` and the example tests against the
+  installed distribution instead of the source tree. The release workflow gains a
+  `preflight` job that refuses a tag whose `vX.Y.Z` does not equal `pyproject.toml`'s
+  version or has no `## [X.Y.Z]` heading in this file. No library code changed.
 
 ### Fixed
 

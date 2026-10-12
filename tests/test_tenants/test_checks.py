@@ -440,14 +440,24 @@ class TestCheckSuperuserConnection:
         assert _check_superuser_connection() == []
 
     @pytest.mark.integration
+    @pytest.mark.superuser_only
     def test_w005_for_real_bypassrls_role(self):
         """Against live PostgreSQL, a non-superuser BYPASSRLS role triggers W005.
 
         ``CREATE ROLE`` is transactional, so the role disappears when the
         test transaction rolls back.
+
+        Creating a ``BYPASSRLS`` role needs a superuser connection. On a plain
+        role, deselect the test with ``-m "not superuser_only"``; it fails
+        instead of skipping so a CI leg whose superuser never materialised
+        cannot go green with the check untested (#110).
         """
         if not _is_superuser():
-            pytest.skip("creating a BYPASSRLS role requires a superuser test connection")
+            pytest.fail(
+                "test_w005_for_real_bypassrls_role needs a PostgreSQL superuser connection "
+                "to CREATE a BYPASSRLS role, but the test connection is a plain role. "
+                'Run as a superuser or deselect it with -m "not superuser_only".'
+            )
         role = "rls_w005_bypass_role"
         with connection.cursor() as cur:
             cur.execute(f"CREATE ROLE {role} NOLOGIN NOSUPERUSER BYPASSRLS")

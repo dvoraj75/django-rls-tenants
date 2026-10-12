@@ -8,13 +8,65 @@ permissions:
   contents: read
 
 jobs:
+  preflight:
+    # Refuse to build or publish a release whose tag does not match the version
+    # in pyproject.toml or has no "## [<version>]" section in CHANGELOG.md.
+    # Both checks are cheap and catch a tag cut before the release commit.
+    name: Release preflight (tag, version, CHANGELOG)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check the tag against pyproject.toml and CHANGELOG.md
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python3 - <<'EOF'
+          import os
+          import pathlib
+          import re
+          import sys
+          import tomllib
+
+          tag = os.environ["RELEASE_TAG"]
+          problems = []
+          if not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
+              problems.append(f"release tag {tag!r} is not of the form vX.Y.Z")
+          version = tag.removeprefix("v")
+
+          pyproject_version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())[
+              "project"
+          ]["version"]
+          if pyproject_version != version:
+              problems.append(
+                  f"pyproject.toml has version = {pyproject_version!r} but the release tag "
+                  f"is {tag!r}; make the release commit (version bump) before tagging"
+              )
+
+          changelog = pathlib.Path("CHANGELOG.md").read_text()
+          heading = re.compile(rf"^## \[{re.escape(version)}\]", re.MULTILINE)
+          if heading.search(changelog) is None:
+              problems.append(
+                  f"CHANGELOG.md has no '## [{version}]' section; turn '## [Unreleased]' "
+                  f"into '## [{version}] - <date>' before tagging"
+              )
+
+          if problems:
+              for problem in problems:
+                  print(f"::error::{problem}")
+              sys.exit(1)
+          print(f"release {tag}: pyproject.toml version and CHANGELOG.md section both match")
+          EOF
+
   ci:
+    needs: preflight
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
       pull-requests: write
 
   docs:
+    needs: preflight
     uses: ./.github/workflows/docs.yml
     permissions:
       contents: read

@@ -40,8 +40,15 @@ uv run pytest tests/test_rls/test_guc.py   # run a single test file
 uv run pytest tests/test_rls/test_guc.py::test_set_get_roundtrip  # single test
 uv run pytest -k "guc and not local"       # keyword filter
 uv run pytest -m integration               # only integration tests (need live PG)
+uv run pytest -m "not superuser_only"      # on a non-superuser DB role (see below)
 uv run pytest --cov                        # with coverage (fail_under = 90%)
 ```
+
+**Zero-skipped rule.** Every PostgreSQL CI leg sets `RLS_FAIL_ON_SKIPPED=1`; a
+`pytest_sessionfinish` hook in `tests/conftest.py` (mirrored in `example/tests/conftest.py`)
+fails the session if anything was skipped. Never add a runtime `pytest.skip()`. Tests that
+need a superuser connection carry `@pytest.mark.superuser_only` (registered in
+`pyproject.toml`) and `pytest.fail()` on a plain role; deselect with `-m "not superuser_only"`.
 
 ### Test Organization
 
@@ -266,11 +273,23 @@ example/
 ## CI
 
 GitHub Actions runs lint + type-check, a strict mkdocs build (`mkdocs build --strict`),
-and a test matrix across
-Python {3.11, 3.12, 3.13, 3.14} × Django {4.2, 5.0, 5.1, 5.2, 6.0} on every push/PR.
-An `example-smoke` job runs `example/manage.py check` and `pytest --collect-only` with no
-database, so changes to `example/` must keep importing cleanly. It then runs
-`makemigrations --check --dry-run` and the example test suite against PostgreSQL as a
-non-superuser role. The example migrations are committed, so a model change in `example/`
-must ship with a regenerated migration (`cd example && uv run --project .. python manage.py
-makemigrations`), or the check step fails.
+a test matrix across Python {3.11, 3.12, 3.13, 3.14} × Django {4.2, 5.0, 5.1, 5.2, 6.0}
+on PostgreSQL 16, and a `test-postgres` job on PostgreSQL 15 and 17 with the oldest and
+newest supported Django (4.2 / 6.0) on every push/PR. All PostgreSQL legs set
+`RLS_FAIL_ON_SKIPPED=1` (see Testing).
+
+The `example-smoke` job tests the **built wheel**, not the source tree: `uv build`, an
+inline check that the wheel holds only `django_rls_tenants/` + `*.dist-info/` (every
+package dir has `__init__.py`; `py.typed`, the management commands and `contrib/celery.py`
+are present), then `uv pip install dist/*.whl` into a clean `.wheel-venv` with the locked
+Django/test deps (`uv export --group test --no-emit-project`). It runs
+`example/manage.py check` and `pytest --collect-only` with no database (so `example/` must
+keep importing cleanly), then `makemigrations --check --dry-run` and the example suite as
+a non-superuser role, all with the venv's interpreter. A new subpackage or data file the
+package needs must therefore end up in the wheel. The example migrations are committed, so
+a model change in `example/` must ship with a regenerated migration (`cd example && uv run
+--project .. python manage.py makemigrations`), or the check step fails.
+
+The release workflow (`publish.yml`) starts with a `preflight` job: the release tag must be
+`vX.Y.Z`, equal to `pyproject.toml`'s `version`, and `CHANGELOG.md` must contain a
+`## [X.Y.Z]` heading. Make the release commit before creating the GitHub release.

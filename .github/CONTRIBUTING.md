@@ -84,7 +84,17 @@ uv run pytest tests/test_rls/test_guc.py
 
 # Run only integration tests
 uv run pytest -m integration
+
+# On a non-superuser test database role (the marked test fails instead of skipping)
+uv run pytest -m "not superuser_only"
 ```
+
+CI fails any PostgreSQL leg that skips a test (`RLS_FAIL_ON_SKIPPED=1`, hook in
+`tests/conftest.py`), so never add a runtime `pytest.skip()`; use a registered marker such
+as `superuser_only` and deselect it. CI also runs PostgreSQL 15, 16 and 17, installs the
+built wheel into a clean virtualenv and runs the example app against it, and the release
+workflow refuses a tag whose version has no `## [X.Y.Z]` heading in `CHANGELOG.md`. See the
+full [contributing guide](https://dvoraj75.github.io/django-rls-tenants/development/contributing/).
 
 ### Test Organization
 

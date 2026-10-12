@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 from decimal import Decimal
 
 import pytest
@@ -28,6 +29,12 @@ from tests.test_app.models import (
 
 _RLS_ROLE = "rls_test_role"
 
+# Zero-skipped-tests rule (#110). A skipped RLS test is indistinguishable from
+# a CI leg whose database role never materialised, so every PostgreSQL CI leg
+# sets this variable and the session fails if anything was skipped. Local runs
+# leave it unset and skips behave as usual.
+_FAIL_ON_SKIPPED_ENV = "RLS_FAIL_ON_SKIPPED"
+
 # GUC variable names that may be set during tests.
 _GUC_NAMES_TO_CLEAR = (
     "rls.is_admin",
@@ -35,6 +42,35 @@ _GUC_NAMES_TO_CLEAR = (
     "rls.is_login_request",
     "rls.is_preauth_request",
 )
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Fail the session on any skipped test when ``RLS_FAIL_ON_SKIPPED=1``.
+
+    Deselected tests (``-m "not superuser_only"``) and ``xfail`` outcomes are
+    not skips and do not trip the rule. Runs inside the terminal reporter's
+    own ``sessionfinish`` wrapper, so the notice lands above the summary line.
+    """
+    if os.environ.get(_FAIL_ON_SKIPPED_ENV) != "1":
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is None:
+        return
+    skipped = reporter.stats.get("skipped", [])
+    if not skipped:
+        return
+    reporter.write_sep(
+        "=",
+        f"{len(skipped)} skipped test(s) but {_FAIL_ON_SKIPPED_ENV}=1: a skipped RLS test "
+        "proves nothing, so the session fails",
+        red=True,
+        bold=True,
+    )
+    for report in skipped:
+        longrepr = getattr(report, "longrepr", None)
+        reason = longrepr[-1] if isinstance(longrepr, tuple) else ""
+        reporter.write_line(f"  {report.nodeid}: {reason}", red=True)
+    session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 @pytest.fixture(autouse=True)

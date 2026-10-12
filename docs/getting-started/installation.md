@@ -6,7 +6,7 @@
 |------------|------------|------------------------------------------|
 | Python     | >= 3.11    | Uses modern type syntax (`X \| Y`)       |
 | Django     | >= 4.2     | LTS and latest supported                 |
-| PostgreSQL | >= 15      | Creating policies requires the table owner (or a superuser) |
+| PostgreSQL | >= 15      | CI runs the suite on 15, 16 and 17. Creating policies requires the table owner (or a superuser) |
 
 ## Install from PyPI
 

@@ -82,7 +82,7 @@ the [Security Model](advanced/security.md) for what that does and does not cover
 |------------|------------|
 | Python     | >= 3.11    |
 | Django     | >= 4.2     |
-| PostgreSQL | >= 15      |
+| PostgreSQL | >= 15 (CI runs the suite on 15, 16 and 17) |
 
 ## Quick Start
 

@@ -115,7 +115,7 @@ Are you using `django-rls-tenants` in production? We'd love to hear about it.
 |------------|---------|
 | Python     | >= 3.11 |
 | Django     | >= 4.2  |
-| PostgreSQL | >= 15   |
+| PostgreSQL | >= 15 (CI runs the suite on 15, 16 and 17) |
 
 ## Contributing
 

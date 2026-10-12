@@ -1,8 +1,38 @@
 """Shared fixtures for the example test suite."""
 
+import os
+
 import pytest
 
 from django_rls_tenants.tenants.testing import rls_bypass
+
+# Zero-skipped-tests rule, mirrored from the library's tests/conftest.py (#110).
+# CI runs this suite against the built wheel as a non-superuser role with
+# RLS_FAIL_ON_SKIPPED=1; a skipped fail-closed test must not pass the job.
+_FAIL_ON_SKIPPED_ENV = "RLS_FAIL_ON_SKIPPED"
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Fail the session on any skipped test when ``RLS_FAIL_ON_SKIPPED=1``."""
+    if os.environ.get(_FAIL_ON_SKIPPED_ENV) != "1":
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is None:
+        return
+    skipped = reporter.stats.get("skipped", [])
+    if not skipped:
+        return
+    reporter.write_sep(
+        "=",
+        f"{len(skipped)} skipped test(s) but {_FAIL_ON_SKIPPED_ENV}=1: the session fails",
+        red=True,
+        bold=True,
+    )
+    for report in skipped:
+        longrepr = getattr(report, "longrepr", None)
+        reason = longrepr[-1] if isinstance(longrepr, tuple) else ""
+        reporter.write_line(f"  {report.nodeid}: {reason}", red=True)
+    session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 @pytest.fixture

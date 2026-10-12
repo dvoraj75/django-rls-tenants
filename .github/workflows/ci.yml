@@ -59,7 +59,13 @@ jobs:
         run: uv run mkdocs build --strict
 
   example-smoke:
-    name: Example checks & PostgreSQL tests
+    # Consumer-project smoke test: build the wheel, install it into a clean venv
+    # (never editable, never the source tree on sys.path) and run the example
+    # app's checks, migration drift check and test suite against it as a
+    # non-superuser role. A packaging defect (missing py.typed, a subpackage
+    # without __init__.py, a stray tests/ directory) fails here instead of at
+    # a user's `pip install`.
+    name: Example app against the built wheel (PostgreSQL 16)
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -80,6 +86,10 @@ jobs:
       POSTGRES_DB: demo
       POSTGRES_USER: app
       POSTGRES_PASSWORD: app
+      RLS_FAIL_ON_SKIPPED: "1"
+      # Every example command runs with this interpreter, never `uv run`, so the
+      # only importable django_rls_tenants is the one installed from the wheel.
+      WHEEL_PYTHON: ${{ github.workspace }}/.wheel-venv/bin/python
     steps:
       - uses: actions/checkout@v6
 
@@ -90,23 +100,92 @@ jobs:
       - name: Set up Python
         run: uv python install 3.12
 
-      - name: Install dependencies
-        run: uv sync --group test
+      - name: Build sdist & wheel
+        run: uv build
 
-      - name: Django system check (imports URLconf -> views -> admin)
+      - name: Inspect wheel contents
+        # The sdist ships tests/ on purpose; only the wheel is asserted on.
+        run: |
+          unzip -l dist/*.whl
+          python3 - dist/*.whl <<'EOF'
+          import posixpath
+          import sys
+          import zipfile
+
+          package = "django_rls_tenants"
+          names = zipfile.ZipFile(sys.argv[1]).namelist()
+          problems = []
+
+          required = [
+              f"{package}/__init__.py",
+              f"{package}/py.typed",
+              f"{package}/contrib/celery.py",
+              f"{package}/management/commands/check_rls.py",
+              f"{package}/management/commands/setup_m2m_rls.py",
+          ]
+          problems += [f"missing from wheel: {name}" for name in required if name not in names]
+
+          # Every directory that holds a module must be an importable package.
+          module_dirs = {posixpath.dirname(n) for n in names if n.endswith(".py")}
+          problems += [
+              f"package directory without __init__.py: {d}/"
+              for d in sorted(module_dirs)
+              if f"{d}/__init__.py" not in names
+          ]
+
+          # Nothing outside the package and its metadata (no tests/, example/, docs/...).
+          for name in names:
+              top = name.split("/", 1)[0]
+              if top != package and not top.endswith(".dist-info"):
+                  problems.append(f"stray path in wheel: {name}")
+              if "__pycache__" in name or name.endswith(".pyc"):
+                  problems.append(f"bytecode in wheel: {name}")
+
+          if problems:
+              for problem in problems:
+                  print(f"::error::{problem}")
+              sys.exit(1)
+          print(f"wheel OK: {len(names)} files, all under {package}/ or *.dist-info/")
+          EOF
+
+      - name: Install the wheel into a clean venv (never editable)
+        # Django and the test tooling come from uv.lock at their pinned versions,
+        # without the project itself, so the committed example migrations match
+        # the Django that generated them and the only django_rls_tenants in the
+        # venv is the wheel.
+        run: |
+          uv venv --python 3.12 .wheel-venv
+          uv export --frozen --no-default-groups --group test --no-emit-project \
+            --no-hashes --no-annotate --output-file consumer-requirements.txt
+          uv pip install --python .wheel-venv -r consumer-requirements.txt dist/*.whl
+          # -I: isolated mode, so the checkout (cwd) is not on sys.path.
+          "$WHEEL_PYTHON" -I - <<'EOF'
+          import pathlib
+          import sys
+
+          import django_rls_tenants
+
+          location = pathlib.Path(django_rls_tenants.__file__).resolve()
+          venv = pathlib.Path(sys.prefix).resolve()
+          print(f"django_rls_tenants {django_rls_tenants.__version__} imported from {location}")
+          if not location.is_relative_to(venv):
+              sys.exit(f"django_rls_tenants resolved outside the venv {venv}: {location}")
+          EOF
+
+      - name: Django system check (imports URLconf -> views -> admin, no database)
         working-directory: example
         env:
           # Keep verifying that imports work without a database connection.
-          POSTGRES_HOST: 127.0.0.1
           POSTGRES_PORT: "1"
-        run: uv run --project .. python manage.py check
+        run: |
+          "$WHEEL_PYTHON" manage.py check
 
-      - name: Collect example tests (no DB needed)
+      - name: Collect example tests (no database)
         working-directory: example
         env:
-          POSTGRES_HOST: 127.0.0.1
           POSTGRES_PORT: "1"
-        run: uv run --project .. python -m pytest tests/ --collect-only -q
+        run: |
+          "$WHEEL_PYTHON" -m pytest tests/ --collect-only -q
 
       - name: Create a non-superuser role for RLS enforcement
         env:
@@ -115,11 +194,11 @@ jobs:
           psql -h 127.0.0.1 -U postgres -d demo -v ON_ERROR_STOP=1
           -c "CREATE ROLE app LOGIN PASSWORD 'app' CREATEDB"
 
-      - name: Run example tests with PostgreSQL RLS enforced
+      - name: Run example tests against the wheel with PostgreSQL RLS enforced
         working-directory: example
         run: |
-          uv run --project .. python manage.py makemigrations --check --dry-run
-          uv run --project .. python -m pytest tests/ -v
+          "$WHEEL_PYTHON" manage.py makemigrations --check --dry-run
+          "$WHEEL_PYTHON" -m pytest tests/ -v
 
   test:
     name: Test (Python ${{ matrix.python-version }}, Django ${{ matrix.django-version }})
@@ -161,6 +240,8 @@ jobs:
 
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/django_rls_tenants_test
+      # Zero-skipped rule: a skipped RLS test must fail the leg (tests/conftest.py).
+      RLS_FAIL_ON_SKIPPED: "1"
 
     steps:
       - uses: actions/checkout@v6
@@ -200,3 +281,60 @@ jobs:
         with:
           name: coverage-report
           path: coverage.xml
+
+  test-postgres:
+    # The README promises PostgreSQL >= 15; the main matrix only ever ran 16.
+    # Four extra legs prove the oldest and newest supported PostgreSQL against
+    # the oldest and newest supported Django without widening the 15-leg
+    # matrix above (16 stays the default everywhere else).
+    name: Test (PostgreSQL ${{ matrix.postgres }}, Django ${{ matrix.django-version }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["15", "17"]
+        django-version: ["4.2", "6.0"]
+        include:
+          - django-version: "4.2"
+            python-version: "3.12"
+          - django-version: "6.0"
+            python-version: "3.14"
+
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: django_rls_tenants_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/django_rls_tenants_test
+      RLS_FAIL_ON_SKIPPED: "1"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          uv sync --group test
+          uv pip install "django~=${{ matrix.django-version }}.0"
+
+      - name: Run tests
+        run: uv run pytest
