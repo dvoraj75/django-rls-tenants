@@ -240,6 +240,8 @@ jobs:
 
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/django_rls_tenants_test
+      UV_PYTHON: ${{ matrix.python-version }}
+      DJANGO_VERSION: ${{ matrix.django-version }}
       # Zero-skipped rule: a skipped RLS test must fail the leg (tests/conftest.py).
       RLS_FAIL_ON_SKIPPED: "1"
 
@@ -255,11 +257,27 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv sync --group test
-          uv pip install "django~=${{ matrix.django-version }}.0"
+          uv sync --locked --no-default-groups --group test
+          uv pip install --python .venv/bin/python "django~=${{ matrix.django-version }}.0"
+
+      - name: Verify matrix versions
+        # Do not let uv re-sync Django to the lockfile version after the override.
+        run: |
+          uv run --no-sync python - <<'EOF'
+          import os
+          import sys
+
+          import django
+
+          python_version = ".".join(map(str, sys.version_info[:2]))
+          django_version = ".".join(map(str, django.VERSION[:2]))
+          print(f"Testing Python {sys.version.split()[0]}, Django {django.get_version()}")
+          assert python_version == os.environ["UV_PYTHON"], python_version
+          assert django_version == os.environ["DJANGO_VERSION"], django_version
+          EOF
 
       - name: Run tests
-        run: uv run pytest --cov --cov-report=xml
+        run: uv run --no-sync python -m pytest --cov --cov-report=xml
 
       - name: Coverage PR comment
         # Skip on PRs from forks: they get a read-only GITHUB_TOKEN, so posting
@@ -319,6 +337,8 @@ jobs:
 
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/django_rls_tenants_test
+      UV_PYTHON: ${{ matrix.python-version }}
+      DJANGO_VERSION: ${{ matrix.django-version }}
       RLS_FAIL_ON_SKIPPED: "1"
 
     steps:
@@ -333,8 +353,24 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv sync --group test
-          uv pip install "django~=${{ matrix.django-version }}.0"
+          uv sync --locked --no-default-groups --group test
+          uv pip install --python .venv/bin/python "django~=${{ matrix.django-version }}.0"
+
+      - name: Verify matrix versions
+        # Do not let uv re-sync Django to the lockfile version after the override.
+        run: |
+          uv run --no-sync python - <<'EOF'
+          import os
+          import sys
+
+          import django
+
+          python_version = ".".join(map(str, sys.version_info[:2]))
+          django_version = ".".join(map(str, django.VERSION[:2]))
+          print(f"Testing Python {sys.version.split()[0]}, Django {django.get_version()}")
+          assert python_version == os.environ["UV_PYTHON"], python_version
+          assert django_version == os.environ["DJANGO_VERSION"], django_version
+          EOF
 
       - name: Run tests
-        run: uv run pytest
+        run: uv run --no-sync python -m pytest

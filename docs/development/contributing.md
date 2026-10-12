@@ -175,6 +175,10 @@ Every push and pull request runs:
   `makemigrations --check --dry-run` and the example test suite as a non-superuser role.
   A packaging defect fails here instead of at a user's `pip install`.
 
+Both test matrices explicitly select their Python interpreter, verify the active Python
+and Django versions, and run pytest with `uv run --no-sync` so the Django override is
+not replaced by the lockfile version.
+
 All PostgreSQL legs run with `RLS_FAIL_ON_SKIPPED=1` (see
 [Skipped tests](#skipped-tests-and-the-superuser_only-marker)).
 

@@ -61,7 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DATABASE_URL` and the README's local-development section uses `export`).
 - **CI now proves what the README claims** (#110). A `test-postgres` job runs the suite on
   PostgreSQL 15 and 17 with the oldest and newest supported Django (4.2 / 6.0) alongside
-  the PostgreSQL 16 matrix, so "PostgreSQL >= 15" is verified at both ends. Every
+  the PostgreSQL 16 matrix, so "PostgreSQL >= 15" is verified at both ends. Both
+  matrices explicitly select and verify Python/Django versions and disable re-syncing
+  when running pytest, preserving the requested Django version. Every
   PostgreSQL leg sets `RLS_FAIL_ON_SKIPPED=1`: a `pytest_sessionfinish` hook in
   `tests/conftest.py` (mirrored in the example suite) fails the session on any skipped
   test, and the one runtime `pytest.skip()` in the suite is now a registered
