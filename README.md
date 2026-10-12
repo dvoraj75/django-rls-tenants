@@ -86,6 +86,9 @@ python manage.py check_rls   # verify policies are in place
 ```
 
 **[Full tutorial and documentation →](https://dvoraj75.github.io/django-rls-tenants/)**
+Something not working? Start with the
+[Troubleshooting page](https://dvoraj75.github.io/django-rls-tenants/troubleshooting/)
+(symptom / cause / fix).
 
 > **Want to see it in action first?** Check out the
 > [example project](example/) -- `cd example && docker compose up`,

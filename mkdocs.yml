@@ -98,6 +98,7 @@ nav:
       - Architecture: advanced/architecture.md
       - Migration Guide: advanced/migration-guide.md
       - Security Model: advanced/security.md
+  - Troubleshooting: troubleshooting.md
   - Reference:
       - API: reference/api.md
   - Development:

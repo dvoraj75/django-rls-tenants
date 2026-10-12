@@ -168,3 +168,5 @@ If any policies are missing, the command exits with a non-zero status and lists 
 - [Protecting Models](../guides/protecting-models.md) -- customize FK fields and constraints.
 - [Context Managers](../guides/context-managers.md) -- use `tenant_context` and `admin_context` in scripts.
 - [Testing](../guides/testing.md) -- test helpers for RLS verification.
+- [Troubleshooting](../troubleshooting.md) -- zero rows, `NoTenantContextError`, system
+  check warnings and other common failures, with the fix for each.

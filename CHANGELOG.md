@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Troubleshooting page and task-oriented index** (`docs/troubleshooting.md`, #109). One
+  symptom / cause / fix entry per known failure mode, each linking to the guide that owns
+  the explanation: zero rows everywhere, the three `NoTenantContextError` hints, `SET LOCAL`
+  outside a transaction, the `USE_LOCAL_SET` middleware-order and ASGI configuration
+  errors, every active system check (W001/W002, W004, W005, W006, W008, W009) with the
+  retired W003/W007, `check_rls` findings, the `createsuperuser` admin trap, Celery
+  propagation, PgBouncer GUC leaks, raw SQL scoping, planner behaviour, the open ASGI
+  token bug (#58), and the 1.3.2 fixes (#79, #94, #95, #100, #102) as "upgrade to fix".
+  The docs home page gains an "I want to..." table mapping fifteen common goals to the
+  page that covers them. Both are in the site nav; the README and the Quick Start's
+  "What's Next?" point at the troubleshooting page.
+
 - **Example demos for `@rls_task`, `safe_tenant_sql()` and `check_rls --verbose`** (#80).
   The example now ships a broker-free Celery app (`demo/celery.py`, eager mode) and
   `notes/tasks.py` with a plain `@rls_task` driven from the Stats page plus a

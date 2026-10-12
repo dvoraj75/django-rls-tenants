@@ -41,6 +41,26 @@ the [Security Model](advanced/security.md) for what that does and does not cover
 - **Configurable escape hatches** -- bypass flags for authentication, admin, migrations.
 - **Drop-in for new projects** -- abstract model, middleware, and test helpers included.
 
+## I want to...
+
+| Goal | Start here |
+|------|------------|
+| Install and protect my first model | [Quick Start](getting-started/quickstart.md), then [Protecting Models](guides/protecting-models.md) |
+| Expose the tenant on my `User` model | [User Integration](guides/user-integration.md) |
+| Set the tenant context for every request | [Middleware](guides/middleware.md) |
+| Set the context in a script or management command | [Context Managers](guides/context-managers.md) |
+| Run a Celery task under the right tenant | [Celery Tasks](guides/celery-tasks.md) |
+| Use the Django admin across tenants | [Admin](guides/admin.md) |
+| Write a test that proves isolation fails closed | [Testing](guides/testing.md) |
+| Write raw SQL that stays tenant-scoped | [Raw SQL](guides/raw-sql.md) |
+| Let authentication or migrations bypass RLS | [Bypass Mode](guides/bypass-mode.md) |
+| Run behind PgBouncer or with persistent connections | [Connection Pooling](guides/connection-pooling.md) |
+| Index tables so RLS stays fast | [Performance & Indexing](guides/performance.md) |
+| Verify the policies are really in the database | [Management Commands](guides/management-commands.md) |
+| Migrate an existing app or another multitenancy library | [Migration Guide](advanced/migration-guide.md) |
+| Understand what RLS does and does not guarantee | [Security Model](advanced/security.md) |
+| Fix something that is wrong right now | [Troubleshooting](troubleshooting.md) |
+
 ## How It Works
 
 ```
