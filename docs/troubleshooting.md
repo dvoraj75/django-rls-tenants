@@ -35,7 +35,10 @@ yields nothing, although the view itself saw data.
 **Cause:** The middleware's context ends when the view returns the response object,
 before the body is iterated.
 
-**Fix:** Open `tenant_context()` / `admin_context()` inside the generator.
+**Fix:** Open `tenant_context()` / `admin_context()` inside the synchronous generator
+and evaluate the queries there. With `USE_LOCAL_SET=True`, enter
+`transaction.atomic(using=alias)` before the context, using the same database alias
+for both; the middleware's request transaction has already ended.
 
 **See:** [Transaction Per Request](guides/middleware.md#transaction-per-request-use_local_settrue).
 
@@ -49,9 +52,14 @@ before the body is iterated.
 
 | Hint starts with | Cause | Fix |
 |---|---|---|
-| `Establish an RLS context before the query` | `STRICT_MODE=True` and a query ran with no context (or a `rls_require_context` Celery task arrived without one) | Wrap the code in `tenant_context()` / `admin_context()`, use `.for_user()`, or run it under the middleware |
+| `Establish an RLS context before the query` | `STRICT_MODE=True` and a query ran with no context | Wrap the code in `tenant_context()` / `admin_context()`, use `.for_user()`, or run it under the middleware |
 | `Assign the user to a tenant (set rls_tenant_id)` | A non-admin `TenantUser` has `rls_tenant_id=None`: a `createsuperuser` account, a user not yet attached to a tenant | Give the user a tenant, or set `is_tenant_admin=True` |
 | `Pass a concrete tenant primary key` | `tenant_context(None)` was called | Pass a real tenant PK, or use `admin_context()` for cross-tenant access |
+
+The first hint also appears when a Celery task with `rls_require_context=True`
+arrives without propagated context. Enqueue it **inside** a tenant or admin context;
+opening a context in the task body is too late because the guard runs before the body.
+See [Requiring a context](guides/celery-tasks.md#requiring-a-context).
 
 **See:** [Strict Mode](guides/context-managers.md#strict-mode),
 [User Integration](guides/user-integration.md#implementing-on-your-user-model),
@@ -119,9 +127,42 @@ the token created in `process_request` can be reset in a different `contextvars.
 Scheduled for v1.4.0 together with native async support.
 
 **Fix:** Run the middleware under WSGI, or leave it out of `MIDDLEWARE` and set the
-context explicitly in the view (`tenant_context()` / `.for_user()`).
+context explicitly in a synchronous view (`tenant_context()` / `.for_user()`). For
+an async view, put both the context and query evaluation in one synchronous function
+called with `sync_to_async(..., thread_sensitive=True)`.
 
 **See:** [Using Without Middleware](guides/middleware.md#using-without-middleware).
+
+### `RuntimeError: ... Token ... has already been used once`
+
+**Symptom:** An exception in a view (for example, an admin `PermissionDenied`) becomes
+a 500 response because middleware cleanup tries to reset the same token twice.
+
+**Cause:** Before 1.3.1, both the exception and response hooks reset the context tokens.
+This is separate from the ASGI "different Context" error above.
+
+**Fix:** Upgrade to 1.3.1 or later.
+
+**See:** [1.3.1 fixes](development/changelog.md#131-2026-10-11).
+
+### `ImportError: cannot import name 'NoTenantContextError' from 'django_rls_tenants'`
+
+**Symptom:** The application fails to import after upgrading from 1.2.0, or an old
+example checkout fails at startup.
+
+**Cause:** The 1.2.1 public API cleanup removed exception re-exports from the package
+root. Older example code still used that import until the 1.3.1 fix (#72).
+
+**Fix:** Import exceptions from their canonical module:
+
+```python
+from django_rls_tenants.exceptions import NoTenantContextError
+```
+
+Update the example checkout if it still uses the old import.
+
+**See:** [1.2.1 upgrade steps](advanced/migration-guide.md#from-120-to-121),
+[Exceptions](reference/api.md#exceptions).
 
 ### `AttributeError: 'User' object has no attribute 'is_tenant_admin'`
 
@@ -218,8 +259,9 @@ The example project's `docker/init-db.sql` does exactly this.
 GUC_PREFIX derives 'myapp.current_tenant'. Tenant isolation will silently break.`
 
 **Cause:** You changed `GUC_PREFIX` (or passed custom `guc_*_var` names to a constraint),
-so the middleware sets one variable while the database policy reads another. Every query
-returns zero rows.
+so the middleware sets one variable while the database policy reads another. A tenant
+GUC mismatch (W001) can make tenant queries return zero rows; an admin GUC mismatch
+(W002) breaks the admin bypass even if tenant queries still work.
 
 **Fix:** Make them agree: either pass the derived names to the `RLSConstraint`, or set
 `GUC_PREFIX` back so it derives the names the constraint uses. Policies already in the
@@ -235,8 +277,9 @@ risks GUC state leaking between requests on persistent connections.`
 **Cause:** Session-scoped GUCs survive on a persistent connection; if the response phase
 that clears them is skipped, the next request on that connection inherits the tenant.
 
-**Fix:** Set `USE_LOCAL_SET=True` (the middleware scopes the GUCs to a per-request
-transaction), or set `CONN_MAX_AGE=0`.
+**Fix:** Under WSGI, set `USE_LOCAL_SET=True` (the middleware scopes the GUCs to a
+per-request transaction), or set `CONN_MAX_AGE=0`. The middleware's transaction mode
+is unavailable under ASGI; use `CONN_MAX_AGE=0` there.
 
 **See:** [W004 in Connection Pooling](guides/connection-pooling.md#w004-conn_max_age-with-session-gucs).
 
@@ -257,9 +300,9 @@ transaction), or set `CONN_MAX_AGE=0`.
 **Symptom:** Documentation or a settings file from an earlier version mentions
 `django_rls_tenants.W003` / `W007`, but `manage.py check` never prints them.
 
-**Cause:** Both warned about `USE_LOCAL_SET=True` without `ATOMIC_REQUESTS`. Since 1.3.2
-the middleware opens its own transaction, so the combination is valid and the checks were
-retired (W003 in 1.3.1, W007 in 1.3.2).
+**Cause:** Both warned about `USE_LOCAL_SET=True` without `ATOMIC_REQUESTS`. W003 was
+retired in 1.3.1 because W007 covered all configured aliases. W007 was retired in 1.3.2
+when the middleware began opening its own transaction, making the combination valid.
 
 **Fix:** Nothing. A leftover `SILENCED_SYSTEM_CHECKS` entry is harmless and can be
 removed.
@@ -333,8 +376,9 @@ request that enqueued it.
 
 **Fix:** Use `@rls_task` (or the `RLSTask` base class) for every step, and set
 `rls_require_context = True` on tasks that must never run tenant-blind so they raise
-instead of returning nothing. Scheduled tasks pick their tenant explicitly inside the
-body.
+instead of returning nothing. Enqueue those tasks inside an active context. Scheduled
+tasks that pick their tenant inside the body must leave `rls_require_context=False`,
+since the guard runs before the body can establish context.
 
 **See:** [Celery Tasks](guides/celery-tasks.md#chains-and-groups),
 [Requiring a context](guides/celery-tasks.md#requiring-a-context).
@@ -349,8 +393,10 @@ tenant, or an unauthenticated request sees rows.
 as soon as the transaction ends, carrying the GUCs with it.
 
 **Fix:** Set `USE_LOCAL_SET=True`. The GUCs become `SET LOCAL` and die with the
-per-request transaction the middleware opens, so a pooled connection is always clean when
-it changes hands.
+per-request transaction the middleware opens under WSGI. Under ASGI, this middleware
+mode is unavailable: use WSGI for transaction pooling, or switch to session pooling
+with `USE_LOCAL_SET=False`. Scripts and other callers using `SET LOCAL` must open
+their own transaction before setting context.
 
 **See:** [PgBouncer: Transaction Mode](guides/connection-pooling.md#transaction-mode-recommended),
 [Connection-Level State](advanced/security.md#connection-level-state).
@@ -365,7 +411,10 @@ ORM (nothing → zero rows; `admin_context()` → all rows). Only the ORM's
 `TenantQuerySet` adds the extra `WHERE tenant_id = X`; raw SQL does not.
 
 **Fix:** Run it inside a context, and add `safe_tenant_sql()` to the `WHERE` clause to get
-the same explicit scoping (and index use) the ORM provides.
+an explicit predicate that preserves admin bypass. For an indexable tenant match, use
+`safe_tenant_sql(include_admin=False)` inside `tenant_context(tenant_id)`. The default
+form's `OR` expression does not provide a tenant index condition; it also continues to
+return every tenant in `admin_context()`.
 
 **See:** [Raw SQL](guides/raw-sql.md).
 

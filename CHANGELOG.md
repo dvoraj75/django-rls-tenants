@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retired W003/W007, `check_rls` findings, the `createsuperuser` admin trap, Celery
   propagation, PgBouncer GUC leaks, raw SQL scoping, planner behaviour, the open ASGI
   token bug (#58), and the 1.3.2 fixes (#79, #94, #95, #100, #102) as "upgrade to fix".
+  Covers the older exception-import and token-reuse failures too, and distinguishes
+  streaming transaction requirements, Celery enqueue-time context, and indexable raw
+  SQL predicates from the admin-inclusive form.
   The docs home page gains an "I want to..." table mapping fifteen common goals to the
   page that covers them. Both are in the site nav; the README and the Quick Start's
   "What's Next?" point at the troubleshooting page.

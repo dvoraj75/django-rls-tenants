@@ -80,7 +80,10 @@ Transaction behavior and limitations:
   savepoint inside the middleware's.
 - A `StreamingHttpResponse` iterates its body after the transaction has ended, so
   queries made while streaming see no tenant context (fail-closed). Open a context
-  inside the generator.
+  inside the synchronous generator and evaluate the queries there. With
+  `USE_LOCAL_SET=True`, first enter `transaction.atomic(using=alias)`, then
+  `tenant_context(tenant_id, using=alias)` (or `admin_context(using=alias)`), using
+  the database alias queried by the generator.
 
 With the default `USE_LOCAL_SET=False` nothing changes: the view runs in autocommit (or
 under `ATOMIC_REQUESTS`, if you enable it) exactly as before.
