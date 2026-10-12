@@ -1,15 +1,15 @@
 """Bypass helpers for RLS policies.
 
-Re-exports ``bypass_flag`` from the ``rls`` layer and provides
+Re-exports ``bypass_flag`` and ``async_bypass_flag`` from the ``rls`` layer and provides
 imperative ``set_bypass_flag`` / ``clear_bypass_flag`` functions.
 """
 
 from __future__ import annotations
 
-from django_rls_tenants.rls.context import bypass_flag
+from django_rls_tenants.rls.context import async_bypass_flag, bypass_flag
 from django_rls_tenants.rls.guc import clear_guc, set_guc
 
-__all__ = ["bypass_flag", "clear_bypass_flag", "set_bypass_flag"]
+__all__ = ["async_bypass_flag", "bypass_flag", "clear_bypass_flag", "set_bypass_flag"]
 
 
 def set_bypass_flag(

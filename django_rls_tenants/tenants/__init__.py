@@ -12,6 +12,7 @@ from django_rls_tenants.exceptions import (
     RLSTenantError,
 )
 from django_rls_tenants.tenants.bypass import (
+    async_bypass_flag,
     bypass_flag,
     clear_bypass_flag,
     set_bypass_flag,
@@ -19,6 +20,8 @@ from django_rls_tenants.tenants.bypass import (
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import (
     admin_context,
+    async_admin_context,
+    async_tenant_context,
     tenant_context,
     with_rls_context,
 )
@@ -43,6 +46,9 @@ __all__ = [
     "TenantQuerySet",
     "TenantUser",
     "admin_context",
+    "async_admin_context",
+    "async_bypass_flag",
+    "async_tenant_context",
     "bypass_flag",
     "clear_bypass_flag",
     "get_current_tenant_id",

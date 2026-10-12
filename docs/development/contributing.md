@@ -114,6 +114,9 @@ tests/
 - **Module docstring**: `"""Tests for django_rls_tenants.{module.path}."""`
 - **Fixtures**: descriptive nouns (`tenant_a`, `admin_user`).
 - **DB access**: `pytestmark = pytest.mark.django_db` at module level.
+- **Async code** is tested from plain sync tests through `asgiref.sync.async_to_sync`
+  (there is no asyncio pytest plugin). Thread-sensitive hops then run on the test
+  thread, so they see the test's connection and transaction.
 
 ### Skipped tests and the `superuser_only` marker
 

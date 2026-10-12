@@ -105,9 +105,10 @@ of the request's `contextvars.Context`. Since 1.3.4, cleanup clears the `Context
 when their tokens belong to another context instead of failing (#58).
 Cleanup also runs if an async view is cancelled before the response or exception hooks
 run. Keep one RLS context per request task: do not `asyncio.gather` work for different
-tenants inside one request, since it shares the request's connection. A native async
-middleware path is tracked in
-[#38](https://github.com/dvoraj75/django-rls-tenants/issues/38).
+tenants inside one request, since it shares the request's connection. Async views that
+need to change the context use `async_tenant_context()` / `async_admin_context()`
+(1.4.0+, see [Async Code](context-managers.md#async-code)). A native async middleware path
+is tracked in [#38](https://github.com/dvoraj75/django-rls-tenants/issues/38).
 
 ### Response Phase (`process_response`)
 
