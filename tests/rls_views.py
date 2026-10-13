@@ -10,10 +10,14 @@ from typing import TYPE_CHECKING
 
 from django.db import connection
 from django.http import Http404, HttpResponse, HttpResponseServerError, JsonResponse
-from django.utils.deprecation import MiddlewareMixin
 
 from django_rls_tenants.rls.guc import get_guc
 from tests.test_app.models import Order, Tenant
+
+try:
+    from django.middleware import MiddlewareMixin  # Django >= 6.2
+except ImportError:  # Django 5.2 - 6.1
+    from django.utils.deprecation import MiddlewareMixin
 
 if TYPE_CHECKING:
     from django.http import HttpRequest

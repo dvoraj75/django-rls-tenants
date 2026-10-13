@@ -11,7 +11,7 @@
 | Auto query scoping | Yes (ORM + RLS dual layer) | Yes (schema isolation) | Yes (ORM rewriting only) |
 | Scaling (1000+ tenants) | Single schema, no overhead | One PG schema per tenant (catalog bloat) | Depends on Citus setup |
 | PostgreSQL required | Yes | Yes | Yes (Citus extension) |
-| Django version support | 4.2 — 6.0 | 4.0+ | 3.2+ |
+| Django version support | 5.2 — 6.1 | 4.0+ | 3.2+ |
 
 ## Schema-Per-Tenant: django-tenants
 

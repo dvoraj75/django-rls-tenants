@@ -12,7 +12,7 @@ import functools
 import inspect
 import logging
 from contextlib import asynccontextmanager, contextmanager
-from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Any
 
 from asgiref.sync import sync_to_async
 from django.db import connections
@@ -28,9 +28,6 @@ from django_rls_tenants.tenants.state import (
     set_current_tenant_id,
     set_rls_context_active,
 )
-
-_P = ParamSpec("_P")
-_R = TypeVar("_R")
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterator
@@ -370,11 +367,11 @@ def _get_arg_from_signature(
     return bound.arguments.get(arg_name)
 
 
-def with_rls_context(
-    func: Callable[_P, _R] | None = None,
+def with_rls_context[**P, R](
+    func: Callable[P, R] | None = None,
     *,
     user_param: str | None = None,
-) -> Callable[_P, _R] | Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
     """Decorator that extracts a user argument and sets RLS context.
 
     Can be used bare or with an explicit ``user_param``::
@@ -398,7 +395,7 @@ def with_rls_context(
     without context (fail-closed: RLS blocks all access).
     """
 
-    def decorator(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    def decorator(fn: Callable[P, R]) -> Callable[P, R]:
         # Cache signature at decoration time (not per-invocation).
         sig = inspect.signature(fn)
         param_name = user_param if user_param is not None else rls_tenants_config.USER_PARAM_NAME
@@ -413,7 +410,7 @@ def with_rls_context(
             )
 
         @functools.wraps(fn)
-        def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
             as_user: TenantUser | None = _get_arg_from_signature(sig, param_name, *args, **kwargs)
 
             if as_user is not None and as_user.is_tenant_admin:

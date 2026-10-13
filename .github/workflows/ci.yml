@@ -201,7 +201,7 @@ jobs:
           "$WHEEL_PYTHON" -m pytest tests/ -v
 
   test:
-    name: Test (Python ${{ matrix.python-version }}, Django ${{ matrix.django-version }})
+    name: Test (Python ${{ matrix.python-version }}, Django ${{ matrix.django-version }}, ${{ matrix.driver }})
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -209,19 +209,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
-        django-version: ["4.2", "5.0", "5.1", "5.2", "6.0"]
-        exclude:
-          - python-version: "3.13"
-            django-version: "4.2"
-          - python-version: "3.14"
-            django-version: "4.2"
-          - python-version: "3.14"
-            django-version: "5.0"
-          - python-version: "3.14"
-            django-version: "5.1"
-          - python-version: "3.11"
-            django-version: "6.0"
+        # The supported-versions policy (docs/getting-started/installation.md) makes
+        # every Python x Django pair valid, so there are no exclude rows.
+        # tests/test_support_matrix.py fails if this drifts from the docs.
+        python-version: ["3.12", "3.13", "3.14"]
+        django-version: ["5.2", "6.0", "6.1"]
+        driver: ["psycopg2"]
+        include:
+          # Driver-neutrality leg: the library must behave identically on psycopg 3.
+          # Installed on top of the synced venv because Django prefers psycopg 3 whenever
+          # it is importable; putting it in a dependency group would flip every leg.
+          - python-version: "3.12"
+            django-version: "6.1"
+            driver: "psycopg3"
 
     services:
       postgres:
@@ -242,6 +242,7 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/django_rls_tenants_test
       UV_PYTHON: ${{ matrix.python-version }}
       DJANGO_VERSION: ${{ matrix.django-version }}
+      DRIVER: ${{ matrix.driver }}
       # Zero-skipped rule: a skipped RLS test must fail the leg (tests/conftest.py).
       RLS_FAIL_ON_SKIPPED: "1"
 
@@ -259,21 +260,31 @@ jobs:
         run: |
           uv sync --locked --no-default-groups --group test
           uv pip install --python .venv/bin/python "django~=${{ matrix.django-version }}.0"
+          if [ "${{ matrix.driver }}" = "psycopg3" ]; then
+            uv pip install --python .venv/bin/python "psycopg[binary,pool]"
+          fi
 
       - name: Verify matrix versions
         # Do not let uv re-sync Django to the lockfile version after the override.
+        # The driver check also proves the psycopg2 legs did not silently flip.
         run: |
           uv run --no-sync python - <<'EOF'
           import os
           import sys
 
           import django
+          from django.db.backends.postgresql.psycopg_any import is_psycopg3
 
           python_version = ".".join(map(str, sys.version_info[:2]))
           django_version = ".".join(map(str, django.VERSION[:2]))
-          print(f"Testing Python {sys.version.split()[0]}, Django {django.get_version()}")
+          driver = "psycopg3" if is_psycopg3 else "psycopg2"
+          print(
+              f"Testing Python {sys.version.split()[0]}, Django {django.get_version()}, "
+              f"driver {driver}"
+          )
           assert python_version == os.environ["UV_PYTHON"], python_version
           assert django_version == os.environ["DJANGO_VERSION"], django_version
+          assert driver == os.environ["DRIVER"], f"driver {driver}, expected {os.environ['DRIVER']}"
           EOF
 
       - name: Run tests
@@ -285,7 +296,8 @@ jobs:
         # and reds the whole job even when tests and coverage pass.
         if: >-
           github.event_name == 'pull_request'
-          && matrix.python-version == '3.12' && matrix.django-version == '5.1'
+          && matrix.python-version == '3.12' && matrix.django-version == '6.1'
+          && matrix.driver == 'psycopg2'
           && github.event.pull_request.head.repo.full_name == github.repository
         uses: orgoro/coverage@v3.2
         with:
@@ -294,17 +306,21 @@ jobs:
           thresholdAll: 0.9
 
       - name: Upload coverage
-        if: matrix.python-version == '3.12' && matrix.django-version == '5.1'
+        # Pinned to one leg: upload-artifact fails on a duplicate artifact name, and
+        # 3.12 / 6.1 runs twice (psycopg2 and psycopg3).
+        if: >-
+          matrix.python-version == '3.12' && matrix.django-version == '6.1'
+          && matrix.driver == 'psycopg2'
         uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: coverage.xml
 
   test-postgres:
-    # The README promises PostgreSQL >= 15; the main matrix only ever ran 16.
+    # The README lists PostgreSQL 15, 16, 17 and 18; the main matrix runs 16.
     # Four extra legs prove the oldest and newest supported PostgreSQL against
-    # the oldest and newest supported Django without widening the 15-leg
-    # matrix above (16 stays the default everywhere else).
+    # the oldest and newest supported Django without widening the matrix above
+    # (16 stays the default everywhere else).
     name: Test (PostgreSQL ${{ matrix.postgres }}, Django ${{ matrix.django-version }})
     runs-on: ubuntu-latest
     permissions:
@@ -312,12 +328,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        postgres: ["15", "17"]
-        django-version: ["4.2", "6.0"]
+        postgres: ["15", "18"]
+        django-version: ["5.2", "6.1"]
         include:
-          - django-version: "4.2"
+          - django-version: "5.2"
             python-version: "3.12"
-          - django-version: "6.0"
+          - django-version: "6.1"
             python-version: "3.14"
 
     services:

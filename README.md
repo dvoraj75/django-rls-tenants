@@ -3,7 +3,7 @@
 [![CI](https://github.com/dvoraj75/django-rls-tenants/actions/workflows/ci.yml/badge.svg)](https://github.com/dvoraj75/django-rls-tenants/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/django-rls-tenants)](https://pypi.org/project/django-rls-tenants/)
 [![Python versions](https://img.shields.io/pypi/pyversions/django-rls-tenants)](https://pypi.org/project/django-rls-tenants/)
-[![Django versions](https://img.shields.io/badge/django-4.2%20%7C%205.0%20%7C%205.1%20%7C%205.2%20%7C%206.0-blue)](https://www.djangoproject.com/)
+[![Django versions](https://img.shields.io/badge/django-5.2%20%7C%206.0%20%7C%206.1-blue)](https://www.djangoproject.com/)
 [![Code style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000)](https://docs.astral.sh/ruff/)
 [![Type checked: mypy](https://img.shields.io/badge/type%20checked-mypy-blue)](https://mypy-lang.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -119,9 +119,12 @@ Are you using `django-rls-tenants` in production? We'd love to hear about it.
 
 | Dependency | Version |
 |------------|---------|
-| Python     | >= 3.11 |
-| Django     | >= 4.2  |
-| PostgreSQL | >= 15 (CI runs the suite on 15, 16 and 17) |
+| Python     | 3.12, 3.13, 3.14 |
+| Django     | 5.2, 6.0, 6.1 |
+| PostgreSQL | 15, 16, 17, 18 |
+
+See the [supported-versions policy](https://dvoraj75.github.io/django-rls-tenants/getting-started/installation/#supported-versions)
+for how these lists change.
 
 ## Contributing
 

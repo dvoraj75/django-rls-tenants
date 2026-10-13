@@ -47,6 +47,18 @@ from django_rls_tenants.tenants.state import (
 if TYPE_CHECKING:
     from django_rls_tenants.tenants.types import TenantUser
 
+try:
+    # django-stubs 6.1.2 still declares the class under its pre-rename name,
+    # RemovedInDjango70Warning (a runtime alias of this one).
+    from django.utils.deprecation import (  # type: ignore[attr-defined]
+        RemovedInDjango2028Warning,
+        warn_about_external_use,
+    )
+except ImportError:  # Django < 6.1: select_related() with no arguments is not deprecated.
+    _SELECT_RELATED_NO_ARGS_DEPRECATED = False
+else:
+    _SELECT_RELATED_NO_ARGS_DEPRECATED = True
+
 logger = logging.getLogger("django_rls_tenants")
 
 
@@ -176,19 +188,48 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         relying solely on per-row RLS ``current_setting()`` evaluation.
 
         Falls back to ``super().select_related()`` when no tenant scope
-        is active or when called with no arguments (select-all mode).
+        is active. Called with no arguments (select-all mode) it adds no
+        tenant filters; Django 6.1 deprecates that form, and the
+        ``RemovedInDjango2028Warning`` names the caller's line, not this
+        method.
 
-        Handles ``select_related(False)`` (Django 5.x) and
-        ``select_related(None)`` (Django 6.0+) for clearing without
-        adding tenant filters.
+        ``select_related(None)`` clears the selection without adding
+        tenant filters. ``select_related(False)`` is treated the same way
+        as a convenience kept for existing callers; Django itself has
+        never accepted ``False``.
         """
-        # Django 5.x uses False, Django 6.0+ uses None to clear
-        # select_related. Normalize to None before calling super() to
-        # avoid AttributeError: 'bool' object has no attribute 'split'.
+        # Django never accepted False (it reaches add_select_related() and
+        # fails with 'bool' object has no attribute 'split'); normalize it
+        # to None, which clears the selection.
         if fields in ((False,), (None,)):
             return super().select_related(None)
         if not fields:
-            return super().select_related()
+            if not _SELECT_RELATED_NO_ARGS_DEPRECATED:
+                return super().select_related()
+            # These guards (and _chain() below) mirror QuerySet.select_related();
+            # all three are internal Django APIs that django-stubs does not declare.
+            self._not_support_combined_queries("select_related")  # type: ignore[attr-defined]
+            if self._fields is not None:  # type: ignore[attr-defined]
+                raise TypeError("Cannot call select_related() after .values() or .values_list()")
+            # Django 6.1 deprecates the no-argument form through
+            # warn_about_external_use(), which blames the first frame outside
+            # django.db.models -- this override. Emit the same warning
+            # ourselves with this package skipped, so the user's call site is
+            # named, and set the flag the way QuerySet.select_related() does,
+            # so Django does not warn a second time. Django-internal callers
+            # (the admin changelist) get no warning from us; Django deprecates
+            # list_select_related=True on its own.
+            # RemovedInDjango2028Warning: when Django removes the no-argument
+            # form, raise TypeError here too.
+            warn_about_external_use(
+                "Calling select_related() with no arguments is deprecated. "
+                "Specify the fields to fetch instead.",
+                category=RemovedInDjango2028Warning,
+                skip_name_prefixes=("django.db.models", "django_rls_tenants."),
+            )
+            everything: TenantQuerySet = self._chain()  # type: ignore[attr-defined]
+            everything.query.select_related = True
+            return everything
         tenant_id = self._get_active_tenant_id()
         qs: TenantQuerySet = super().select_related(*fields)
         if tenant_id is None:

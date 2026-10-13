@@ -11,8 +11,8 @@ expected to uphold this code. Please report unacceptable behavior to dvoraj75@gm
 
 ## Prerequisites
 
-- Python 3.11+
-- PostgreSQL 15+
+- Python 3.12 or newer
+- PostgreSQL 15–18
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
 
 ## Development Setup
@@ -166,9 +166,10 @@ Every push and pull request runs:
 
 - **Lint & Type Check** -- `uv lock --check`, Ruff (check + format) and mypy.
 - **Docs** -- `mkdocs build --strict`.
-- **Test matrix** -- Python 3.11-3.14 x Django 4.2-6.0 on PostgreSQL 16.
-- **PostgreSQL 15 and 17 legs** -- the oldest and newest supported Django (4.2 on
-  Python 3.12, 6.0 on Python 3.14) on both, so the "PostgreSQL >= 15" requirement is
+- **Test matrix** -- Python 3.12-3.14 x Django 5.2-6.1 on PostgreSQL 16 with psycopg2,
+  plus a psycopg 3 leg on Python 3.12 / Django 6.1 that keeps the library driver-neutral.
+- **PostgreSQL 15 and 18 legs** -- the oldest and newest supported Django (5.2 on
+  Python 3.12, 6.1 on Python 3.14) on both, so the supported PostgreSQL range is
   verified at each end rather than assumed.
 - **Example app against the built wheel** -- `uv build`, an assertion on the wheel's
   file list (only `django_rls_tenants/` and `*.dist-info/`, every package directory has
@@ -179,11 +180,21 @@ Every push and pull request runs:
   A packaging defect fails here instead of at a user's `pip install`.
 
 Both test matrices explicitly select their Python interpreter, verify the active Python
-and Django versions, and run pytest with `uv run --no-sync` so the Django override is
-not replaced by the lockfile version.
+and Django versions (and, in the main matrix, the database driver), and run pytest with
+`uv run --no-sync` so the Django override is not replaced by the lockfile version. The
+psycopg 3 leg installs `psycopg` on top of the synced environment: Django prefers it
+whenever it is importable, so it is deliberately absent from every dependency group.
 
 All PostgreSQL legs run with `RLS_FAIL_ON_SKIPPED=1` (see
-[Skipped tests](#skipped-tests-and-the-superuser_only-marker)).
+[Skipped tests](#skipped-tests-and-the-superuser_only-marker)). `tests/conftest.py` also
+turns every Django `RemovedIn*Warning` into a test error, so the newest Django leg fails
+as soon as Django deprecates something the library calls.
+
+The supported-versions policy lives in the
+[installation guide](../getting-started/installation.md#supported-versions);
+`tests/test_support_matrix.py` fails when any file disagrees with it. To change the
+matrix, edit the constants at the top of that test first; it then names every file
+that still states the old versions.
 
 Publishing a GitHub release runs a **preflight** job before anything else: the tag must
 be `vX.Y.Z`, `X.Y.Z` must equal `version` in `pyproject.toml`, and `CHANGELOG.md` must

@@ -241,6 +241,25 @@ python manage.py shell -c \
 **See:** [Admin: Fail-closed](guides/admin.md#fail-closed),
 [example project README](https://github.com/dvoraj75/django-rls-tenants/tree/main/example).
 
+### `RemovedInDjango2028Warning: Calling select_related() with no arguments is deprecated`
+
+**Symptom:** On Django 6.1 or newer, a test run or the warnings log shows this
+deprecation for a queryset of an RLS-protected model.
+
+**Cause:** Django 6.1 deprecates `select_related()` with no arguments ("follow every
+non-null foreign key"); Django 2028 will raise `TypeError` for it. It is the calling
+code that is deprecated, not the library: the warning names the line that made the
+call. Releases before 1.4.0 attributed it to `django_rls_tenants/tenants/managers.py`
+instead.
+
+**Fix:** Name the relations to fetch, e.g. `Order.objects.select_related("customer")`;
+named relations also get the tenant filter on the joined RLS-protected tables. Or switch
+the queryset to Django 6.1's `fetch_mode(FETCH_PEERS)`, which loads related objects on
+first access. For the admin, replace `list_select_related = True` with a list of fields
+(Django warns about that setting itself).
+
+**See:** [Supported versions](getting-started/installation.md#supported-versions).
+
 ## System check warnings
 
 `python manage.py check` prints these. IDs are never renumbered; W003 and W007 are

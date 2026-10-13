@@ -2,11 +2,40 @@
 
 ## Requirements
 
-| Dependency | Version    | Notes                                    |
-|------------|------------|------------------------------------------|
-| Python     | >= 3.11    | Uses modern type syntax (`X \| Y`)       |
-| Django     | >= 4.2     | LTS and latest supported                 |
-| PostgreSQL | >= 15      | CI runs the suite on 15, 16 and 17. Creating policies requires the table owner (or a superuser) |
+| Dependency | Version          | Notes                                    |
+|------------|------------------|------------------------------------------|
+| Python     | 3.12, 3.13, 3.14 | Every version that all listed Django series support |
+| Django     | 5.2, 6.0, 6.1    | 5.2 is the current LTS                   |
+| PostgreSQL | 15, 16, 17, 18   | CI runs 15 and 18 as the edges and 16 as the default. Creating policies requires the table owner (or a superuser) |
+
+## Supported versions
+
+The lists above follow a written policy, so you can tell in advance when a version
+will be added or dropped.
+
+- **Django:** every series the Django project currently supports, in mainstream or
+  extended support. A series is dropped in the first minor release of
+  `django-rls-tenants` after its upstream end of extended support. Dropping a series
+  that Django no longer supports is not a breaking change for this project.
+- **Python:** the versions supported by *every* supported Django series (the
+  intersection), so every Python and Django pair is tested. A new Python version is
+  added once every supported Django series supports it.
+- **PostgreSQL:** an explicit list of the majors that the PostgreSQL project supports
+  upstream and that are 15 or newer. The oldest and newest each have a CI leg, and the
+  default leg runs a version in between. A new major is added after its first minor
+  (`X.1`) release; a major is dropped after its upstream end of life.
+- **Driver:** psycopg 3 and psycopg2 both run in CI for as long as Django supports
+  both. The library has no driver-specific code.
+
+Django moves to year-based version numbers in 2028 ("Django 2028"). Here, a *series*
+means one feature release, whatever its number.
+
+**What dropping means.** Releases that supported a dropped version stay on PyPI.
+`django-rls-tenants` 1.3.x works on Django 4.2–5.1 and Python 3.11; pin it there:
+
+```bash
+pip install "django-rls-tenants<1.4"
+```
 
 ## Install from PyPI
 

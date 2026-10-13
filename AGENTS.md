@@ -5,7 +5,7 @@
 ## Project Overview
 
 Django library providing database-enforced multitenancy using PostgreSQL Row-Level Security (RLS).
-Python 3.11+, Django 4.2+, PostgreSQL 15+. Uses `uv` for dependency management and `hatchling` as build backend.
+Python 3.12+, Django 5.2+, PostgreSQL 15–18. Uses `uv` for dependency management and `hatchling` as build backend.
 
 ## Build & Dependencies
 
@@ -273,10 +273,24 @@ example/
 ## CI
 
 GitHub Actions runs lint + type-check, a strict mkdocs build (`mkdocs build --strict`),
-a test matrix across Python {3.11, 3.12, 3.13, 3.14} × Django {4.2, 5.0, 5.1, 5.2, 6.0}
-on PostgreSQL 16, and a `test-postgres` job on PostgreSQL 15 and 17 with the oldest and
-newest supported Django (4.2 / 6.0) on every push/PR. All PostgreSQL legs set
-`RLS_FAIL_ON_SKIPPED=1` (see Testing).
+a test matrix across Python {3.12, 3.13, 3.14} × Django {5.2, 6.0, 6.1} on PostgreSQL 16
+(psycopg2, no `exclude` rows) plus one psycopg 3 leg on Python 3.12 / Django 6.1, and a
+`test-postgres` job on PostgreSQL 15 and 18 with the oldest and newest supported Django
+(5.2 on Python 3.12 / 6.1 on Python 3.14) on every push/PR. Coverage is reported from the
+3.12 / 6.1 / psycopg2 leg. All PostgreSQL legs set `RLS_FAIL_ON_SKIPPED=1` (see Testing).
+`tests/conftest.py` also turns every Django `RemovedIn*Warning` into a test error, so the
+newest Django leg fails as soon as Django deprecates something the library calls.
+
+### Supported versions
+
+The policy lives in `docs/getting-started/installation.md` (`## Supported versions`):
+every Django series upstream still supports; the Python versions that *all* of them
+support; an explicit list of PostgreSQL majors. The matrix is stated in `pyproject.toml`,
+`.github/workflows/ci.yml`, `README.md`, `docs/index.md`, the installation guide,
+`docs/comparison.md`, this file, both contributing guides and `example/Dockerfile`.
+`tests/test_support_matrix.py` parses all of them: change the constants at the top of
+that file first, and the test lists every file that disagrees. It reads files the sdist
+does not ship, so `pyproject.toml` excludes it from the sdist.
 
 The `example-smoke` job tests the **built wheel**, not the source tree: `uv build`, an
 inline check that the wheel holds only `django_rls_tenants/` + `*.dist-info/` (every

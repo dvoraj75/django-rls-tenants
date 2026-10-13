@@ -106,13 +106,13 @@ class TestRequestFinishedSafetyNet:
     def test_clears_flag_even_on_exception(self):
         """_clear_gucs_set_flag() runs even when clear_guc raises.
 
-        Corrupt the underlying psycopg2 connection (without Django
+        Corrupt the underlying driver connection (without Django
         knowing) so ``clear_guc`` raises ``InterfaceError``.
         The handler should catch it and still clear the flag.
         """
         _mark_gucs_set()
-        # Ensure Django has a live connection, then close psycopg2
-        # underneath so clear_guc() will fail with InterfaceError.
+        # Ensure Django has a live connection, then close the driver
+        # connection underneath so clear_guc() will fail with InterfaceError.
         connection.ensure_connection()
         connection.connection.close()
 
@@ -151,7 +151,7 @@ class TestConnectionCreatedSignalHandler:
 
     The handler is a closure inside ``AppConfig.ready()``. We test it
     by forcing a real database reconnection (closing the underlying
-    psycopg2 connection and resetting Django's wrapper) so that
+    driver connection and resetting Django's wrapper) so that
     ``connection_created`` fires with ContextVar state active.
     """
 
