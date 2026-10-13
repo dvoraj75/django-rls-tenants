@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack
 from contextvars import ContextVar, Token
 from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -83,8 +83,9 @@ def _reset_or_clear[T](
     back into the request context, but the ``Token`` belongs to the discarded copy
     and ``ContextVar.reset()`` rejects it with ``ValueError``. That is how
     ``MiddlewareMixin.__acall__`` drove this middleware under ASGI before 1.4.0
-    (#58). ``__acall__`` now keeps its tokens in the request coroutine (#38), so
-    this fallback is defence in depth. Clearing the variable restores the same
+    (#58), and how it still drives a subclass that overrides those hooks. The
+    native ``__acall__`` keeps its tokens in the request coroutine (#38) and never
+    needs this fallback. Clearing the variable restores the same
     "no context" baseline the token would have restored, because the middleware
     is the outermost context setter of a request. A ``RuntimeError`` (token used
     twice) is a real bug and is not caught.
@@ -157,6 +158,14 @@ class _RequestScope(NamedTuple):
     tenant_id: int | str | None
 
 
+_ASGI_LOCAL_SET_MESSAGE = (
+    "RLSTenantMiddleware cannot use RLS_TENANTS['USE_LOCAL_SET'] = True "
+    "under ASGI: SET LOCAL needs a transaction held open across the whole "
+    "request, which the async middleware path cannot provide. Serve the "
+    "application through WSGI, or set USE_LOCAL_SET=False."
+)
+
+
 class RLSTenantMiddleware(MiddlewareMixin):
     """Set RLS context for each authenticated request.
 
@@ -189,11 +198,19 @@ class RLSTenantMiddleware(MiddlewareMixin):
     ``MiddlewareMixin.__acall__``: one thread-sensitive hop resolves the user
     and sets the GUCs, the tenant ``ContextVar`` values are set and reset
     with their own tokens in the request coroutine, and one hop clears the
-    GUCs at the end. ``USE_LOCAL_SET=True`` stays WSGI-only.
+    GUCs at the end. A subclass that overrides ``process_request`` or
+    ``process_response`` keeps the hook-based path, so its hooks still run.
+    ``USE_LOCAL_SET=True`` stays WSGI-only.
     """
 
     def __init__(self, get_response: Callable[..., Any]) -> None:
         super().__init__(get_response)
+        # The native async path does not call these hooks, so a subclass that
+        # customises them is served through MiddlewareMixin.__acall__ instead.
+        self._sync_hooks_overridden = any(
+            getattr(type(self), hook) is not getattr(RLSTenantMiddleware, hook)
+            for hook in ("process_request", "process_response")
+        )
         if rls_tenants_config.USE_LOCAL_SET:
             self._validate_exception_middleware_order()
 
@@ -263,13 +280,22 @@ class RLSTenantMiddleware(MiddlewareMixin):
         ``finally`` block resets them with their own tokens, which restores any
         outer value. A second hop clears the GUCs, unless ``process_exception``
         already ended the context for a failed view. Cleanup also runs when the
-        request task is cancelled. As on the WSGI path, the context ends when the
-        chain returns, before a streaming response body is iterated.
+        request task is cancelled; only a second cancellation that arrives while
+        the clear hop is still queued can skip it, and the ``request_finished``
+        safety net then retries where it can see the request's flag. As on the
+        WSGI path, the context ends when the chain returns, before a streaming
+        response body is iterated.
+
+        A subclass that overrides ``process_request`` or ``process_response``
+        is served by ``_acall_through_sync_hooks`` instead, so its hooks run as
+        they did before this path existed.
 
         ``USE_LOCAL_SET=True`` is not supported here: the async path cannot hold
         a synchronous ``transaction.atomic()`` open across the awaited chain, so
         authenticated requests raise ``RLSConfigurationError``.
         """
+        if self._sync_hooks_overridden:
+            return await self._acall_through_sync_hooks(request)
         conf = rls_tenants_config
         scope = await self._aenter_request(request, conf)
         if scope is None:
@@ -280,16 +306,22 @@ class RLSTenantMiddleware(MiddlewareMixin):
         try:
             return await self._aget_response(request)
         finally:
-            reset_current_tenant_id(tenant_token)
-            reset_rls_context_active(active_token)
-            # False when process_exception has already cleared the GUCs. Left set
-            # if the clear fails, so the request_finished safety net can retry.
-            if _were_gucs_set():
-                await sync_to_async(_clear_request_gucs, thread_sensitive=True)(conf)
-                _clear_gucs_set_flag()
+            try:
+                reset_current_tenant_id(tenant_token)
+                reset_rls_context_active(active_token)
+            finally:
+                # False when process_exception has already cleared the GUCs. Left
+                # set if the clear fails, so the request_finished safety net can
+                # retry. Runs even if a reset fails, as in _cleanup_rls_state.
+                if _were_gucs_set():
+                    await sync_to_async(_clear_request_gucs, thread_sensitive=True)(conf)
+                    _clear_gucs_set_flag()
 
-    @staticmethod
-    def _enter_request_gucs(request: HttpRequest, conf: RLSTenantsConfig) -> _RequestScope | None:
+    def _enter_request_gucs(
+        self,
+        request: HttpRequest,
+        conf: RLSTenantsConfig,
+    ) -> _RequestScope | None:
         """Resolve the request user and set the GUCs on every alias, in one sync call.
 
         ``__acall__`` runs this in a single thread-sensitive hop. It never sets
@@ -311,17 +343,11 @@ class RLSTenantMiddleware(MiddlewareMixin):
         if not _is_authenticated(request):
             return None
         if conf.USE_LOCAL_SET:
-            msg = (
-                "RLSTenantMiddleware cannot use RLS_TENANTS['USE_LOCAL_SET'] = True "
-                "under ASGI: SET LOCAL needs a transaction held open across the whole "
-                "request, which the async middleware path cannot provide. Serve the "
-                "application through WSGI, or set USE_LOCAL_SET=False."
-            )
-            raise RLSConfigurationError(msg)
+            raise RLSConfigurationError(_ASGI_LOCAL_SET_MESSAGE)
         user: Any = request.user
         try:
             guc_vars = _resolve_user_guc_vars(user, conf)
-            RLSTenantMiddleware._set_gucs_on_all_databases(guc_vars, conf)
+            self._set_gucs_on_all_databases(guc_vars, conf)
             tenant_id = None if user.is_tenant_admin else user.rls_tenant_id
         except Exception:
             logger.exception("Failed to set RLS GUC variables, clearing to prevent leak")
@@ -343,25 +369,47 @@ class RLSTenantMiddleware(MiddlewareMixin):
     ) -> _RequestScope | None:
         """Run ``_enter_request_gucs`` in one hop, undoing it if the task is cancelled meanwhile.
 
-        asgiref cannot stop a sync function that is already running in its
-        thread: when the awaiting task is cancelled, the hop completes anyway
-        and its result is discarded. The hop is therefore shielded, as in
-        ``django_rls_tenants.rls.context._run_enter_hop``: a cancellation waits
-        for the hop, clears the GUCs it set in a second hop and only then
-        propagates. A hop that failed has already cleared its own GUCs.
+        The hop is awaited directly, not wrapped in a task, so ``ContextVar``
+        values set while ``request.user`` is resolved (by an authentication
+        backend, for example) reach the rest of the request, as they did
+        through ``process_request``. asgiref cannot stop a sync function that
+        is already running in its thread: on cancellation it discards the result
+        and raises at once. The GUCs the hop may have set are then cleared in a
+        second hop before ``CancelledError`` propagates. That hop is queued on
+        the same thread-sensitive thread, so it runs after the first one ends.
         """
-        hop = asyncio.ensure_future(
-            sync_to_async(self._enter_request_gucs, thread_sensitive=True)(request, conf),
-        )
         try:
-            return await asyncio.shield(hop)
+            return await sync_to_async(self._enter_request_gucs, thread_sensitive=True)(
+                request,
+                conf,
+            )
         except asyncio.CancelledError:
-            scope: _RequestScope | None = None
-            with suppress(Exception):
-                scope = await hop
-            if scope is not None:
-                await sync_to_async(_clear_gucs_on_all_databases, thread_sensitive=True)(conf)
+            await sync_to_async(_clear_gucs_on_all_databases, thread_sensitive=True)(conf)
             raise
+
+    async def _acall_through_sync_hooks(self, request: HttpRequest) -> HttpResponseBase:
+        """Serve the request through ``MiddlewareMixin.__acall__`` and the sync hooks.
+
+        Used for subclasses that override ``process_request`` or
+        ``process_response``. Each hook runs in its own ``sync_to_async`` hop,
+        so cleanup clears the ``ContextVar`` values instead of resetting them
+        (see ``_reset_or_clear``). A cancelled request skips Django's response
+        and exception hooks, so the ``finally`` block cleans it up instead.
+
+        Raises:
+            RLSConfigurationError: If ``USE_LOCAL_SET=True`` and the request is
+                authenticated.
+        """
+        if rls_tenants_config.USE_LOCAL_SET and await sync_to_async(
+            _is_authenticated,
+            thread_sensitive=True,
+        )(request):
+            raise RLSConfigurationError(_ASGI_LOCAL_SET_MESSAGE)
+        try:
+            return await super().__acall__(request)
+        finally:
+            if getattr(request, "_rls_state_reset", False) is not True or _were_gucs_set():
+                await sync_to_async(self._cleanup_rls_state, thread_sensitive=True)(request)
 
     async def _aget_response(self, request: HttpRequest) -> HttpResponseBase:
         """Await the downstream chain; ``async_mode`` guarantees it is a coroutine function."""

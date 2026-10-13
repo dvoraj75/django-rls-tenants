@@ -126,6 +126,11 @@ first, so error pages run fail-closed, as under WSGI. If a synchronous-only midd
 listed after `RLSTenantMiddleware`, Django runs `RLSTenantMiddleware` on its synchronous path
 inside a hop instead, which works too.
 
+The async path does not call `process_request` or `process_response`. A subclass that
+overrides either hook therefore keeps the hook-based path that 1.3.4 used, so its hooks
+still run under ASGI. Each hook then costs its own hop, and cleanup clears the `ContextVar`s
+rather than restoring an outer context.
+
 Async views that need a different context use `async_tenant_context()` /
 `async_admin_context()` (see [Async Code](context-managers.md#async-code)); on exit they
 restore the middleware's context. Keep one RLS context per request task: do not

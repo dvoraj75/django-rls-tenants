@@ -1,11 +1,12 @@
-"""End-to-end tests for ``RLSTenantMiddleware`` under ASGI (#58).
+"""End-to-end tests for ``RLSTenantMiddleware`` under ASGI (#58, #38).
 
 Drives real requests through the full middleware stack with ``django.test.AsyncClient``.
 Before the #58 fix every authenticated request failed with ``ValueError: <Token ...> was
 created in a different Context``: ``MiddlewareMixin.__acall__`` runs ``process_request``
 and ``process_response`` / ``process_exception`` in separate ``sync_to_async`` hops,
 each in its own copy of the request's ``contextvars.Context``, so the tokens saved by
-``process_request`` could not be reset afterwards.
+``process_request`` could not be reset afterwards. Since #38 the middleware serves
+these requests on its own async path; ``TestNativeAsyncPath`` covers it with async views.
 
 ``AsyncClientHandler`` fires ``request_finished`` on a throwaway connection, so the
 "nothing left behind" assertions below check the middleware's own cleanup, not the
@@ -29,13 +30,15 @@ from tests.test_app.models import AdminUser
 
 pytestmark = pytest.mark.django_db
 
+_RLS = "django_rls_tenants.tenants.middleware.RLSTenantMiddleware"
+
 _MIDDLEWARE_WITH_RLS = [
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
-    "django_rls_tenants.tenants.middleware.RLSTenantMiddleware",
+    _RLS,
 ]
 
 
@@ -275,6 +278,44 @@ class TestNativeAsyncPath:
             response = async_to_sync(client.get)("/rls/orders/")
 
         assert response.status_code == 200
+        assert response.json()["database_products"] == ["Widget A1", "Widget A2"]
+        assert response.json()["tenant_guc"] == str(tenant_a.pk)
+        _assert_request_left_nothing_behind()
+
+    def test_sync_only_middleware_above_keeps_the_native_path(
+        self, scoped_web_user, sample_orders, tenant_a
+    ):
+        """Above ours, a sync-only middleware reaches the native path through async_to_sync."""
+        middleware = [*_MIDDLEWARE_WITH_RLS]
+        middleware.insert(middleware.index(_RLS), "tests.rls_views.SyncOnlyMiddleware")
+        client = AsyncClient()
+        client.force_login(scoped_web_user)
+
+        with (
+            override_settings(MIDDLEWARE=middleware),
+            patch.object(RLSTenantMiddleware, "process_request", side_effect=AssertionError),
+        ):
+            body = async_to_sync(client.get)("/rls/async-orders/").json()
+
+        assert body["products"] == ["Widget A1", "Widget A2"]
+        assert body["database_products"] == ["Widget A1", "Widget A2"]
+        assert body["tenant_guc"] == str(tenant_a.pk)
+        _assert_request_left_nothing_behind()
+
+    def test_subclass_with_sync_hooks_keeps_them_under_asgi(
+        self, scoped_web_user, sample_orders, tenant_a
+    ):
+        middleware = [
+            "tests.rls_views.TaggingRLSTenantMiddleware" if path == _RLS else path
+            for path in _MIDDLEWARE_WITH_RLS
+        ]
+        client = AsyncClient()
+        client.force_login(scoped_web_user)
+
+        with override_settings(MIDDLEWARE=middleware):
+            response = async_to_sync(client.get)("/rls/async-orders/")
+
+        assert response["X-RLS-Hooks"] == "sync"
         assert response.json()["database_products"] == ["Widget A1", "Widget A2"]
         assert response.json()["tenant_guc"] == str(tenant_a.pk)
         _assert_request_left_nothing_behind()

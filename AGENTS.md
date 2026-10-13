@@ -120,6 +120,9 @@ clears the GUCs. Never set or reset a `ContextVar` inside a `sync_to_async` hop 
 belongs to a copied context, #58), and never use `thread_sensitive=False` in library code
 (another thread means another connection). `process_exception` must keep ending the context
 under ASGI, because Django builds the error response on another thread and connection.
+A subclass that overrides `process_request` or `process_response` is detected in `__init__`
+and served by `_acall_through_sync_hooks` (`MiddlewareMixin.__acall__`), so changes to the
+sync hooks must keep that path working too.
 
 ## Code Style
 

@@ -13,7 +13,9 @@ import pytest
 from asgiref.sync import async_to_sync, iscoroutinefunction, sync_to_async
 from django.core.signals import request_finished
 from django.db import OperationalError, close_old_connections, connection
+from django.http import HttpRequest
 from django.test import override_settings
+from django.utils.functional import SimpleLazyObject
 
 from django_rls_tenants.exceptions import NoTenantContextError, RLSConfigurationError
 from django_rls_tenants.rls.guc import get_guc, set_guc
@@ -575,7 +577,12 @@ def _hop(func, *args):
 
 
 class TestTokenResetAcrossContexts:
-    """#58: tokens created in one sync_to_async hop are reset in another under ASGI."""
+    """#58: tokens created in one sync_to_async hop are reset in another under ASGI.
+
+    Since #38 the ``_run_async_middleware`` and cancellation tests run the native
+    ``__acall__``. The ``_hop`` tests cover the fallback that the hook-based path,
+    still used by subclasses that override the sync hooks, depends on.
+    """
 
     @staticmethod
     def _run_async_middleware(user):
@@ -806,6 +813,9 @@ def _state():
     return get_current_tenant_id(), get_rls_context_active(), _were_gucs_set()
 
 
+_AUTH_SIDE_EFFECT = contextvars.ContextVar("auth_side_effect", default=None)
+
+
 def _assert_async_request_left_nothing_behind():
     assert _state() == (None, False, False)
     assert get_guc("rls.current_tenant") is None
@@ -867,6 +877,31 @@ class TestNativeAsyncPath:
 
         assert seen["state"] == (None, False, False)
         assert hops == ["_enter_request_gucs"]
+        _assert_async_request_left_nothing_behind()
+
+    def test_contextvars_set_while_resolving_the_user_reach_the_view(self, tenant_a_user):
+        """An auth backend's ContextVar writes survive the enter hop, as with process_request."""
+
+        def load_user():
+            _AUTH_SIDE_EFFECT.set("set by the auth backend")
+            return tenant_a_user
+
+        # A real HttpRequest: MagicMock.__setattr__ would evaluate the lazy object.
+        request = HttpRequest()
+        request.user = SimpleLazyObject(load_user)
+        seen = {}
+
+        async def aget_response(request):
+            seen["side_effect"] = _AUTH_SIDE_EFFECT.get()
+            seen["tenant_id"] = get_current_tenant_id()
+            return MagicMock()
+
+        async_to_sync(_async_mw(aget_response))(request)
+
+        assert seen == {
+            "side_effect": "set by the auth backend",
+            "tenant_id": tenant_a_user.rls_tenant_id,
+        }
         _assert_async_request_left_nothing_behind()
 
     @pytest.mark.parametrize(("outer_tenant", "outer_active"), [(None, False), (999, True)])
@@ -978,14 +1013,14 @@ class TestNativeAsyncPath:
         real_enter = RLSTenantMiddleware._enter_request_gucs
         holder = {}
 
-        def slow_enter(request, conf):
+        def slow_enter(self, request, conf):
             # Cancel the awaiting task from inside the hop, then keep the hop busy
             # long enough for the cancellation to arrive while it runs.
             holder["loop"].call_soon_threadsafe(holder["task"].cancel)
             time.sleep(0.05)
-            return real_enter(request, conf)
+            return real_enter(self, request, conf)
 
-        monkeypatch.setattr(RLSTenantMiddleware, "_enter_request_gucs", staticmethod(slow_enter))
+        monkeypatch.setattr(RLSTenantMiddleware, "_enter_request_gucs", slow_enter)
 
         async def aget_response(request):
             pytest.fail("The chain must not run after a cancelled entry")
@@ -1008,15 +1043,13 @@ class TestNativeAsyncPath:
         """A hop that fails while the task is being cancelled must not replace the cancel."""
         holder = {}
 
-        def failing_enter(request, conf):
+        def failing_enter(self, request, conf):
             holder["loop"].call_soon_threadsafe(holder["task"].cancel)
             time.sleep(0.05)
             msg = "enter failed"
             raise RuntimeError(msg)
 
-        monkeypatch.setattr(
-            RLSTenantMiddleware, "_enter_request_gucs", staticmethod(failing_enter)
-        )
+        monkeypatch.setattr(RLSTenantMiddleware, "_enter_request_gucs", failing_enter)
 
         async def aget_response(request):
             pytest.fail("The chain must not run after a cancelled entry")
@@ -1031,6 +1064,25 @@ class TestNativeAsyncPath:
 
         async_to_sync(run)()
         _assert_async_request_left_nothing_behind()
+
+    def test_guc_clear_survives_a_failing_reset(self, tenant_a_user, monkeypatch):
+        """A token reset that raises must not skip the GUC clear (the error still propagates)."""
+
+        def failing_reset(token):
+            msg = "reset failed"
+            raise ValueError(msg)
+
+        monkeypatch.setattr(middleware_module, "reset_current_tenant_id", failing_reset)
+
+        async def aget_response(request):
+            return MagicMock()
+
+        with pytest.raises(ValueError, match="reset failed"):
+            async_to_sync(_async_mw(aget_response))(_make_request(user=tenant_a_user))
+
+        assert get_guc("rls.current_tenant") is None
+        assert get_guc("rls.is_admin") is None
+        assert _were_gucs_set() is False
 
     def test_failed_clear_keeps_flag_for_the_safety_net(self, tenant_a_user, monkeypatch):
         def failing_clear(conf):
@@ -1054,4 +1106,98 @@ class TestNativeAsyncPath:
             request_finished.send(sender=self.__class__)
         finally:
             request_finished.connect(close_old_connections)
+        _assert_async_request_left_nothing_behind()
+
+
+class _HookOverridingMiddleware(RLSTenantMiddleware):
+    """A project subclass that customises both synchronous hooks."""
+
+    def __init__(self, get_response):
+        super().__init__(get_response)
+        self.calls = []
+
+    def process_request(self, request):
+        self.calls.append("process_request")
+        return super().process_request(request)
+
+    def process_response(self, request, response):
+        self.calls.append("process_response")
+        return super().process_response(request, response)
+
+
+class TestSubclassWithSyncHooks:
+    """A subclass that overrides a sync hook keeps the hook-based async path (#38)."""
+
+    @pytest.mark.parametrize("hook", ["process_request", "process_response"])
+    def test_overriding_either_hook_selects_the_hook_path(self, hook):
+        def override(self, *args):
+            return getattr(RLSTenantMiddleware, hook)(self, *args)
+
+        subclass = type("Subclass", (RLSTenantMiddleware,), {hook: override})
+
+        def get_response(request):
+            return MagicMock()
+
+        assert subclass(get_response)._sync_hooks_overridden is True
+        assert RLSTenantMiddleware(get_response)._sync_hooks_overridden is False
+
+    def test_overridden_hooks_run_under_asgi(self, tenant_a_user, monkeypatch):
+        hops = _record_hops(monkeypatch)
+        seen = {}
+
+        async def aget_response(request):
+            seen["state"] = _state()
+            return MagicMock(name="response")
+
+        mw = _HookOverridingMiddleware(get_response=aget_response)
+        assert iscoroutinefunction(mw) is True
+        response = async_to_sync(mw)(_make_request(user=tenant_a_user))
+
+        assert response._mock_name == "response"
+        assert mw.calls == ["process_request", "process_response"]
+        assert seen["state"] == (tenant_a_user.rls_tenant_id, True, True)
+        # process_response already cleaned up, so the finally block makes no hop.
+        assert hops == []
+        _assert_async_request_left_nothing_behind()
+
+    def test_cancelled_request_is_cleaned_up(self, tenant_a_user):
+        """Cancellation skips Django's response hook; the finally block cleans up."""
+        seen = {}
+
+        async def run():
+            started = asyncio.Event()
+
+            async def aget_response(request):
+                started.set()
+                await asyncio.Event().wait()
+
+            mw = _HookOverridingMiddleware(get_response=aget_response)
+
+            async def serve_request():
+                try:
+                    await mw(_make_request(user=tenant_a_user))
+                finally:
+                    seen["calls"] = list(mw.calls)
+                    seen["state"] = _state()
+                    seen["guc"] = await sync_to_async(get_guc)("rls.current_tenant")
+
+            task = asyncio.create_task(serve_request())
+            await asyncio.wait_for(started.wait(), timeout=5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        async_to_sync(run)()
+
+        assert seen == {"calls": ["process_request"], "state": (None, False, False), "guc": None}
+
+    @override_settings(RLS_TENANTS=_LOCAL_SET)
+    def test_use_local_set_is_refused(self, tenant_a_user):
+        async def aget_response(request):
+            pytest.fail("The chain must not run when USE_LOCAL_SET is refused")
+
+        mw = _HookOverridingMiddleware(get_response=aget_response)
+        with pytest.raises(RLSConfigurationError, match="under ASGI"):
+            async_to_sync(mw)(_make_request(user=tenant_a_user))
+        assert mw.calls == []
         _assert_async_request_left_nothing_behind()

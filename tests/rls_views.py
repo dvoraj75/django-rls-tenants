@@ -20,6 +20,7 @@ from django.http import (
 
 from django_rls_tenants.rls.guc import aget_guc, get_guc
 from django_rls_tenants.tenants.context import async_admin_context, async_tenant_context
+from django_rls_tenants.tenants.middleware import RLSTenantMiddleware
 from django_rls_tenants.tenants.state import get_current_tenant_id
 from tests.test_app.models import Order, Tenant
 
@@ -157,6 +158,14 @@ class SyncOnlyMiddleware:
 
     def __call__(self, request):
         return self.get_response(request)
+
+
+class TaggingRLSTenantMiddleware(RLSTenantMiddleware):
+    """A project subclass that overrides a sync hook, which keeps the hook-based path."""
+
+    def process_response(self, request, response):
+        response["X-RLS-Hooks"] = "sync"
+        return super().process_response(request, response)
 
 
 def exception_middleware_factory(get_response):

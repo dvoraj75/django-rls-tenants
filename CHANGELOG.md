@@ -61,9 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so the GUC work still runs in those hops; the gain is correctness: the #58 token problem
   cannot occur, and a context active around the middleware is restored instead of
   cleared. A cancellation during the entry hop is undone. `process_exception` still ends
-  the context before Django builds the error response on another thread. The WSGI path,
-  streaming bodies (iterated after cleanup, fail-closed) and the `USE_LOCAL_SET=True`
-  refusal under ASGI are unchanged.
+  the context before Django builds the error response on another thread. A subclass that
+  overrides `process_request` or `process_response` keeps the 1.3.4 hook-based path, so
+  its hooks still run under ASGI. The WSGI path, streaming bodies (iterated after cleanup,
+  fail-closed) and the `USE_LOCAL_SET=True` refusal under ASGI are unchanged.
 
 ### Fixed
 
