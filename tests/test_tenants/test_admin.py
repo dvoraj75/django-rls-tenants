@@ -26,7 +26,6 @@ from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import patch
 
-import django
 import pytest
 from django.contrib import admin
 from django.core.exceptions import PermissionDenied
@@ -75,17 +74,12 @@ def _scoped_user(tenant_id: int | None = 3) -> SimpleNamespace:
 
 
 def _filter_params(**params: str) -> dict[str, Any]:
-    """Build changelist filter params the way the running Django's ChangeList does.
+    """Build changelist filter params the way Django's ChangeList does.
 
-    Django < 5.0 hands list filters scalar query values; >= 5.0 hands them
-    single-item lists (``dict(request.GET.lists())``) and ``SimpleListFilter``
-    reads ``value[-1]``. Mirroring that keeps the switcher unit tests correct on
-    the whole 4.2--6.0 support matrix -- a bare ``["77"]`` returns ``["77"]`` (not
-    ``"77"``) from ``value()`` on 4.2.
+    ChangeList hands list filters single-item lists (``dict(request.GET.lists())``)
+    and ``SimpleListFilter`` reads ``value[-1]``.
     """
-    if django.VERSION >= (5, 0):
-        return {key: [value] for key, value in params.items()}
-    return dict(params)
+    return {key: [value] for key, value in params.items()}
 
 
 # ---------------------------------------------------------------------------

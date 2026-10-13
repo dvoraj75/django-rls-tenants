@@ -58,7 +58,7 @@ body:
     id: django-version
     attributes:
       label: Django Version
-      placeholder: "5.1"
+      placeholder: "6.1"
     validations:
       required: true
 

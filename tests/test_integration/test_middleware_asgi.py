@@ -92,7 +92,6 @@ class TestMiddlewareAsgiRequestCycle:
         self, scoped_web_user, sample_orders, tenant_a, rls_middleware
     ):
         client = AsyncClient()
-        # Sync force_login: aforce_login only exists from Django 5.0.
         client.force_login(scoped_web_user)
 
         response = async_to_sync(client.get)("/rls/orders/")

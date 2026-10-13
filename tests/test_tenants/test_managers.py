@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import warnings
 from decimal import Decimal
 from unittest.mock import MagicMock
 
+import django
 import pytest
 from django.core.exceptions import FieldError
+from django.db import NotSupportedError
 from django.db.models import Sum
 from django.test import override_settings
 
@@ -312,13 +315,73 @@ class TestSelectRelated:
             # Should work without AttributeError
             assert list(qs) is not None
 
-    def test_select_related_no_args_falls_through(self, sample_orders, tenant_a):
-        """select_related() with no arguments falls through to super()."""
+    @pytest.mark.parametrize("via_manager", [False, True])
+    def test_select_related_no_args_warns_at_caller_on_django_61(
+        self, sample_orders, tenant_a, via_manager
+    ):
+        """select_related() with no arguments selects everything, deprecated on 6.1+.
+
+        Django 6.1 deprecates the no-argument form. The warning must name this
+        file (the caller), not ``managers.py``, whether the call goes through the
+        manager proxy or a queryset. Older Django must not warn at all.
+        """
         with tenant_context(tenant_a.pk):
-            qs = Order.objects.all().select_related()
-            sql = str(qs.query)
+            source = Order.objects if via_manager else Order.objects.all()
+            if django.VERSION >= (6, 1):
+                with pytest.warns(
+                    (DeprecationWarning, PendingDeprecationWarning),
+                    match=r"select_related\(\) with no arguments",
+                ) as rec:
+                    qs = source.select_related()
+                assert len(rec) == 1
+                assert rec[0].filename == __file__
+            else:
+                with warnings.catch_warnings(record=True) as rec:
+                    warnings.simplefilter("always")
+                    qs = source.select_related()
+                deprecations = [
+                    w
+                    for w in rec
+                    if issubclass(w.category, (DeprecationWarning, PendingDeprecationWarning))
+                ]
+                assert deprecations == []
+            assert qs.query.select_related is True
             # Auto-scope adds tenant_id filter, but no extra join filters
-            assert "tenant_id" in sql
+            assert "tenant_id" in str(qs.query)
+            assert {order.tenant_id for order in qs} == {tenant_a.pk}
+
+    def test_select_related_no_args_silent_for_django_internal_caller(
+        self, sample_orders, tenant_a
+    ):
+        """A caller inside Django (the admin changelist) gets no warning from us.
+
+        Django deprecates ``list_select_related=True`` itself; warning again from
+        the queryset would duplicate it. The call is compiled into a module whose
+        ``__name__`` is ``django.contrib.admin.views.main``, which is what
+        ``warn_about_external_use`` inspects to tell Django's frames apart.
+        """
+        namespace = {"__name__": "django.contrib.admin.views.main", "Order": Order}
+        code = compile("qs = Order.objects.all().select_related()", "fake_admin.py", "exec")
+        with tenant_context(tenant_a.pk), warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            exec(code, namespace)  # noqa: S102  -- fixed source, simulates a Django caller
+        assert rec == []
+        assert namespace["qs"].query.select_related is True
+
+    def test_select_related_no_args_after_values_raises(self, sample_orders, tenant_a):
+        """The no-argument form keeps Django's guard against values() querysets."""
+        with (
+            tenant_context(tenant_a.pk),
+            pytest.raises(TypeError, match=r"after \.values\(\)"),
+        ):
+            Order.objects.values("pk").select_related()
+
+    def test_select_related_no_args_on_combined_query_raises(self, sample_orders, tenant_a):
+        """The no-argument form keeps Django's guard against union() querysets."""
+        with tenant_context(tenant_a.pk):
+            combined = Order.objects.all().union(Order.objects.all())
+            with pytest.raises(NotSupportedError, match="select_related"):
+                combined.select_related()
 
     def test_select_related_non_rls_model_no_extra_filter(self, sample_orders, tenant_a):
         """select_related('tenant') to a non-RLS model does NOT add extra filter."""

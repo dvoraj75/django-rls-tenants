@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Support for Django 4.2, 5.0 and 5.1 and Python 3.11** (#114). All three Django series
+  are past their upstream end of extended support, and Python 3.11 is not supported by
+  every remaining Django series. Under the new supported-versions policy this is not a
+  breaking change: 1.3.x stays on PyPI and keeps working there
+  (`pip install "django-rls-tenants<1.4"`).
+
 ### Added
 
 - **Async GUC primitives and async context managers** (#36, #37). `aset_guc()`,
@@ -23,6 +31,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside a synchronous `transaction.atomic()`. Use one context per task: sibling tasks
   of one request share its connection, so `asyncio.gather` across tenants is not safe
   for raw SQL. No behaviour change for sync code.
+- **Django 6.1 support** (#114), with classifiers and CI legs.
+- **Explicit PostgreSQL 15–18 support** (#114). The requirements tables list every
+  supported major; CI runs 16 by default and 15 and 18 as the edges.
+- **psycopg 3 CI leg** (#114) on Python 3.12 / Django 6.1. The library stays
+  driver-neutral; psycopg2 remains the default in every other leg.
+- **Supported-versions policy** in the installation guide ("Supported versions", #114):
+  which Django, Python and PostgreSQL versions are supported, when they are added and
+  dropped, and what dropping means.
+- **`tests/test_support_matrix.py`** (#114) cross-checks every file that states the
+  matrix (`pyproject.toml`, CI, README, docs, AGENTS.md, both contributing guides, the
+  example Dockerfile) and names each one that disagrees. Excluded from the sdist, since
+  it reads files the sdist does not ship. The test suite also turns every Django
+  deprecation warning into an error.
+
+### Changed
+
+- `requires-python` is now `>=3.12` and the dependency `django>=5.2` (#114). The lockfile
+  moves to Django 6.1.2 (django-stubs 6.1.2, mypy 2.4.0); the example Docker image
+  installs Django 6.1.
+
+### Fixed
+
+- **`select_related()` with no arguments on Django 6.1** (#114). Django 6.1 deprecates
+  that form, and the `RemovedInDjango2028Warning` blamed
+  `TenantQuerySet.select_related` in `managers.py` instead of the code that made the
+  call. The warning now names the caller's line, and Django-internal callers (the admin
+  changelist with `list_select_related = True`, which Django deprecates separately) are
+  not warned twice. No warning on Django 5.2 or 6.0, where the form is not deprecated.
 
 ## [1.3.4] - 2026-10-12
 

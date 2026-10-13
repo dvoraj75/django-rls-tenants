@@ -114,16 +114,15 @@ class TestWithRlsContextAnnotations:
         assert "user_param" in ann
 
     def test_signature_uses_paramspec(self):
-        """with_rls_context uses ParamSpec (_P) and TypeVar (_R) in its signature."""
-        # Verify the raw annotation strings reference the ParamSpec/TypeVar
+        """with_rls_context declares PEP 695 type parameters ``[**P, R]``."""
+        param_spec, result = with_rls_context.__type_params__
+        assert isinstance(param_spec, typing.ParamSpec)
+        assert isinstance(result, typing.TypeVar)
+        # The stringified annotations reference both parameters.
         ann = with_rls_context.__annotations__
-        func_ann = ann["func"]
-        return_ann = ann["return"]
-        # The stringified annotations should reference _P and _R
-        assert "_P" in str(func_ann)
-        assert "_R" in str(func_ann)
-        assert "_P" in str(return_ann)
-        assert "_R" in str(return_ann)
+        for key in ("func", "return"):
+            assert param_spec.__name__ in str(ann[key])
+            assert result.__name__ in str(ann[key])
 
     def test_decorated_function_is_callable(self):
         """Decorated function remains callable (basic smoke test, no DB)."""

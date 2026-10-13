@@ -170,6 +170,18 @@ connection in another thread.
 This release addresses the full async stack, from low-level GUC operations
 up through middleware and context managers.
 
+### Tier 0: Platform
+
+- [ ] **Supported-versions policy and matrix refresh** (#114) — A written policy (every
+  Django series upstream supports; the Python versions all of them support; an explicit
+  PostgreSQL list), applied: drop Django 4.2/5.0/5.1 and Python 3.11, add Django 6.1,
+  PostgreSQL 15–18 with CI on 15 and 18, a psycopg 3 CI leg. On Django 6.1 the
+  `select_related()`-without-arguments deprecation names the caller.
+  `tests/test_support_matrix.py` fails when any file states a different matrix, and a
+  weekly canary runs Django `main`, the next Python and the next PostgreSQL.
+  *Why:* The matrix had drifted (EOL Django series, a coverage gate pinned to one, an
+  example image on 5.1), and nothing would have noticed the next drift.
+
 ### Tier 1: Async GUC primitives (`rls/guc.py`)
 
 - [x] **`aset_guc()`, `aget_guc()`, `aclear_guc()`, `arestore_guc()`** — Async

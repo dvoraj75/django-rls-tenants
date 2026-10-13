@@ -44,6 +44,20 @@ _GUC_NAMES_TO_CLEAR = (
 )
 
 
+def pytest_configure(config):
+    """Turn every Django deprecation warning into a test error.
+
+    Classes are discovered at runtime (``RemovedInDjango2028Warning`` today) so the
+    year-based rename in Django 2028 cannot break the hook. The newest Django leg then
+    fails on the day Django deprecates something this library calls (#114).
+    """
+    from django.utils import deprecation  # noqa: PLC0415  -- keep conftest import-light
+
+    for name, obj in vars(deprecation).items():
+        if name.startswith("RemovedIn") and isinstance(obj, type) and issubclass(obj, Warning):
+            config.addinivalue_line("filterwarnings", f"error::django.utils.deprecation.{name}")
+
+
 def pytest_sessionfinish(session, exitstatus):
     """Fail the session on any skipped test when ``RLS_FAIL_ON_SKIPPED=1``.
 

@@ -11,7 +11,7 @@ database-enforced tenant isolation using PostgreSQL Row-Level Security (RLS).
 ## Requirements
 
 - [Docker](https://docs.docker.com/get-docker/) & Docker Compose (recommended)
-- **Or** Python 3.12+ and PostgreSQL 16+ for local development
+- **Or** Python 3.12+ and PostgreSQL 15+ for local development
 
 ## Quick Start (Docker)
 

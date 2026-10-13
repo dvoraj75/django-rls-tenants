@@ -10,9 +10,9 @@ import logging
 from contextlib import ExitStack
 from contextvars import ContextVar, Token
 from functools import partial
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any
 
-from asgiref.sync import iscoroutinefunction, sync_to_async
+from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.db import connections, transaction
 from django.utils.deprecation import MiddlewareMixin
@@ -36,8 +36,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("django_rls_tenants")
 
-_T = TypeVar("_T")
-
 # Flag indicating whether GUCs were set during this request.
 # Uses ``ContextVar`` for proper isolation in both WSGI (threaded)
 # and ASGI (async task) deployments. Previous versions used
@@ -60,9 +58,9 @@ def _were_gucs_set() -> bool:
     return _gucs_set_var.get()
 
 
-def _reset_or_clear(
-    token: Token[_T] | None,
-    reset: Callable[[Token[_T]], None],
+def _reset_or_clear[T](
+    token: Token[T] | None,
+    reset: Callable[[Token[T]], None],
     clear: Callable[[], object],
 ) -> None:
     """Restore a ``ContextVar`` through its token, or clear it when the token is unusable.
@@ -193,8 +191,7 @@ class RLSTenantMiddleware(MiddlewareMixin):
         ``process_response``. Unauthenticated requests get no transaction
         (no GUCs are set for them either).
         """
-        # Django 4.2/5.0 mark the instance but do not expose async_mode.
-        if iscoroutinefunction(self):
+        if self.async_mode:
             return self.__acall__(request)
         conf = rls_tenants_config
         if not conf.USE_LOCAL_SET or not _is_authenticated(request):
