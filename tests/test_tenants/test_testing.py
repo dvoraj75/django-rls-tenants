@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+import inspect
+import threading
 from decimal import Decimal
 
 import pytest
@@ -10,10 +11,12 @@ from asgiref.sync import async_to_sync, sync_to_async
 from django.conf import settings
 from django.db import connection
 from django.test import TestCase
+from django.utils.connection import ConnectionDoesNotExist
 
 from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.guc import aget_guc, get_guc
 from django_rls_tenants.tenants import testing as testing_mod
+from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import admin_context
 from django_rls_tenants.tenants.state import get_current_tenant_id, get_rls_context_active
 from django_rls_tenants.tenants.testing import (
@@ -149,7 +152,19 @@ class TestAsyncRlsBypass:
             return await _gucs(), get_current_tenant_id(), get_rls_context_active()
 
         assert async_to_sync(run)() == ((None, None), None, False)
+
+    def test_restores_on_exception(self):
+        """An exception in the block propagates and still restores the GUCs and the state."""
+
+        async def run():
+            async with async_rls_bypass():
+                raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            async_to_sync(run)()
         assert get_guc("rls.is_admin") is None
+        assert get_current_tenant_id() is None
+        assert get_rls_context_active() is False
 
     def test_restores_enclosing_tenant_scope(self, tenant_a):
         """An inner bypass block does not leak admin access into the enclosing tenant block."""
@@ -233,31 +248,58 @@ class TestAsyncRlsAsTenant:
         assert async_to_sync(run)() == (2, 2)
 
 
+async def _enter(manager):
+    async with manager:
+        pytest.fail("The block must not run")
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: _enter(async_rls_bypass(using="nope")),
+        lambda: _enter(async_rls_as_tenant(1, using="nope")),
+        lambda: aassert_rls_enabled("test_order", using="nope"),
+        lambda: aassert_rls_policy_exists("test_order", using="nope"),
+        lambda: aassert_rls_blocks_without_context(Order, using="nope"),
+    ],
+    ids=["bypass", "as_tenant", "enabled", "policy_exists", "blocks_without_context"],
+)
+def test_async_helpers_use_the_given_alias(call):
+    """Every async helper runs its SQL on the ``using`` alias, not on ``default``."""
+
+    async def run():
+        await call()
+
+    with pytest.raises(ConnectionDoesNotExist, match="nope"):
+        async_to_sync(run)()
+    assert get_current_tenant_id() is None
+    assert get_rls_context_active() is False
+
+
 @pytest.mark.parametrize(
     ("helper", "target", "args"),
     [
-        (async_rls_bypass, "async_admin_context", ()),
-        (async_rls_as_tenant, "async_tenant_context", (7,)),
+        (aassert_rls_enabled, "assert_rls_enabled", ("tbl",)),
+        (aassert_rls_policy_exists, "assert_rls_policy_exists", ("tbl", "pol")),
+        (aassert_rls_blocks_without_context, "assert_rls_blocks_without_context", (Order,)),
     ],
-    ids=["bypass", "as_tenant"],
+    ids=["enabled", "policy_exists", "blocks_without_context"],
 )
-def test_async_context_helpers_forward_using(monkeypatch, helper, target, args):
-    """Both async context helpers pass their arguments and ``using`` to the tenant layer."""
-    seen = []
+def test_async_assertions_call_the_sync_one_on_the_test_thread(monkeypatch, helper, target, args):
+    """Each assertion calls its sync version once, with every argument, on the test thread.
 
-    @asynccontextmanager
-    async def spy(*spy_args, using):
-        seen.append((spy_args, using))
-        yield
+    A hop on another thread would use another connection, outside the test's
+    transaction. For the two catalog-only assertions nothing else would notice.
+    """
+    signature = inspect.signature(getattr(testing_mod, target))
+    calls = []
+
+    def spy(*spy_args, **spy_kwargs):
+        calls.append((signature.bind(*spy_args, **spy_kwargs).arguments, threading.get_ident()))
 
     monkeypatch.setattr(testing_mod, target, spy)
-
-    async def run():
-        async with helper(*args, using="replica"):
-            pass
-
-    async_to_sync(run)()
-    assert seen == [(args, "replica")]
+    async_to_sync(helper)(*args, using="replica")
+    assert calls == [(signature.bind(*args, using="replica").arguments, threading.get_ident())]
 
 
 class TestAsyncAssertions:
@@ -308,12 +350,14 @@ class TestAsyncAssertions:
             async_to_sync(aassert_rls_blocks_without_context)(Tenant)
 
 
+@pytest.mark.usefixtures("enforce_rls")
 class TestAsyncHelpersInDjangoTestCase(TestCase):
     """The path the testing guide recommends: ``async def`` methods on a Django ``TestCase``.
 
     Django runs those methods through ``async_to_sync``, so the helpers' hops
     land on the test thread and see the rows ``setUpTestData`` created inside
-    the class transaction.
+    the class transaction. ``enforce_rls`` makes the raw counts depend on the
+    RLS policy on a superuser connection too, not only on the ORM filter.
     """
 
     @classmethod
@@ -326,17 +370,22 @@ class TestAsyncHelpersInDjangoTestCase(TestCase):
 
     async def test_helpers_see_the_test_transaction(self):
         """Rows from setUpTestData are visible and scoped inside the async helpers."""
+        raw_count = sync_to_async(_raw_order_count, thread_sensitive=True)
         async with async_rls_as_tenant(self.tenant_a.pk):
             assert await Order.objects.acount() == 1
+            assert await raw_count() == 1
         async with async_rls_bypass():
             assert await Order.objects.acount() == 2
+            assert await raw_count() == 2
         await aassert_rls_enabled("test_order")
         await aassert_rls_policy_exists("test_order")
+        await aassert_rls_blocks_without_context(Order)
 
     async def test_use_local_set_works_inside_the_test_transaction(self):
         """USE_LOCAL_SET=True works: the test transaction is open on the hop thread."""
         with self.settings(RLS_TENANTS={**settings.RLS_TENANTS, "USE_LOCAL_SET": True}):
+            assert rls_tenants_config.USE_LOCAL_SET is True
             async with async_rls_as_tenant(self.tenant_a.pk):
                 assert await _gucs() == ("false", str(self.tenant_a.pk))
-                assert await Order.objects.acount() == 1
+                assert await sync_to_async(_raw_order_count, thread_sensitive=True)() == 1
             assert await _gucs() == (None, None)

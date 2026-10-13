@@ -38,9 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counterparts. The context managers wrap `async_admin_context()` and
   `async_tenant_context()`, and each assertion runs its sync version in one
   thread-sensitive hop. A new "Async Tests" section in the testing guide explains which
-  connection an async test uses. Django `TestCase` `async def` methods and `async_to_sync`
-  share the test's transaction. pytest-asyncio and anyio tests run on a separate
-  connection, so their fixture data is invisible and their writes are committed.
+  connection an async test uses. Django `TestCase` `async def` methods, and sync tests
+  that drive a coroutine with `async_to_sync`, share the test's transaction.
+  pytest-asyncio and anyio tests run on a separate connection outside the test
+  transaction. With plain `django_db`, their fixture rows are invisible and their writes
+  are committed.
 - **Django 6.1 support** (#114), with classifiers and CI legs.
 - **Explicit PostgreSQL 15–18 support** (#114). The requirements tables list every
   supported major; CI runs 16 by default and 15 and 18 as the edges.

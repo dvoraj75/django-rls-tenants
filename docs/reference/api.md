@@ -204,8 +204,8 @@ the tenant switcher, and the middleware interaction.
 
 #### Async Testing Helpers
 
-For `async def` tests. Under each test style, the connection these helpers use is described
-in [Async Tests](../guides/testing.md#async-tests).
+For `async def` tests. Which database connection they use depends on how the test runs the
+coroutine; see [Async Tests](../guides/testing.md#async-tests).
 
 ::: django_rls_tenants.tenants.testing.async_rls_bypass
 

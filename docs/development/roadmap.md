@@ -239,9 +239,10 @@ up through middleware and context managers.
 - [x] **Async testing helpers** — `async_rls_bypass()`, `async_rls_as_tenant()`,
   `aassert_rls_enabled()`, `aassert_rls_policy_exists()` and
   `aassert_rls_blocks_without_context()` for `async def` tests (#40).
-  *Why:* Async test functions cannot use sync context managers without
-  `sync_to_async` wrappers. First-class async helpers remove boilerplate
-  and ensure correct usage.
+  *Why:* The sync helpers cannot run in an `async def` test (their database
+  calls raise `SynchronousOnlyOperation`), and wrapping a `@contextmanager`
+  in `sync_to_async` breaks the generator protocol. First-class async
+  helpers remove that boilerplate and ensure correct usage.
 
 ### Tier 5: Connection-affinity safety net
 

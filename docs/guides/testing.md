@@ -212,16 +212,22 @@ Django has no asynchronous database cursor. The helpers and the async ORM run th
 `thread_sensitive` hops. The thread a hop lands on determines its connection, and therefore
 the transaction it sees. That thread depends on how the test runs the coroutine:
 
-- **`async def` methods on a Django `TestCase` or `TransactionTestCase`** (recommended).
-  Django runs the method through `async_to_sync`, so the hops run on the test thread. They
-  use the test's connection and transaction, they see rows from `setUpTestData` and
-  fixtures, and `USE_LOCAL_SET=True` works.
-- **A sync pytest test that drives a coroutine with `async_to_sync`.** The result is the
-  same, and it works with plain `@pytest.mark.django_db` and your usual fixtures. The
-  library tests itself this way.
-- **`async def` tests run by pytest-asyncio or anyio's pytest plugin.** These plugins run
-  the event loop directly on the test thread. Every hop therefore goes to asgiref's shared
-  executor thread, which opens a **separate connection**. See the warning below.
+- **`async def` methods on a Django `TestCase`** (recommended). Django runs the method
+  through `async_to_sync`, so the hops run on the test thread. They use the test's
+  connection and transaction, they see rows from `setUpTestData` and fixtures, and
+  `USE_LOCAL_SET=True` works.
+- **`async def` methods on a `TransactionTestCase`.** The hops also run on the test thread
+  and use its connection, but no test transaction is open. Writes are committed, and the
+  tables are flushed after each test. With `USE_LOCAL_SET=True`, the async context managers
+  raise `RLSConfigurationError`.
+- **A sync pytest test that drives a coroutine with `async_to_sync`.** The hops run on the
+  test thread too. With plain `@pytest.mark.django_db` this behaves like a `TestCase` and
+  works with your usual fixtures. With `transaction=True` it behaves like a
+  `TransactionTestCase`. The library tests itself this way.
+- **`async def` tests run by pytest-asyncio, or by anyio's pytest plugin on the asyncio
+  backend.** These plugins run the event loop directly on the test thread, with no
+  `async_to_sync` above it. Every hop therefore goes to asgiref's shared executor thread,
+  which opens a **separate connection**. See the warning below.
 
 ```python title="Django TestCase"
 from django.test import TestCase
@@ -256,6 +262,10 @@ class OrderIsolationTests(TestCase):
         await aassert_rls_blocks_without_context(Order)
 ```
 
+Like its sync version, `aassert_rls_blocks_without_context()` passes only when the test
+connects with a role that RLS applies to. A superuser, or a role with `BYPASSRLS`, sees
+every row.
+
 ```python title="pytest: sync test + async_to_sync"
 import pytest
 from asgiref.sync import async_to_sync
@@ -282,21 +292,33 @@ def test_async_report_is_scoped(tenant_a, sample_orders):
       **invisible** to the test.
     - Rows the test writes are **committed**, so they outlive the test and later tests see
       them.
+    - A write that collides with a row the test transaction inserted or locked (for
+      example `aget_or_create()` on a fixture row's unique key) waits for that transaction
+      to end. It cannot end while the test runs, so the test **hangs**.
     - Anything a sync fixture set on the test's connection, such as `SET ROLE` or GUCs,
-      does not apply.
-    - With `USE_LOCAL_SET=True` the async helpers raise `RLSConfigurationError`, because
-      no transaction is open on that thread.
+      does not apply. If RLS is only enforced after such a `SET ROLE` (because the tests
+      connect as a superuser), it is bypassed on the executor connection. ORM-level
+      isolation checks still pass there, because of the auto-scope filter, so they pass for
+      the wrong reason.
+    - With `USE_LOCAL_SET=True`, `async_rls_bypass()` and `async_rls_as_tenant()` raise
+      `RLSConfigurationError` and `aassert_rls_blocks_without_context()` raises
+      `RuntimeError`, because no transaction is open on that thread.
     - The extra connection stays open, so pytest-django cannot drop the test database at
-      the end of the session ("database ... is being accessed by other users").
+      the end of the session. It reports this only as a `PytestWarning` ("database ... is
+      being accessed by other users") and leaves the database behind.
 
-    Prefer the two patterns above. If you must use the plugin, mark the tests
+    Prefer the patterns above. If you must use the plugin, mark the tests
     `@pytest.mark.django_db(transaction=True)`. Committed fixture rows are then visible,
-    and the tables are flushed after each test. Also close the executor thread's connection
-    when the test ends:
+    nothing waits on an open test transaction, and the tables are flushed after each test.
+    The `SET ROLE` and `USE_LOCAL_SET` points still apply. Also close the executor thread's
+    connection when the test ends:
 
     ```python
+    import pytest
     from asgiref.sync import sync_to_async
     from django.db import connections
+
+    from django_rls_tenants.tenants.testing import async_rls_as_tenant
 
 
     @pytest.mark.asyncio

@@ -161,6 +161,10 @@ async def async_rls_bypass(*, using: str = "default") -> AsyncIterator[None]:
     Args:
         using: Database alias. Default: ``"default"``.
 
+    Raises:
+        RLSConfigurationError: If ``USE_LOCAL_SET=True`` and no transaction is
+            open on the hop thread.
+
     Usage::
 
         async with async_rls_bypass():
@@ -187,6 +191,8 @@ async def async_rls_as_tenant(
 
     Raises:
         NoTenantContextError: If ``tenant_id`` is ``None``.
+        RLSConfigurationError: If ``USE_LOCAL_SET=True`` and no transaction is
+            open on the hop thread.
 
     Usage::
 
