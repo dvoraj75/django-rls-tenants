@@ -129,6 +129,85 @@ with transaction.atomic(), tenant_context(tenant_id=1):
     Order.objects.count()
 ```
 
+## Async Code
+
+*Added in 1.4.0.* `async_tenant_context()` and `async_admin_context()` are the
+`async with` counterparts of the two managers above, for async views, consumers and
+tasks:
+
+```python
+from django_rls_tenants import async_admin_context, async_tenant_context
+
+
+async def order_count(request, tenant_id):
+    async with async_tenant_context(tenant_id):
+        count = await Order.objects.acount()
+    async with async_admin_context():
+        total = await Order.objects.acount()
+    return JsonResponse({"tenant": count, "all": total})
+```
+
+Django has no asynchronous database cursor: every async ORM call is a
+`sync_to_async(..., thread_sensitive=True)` hop to the thread that owns the connection.
+The async managers work the same way, with one hop on entry (snapshot and set the GUCs)
+and one on exit (restore), so they are **not** non-blocking. What they give you is
+`async with` ergonomics, and tenant state (`ContextVar`s) that is set and reset in your
+coroutine itself, so the auto-scope filter and [strict mode](#strict-mode) apply to
+`acount()`, `aget()`, `async for` and the rest of the async ORM.
+
+[Nesting](#nesting) and [exceptions](#exceptions-inside-a-context-block) behave exactly as
+for the sync managers, including the restore in both GUC modes. The restore also runs when
+the task is cancelled inside the block, or while the entry hop is still running.
+
+The generic layer has the same pair, `async_rls_context()` and `async_bypass_flag()`, plus
+the primitives `aset_guc()`, `aget_guc()`, `aclear_guc()` and `arestore_guc()` (see the
+[API reference](../reference/api.md#async-guc-helpers)).
+
+### `USE_LOCAL_SET=True` in async code
+
+`SET LOCAL` needs `transaction.atomic()` open on the thread that runs the database calls,
+and a coroutine cannot open one (`atomic()` on the event-loop thread raises
+`SynchronousOnlyOperation`). With `USE_LOCAL_SET=True` the async managers therefore raise
+`RLSConfigurationError` unless the coroutine is driven by `async_to_sync` from synchronous
+code that is already inside `transaction.atomic()`:
+
+```python
+from asgiref.sync import async_to_sync
+from django.db import transaction
+
+with transaction.atomic():
+    async_to_sync(do_tenant_work)()   # async_tenant_context() inside works
+```
+
+Under an ASGI request or a bare event loop, use the default `USE_LOCAL_SET=False`. The
+generic `async_rls_context()` and `async_bypass_flag()` do not check this: with
+`is_local=True` outside a transaction the `RuntimeError` from `set_guc()` propagates.
+
+### One context per task
+
+Sibling tasks of one request share the request's database connection. Their GUC writes
+interleave, so **do not** run blocks for different tenants concurrently:
+
+```python
+# Do not: both tasks write rls.current_tenant on the same connection.
+await asyncio.gather(
+    report_for(tenant_a),   # async with async_tenant_context(tenant_a.pk): ...
+    report_for(tenant_b),   # async with async_tenant_context(tenant_b.pk): ...
+)
+```
+
+Model queries stay scoped, because each task has its own `ContextVar` state and the ORM
+auto-scope filter uses it. Raw SQL, `safe_tenant_sql()` and M2M through tables rely on
+the GUCs alone and are not protected. Run such work one tenant after another.
+
+### Mixing sync and async code
+
+The sync and async managers nest in both directions. A sync `tenant_context()` inside a
+`sync_to_async(..., thread_sensitive=True)` call runs on the same connection and restores
+the outer async block when it exits; an async block run with `async_to_sync` inside a sync
+`tenant_context()` restores the sync scope. Always pass `thread_sensitive=True` (the
+default): a different thread means a different connection, which does not carry the GUCs.
+
 ## @with_rls_context Decorator
 
 The `with_rls_context` decorator automatically extracts a user argument from a
@@ -233,6 +312,8 @@ with admin_context():
 
 The `@with_rls_context` decorator also establishes an active context when a valid
 user argument is provided, so decorated functions pass the strict mode check.
+`async_tenant_context()` and `async_admin_context()` set the flag in the coroutine, so the
+async ORM passes the check inside them too (see [Async Code](#async-code)).
 
 See [Configuration](../getting-started/configuration.md#strict_mode) for setup
 instructions.

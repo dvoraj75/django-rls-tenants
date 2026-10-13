@@ -83,6 +83,16 @@ Both imperative helpers accept `is_local=True` for a transaction-scoped `SET LOC
 flag; this must run inside `transaction.atomic()`. Pass the same `is_local` value to
 `set_bypass_flag()` and `clear_bypass_flag()`.
 
+In async code, use `async_bypass_flag()` (1.4.0+), which has the same save/restore
+semantics (see [Async Code](context-managers.md#async-code)):
+
+```python
+from django_rls_tenants.tenants.bypass import async_bypass_flag
+
+async with async_bypass_flag("rls.auth_bypass"):
+    user = await User.objects.aget(email="admin@example.com")
+```
+
 ### Use Case: Authentication
 
 During authentication, the user record must be read before the tenant context is known.

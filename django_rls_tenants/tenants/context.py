@@ -1,8 +1,9 @@
 """Tenant-aware RLS context managers and decorator.
 
 Provides ``tenant_context``, ``admin_context`` for scoping database
-access, and ``with_rls_context`` for automatically extracting user
-context from function arguments.
+access, their ``async with`` counterparts ``async_tenant_context`` and
+``async_admin_context``, and ``with_rls_context`` for automatically
+extracting user context from function arguments.
 """
 
 from __future__ import annotations
@@ -10,11 +11,14 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
-from django_rls_tenants.exceptions import NoTenantContextError
-from django_rls_tenants.rls.context import restore_gucs
+from asgiref.sync import sync_to_async
+from django.db import connections
+
+from django_rls_tenants.exceptions import NoTenantContextError, RLSConfigurationError
+from django_rls_tenants.rls.context import _enter_gucs, _run_enter_hop, restore_gucs
 from django_rls_tenants.rls.guc import clear_guc, get_guc, set_guc
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.errors import HINT_TENANT_ID_NONE, HINT_USER_NO_TENANT
@@ -29,7 +33,7 @@ _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import AsyncIterator, Callable, Iterator
 
     from django_rls_tenants.tenants.conf import RLSTenantsConfig
     from django_rls_tenants.tenants.types import TenantUser
@@ -176,6 +180,172 @@ def _snapshot_gucs(conf: RLSTenantsConfig, *, using: str) -> dict[str, str | Non
         conf.GUC_IS_ADMIN: get_guc(conf.GUC_IS_ADMIN, using=using),
         conf.GUC_CURRENT_TENANT: get_guc(conf.GUC_CURRENT_TENANT, using=using),
     }
+
+
+def _enter_tenant_gucs(
+    variables: dict[str, str],
+    *,
+    is_local: bool,
+    using: str,
+) -> dict[str, str | None]:
+    """Snapshot + set the admin/tenant GUCs for an async block; one thread hop.
+
+    Runs inside the hop, so ``in_atomic_block`` is read from the connection
+    the block's queries will use.
+
+    Raises:
+        RLSConfigurationError: If ``is_local`` is set and the hop thread is
+            not inside ``transaction.atomic()``.
+    """
+    if is_local and not connections[using].in_atomic_block:
+        msg = (
+            "async_tenant_context() and async_admin_context() cannot use "
+            "RLS_TENANTS['USE_LOCAL_SET'] = True here: SET LOCAL needs a transaction held "
+            "open on the thread that runs the database calls, and a coroutine cannot open "
+            "one. Run the block from synchronous code inside transaction.atomic() via "
+            "async_to_sync, or set USE_LOCAL_SET=False."
+        )
+        raise RLSConfigurationError(msg)
+    return _enter_gucs(variables, is_local=is_local, using=using)
+
+
+@asynccontextmanager
+async def async_tenant_context(
+    tenant_id: int | str,
+    *,
+    using: str = "default",
+) -> AsyncIterator[None]:
+    """Async counterpart of :func:`tenant_context`, for ``async with``. Supports nesting.
+
+    Usage::
+
+        async with async_tenant_context(tenant.pk):
+            count = await Order.objects.acount()
+
+    The GUCs are snapshotted and set in one ``thread_sensitive``
+    ``sync_to_async`` hop on entry and restored in one hop on exit. Django
+    has no asynchronous database cursor, so this is not a non-blocking call;
+    the hop runs on the thread that owns the task's connection (under ASGI,
+    the request's thread, shared with the async ORM). The tenant state
+    ``ContextVar`` values are set and reset in the coroutine itself, so the
+    ORM auto-scope filter and ``STRICT_MODE`` see them in async code. Nesting
+    (with sync or async blocks) and the restore in both GUC modes behave as
+    in :func:`tenant_context`.
+
+    **USE_LOCAL_SET.** ``SET LOCAL`` needs ``transaction.atomic()`` open on
+    the hop thread, which a coroutine cannot open. With ``USE_LOCAL_SET=True``
+    the block only works when the coroutine is driven by ``async_to_sync``
+    from synchronous code that is inside ``atomic()``; anywhere else (a bare
+    event loop, an ASGI request) it raises :class:`RLSConfigurationError`.
+
+    **One context per task.** Sibling tasks of one request (for example
+    under ``asyncio.gather``) share the request's database connection, so
+    their GUC writes interleave. The ORM auto-scope filter still keeps model
+    queries scoped (``ContextVar`` state is per task), but raw SQL,
+    ``safe_tenant_sql()`` and M2M through tables rely on the GUCs alone and
+    are not protected. Do not run context blocks concurrently in sibling
+    tasks that share a connection.
+
+    The restore runs even when the task is cancelled while entering or
+    inside the block; only a second cancellation delivered during the
+    restore itself can skip it (for requests ``RLSTenantMiddleware`` set a
+    context for, its safety net clears the GUCs at the end of the request).
+
+    Args:
+        tenant_id: The tenant PK to scope queries to.
+        using: Database alias. Default: ``"default"``.
+
+    Raises:
+        NoTenantContextError: If ``tenant_id`` is ``None``.
+        RLSConfigurationError: If ``USE_LOCAL_SET=True`` and no transaction is
+            open on the hop thread.
+    """
+    if tenant_id is None:
+        msg = "tenant_id cannot be None."
+        raise NoTenantContextError(msg, hint=HINT_TENANT_ID_NONE)
+
+    conf = rls_tenants_config
+    # Read once so entry and exit agree even if settings change mid-block.
+    is_local = conf.USE_LOCAL_SET
+
+    # GUCs first, ContextVars second (the sync manager does the reverse):
+    # a failed hop then leaves no ContextVar to unwind. The ContextVars are
+    # set here in the coroutine, never inside the hop, because a token
+    # created in the hop's context copy cannot be reset from here (#58).
+    previous = await _run_enter_hop(
+        _enter_tenant_gucs,
+        {conf.GUC_IS_ADMIN: "false", conf.GUC_CURRENT_TENANT: str(tenant_id)},
+        is_local=is_local,
+        using=using,
+    )
+    active_token = set_rls_context_active(True)
+    token = set_current_tenant_id(tenant_id)
+    logger.debug("async_tenant_context entered: tenant_id=%s, using=%s", tenant_id, using)
+    exc_pending = False
+    try:
+        yield
+    except BaseException:
+        exc_pending = True
+        raise
+    finally:
+        reset_current_tenant_id(token)
+        reset_rls_context_active(active_token)
+        await sync_to_async(restore_gucs, thread_sensitive=True)(
+            previous,
+            is_local=is_local,
+            using=using,
+            exc_pending=exc_pending,
+        )
+        logger.debug("async_tenant_context exited: tenant_id=%s, using=%s", tenant_id, using)
+
+
+@asynccontextmanager
+async def async_admin_context(
+    *,
+    using: str = "default",
+) -> AsyncIterator[None]:
+    """Async counterpart of :func:`admin_context`, for ``async with``. Supports nesting.
+
+    Same hop model, ``USE_LOCAL_SET`` constraint and one-context-per-task
+    rule as :func:`async_tenant_context`. An inner ``async_admin_context()``
+    never leaks the admin bypass into the enclosing block.
+
+    Args:
+        using: Database alias. Default: ``"default"``.
+
+    Raises:
+        RLSConfigurationError: If ``USE_LOCAL_SET=True`` and no transaction is
+            open on the hop thread.
+    """
+    conf = rls_tenants_config
+    is_local = conf.USE_LOCAL_SET
+
+    # Same mapping as admin_context(): clear_guc() is set_guc(name, "").
+    previous = await _run_enter_hop(
+        _enter_tenant_gucs,
+        {conf.GUC_IS_ADMIN: "true", conf.GUC_CURRENT_TENANT: ""},
+        is_local=is_local,
+        using=using,
+    )
+    active_token = set_rls_context_active(True)
+    token = set_current_tenant_id(None)
+    logger.debug("async_admin_context entered: using=%s", using)
+    exc_pending = False
+    try:
+        yield
+    except BaseException:
+        exc_pending = True
+        raise
+    finally:
+        reset_current_tenant_id(token)
+        reset_rls_context_active(active_token)
+        await sync_to_async(restore_gucs, thread_sensitive=True)(
+            previous,
+            is_local=is_local,
+            using=using,
+            exc_pending=exc_pending,
+        )
+        logger.debug("async_admin_context exited: using=%s", using)
 
 
 def _get_arg_from_signature(

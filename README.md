@@ -46,6 +46,9 @@ returns zero rows, never leaked data.
   enqueue to worker, including across chains, groups, and chords
   (`pip install "django-rls-tenants[celery]"`).
   [Celery guide →](https://dvoraj75.github.io/django-rls-tenants/guides/celery-tasks/)
+- **Async context managers** -- `async with async_tenant_context(...)` for async views,
+  consumers and tasks; tenant state is set in the coroutine, so the async ORM is scoped.
+  [Async guide →](https://dvoraj75.github.io/django-rls-tenants/guides/context-managers/#async-code)
 - **Raw SQL helpers** -- `safe_tenant_sql()` builds a tenant-filter predicate;
   `current_tenant_value_sql()` returns the current tenant ID expression for inserts
   and projections. Both reuse the expressions used by RLS policies.

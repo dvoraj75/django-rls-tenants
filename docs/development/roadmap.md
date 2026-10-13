@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: 2026-10-12
+> Last updated: 2026-10-13
 >
 > Priorities may shift based on community feedback.
 > Have a suggestion? [Open an issue](https://github.com/dvoraj75/django-rls-tenants/issues).
@@ -172,28 +172,30 @@ up through middleware and context managers.
 
 ### Tier 1: Async GUC primitives (`rls/guc.py`)
 
-- [ ] **`aset_guc()`, `aget_guc()`, `aclear_guc()`** — Async counterparts to
-  the existing sync functions, using Django's async-compatible database API
-  (`connection.cursor()` wrapped in `database_sync_to_async` or direct async
-  cursor when Django supports it).
-  *Why:* Every higher-level async API depends on non-blocking GUC operations.
-  Without these, all async code paths force a thread-hop for every GUC call,
-  negating the performance benefits of async.
+- [x] **`aset_guc()`, `aget_guc()`, `aclear_guc()`, `arestore_guc()`** — Async
+  counterparts to the existing sync functions (#36). Each runs the sync function in
+  one `sync_to_async(..., thread_sensitive=True)` hop: Django has no asynchronous
+  database cursor (every async ORM call is the same kind of hop), so these are not
+  non-blocking, but they run on the thread that owns the task's connection.
+  *Why:* `await`-able building blocks for async code that manages GUCs directly. The
+  win is ergonomics and the correct connection, not a non-blocking database call.
 
 ### Tier 2: Async context managers (`tenants/context.py`, `rls/context.py`)
 
-- [ ] **`async_tenant_context()`** — `@asynccontextmanager` variant of
-  `tenant_context()` that uses `aset_guc()`/`aclear_guc()` internally.
+- [x] **`async_tenant_context()`** — `@asynccontextmanager` variant of
+  `tenant_context()` (#37). One thread hop on entry (snapshot and set the GUCs) and
+  one on exit (restore), instead of one per GUC call; the tenant `ContextVar`s are set
+  and reset in the coroutine, so the async ORM is scoped and strict mode applies.
   *Why:* `tenant_context()` uses `@contextmanager` (sync generator) and
   cannot be used with `async with`. Wrapping it in `sync_to_async` breaks
   the generator protocol.
 
-- [ ] **`async_admin_context()`** — `@asynccontextmanager` variant of
-  `admin_context()`.
+- [x] **`async_admin_context()`** — `@asynccontextmanager` variant of
+  `admin_context()` (#37).
   *Why:* Same issue as `tenant_context()` — sync generators are not
   async-compatible.
 
-- [ ] **`async_rls_context()` and `async_bypass_flag()`** — Async variants
+- [x] **`async_rls_context()` and `async_bypass_flag()`** — Async variants
   of the generic `rls_context()` and `bypass_flag()` context managers.
   *Why:* Completes the async context manager surface area so users never
   need to manually bridge sync/async for RLS operations.
@@ -202,8 +204,8 @@ up through middleware and context managers.
 
 - [ ] **Async-native `RLSTenantMiddleware`** — Add `__acall__` (or the
   Django 4.1+ async middleware pattern) so the middleware runs natively in
-  the ASGI event loop without `sync_to_async` thread-hops. Uses
-  `aset_guc()`/`aclear_guc()` for GUC operations.
+  the ASGI event loop. GUC operations still need a thread-sensitive hop
+  (`aset_guc()`/`aclear_guc()`), since Django has no async cursor.
   *Why:* The current `MiddlewareMixin`-based middleware works under ASGI
   but forces a sync-to-async thread-hop per request. For high-concurrency
   ASGI deployments, this adds latency and limits throughput. A native async

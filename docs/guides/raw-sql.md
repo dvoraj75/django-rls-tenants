@@ -179,5 +179,8 @@ predicate lands.
 
 !!! note "Sync only"
     Like the rest of v1.3.0, these helpers are synchronous. They build a SQL
-    string and read the GUC your synchronous context set; there is no async/ASGI
-    variant yet.
+    string and rely on the GUC set by the active context, which can be a sync
+    context manager or, since 1.4.0, an
+    [async one](context-managers.md#async-code). There is no separate async
+    variant. Do not run raw SQL while sibling tasks of one request hold
+    different contexts (see [One context per task](context-managers.md#one-context-per-task)).

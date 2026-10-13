@@ -56,11 +56,18 @@ class TestLazyImports:
 
     def test_context_managers(self):
         """Context managers are importable from the top-level package."""
-        from django_rls_tenants import admin_context, tenant_context  # noqa: PLC0415
+        from django_rls_tenants import (  # noqa: PLC0415
+            admin_context,
+            async_admin_context,
+            async_tenant_context,
+            tenant_context,
+        )
         from django_rls_tenants.tenants import context as ctx_mod  # noqa: PLC0415
 
         assert admin_context is ctx_mod.admin_context
         assert tenant_context is ctx_mod.tenant_context
+        assert async_admin_context is ctx_mod.async_admin_context
+        assert async_tenant_context is ctx_mod.async_tenant_context
 
     def test_raw_sql_helpers(self):
         """The raw-SQL helpers are importable from the top-level package."""

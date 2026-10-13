@@ -116,6 +116,21 @@ support is tracked for v1.4.0.
 
 **See:** [`USE_LOCAL_SET` and ASGI](guides/middleware.md#use_local_set-and-asgi).
 
+### `RLSConfigurationError: async_tenant_context() and async_admin_context() cannot use RLS_TENANTS['USE_LOCAL_SET'] = True here`
+
+**Symptom:** `async with async_tenant_context(...)` or `async_admin_context()` fails on
+entry with this error, in an ASGI view, a consumer, or a script run with `asyncio.run()`.
+
+**Cause:** `SET LOCAL` needs `transaction.atomic()` open on the thread that runs the
+database calls, and a coroutine cannot open one. The block would otherwise fail inside
+`SET LOCAL` or set the GUC in a transaction your queries do not use.
+
+**Fix:** Set `USE_LOCAL_SET=False` for async deployments. If the coroutine is called from
+synchronous code, wrap that call in `transaction.atomic()` and run the coroutine with
+`async_to_sync`; the managers then work in `SET LOCAL` mode.
+
+**See:** [`USE_LOCAL_SET=True` in async code](guides/context-managers.md#use_local_settrue-in-async-code).
+
 ### `ValueError: ... Token was created in a different Context` under ASGI
 
 **Symptom:** Authenticated requests fail with a 500 and a `ValueError` from
@@ -130,11 +145,13 @@ hop, so the token created in `process_request` was reset in a different
 **Fix:** Upgrade to 1.3.4 or later; the middleware now clears the context when a token
 cannot be reset. On 1.3.3 and earlier, run the middleware under WSGI, or leave it out of
 `MIDDLEWARE` and set the context explicitly in a synchronous view (`tenant_context()` /
-`.for_user()`). For an async view, put both the context and query evaluation in one
-synchronous function called with `sync_to_async(..., thread_sensitive=True)`.
+`.for_user()`). For an async view on 1.4.0 or later, use `async_tenant_context()` /
+`async_admin_context()`. On older versions, put both the context and query evaluation in
+one synchronous function called with `sync_to_async(..., thread_sensitive=True)`.
 
 **See:** [Running under ASGI](guides/middleware.md#running-under-asgi),
-[Using Without Middleware](guides/middleware.md#using-without-middleware).
+[Using Without Middleware](guides/middleware.md#using-without-middleware),
+[Async Code](guides/context-managers.md#async-code).
 
 ### `RuntimeError: ... Token ... has already been used once`
 

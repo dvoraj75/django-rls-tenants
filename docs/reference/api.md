@@ -18,6 +18,8 @@ from django_rls_tenants import (
     TenantQuerySet,
     TenantUser,
     admin_context,
+    async_admin_context,
+    async_tenant_context,
     current_tenant_value_sql,
     safe_tenant_sql,
     tenant_context,
@@ -67,6 +69,20 @@ from `tenants/`.
 
 ::: django_rls_tenants.rls.guc.restore_guc
 
+#### Async GUC Helpers
+
+Each runs the sync helper in one `thread_sensitive` `sync_to_async` hop. Django has no
+asynchronous database cursor, so these are not non-blocking calls; see
+[Async Code](../guides/context-managers.md#async-code).
+
+::: django_rls_tenants.rls.guc.aset_guc
+
+::: django_rls_tenants.rls.guc.aget_guc
+
+::: django_rls_tenants.rls.guc.aclear_guc
+
+::: django_rls_tenants.rls.guc.arestore_guc
+
 ### Constraints
 
 ::: django_rls_tenants.rls.constraints.RLSConstraint
@@ -82,6 +98,10 @@ from `tenants/`.
 ::: django_rls_tenants.rls.context.rls_context
 
 ::: django_rls_tenants.rls.context.bypass_flag
+
+::: django_rls_tenants.rls.context.async_rls_context
+
+::: django_rls_tenants.rls.context.async_bypass_flag
 
 ---
 
@@ -108,6 +128,10 @@ Django multitenancy built on top of the `rls/` primitives.
 ::: django_rls_tenants.tenants.context.tenant_context
 
 ::: django_rls_tenants.tenants.context.admin_context
+
+::: django_rls_tenants.tenants.context.async_tenant_context
+
+::: django_rls_tenants.tenants.context.async_admin_context
 
 ::: django_rls_tenants.tenants.context.with_rls_context
 

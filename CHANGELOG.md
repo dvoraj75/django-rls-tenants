@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Async GUC primitives and async context managers** (#36, #37). `aset_guc()`,
+  `aget_guc()`, `aclear_guc()` and `arestore_guc()` in `django_rls_tenants.rls`, and
+  `async_tenant_context()` and `async_admin_context()` (both also exported top-level),
+  `async_rls_context()` and `async_bypass_flag()` for `async with`. Django has no
+  asynchronous database cursor, so these are thread-sensitive `sync_to_async` hops, like
+  the async ORM itself, not non-blocking calls: the managers make one hop on entry and
+  one on exit, set and reset the tenant `ContextVar`s in the calling coroutine (so the
+  auto-scope filter and `STRICT_MODE` apply to `acount()` and friends, and the #58 token
+  problem cannot occur), and support nesting with sync and async blocks in both GUC
+  modes, including restore when the task is cancelled (even during entry). With `USE_LOCAL_SET=True` the tenant
+  managers raise `RLSConfigurationError` unless the coroutine runs via `async_to_sync`
+  inside a synchronous `transaction.atomic()`. Use one context per task: sibling tasks
+  of one request share its connection, so `asyncio.gather` across tenants is not safe
+  for raw SQL. No behaviour change for sync code.
+
 ## [1.3.4] - 2026-10-12
 
 ### Fixed

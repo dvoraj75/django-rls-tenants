@@ -50,6 +50,7 @@ the [Security Model](advanced/security.md) for what that does and does not cover
 | Set the tenant context for every request | [Middleware](guides/middleware.md) |
 | Set the context in a script or management command | [Context Managers](guides/context-managers.md) |
 | Run a Celery task under the right tenant | [Celery Tasks](guides/celery-tasks.md) |
+| Use the tenant context in an async view or consumer | [Async Code](guides/context-managers.md#async-code) |
 | Use the Django admin across tenants | [Admin](guides/admin.md) |
 | Write a test that proves isolation fails closed | [Testing](guides/testing.md) |
 | Write raw SQL that stays tenant-scoped | [Raw SQL](guides/raw-sql.md) |

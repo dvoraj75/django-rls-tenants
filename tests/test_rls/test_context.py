@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 import pytest
+from asgiref.sync import async_to_sync, sync_to_async
 from django.db import DataError
 
-from django_rls_tenants.rls.context import bypass_flag, rls_context
-from django_rls_tenants.rls.guc import get_guc, set_guc
+from django_rls_tenants.rls.context import (
+    _enter_gucs,
+    async_bypass_flag,
+    async_rls_context,
+    bypass_flag,
+    rls_context,
+)
+from django_rls_tenants.rls.guc import aget_guc, get_guc, set_guc
 
 pytestmark = pytest.mark.django_db
 
@@ -238,3 +248,310 @@ def test_partial_setup_failure_restores_previous_values():
 
     assert get_guc("rls.is_admin") == "false"
     assert get_guc("statement_timeout") == previous_timeout
+
+
+# ---------------------------------------------------------------------------
+# async_rls_context / async_bypass_flag (#37)
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncRlsContext:
+    """Async managers driven through async_to_sync (hops run on the test thread)."""
+
+    def test_sets_and_restores(self):
+        """async_rls_context sets GUCs in the block and restores previous values."""
+        set_guc("rls.test_actx", "original")
+
+        async def run():
+            async with async_rls_context({"rls.test_actx": "inside"}):
+                return await aget_guc("rls.test_actx")
+
+        assert async_to_sync(run)() == "inside"
+        assert get_guc("rls.test_actx") == "original"
+
+    def test_clears_when_no_previous(self):
+        """async_rls_context clears GUCs on exit when no previous value existed."""
+
+        async def run():
+            async with async_rls_context({"rls.test_actx_new": "temp"}):
+                return await aget_guc("rls.test_actx_new")
+
+        assert async_to_sync(run)() == "temp"
+        assert get_guc("rls.test_actx_new") is None
+
+    def test_nesting_restores_outer_value(self):
+        """An inner async_rls_context restores the outer block's value."""
+
+        async def run():
+            seen = []
+            async with async_rls_context({"rls.test_anest": "outer"}):
+                async with async_rls_context({"rls.test_anest": "inner"}):
+                    seen.append(await aget_guc("rls.test_anest"))
+                seen.append(await aget_guc("rls.test_anest"))
+            return seen
+
+        assert async_to_sync(run)() == ["inner", "outer"]
+        assert get_guc("rls.test_anest") is None
+
+    def test_bypass_flag_sets_and_restores(self):
+        """async_bypass_flag sets 'true' and restores the previous value."""
+        set_guc("rls.test_aflag", "false")
+
+        async def run():
+            async with async_bypass_flag("rls.test_aflag"):
+                return await aget_guc("rls.test_aflag")
+
+        assert async_to_sync(run)() == "true"
+        assert get_guc("rls.test_aflag") == "false"
+
+    def test_bypass_flag_clears_when_no_previous(self):
+        """async_bypass_flag clears the flag on exit when it was unset before."""
+
+        async def run():
+            async with async_bypass_flag("rls.test_aflag_new"):
+                return await aget_guc("rls.test_aflag_new")
+
+        assert async_to_sync(run)() == "true"
+        assert get_guc("rls.test_aflag_new") is None
+
+    @pytest.mark.parametrize("use_bypass", [False, True], ids=["rls_context", "bypass_flag"])
+    def test_exception_in_body_still_restores(self, use_bypass):
+        """A Python exception in the body propagates and the GUC is restored."""
+        set_guc("rls.test_aexc", "outer")
+
+        async def run():
+            inner = (
+                async_bypass_flag("rls.test_aexc")
+                if use_bypass
+                else async_rls_context({"rls.test_aexc": "inner"})
+            )
+            async with inner:
+                raise ValueError("boom")
+
+        with pytest.raises(ValueError, match="boom"):
+            async_to_sync(run)()
+        assert get_guc("rls.test_aexc") == "outer"
+
+    def test_cancelled_error_in_body_restores(self):
+        """CancelledError raised in the body still runs the restore hop (and propagates)."""
+
+        async def run():
+            async with async_rls_context({"rls.test_acancel": "v"}):
+                raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            async_to_sync(run)()
+        assert get_guc("rls.test_acancel") is None
+
+    def test_cancelled_during_enter_hop_restores(self, monkeypatch):
+        """A cancel that lands while the enter hop runs still undoes the GUC change.
+
+        asgiref cannot stop a sync function already running in its thread: the hop
+        completes, its result is discarded and ``CancelledError`` is raised. The
+        manager must wait for the snapshot and restore it before propagating.
+        """
+        import django_rls_tenants.rls.context as ctx_mod  # noqa: PLC0415
+
+        real_enter = ctx_mod._enter_gucs
+        holder = {}
+
+        def slow_enter(variables, **kwargs):
+            # Cancel the awaiting task from inside the hop, then keep the hop busy
+            # long enough for the cancellation to be delivered while it runs.
+            holder["loop"].call_soon_threadsafe(holder["task"].cancel)
+            time.sleep(0.05)
+            return real_enter(variables, **kwargs)
+
+        monkeypatch.setattr(ctx_mod, "_enter_gucs", slow_enter)
+
+        async def body():
+            async with async_rls_context({"rls.test_acancel_enter": "v"}):
+                pytest.fail("The block must not run after a cancelled entry")
+
+        async def run():
+            holder["loop"] = asyncio.get_running_loop()
+            holder["task"] = asyncio.create_task(body())
+            with pytest.raises(asyncio.CancelledError):
+                await holder["task"]
+            return await aget_guc("rls.test_acancel_enter")
+
+        assert async_to_sync(run)() is None
+        assert get_guc("rls.test_acancel_enter") is None
+
+    def test_sync_rls_context_inside_hop_inside_async_block(self):
+        """A sync rls_context run in a hop nests inside an async block and restores it."""
+
+        def sync_inner():
+            with rls_context({"rls.test_amix": "sync_inner"}):
+                return get_guc("rls.test_amix")
+
+        async def run():
+            async with async_rls_context({"rls.test_amix": "async_outer"}):
+                inner = await sync_to_async(sync_inner, thread_sensitive=True)()
+                return inner, await aget_guc("rls.test_amix")
+
+        assert async_to_sync(run)() == ("sync_inner", "async_outer")
+        assert get_guc("rls.test_amix") is None
+
+    def test_async_block_inside_sync_rls_context(self):
+        """An async block run through async_to_sync inside a sync block restores it."""
+
+        async def async_inner():
+            async with async_rls_context({"rls.test_amix2": "async_inner"}):
+                return await aget_guc("rls.test_amix2")
+
+        with rls_context({"rls.test_amix2": "sync_outer"}):
+            assert async_to_sync(async_inner)() == "async_inner"
+            assert get_guc("rls.test_amix2") == "sync_outer"
+        assert get_guc("rls.test_amix2") is None
+
+
+class TestEnterGucs:
+    """The private one-hop enter helper used by the async managers."""
+
+    def test_returns_previous_values(self):
+        """The snapshot is taken before the variables are set."""
+        set_guc("rls.test_enter_a", "before")
+        previous = _enter_gucs(
+            {"rls.test_enter_a": "after", "rls.test_enter_b": "x"},
+            is_local=False,
+            using="default",
+        )
+        assert previous == {"rls.test_enter_a": "before", "rls.test_enter_b": None}
+        assert get_guc("rls.test_enter_a") == "after"
+        assert get_guc("rls.test_enter_b") == "x"
+
+    def test_partial_failure_restores_already_set(self, monkeypatch):
+        """If the second set fails, the first variable is restored before the error."""
+        import django_rls_tenants.rls.context as ctx_mod  # noqa: PLC0415
+
+        set_guc("rls.test_enter_first", "before")
+        real_set_guc = ctx_mod.set_guc
+
+        def _fail_second(name, value, **kwargs):
+            if name == "rls.test_enter_second":
+                raise RuntimeError("second failed")
+            real_set_guc(name, value, **kwargs)
+
+        monkeypatch.setattr(ctx_mod, "set_guc", _fail_second)
+        with pytest.raises(RuntimeError, match="second failed"):
+            _enter_gucs(
+                {"rls.test_enter_first": "changed", "rls.test_enter_second": "v"},
+                is_local=False,
+                using="default",
+            )
+        assert get_guc("rls.test_enter_first") == "before"
+        assert get_guc("rls.test_enter_second") is None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_async_partial_setup_failure_restores_previous_values():
+    """A rejected later setting must not leak an earlier admin bypass (async form)."""
+    set_guc("rls.is_admin", "false")
+    previous_timeout = get_guc("statement_timeout")
+
+    async def run():
+        async with async_rls_context({"rls.is_admin": "true", "statement_timeout": "invalid"}):
+            pytest.fail("The block must not run after setup fails")
+
+    with pytest.raises(DataError, match="invalid value"):
+        async_to_sync(run)()
+
+    assert get_guc("rls.is_admin") == "false"
+    assert get_guc("statement_timeout") == previous_timeout
+
+
+def _divide_by_zero():
+    from django.db import connection  # noqa: PLC0415
+
+    with connection.cursor() as cur:
+        cur.execute("SELECT 1/0")
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("is_local", [False, True], ids=["set_config", "set_local"])
+class TestAsyncNestedRestore:
+    """Async blocks restore the outer *database* scope in both GUC modes.
+
+    ``SET LOCAL`` from a coroutine needs ``atomic()`` open on the hop thread;
+    under ``async_to_sync`` that is the test thread, so each test opens the
+    transaction in sync code and drives the coroutine from inside it.
+    """
+
+    def test_nested_restores_outer_value(self, is_local):
+        """Inner async block restores the outer async block's value."""
+        from django.db import transaction  # noqa: PLC0415
+
+        async def run():
+            seen = []
+            async with async_rls_context({"rls.anest": "outer"}, is_local=is_local):
+                async with async_rls_context({"rls.anest": "inner"}, is_local=is_local):
+                    seen.append(await aget_guc("rls.anest"))
+                seen.append(await aget_guc("rls.anest"))
+            return seen
+
+        with transaction.atomic():
+            assert async_to_sync(run)() == ["inner", "outer"]
+            assert get_guc("rls.anest") is None
+        assert get_guc("rls.anest") is None
+
+    def test_bypass_flag_nested_is_cleared_on_exit(self, is_local):
+        """The async bypass flag does not outlive its block inside an outer context."""
+        from django.db import transaction  # noqa: PLC0415
+
+        async def run():
+            async with async_rls_context({"rls.anest_t": "42"}, is_local=is_local):
+                async with async_bypass_flag("rls.anest_flag", is_local=is_local):
+                    inside = await aget_guc("rls.anest_flag")
+                return inside, await aget_guc("rls.anest_flag"), await aget_guc("rls.anest_t")
+
+        with transaction.atomic():
+            assert async_to_sync(run)() == ("true", None, "42")
+
+    @pytest.mark.parametrize("use_bypass", [False, True], ids=["rls_context", "bypass_flag"])
+    def test_db_error_surfaces_original_exception(self, is_local, use_bypass):
+        """A failed statement is reported as itself, not as 'transaction is aborted'."""
+        from django.db import transaction  # noqa: PLC0415
+
+        async def run():
+            inner = (
+                async_bypass_flag("rls.anest_db", is_local=is_local)
+                if use_bypass
+                else async_rls_context({"rls.anest_db": "v"}, is_local=is_local)
+            )
+            async with inner:
+                await sync_to_async(_divide_by_zero, thread_sensitive=True)()
+
+        with pytest.raises(DataError, match="division by zero"), transaction.atomic():
+            async_to_sync(run)()
+        # The whole transaction rolled back, taking the GUC change with it.
+        assert get_guc("rls.anest_db") is None
+
+    def test_db_error_inside_savepoint_rollback_restores_outer(self, is_local):
+        """Inside a nested atomic(): the savepoint rollback reinstates the outer scope."""
+        from django.db import connection, transaction  # noqa: PLC0415
+
+        async def inner():
+            async with async_rls_context({"rls.anest_sp": "inner"}, is_local=is_local):
+                await sync_to_async(_divide_by_zero, thread_sensitive=True)()
+
+        with transaction.atomic(), rls_context({"rls.anest_sp": "outer"}, is_local=is_local):
+            with pytest.raises(DataError, match="division by zero"), transaction.atomic():
+                async_to_sync(inner)()
+            assert get_guc("rls.anest_sp") == "outer"
+            with connection.cursor() as cur:
+                cur.execute("SELECT 1")
+                assert cur.fetchone() == (1,)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_async_rls_context_is_local_without_transaction_raises():
+    """The generic manager lets set_guc's RuntimeError propagate for is_local=True."""
+
+    async def run():
+        async with async_rls_context({"rls.test_alocal": "v"}, is_local=True):
+            pytest.fail("The block must not run without a transaction")
+
+    with pytest.raises(RuntimeError, match="Cannot use SET LOCAL"):
+        async_to_sync(run)()
+    assert get_guc("rls.test_alocal") is None
