@@ -45,7 +45,7 @@ The upper layer builds Django multitenancy on top of `rls/`:
 | `operations.py` | `AddM2MRLSPolicy` -- reversible migration operation for M2M RLS policies |
 | `tenants/managers.py` | `TenantQuerySet`, `RLSManager` -- lazy GUC setting at query eval time |
 | `tenants/context.py` | `tenant_context()`, `admin_context()`, `@with_rls_context` |
-| `tenants/middleware.py` | `RLSTenantMiddleware` -- per-request RLS context |
+| `tenants/middleware.py` | `RLSTenantMiddleware` -- per-request RLS context, with a native async path for ASGI |
 | `tenants/bypass.py` | `set_bypass_flag()`, `clear_bypass_flag()`, `bypass_flag()` |
 | `tenants/testing.py` | Test helpers: `rls_bypass`, `rls_as_tenant`, assertion functions |
 | `tenants/types.py` | `TenantUser` protocol |

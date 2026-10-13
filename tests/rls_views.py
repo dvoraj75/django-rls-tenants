@@ -8,10 +8,19 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from asgiref.sync import sync_to_async
 from django.db import connection
-from django.http import Http404, HttpResponse, HttpResponseServerError, JsonResponse
+from django.http import (
+    Http404,
+    HttpResponse,
+    HttpResponseServerError,
+    JsonResponse,
+    StreamingHttpResponse,
+)
 
-from django_rls_tenants.rls.guc import get_guc
+from django_rls_tenants.rls.guc import aget_guc, get_guc
+from django_rls_tenants.tenants.context import async_admin_context, async_tenant_context
+from django_rls_tenants.tenants.state import get_current_tenant_id
 from tests.test_app.models import Order, Tenant
 
 try:
@@ -20,25 +29,75 @@ except ImportError:  # Django 5.2 - 6.1
     from django.utils.deprecation import MiddlewareMixin
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from django.http import HttpRequest
+
+
+def _database_products() -> list[str]:
+    """Read the products with raw SQL, bypassing the ORM auto-scope filter.
+
+    Only PostgreSQL's RLS policy filters these rows.
+    """
+    with connection.cursor() as cursor:
+        table = connection.ops.quote_name(Order._meta.db_table)
+        cursor.execute(f"SELECT product FROM {table} ORDER BY product")
+        return [row[0] for row in cursor.fetchall()]
 
 
 def orders_view(request: HttpRequest) -> JsonResponse:
     """Return the products visible to the request's tenant plus request-time state."""
-    # Bypass ORM auto-scoping to prove PostgreSQL itself filters the rows.
-    with connection.cursor() as cursor:
-        table = connection.ops.quote_name(Order._meta.db_table)
-        cursor.execute(f"SELECT product FROM {table} ORDER BY product")
-        database_products = [row[0] for row in cursor.fetchall()]
     return JsonResponse(
         {
             "products": sorted(Order.objects.values_list("product", flat=True)),
-            "database_products": database_products,
+            "database_products": _database_products(),
             "in_atomic_block": connection.in_atomic_block,
             "tenant_guc": get_guc("rls.current_tenant"),
             "is_admin_guc": get_guc("rls.is_admin"),
         }
     )
+
+
+async def _products() -> list[str]:
+    return [order.product async for order in Order.objects.order_by("product")]
+
+
+async def async_orders_view(request: HttpRequest) -> JsonResponse:
+    """Async twin of ``orders_view``: async ORM, raw SQL and the GUCs of the request."""
+    return JsonResponse(
+        {
+            "products": await _products(),
+            "database_products": await sync_to_async(_database_products)(),
+            "tenant_id": get_current_tenant_id(),
+            "tenant_guc": await aget_guc("rls.current_tenant"),
+            "is_admin_guc": await aget_guc("rls.is_admin"),
+        }
+    )
+
+
+async def async_widen_to_admin_view(request: HttpRequest) -> JsonResponse:
+    """Widen the request's tenant context to admin for one block, then fall back."""
+    async with async_admin_context():
+        everything = await _products()
+    return JsonResponse(
+        {
+            "admin": everything,
+            "after": await _products(),
+            "tenant_guc": await aget_guc("rls.current_tenant"),
+        }
+    )
+
+
+async def async_stream_view(request: HttpRequest) -> StreamingHttpResponse:
+    """Stream an async body; it runs after the middleware has ended the request context."""
+    tenant_id = get_current_tenant_id()
+
+    async def body() -> AsyncIterator[str]:
+        yield f"{await Order.objects.acount()}\n"
+        async with async_tenant_context(tenant_id):
+            yield f"{await Order.objects.acount()}\n"
+
+    return StreamingHttpResponse(body())
 
 
 def boom_view(request: HttpRequest) -> JsonResponse:
@@ -81,6 +140,23 @@ class DatabaseExceptionMiddleware(MiddlewareMixin):
 
     def process_exception(self, request, exception):
         return JsonResponse({"tenants": Tenant.objects.count()}, status=409)
+
+
+class SyncOnlyMiddleware:
+    """A middleware that cannot run async.
+
+    Listed after ``RLSTenantMiddleware`` under ASGI it makes Django run the
+    RLS middleware on its synchronous path, adapted with ``sync_to_async``.
+    """
+
+    sync_capable = True
+    async_capable = False
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        return self.get_response(request)
 
 
 def exception_middleware_factory(get_response):

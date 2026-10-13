@@ -111,6 +111,16 @@ context. This distinguishes "no context" (should raise) from "admin context"
 on entry and restore via token on exit. The guard is in
 `TenantQuerySet._check_strict_mode()`.
 
+### Async Middleware Path
+
+Under ASGI, `RLSTenantMiddleware.__acall__` (not `MiddlewareMixin.__acall__`) serves the
+request: one thread-sensitive hop (`_enter_request_gucs`) reads `request.user` and sets the
+GUCs, the `ContextVar`s are set and reset with tokens in the request coroutine, and one hop
+clears the GUCs. Never set or reset a `ContextVar` inside a `sync_to_async` hop (the token
+belongs to a copied context, #58), and never use `thread_sensitive=False` in library code
+(another thread means another connection). `process_exception` must keep ending the context
+under ASGI, because Django builds the error response on another thread and connection.
+
 ## Code Style
 
 ### General Formatting

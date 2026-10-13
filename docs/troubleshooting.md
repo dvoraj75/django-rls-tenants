@@ -38,7 +38,8 @@ before the body is iterated.
 **Fix:** Open `tenant_context()` / `admin_context()` inside the synchronous generator
 and evaluate the queries there. With `USE_LOCAL_SET=True`, enter
 `transaction.atomic(using=alias)` before the context, using the same database alias
-for both; the middleware's request transaction has already ended.
+for both; the middleware's request transaction has already ended. In an async generator
+(ASGI), use `async with async_tenant_context()` / `async_admin_context()` instead.
 
 **See:** [Transaction Per Request](guides/middleware.md#transaction-per-request-use_local_settrue).
 
@@ -111,8 +112,8 @@ middleware factory, above `RLSTenantMiddleware` in `MIDDLEWARE`.
 across the awaited downstream chain, so there is no transaction for `SET LOCAL` to live
 in.
 
-**Fix:** Serve the application through WSGI, or set `USE_LOCAL_SET=False`. Native async
-support is tracked for v1.4.0.
+**Fix:** Serve the application through WSGI, or set `USE_LOCAL_SET=False`. The native
+async middleware path added in 1.4.0 has the same limit.
 
 **See:** [`USE_LOCAL_SET` and ASGI](guides/middleware.md#use_local_set-and-asgi).
 
@@ -143,7 +144,8 @@ hop, so the token created in `process_request` was reset in a different
 `contextvars.Context`.
 
 **Fix:** Upgrade to 1.3.4 or later; the middleware now clears the context when a token
-cannot be reset. On 1.3.3 and earlier, run the middleware under WSGI, or leave it out of
+cannot be reset. Since 1.4.0 it serves ASGI requests on its own async path, which keeps
+the tokens in one context. On 1.3.3 and earlier, run the middleware under WSGI, or leave it out of
 `MIDDLEWARE` and set the context explicitly in a synchronous view (`tenant_context()` /
 `.for_user()`). For an async view on 1.4.0 or later, use `async_tenant_context()` /
 `async_admin_context()`. On older versions, put both the context and query evaluation in
