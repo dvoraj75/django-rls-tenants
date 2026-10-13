@@ -163,6 +163,9 @@ The generic layer has the same pair, `async_rls_context()` and `async_bypass_fla
 the primitives `aset_guc()`, `aget_guc()`, `aclear_guc()` and `arestore_guc()` (see the
 [API reference](../reference/api.md#async-guc-helpers)).
 
+For tests, the testing helpers have async counterparts. [Async Tests](testing.md#async-tests)
+also explains which database connection an `async def` test uses.
+
 ### `USE_LOCAL_SET=True` in async code
 
 `SET LOCAL` needs `transaction.atomic()` open on the thread that runs the database calls,

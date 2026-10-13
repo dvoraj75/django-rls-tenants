@@ -31,6 +31,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside a synchronous `transaction.atomic()`. Use one context per task: sibling tasks
   of one request share its connection, so `asyncio.gather` across tenants is not safe
   for raw SQL. No behaviour change for sync code.
+- **Async testing helpers** (#40). `django_rls_tenants.tenants.testing` gains
+  `async_rls_bypass()` and `async_rls_as_tenant()` for `async with`, plus
+  `aassert_rls_enabled()`, `aassert_rls_policy_exists()` and
+  `aassert_rls_blocks_without_context()`. They take the same arguments as their sync
+  counterparts. The context managers wrap `async_admin_context()` and
+  `async_tenant_context()`, and each assertion runs its sync version in one
+  thread-sensitive hop. A new "Async Tests" section in the testing guide explains which
+  connection an async test uses. Django `TestCase` `async def` methods, and sync tests
+  that drive a coroutine with `async_to_sync`, share the test's transaction.
+  pytest-asyncio and anyio tests run on a separate connection outside the test
+  transaction. With plain `django_db`, their fixture rows are invisible and their writes
+  are committed.
 - **Django 6.1 support** (#114), with classifiers and CI legs.
 - **Explicit PostgreSQL 15–18 support** (#114). The requirements tables list every
   supported major; CI runs 16 by default and 15 and 18 as the edges.

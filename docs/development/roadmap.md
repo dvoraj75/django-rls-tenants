@@ -236,11 +236,13 @@ up through middleware and context managers.
   body ran under the caller's context: inside an outer admin context, a
   coroutine decorated for a tenant user saw every tenant.
 
-- [ ] **Async testing helpers** — `async_rls_bypass()`, `async_rls_as_tenant()`,
-  and async variants of assertion helpers for use in async test functions.
-  *Why:* Async test suites (e.g., `pytest-asyncio`) cannot use sync context
-  managers without `sync_to_async` wrappers. First-class async helpers
-  remove boilerplate and ensure correct usage.
+- [x] **Async testing helpers** — `async_rls_bypass()`, `async_rls_as_tenant()`,
+  `aassert_rls_enabled()`, `aassert_rls_policy_exists()` and
+  `aassert_rls_blocks_without_context()` for `async def` tests (#40).
+  *Why:* The sync helpers cannot run in an `async def` test (their database
+  calls raise `SynchronousOnlyOperation`), and wrapping a `@contextmanager`
+  in `sync_to_async` breaks the generator protocol. First-class async
+  helpers remove that boilerplate and ensure correct usage.
 
 ### Tier 5: Connection-affinity safety net
 
