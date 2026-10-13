@@ -12,7 +12,7 @@ import functools
 import inspect
 import logging
 from contextlib import asynccontextmanager, contextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast, overload
 
 from asgiref.sync import sync_to_async
 from django.db import connections
@@ -367,6 +367,77 @@ def _get_arg_from_signature(
     return bound.arguments.get(arg_name)
 
 
+def _decorated_call_tenant_id(as_user: TenantUser, qualname: str) -> int | str | None:
+    """Return the tenant a ``@with_rls_context`` call is scoped to, or ``None`` for an admin.
+
+    Args:
+        as_user: The user argument of the call (never ``None`` here).
+        qualname: Name of the decorated function, for the error message.
+
+    Returns:
+        The user's ``rls_tenant_id``, or ``None`` when ``is_tenant_admin`` is true.
+
+    Raises:
+        NoTenantContextError: If a non-admin user has ``rls_tenant_id=None``.
+    """
+    if as_user.is_tenant_admin:
+        return None
+    tenant_id = as_user.rls_tenant_id
+    if tenant_id is None:
+        msg = f"Non-admin user passed to {qualname} has rls_tenant_id=None."
+        raise NoTenantContextError(msg, hint=HINT_USER_NO_TENANT)
+    return tenant_id
+
+
+def _reject_coroutine[T](result: T, qualname: str) -> T:
+    """Fail a sync ``@with_rls_context`` call whose function returned a coroutine.
+
+    The sync wrapper has already left the RLS context by the time anyone
+    awaits that coroutine, so its body would run under the caller's context
+    instead. This happens when ``inspect.iscoroutinefunction()`` cannot see
+    that the function is async (an object with ``async def __call__``, or an
+    ``async def`` behind a decorator that hides it).
+
+    Args:
+        result: The value the decorated function returned.
+        qualname: Name of the decorated function, for the error message.
+
+    Returns:
+        ``result`` unchanged when it is not a coroutine.
+
+    Raises:
+        TypeError: If ``result`` is a coroutine. It is closed first, so
+            Python does not warn that it was never awaited.
+    """
+    if inspect.iscoroutine(result):
+        result.close()
+        msg = (
+            f"@with_rls_context: {qualname} returned a coroutine, but it was decorated as a "
+            "synchronous function, so the coroutine would run after the decorator has "
+            "returned, outside the RLS context it manages. Decorate the async def function "
+            "itself (directly, or under decorators that keep it a coroutine function), or use "
+            "async_tenant_context() / async_admin_context() inside it."
+        )
+        raise TypeError(msg)
+    return result
+
+
+@overload
+def with_rls_context[**P, R](
+    func: Callable[P, R],
+    *,
+    user_param: str | None = None,
+) -> Callable[P, R]: ...
+
+
+@overload
+def with_rls_context[**P, R](
+    func: None = None,
+    *,
+    user_param: str | None = None,
+) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
+
+
 def with_rls_context[**P, R](
     func: Callable[P, R] | None = None,
     *,
@@ -382,6 +453,21 @@ def with_rls_context[**P, R](
         @with_rls_context(user_param="current_user")
         def my_view(request, current_user): ...
 
+    ``async def`` functions are supported: the decorator detects them with
+    :func:`inspect.iscoroutinefunction` and returns an ``async def`` wrapper
+    that enters :func:`async_tenant_context` / :func:`async_admin_context`
+    around the awaited body. The wrapper is itself a coroutine function, so
+    Django and other async-aware decorators treat it as async::
+
+        @with_rls_context
+        async def order_count(as_user):
+            return await Order.objects.acount()
+
+    In the async wrapper the user argument is read (``is_tenant_admin``,
+    ``rls_tenant_id``) in the coroutine, when the call is awaited, so those
+    properties must not query the database; pass a loaded user (in an async
+    view, ``await request.auser()``, not ``request.user``).
+
     Args:
         func: The function to decorate (when used without parentheses).
         user_param: Override the parameter name to look for. Defaults to
@@ -391,11 +477,32 @@ def with_rls_context[**P, R](
         The decorated function with the same signature as the original,
         or a decorator factory when called with keyword arguments.
 
+    Raises:
+        TypeError: At decoration time, if the function is a generator or an
+            async generator function (its body runs while the caller
+            iterates, after the context has been exited). At call time, if a
+            function decorated as synchronous returns a coroutine.
+        NoTenantContextError: At call time (when awaited, for ``async def``),
+            if a non-admin user has ``rls_tenant_id=None``.
+
     When the user argument is ``None``, logs a warning and proceeds
     without context (fail-closed: RLS blocks all access).
     """
 
     def decorator(fn: Callable[P, R]) -> Callable[P, R]:
+        # Callable objects have no __qualname__ of their own.
+        qualname: str = getattr(fn, "__qualname__", type(fn).__qualname__)
+
+        if inspect.isgeneratorfunction(fn) or inspect.isasyncgenfunction(fn):
+            msg = (
+                f"@with_rls_context cannot decorate the generator function {qualname}: its "
+                "body runs while the caller iterates, after the decorator's RLS context has "
+                "been exited. Enter the context inside the generator instead (tenant_context() "
+                "/ admin_context(), or async_tenant_context() / async_admin_context() in an "
+                "async generator)."
+            )
+            raise TypeError(msg)
+
         # Cache signature at decoration time (not per-invocation).
         sig = inspect.signature(fn)
         param_name = user_param if user_param is not None else rls_tenants_config.USER_PARAM_NAME
@@ -406,31 +513,46 @@ def with_rls_context[**P, R](
                 "RLS context will never be set (fail-closed). "
                 "Use @with_rls_context(user_param='your_param') to specify explicitly.",
                 param_name,
-                fn.__qualname__,
+                qualname,
             )
 
-        @functools.wraps(fn)
-        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        def user_of(*args: P.args, **kwargs: P.kwargs) -> TenantUser | None:
+            """Read the user argument of one call; log a warning when it is ``None``."""
             as_user: TenantUser | None = _get_arg_from_signature(sig, param_name, *args, **kwargs)
-
-            if as_user is not None and as_user.is_tenant_admin:
-                ctx = admin_context()
-            elif as_user is not None:
-                tenant_id = as_user.rls_tenant_id
-                if tenant_id is None:
-                    msg = f"Non-admin user passed to {fn.__qualname__} has rls_tenant_id=None."
-                    raise NoTenantContextError(msg, hint=HINT_USER_NO_TENANT)
-                ctx = tenant_context(tenant_id)
-            else:
+            if as_user is None:
                 logger.warning(
                     "with_rls_context: %s is None in call to %s, no RLS context set (fail-closed)",
                     param_name,
-                    fn.__qualname__,
+                    qualname,
                 )
-                return fn(*args, **kwargs)
+            return as_user
 
+        if inspect.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)
+            async def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> Any:
+                as_user = user_of(*args, **kwargs)
+                if as_user is None:
+                    return await fn(*args, **kwargs)
+                tenant_id = _decorated_call_tenant_id(as_user, qualname)
+                ctx = (
+                    async_admin_context() if tenant_id is None else async_tenant_context(tenant_id)
+                )
+                async with ctx:
+                    return await fn(*args, **kwargs)
+
+            # mypy cannot express "R is a coroutine" for the async branch.
+            return cast("Callable[P, R]", async_wrapper)
+
+        @functools.wraps(fn)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            as_user = user_of(*args, **kwargs)
+            if as_user is None:
+                return _reject_coroutine(fn(*args, **kwargs), qualname)
+            tenant_id = _decorated_call_tenant_id(as_user, qualname)
+            ctx = admin_context() if tenant_id is None else tenant_context(tenant_id)
             with ctx:
-                return fn(*args, **kwargs)
+                return _reject_coroutine(fn(*args, **kwargs), qualname)
 
         return wrapper
 

@@ -228,20 +228,22 @@ up through middleware and context managers.
 
 ### Tier 4: Async-safe decorator and testing helpers
 
-- [ ] **Async-aware `@with_rls_context`** — Detect whether the decorated
-  function is a coroutine and return an async wrapper that uses
-  `async_tenant_context()` / `async_admin_context()` instead of the sync
-  variants.
-  *Why:* The current decorator wraps the return value in a sync context
-  manager. Decorating an `async def` view silently returns the coroutine
-  object without awaiting it — a data-leak risk since no RLS context is
-  established.
+- [x] **Async-aware `@with_rls_context`** — An `async def` function gets an
+  `async def` wrapper that enters `async_tenant_context()` /
+  `async_admin_context()` around the awaited body (#39). Generator functions
+  are rejected at decoration time, and a sync-wrapped function that returns a
+  coroutine raises `TypeError`.
+  *Why:* The sync wrapper left the context before the coroutine ran, so the
+  body ran under the caller's context: inside an outer admin context, a
+  coroutine decorated for a tenant user saw every tenant.
 
-- [ ] **Async testing helpers** — `async_rls_bypass()`, `async_rls_as_tenant()`,
-  and async variants of assertion helpers for use in async test functions.
-  *Why:* Async test suites (e.g., `pytest-asyncio`) cannot use sync context
-  managers without `sync_to_async` wrappers. First-class async helpers
-  remove boilerplate and ensure correct usage.
+- [x] **Async testing helpers** — `async_rls_bypass()`, `async_rls_as_tenant()`,
+  `aassert_rls_enabled()`, `aassert_rls_policy_exists()` and
+  `aassert_rls_blocks_without_context()` for `async def` tests (#40).
+  *Why:* The sync helpers cannot run in an `async def` test (their database
+  calls raise `SynchronousOnlyOperation`), and wrapping a `@contextmanager`
+  in `sync_to_async` breaks the generator protocol. First-class async
+  helpers remove that boilerplate and ensure correct usage.
 
 ### Tier 5: Connection-affinity safety net
 

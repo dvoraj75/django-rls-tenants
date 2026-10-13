@@ -143,6 +143,9 @@ def process_order(request, as_user):
     ...
 ```
 
+It works on `async def` functions too (in an async view, pass `await request.auser()`,
+not `request.user`); see [Async Functions](context-managers.md#async-functions).
+
 ## Non-User Objects
 
 The protocol is structural, so any object with the right properties works. This is

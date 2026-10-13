@@ -163,6 +163,9 @@ The generic layer has the same pair, `async_rls_context()` and `async_bypass_fla
 the primitives `aset_guc()`, `aget_guc()`, `aclear_guc()` and `arestore_guc()` (see the
 [API reference](../reference/api.md#async-guc-helpers)).
 
+For tests, the testing helpers have async counterparts. [Async Tests](testing.md#async-tests)
+also explains which database connection an `async def` test uses.
+
 ### `USE_LOCAL_SET=True` in async code
 
 `SET LOCAL` needs `transaction.atomic()` open on the thread that runs the database calls,
@@ -226,11 +229,92 @@ def process_order(request, as_user):
 
 ### How It Works
 
-1. At **decoration time**: caches `inspect.signature()` of the wrapped function.
-2. At **call time**: extracts the user argument by name from `*args`/`**kwargs`.
-3. If the user is an **admin** (`is_tenant_admin=True`): wraps in `admin_context()`.
-4. If the user is a **tenant user**: wraps in `tenant_context(user.rls_tenant_id)`.
+1. At **decoration time**: rejects generator functions (see
+   [What the Decorator Rejects](#what-the-decorator-rejects)), caches
+   `inspect.signature()` of the wrapped function, and picks an `async def` wrapper for an
+   `async def` function (see [Async Functions](#async-functions)), a plain one otherwise.
+2. At **call time** (for an `async def`, when the call is awaited): extracts the user
+   argument by name from `*args`/`**kwargs`.
+3. If the user is an **admin** (`is_tenant_admin=True`): wraps in `admin_context()`
+   (`async_admin_context()` for an `async def`).
+4. If the user is a **tenant user**: wraps in `tenant_context(user.rls_tenant_id)`
+   (`async_tenant_context()` for an `async def`).
 5. If the user is **`None`**: logs a warning and proceeds without context (fail-closed).
+
+### Async Functions
+
+*Added in 1.4.0.* On an `async def` function the decorator returns an `async def`
+wrapper, which enters `async_admin_context()` or `async_tenant_context()` around the
+awaited body, so the context covers every `await` in it:
+
+```python
+from django.contrib.auth.decorators import login_required
+
+
+@with_rls_context
+async def order_count(as_user):
+    return await Order.objects.acount()
+
+
+@login_required  # an AnonymousUser has no is_tenant_admin / rls_tenant_id
+async def dashboard(request):
+    user = await request.auser()
+    return JsonResponse({"orders": await order_count(as_user=user)})
+```
+
+- The wrapper is itself a coroutine function, so Django (async views and async-aware
+  decorators such as `@require_GET`) and `asyncio` treat the decorated function as async.
+- Calling the function only creates the coroutine. The user argument is read, the context
+  entered, the body run and the context restored when it is awaited, all in the awaiting
+  task. A `NoTenantContextError` for a non-admin user without a tenant is raised by the
+  `await`.
+- `is_tenant_admin` and `rls_tenant_id` are read in the coroutine, so they must not query
+  the database. Pass a loaded user: in an async view use `await request.auser()`, not
+  `request.user`, a lazy object that queries on first access and raises
+  `SynchronousOnlyOperation` in async code.
+- Everything in [Async Code](#async-code) applies: one thread hop on entry and one on exit,
+  the [`USE_LOCAL_SET=True` limitation](#use_local_settrue-in-async-code), and
+  [one context per task](#one-context-per-task). In particular, do not run decorated calls
+  for different users concurrently, as in
+  `asyncio.gather(order_count(as_user=a), order_count(as_user=b))`: the tasks share the
+  request's connection, so raw SQL and M2M through tables can see the other user's rows.
+
+!!! warning "Before 1.4.0"
+    The decorator always returned a sync wrapper. On an `async def` it entered and left the
+    context before the coroutine ran, so the body ran under the caller's context instead.
+    Called from synchronous code inside `admin_context()` (for example through
+    `async_to_sync`), a coroutine decorated for a tenant user saw **every tenant's rows**.
+    Awaited from async code, the call failed with `SynchronousOnlyOperation` (#39).
+
+### What the Decorator Rejects
+
+Both cases below raise `TypeError` instead of running a body outside the context.
+
+- **Generator functions**, sync (`def` with `yield`) or async (`async def` with `yield`),
+  fail at decoration time. A generator's body runs while the caller iterates, after the
+  decorated call has returned, so no wrapper can keep a context around it. Enter the
+  context inside the generator instead:
+
+    ```python
+    def export_orders(as_user):
+        if as_user.is_tenant_admin:
+            ctx = admin_context()
+        else:
+            ctx = tenant_context(as_user.rls_tenant_id)
+        with ctx:
+            yield from Order.objects.iterator()
+    ```
+
+    While the generator is suspended between items, its context is active for the caller
+    too, and it is only restored when the generator finishes or is closed. Iterate it to
+    the end, or close it (`contextlib.closing()`; Django closes a `StreamingHttpResponse`
+    body for you).
+
+- **A coroutine returned by a function the decorator saw as synchronous** fails at call
+  time, after the coroutine is closed. This happens for an object with
+  `async def __call__`, or for an `async def` under another decorator that returns a plain
+  function. Put `@with_rls_context` directly on the `async def`, as the innermost
+  decorator.
 
 ### Default Parameter Name
 
@@ -311,7 +395,8 @@ with admin_context():
 ```
 
 The `@with_rls_context` decorator also establishes an active context when a valid
-user argument is provided, so decorated functions pass the strict mode check.
+user argument is provided, so decorated functions pass the strict mode check (for an
+`async def`, for the whole awaited body).
 `async_tenant_context()` and `async_admin_context()` set the flag in the coroutine, so the
 async ORM passes the check inside them too (see [Async Code](#async-code)).
 

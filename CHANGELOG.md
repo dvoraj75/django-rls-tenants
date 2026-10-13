@@ -31,6 +31,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside a synchronous `transaction.atomic()`. Use one context per task: sibling tasks
   of one request share its connection, so `asyncio.gather` across tenants is not safe
   for raw SQL. No behaviour change for sync code.
+- **Async testing helpers** (#40). `django_rls_tenants.tenants.testing` gains
+  `async_rls_bypass()` and `async_rls_as_tenant()` for `async with`, plus
+  `aassert_rls_enabled()`, `aassert_rls_policy_exists()` and
+  `aassert_rls_blocks_without_context()`. They take the same arguments as their sync
+  counterparts. The context managers wrap `async_admin_context()` and
+  `async_tenant_context()`, and each assertion runs its sync version in one
+  thread-sensitive hop. A new "Async Tests" section in the testing guide explains which
+  connection an async test uses. Django `TestCase` `async def` methods, and sync tests
+  that drive a coroutine with `async_to_sync`, share the test's transaction.
+  pytest-asyncio and anyio tests run on a separate connection outside the test
+  transaction. With plain `django_db`, their fixture rows are invisible and their writes
+  are committed.
 - **Django 6.1 support** (#114), with classifiers and CI legs.
 - **Explicit PostgreSQL 15–18 support** (#114). The requirements tables list every
   supported major; CI runs 16 by default and 15 and 18 as the edges.
@@ -65,6 +77,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overrides `process_request` or `process_response` keeps the 1.3.4 hook-based path, so
   its hooks still run under ASGI. The WSGI path, streaming bodies (iterated after cleanup,
   fail-closed) and the `USE_LOCAL_SET=True` refusal under ASGI are unchanged.
+- **`@with_rls_context` rejects generator functions and coroutine results** (#39).
+  Decorating a generator or async generator function now raises `TypeError` at
+  decoration time: its body runs while the caller iterates, after the decorator has left
+  the context, so it never ran under the decorated user's context. A function decorated
+  as synchronous that returns a coroutine (an object with `async def __call__`, or an
+  `async def` under a decorator that hides it) now raises `TypeError` when called, after
+  closing the coroutine. Enter the context inside the generator or coroutine instead.
 
 ### Fixed
 
@@ -79,6 +98,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`RemovedInDjango2029Warning`). `RLSTenantMiddleware` now imports from the new location
   when it exists and falls back to the old one on Django 5.2–6.1, so the warning never
   points at this library.
+- **`@with_rls_context` on `async def` functions** (#39). The decorator now returns an
+  `async def` wrapper for coroutine functions, which enters `async_tenant_context()` /
+  `async_admin_context()` around the awaited body. Before, the sync wrapper entered and
+  left the context before the coroutine ran, so the body ran under the caller's context:
+  called from synchronous code inside `admin_context()` (for example via
+  `async_to_sync`), a coroutine decorated for a tenant user saw every tenant's rows, and
+  awaited from async code the call failed with `SynchronousOnlyOperation`.
+- **`@with_rls_context` type signature** (#39). Type checkers saw the decorator return a
+  union of "the decorated function" and "a decorator", so every call to a decorated
+  function failed type checking, and `@with_rls_context(user_param=...)` turned it into
+  `(*Never, **Never) -> Never`. Two `@overload`s now give each form its exact type: the
+  decorated function keeps its signature and return type (a coroutine for `async def`).
 
 ## [1.3.4] - 2026-10-12
 
