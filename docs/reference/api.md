@@ -202,6 +202,21 @@ the tenant switcher, and the middleware interaction.
 
 ::: django_rls_tenants.tenants.testing.assert_rls_blocks_without_context
 
+#### Async Testing Helpers
+
+For `async def` tests. Under each test style, the connection these helpers use is described
+in [Async Tests](../guides/testing.md#async-tests).
+
+::: django_rls_tenants.tenants.testing.async_rls_bypass
+
+::: django_rls_tenants.tenants.testing.async_rls_as_tenant
+
+::: django_rls_tenants.tenants.testing.aassert_rls_enabled
+
+::: django_rls_tenants.tenants.testing.aassert_rls_policy_exists
+
+::: django_rls_tenants.tenants.testing.aassert_rls_blocks_without_context
+
 ---
 
 ## Contrib
