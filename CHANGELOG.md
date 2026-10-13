@@ -44,12 +44,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   example Dockerfile) and names each one that disagrees. Excluded from the sdist, since
   it reads files the sdist does not ship. The test suite also turns every Django
   deprecation warning into an error.
+- **Weekly canary workflow** (`.github/workflows/canary.yml`, #114): Django `main`, the
+  next Python (3.15) and the next PostgreSQL (19 beta). It blocks nothing; a red run
+  means a matrix review is due.
 
 ### Changed
 
 - `requires-python` is now `>=3.12` and the dependency `django>=5.2` (#114). The lockfile
-  moves to Django 6.1.2 (django-stubs 6.1.2, mypy 2.4.0); the example Docker image
-  installs Django 6.1.
+  moves to Django 6.1.2 (django-stubs 6.1.2, mypy 2.4.0) and psycopg2-binary 2.9.13 (the
+  first release with Python 3.15 wheels); the example Docker image installs Django 6.1.
 
 ### Fixed
 

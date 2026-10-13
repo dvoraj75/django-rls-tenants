@@ -281,6 +281,12 @@ a test matrix across Python {3.12, 3.13, 3.14} × Django {5.2, 6.0, 6.1} on Post
 `tests/conftest.py` also turns every Django `RemovedIn*Warning` into a test error, so the
 newest Django leg fails as soon as Django deprecates something the library calls.
 
+A weekly **canary** (`.github/workflows/canary.yml`, Mondays 06:00 UTC and on demand) runs
+the suite against Django `main`, the next Python and the next PostgreSQL (a beta or RC
+image). It blocks nothing; a red run means a matrix review is due. Its versions are
+single-value matrix entries with "bump me" comments, and the drift test checks they stay
+newer than the supported matrix.
+
 ### Supported versions
 
 The policy lives in `docs/getting-started/installation.md` (`## Supported versions`):

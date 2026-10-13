@@ -1,0 +1,161 @@
+# Weekly canary: the suite against versions just beyond the supported matrix.
+# Failures here block nothing; they say a matrix review is due (see the
+# supported-versions policy in docs/getting-started/installation.md).
+#
+# The jobs are independent, so one red job never stops the others. They do not
+# set continue-on-error: that would mark a failed run green and silence GitHub's
+# scheduled-run failure notification, which is the whole signal.
+name: Canary
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The newest supported Django series; tests/test_support_matrix.py keeps it in step.
+  DJANGO_SERIES: "6.1"
+  # Zero-skipped rule: a skipped RLS test must fail the leg (tests/conftest.py).
+  RLS_FAIL_ON_SKIPPED: "1"
+  DATABASE_URL: postgres://postgres:postgres@localhost:5432/django_rls_tenants_test
+
+jobs:
+  django-main:
+    name: Canary (Django main)
+    runs-on: ubuntu-latest
+    env:
+      UV_PYTHON: "3.14"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: django_rls_tenants_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install "$UV_PYTHON"
+
+      - name: Install dependencies
+        run: |
+          uv sync --locked --no-default-groups --group test
+          uv pip install --python .venv/bin/python "git+https://github.com/django/django.git@main"
+
+      - name: Show versions
+        # Do not let uv re-sync Django to the lockfile version after the override.
+        run: >-
+          uv run --no-sync python -c "import django, sys;
+          print(f'Python {sys.version.split()[0]}, Django {django.get_version()}')"
+
+      - name: Run tests
+        run: uv run --no-sync python -m pytest --no-cov
+
+  python-next:
+    name: Canary (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Bump when the next Python appears. uv may install a release candidate
+        # until the final release lands in its index.
+        python-version: ["3.15"]
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: django_rls_tenants_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          uv sync --locked --no-default-groups --group test
+          uv pip install --python .venv/bin/python "django~=${DJANGO_SERIES}.0"
+
+      - name: Show versions
+        run: >-
+          uv run --no-sync python -c "import django, sys;
+          print(f'Python {sys.version.split()[0]}, Django {django.get_version()}')"
+
+      - name: Run tests
+        run: uv run --no-sync python -m pytest --no-cov
+
+  postgres-next:
+    name: Canary (PostgreSQL ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Bump to 19rc1 / 19 as Docker Hub publishes them. A single-value matrix
+        # because service containers cannot read env.
+        postgres: ["19beta2"]
+    env:
+      UV_PYTHON: "3.14"
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: django_rls_tenants_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install "$UV_PYTHON"
+
+      - name: Install dependencies
+        run: |
+          uv sync --locked --no-default-groups --group test
+          uv pip install --python .venv/bin/python "django~=${DJANGO_SERIES}.0"
+
+      - name: Show versions
+        run: >-
+          uv run --no-sync python -c "import django, sys;
+          print(f'Python {sys.version.split()[0]}, Django {django.get_version()}')"
+
+      - name: Run tests
+        run: uv run --no-sync python -m pytest --no-cov
