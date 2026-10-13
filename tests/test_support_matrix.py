@@ -204,6 +204,33 @@ def test_ci_coverage_gate_names_a_real_leg():
         )
 
 
+def test_canary_runs_beyond_the_matrix():
+    """The canary must stay one step ahead, so a matrix bump reminds you to move it."""
+    rel = ".github/workflows/canary.yml"
+    workflow = _workflow(rel)
+    jobs = workflow["jobs"]
+
+    assert workflow["env"]["DJANGO_SERIES"] == _max(DJANGO), (
+        f"{rel}: DJANGO_SERIES is {workflow['env']['DJANGO_SERIES']!r}, "
+        f"expected the newest supported series {_max(DJANGO)!r}"
+    )
+    (python_next,) = jobs["python-next"]["strategy"]["matrix"]["python-version"]
+    assert _key(python_next) > _key(_max(PYTHON)), (
+        f"{rel}: python-next runs {python_next}, which is not newer than {_max(PYTHON)}"
+    )
+    (postgres_next,) = jobs["postgres-next"]["strategy"]["matrix"]["postgres"]
+    major = re.match(r"\d+", postgres_next)
+    assert major, f"{rel}: postgres-next tag {postgres_next!r} does not start with a major"
+    assert int(major.group()) > int(_max(POSTGRES)), (
+        f"{rel}: postgres-next runs {postgres_next}, which is not newer than {_max(POSTGRES)}"
+    )
+    for job in ("django-main", "postgres-next"):
+        python = jobs[job]["env"]["UV_PYTHON"]
+        assert python == _max(PYTHON), (
+            f"{rel}: {job} runs Python {python}, expected the newest supported {_max(PYTHON)}"
+        )
+
+
 # --- README and docs --------------------------------------------------------------------
 
 

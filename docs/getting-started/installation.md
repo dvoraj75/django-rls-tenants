@@ -27,6 +27,9 @@ will be added or dropped.
 - **Driver:** psycopg 3 and psycopg2 both run in CI for as long as Django supports
   both. The library has no driver-specific code.
 
+A weekly canary job runs the test suite against Django's development branch, the next
+Python and the next PostgreSQL, so new versions are checked before they are added.
+
 Django moves to year-based version numbers in 2028 ("Django 2028"). Here, a *series*
 means one feature release, whatever its number.
 

@@ -196,6 +196,11 @@ The supported-versions policy lives in the
 matrix, edit the constants at the top of that test first; it then names every file
 that still states the old versions.
 
+A weekly **canary** workflow (Mondays, or run it by hand from the Actions tab) runs the
+suite against Django `main`, the next Python and the next PostgreSQL release. It blocks
+nothing: a red run means an upcoming version breaks something and a matrix review is
+due before that version lands in the supported list.
+
 Publishing a GitHub release runs a **preflight** job before anything else: the tag must
 be `vX.Y.Z`, `X.Y.Z` must equal `version` in `pyproject.toml`, and `CHANGELOG.md` must
 contain a `## [X.Y.Z]` heading. Make the release commit (version bump + changelog

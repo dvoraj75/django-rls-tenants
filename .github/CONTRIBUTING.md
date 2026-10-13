@@ -102,7 +102,9 @@ the release workflow refuses a tag whose version has no `## [X.Y.Z]` heading in
 
 The supported-versions policy lives in the
 [installation guide](https://dvoraj75.github.io/django-rls-tenants/getting-started/installation/#supported-versions);
-`tests/test_support_matrix.py` fails when any file disagrees with it.
+`tests/test_support_matrix.py` fails when any file disagrees with it. A weekly canary
+workflow runs the suite against Django `main`, the next Python and the next PostgreSQL;
+it blocks nothing, and a red run means a matrix review is due.
 
 ### Test Organization
 
