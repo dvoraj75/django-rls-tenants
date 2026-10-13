@@ -167,3 +167,18 @@ class TestWithRlsContextAnnotations:
             return "result"
 
         assert not inspect.iscoroutinefunction(my_service_function)
+
+    def test_overloads_type_both_forms(self):
+        """Overloads give type checkers one precise type per form (#39).
+
+        With only the implementation signature, a type checker saw
+        ``@with_rls_context`` return ``Callable[P, R] | Callable[[...], ...]``, so
+        calling the decorated function failed type checking, and
+        ``@with_rls_context(user_param=...)`` left ``P`` and ``R`` unsolved
+        (``Never``). Checked with mypy --strict and ty on a user-code probe.
+        """
+        bare, factory = typing.get_overloads(with_rls_context)
+        assert bare.__annotations__["func"] == "Callable[P, R]"
+        assert bare.__annotations__["return"] == "Callable[P, R]"
+        assert factory.__annotations__["func"] == "None"
+        assert factory.__annotations__["return"] == "Callable[[Callable[P, R]], Callable[P, R]]"

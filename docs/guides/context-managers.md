@@ -245,11 +245,15 @@ wrapper, which enters `async_admin_context()` or `async_tenant_context()` around
 awaited body, so the context covers every `await` in it:
 
 ```python
+from django.contrib.auth.decorators import login_required
+
+
 @with_rls_context
 async def order_count(as_user):
     return await Order.objects.acount()
 
 
+@login_required  # an AnonymousUser has no is_tenant_admin / rls_tenant_id
 async def dashboard(request):
     user = await request.auser()
     return JsonResponse({"orders": await order_count(as_user=user)})
@@ -267,7 +271,10 @@ async def dashboard(request):
   `SynchronousOnlyOperation` in async code.
 - Everything in [Async Code](#async-code) applies: one thread hop on entry and one on exit,
   the [`USE_LOCAL_SET=True` limitation](#use_local_settrue-in-async-code), and
-  [one context per task](#one-context-per-task).
+  [one context per task](#one-context-per-task). In particular, do not run decorated calls
+  for different users concurrently, as in
+  `asyncio.gather(order_count(as_user=a), order_count(as_user=b))`: the tasks share the
+  request's connection, so raw SQL and M2M through tables can see the other user's rows.
 
 !!! warning "Before 1.4.0"
     The decorator always returned a sync wrapper. On an `async def` it entered and left the
@@ -287,9 +294,18 @@ Both cases below raise `TypeError` instead of running a body outside the context
 
     ```python
     def export_orders(as_user):
-        with tenant_context(as_user.rls_tenant_id):
+        if as_user.is_tenant_admin:
+            ctx = admin_context()
+        else:
+            ctx = tenant_context(as_user.rls_tenant_id)
+        with ctx:
             yield from Order.objects.iterator()
     ```
+
+    While the generator is suspended between items, its context is active for the caller
+    too, and it is only restored when the generator finishes or is closed. Iterate it to
+    the end, or close it (`contextlib.closing()`; Django closes a `StreamingHttpResponse`
+    body for you).
 
 - **A coroutine returned by a function the decorator saw as synchronous** fails at call
   time, after the coroutine is closed. This happens for an object with

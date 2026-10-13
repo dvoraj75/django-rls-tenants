@@ -1200,6 +1200,22 @@ def test_async_decorated_call_restores_outer_scope(guc_mode):
         assert get_current_tenant_id() == 101
 
 
+@pytest.mark.django_db(transaction=True)
+def test_async_decorated_admin_call_does_not_leak_bypass(guc_mode):
+    """An admin-decorated coroutine inside a tenant block leaves no admin bypass behind."""
+    from django.db import transaction  # noqa: PLC0415
+
+    admin = MagicMock()
+    admin.is_tenant_admin = True
+    admin.rls_tenant_id = None
+    with transaction.atomic(), tenant_context(101):
+        assert async_to_sync(_decorated_scope)(as_user=admin) == (("true", None), None, True)
+        assert get_guc("rls.is_admin") == "false"
+        assert get_guc("rls.current_tenant") == "101"
+        assert get_current_tenant_id() == 101
+        assert get_rls_context_active() is True
+
+
 class TestWithRlsContextRejectsGenerators:
     """Generator bodies run after the wrapper returns, so decorating one is an error (#39)."""
 

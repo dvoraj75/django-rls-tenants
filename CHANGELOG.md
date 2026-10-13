@@ -81,6 +81,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   called from synchronous code inside `admin_context()` (for example via
   `async_to_sync`), a coroutine decorated for a tenant user saw every tenant's rows, and
   awaited from async code the call failed with `SynchronousOnlyOperation`.
+- **`@with_rls_context` type signature** (#39). Type checkers saw the decorator return a
+  union of "the decorated function" and "a decorator", so every call to a decorated
+  function failed type checking, and `@with_rls_context(user_param=...)` turned it into
+  `(*Never, **Never) -> Never`. Two `@overload`s now give each form its exact type: the
+  decorated function keeps its signature and return type (a coroutine for `async def`).
 
 ## [1.3.4] - 2026-10-12
 

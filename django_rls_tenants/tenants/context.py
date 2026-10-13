@@ -12,7 +12,7 @@ import functools
 import inspect
 import logging
 from contextlib import asynccontextmanager, contextmanager
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, cast, overload
 
 from asgiref.sync import sync_to_async
 from django.db import connections
@@ -413,13 +413,29 @@ def _reject_coroutine[T](result: T, qualname: str) -> T:
         result.close()
         msg = (
             f"@with_rls_context: {qualname} returned a coroutine, but it was decorated as a "
-            "synchronous function, so the RLS context would be gone before the coroutine "
-            "runs. Decorate the async def function itself (directly, or under decorators "
-            "that keep it a coroutine function), or use async_tenant_context() / "
-            "async_admin_context() inside it."
+            "synchronous function, so the coroutine would run after the decorator has "
+            "returned, outside the RLS context it manages. Decorate the async def function "
+            "itself (directly, or under decorators that keep it a coroutine function), or use "
+            "async_tenant_context() / async_admin_context() inside it."
         )
         raise TypeError(msg)
     return result
+
+
+@overload
+def with_rls_context[**P, R](
+    func: Callable[P, R],
+    *,
+    user_param: str | None = None,
+) -> Callable[P, R]: ...
+
+
+@overload
+def with_rls_context[**P, R](
+    func: None = None,
+    *,
+    user_param: str | None = None,
+) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
 
 def with_rls_context[**P, R](
