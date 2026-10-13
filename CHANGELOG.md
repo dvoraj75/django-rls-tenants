@@ -65,6 +65,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `requires-python` is now `>=3.12` and the dependency `django>=5.2` (#114). The lockfile
   moves to Django 6.1.2 (django-stubs 6.1.2, mypy 2.4.0) and psycopg2-binary 2.9.13 (the
   first release with Python 3.15 wheels); the example Docker image installs Django 6.1.
+- **`RLSTenantMiddleware` serves ASGI requests on its own async path** (#38). A
+  hand-written `__acall__` replaces `MiddlewareMixin.__acall__`: one thread-sensitive hop
+  reads `request.user` and sets the GUCs on every alias, the tenant `ContextVar`s are set
+  and reset with their own tokens in the request coroutine, and one hop clears the GUCs
+  (none if `process_exception` already did). Django has no asynchronous database cursor,
+  so the GUC work still runs in those hops; the gain is correctness: the #58 token problem
+  cannot occur, and a context active around the middleware is restored instead of
+  cleared. A cancellation during the entry hop is undone. `process_exception` still ends
+  the context before Django builds the error response on another thread. A subclass that
+  overrides `process_request` or `process_response` keeps the 1.3.4 hook-based path, so
+  its hooks still run under ASGI. The WSGI path, streaming bodies (iterated after cleanup,
+  fail-closed) and the `USE_LOCAL_SET=True` refusal under ASGI are unchanged.
 - **`@with_rls_context` rejects generator functions and coroutine results** (#39).
   Decorating a generator or async generator function now raises `TypeError` at
   decoration time: its body runs while the caller iterates, after the decorator has left

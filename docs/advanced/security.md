@@ -182,7 +182,8 @@ another if cleanup fails.
 
 Mitigations:
 
-- **Default behavior**: middleware clears GUCs in `process_response`.
+- **Default behavior**: middleware clears GUCs in `process_response` (WSGI) or at the end
+  of its async path (ASGI).
 - **Safety net**: `request_finished` signal clears GUCs if `process_response` is skipped.
 - **USE_LOCAL_SET**: `SET LOCAL` scopes GUCs to the transaction, preventing leaks.
 

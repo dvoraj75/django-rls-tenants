@@ -214,16 +214,17 @@ up through middleware and context managers.
 
 ### Tier 3: Async middleware (`tenants/middleware.py`)
 
-- [ ] **Async-native `RLSTenantMiddleware`** — Add `__acall__` (or the
-  Django 4.1+ async middleware pattern) so the middleware runs natively in
-  the ASGI event loop. GUC operations still need a thread-sensitive hop
-  (`aset_guc()`/`aclear_guc()`), since Django has no async cursor.
-  *Why:* The current `MiddlewareMixin`-based middleware works under ASGI
-  but forces a sync-to-async thread-hop per request. For high-concurrency
-  ASGI deployments, this adds latency and limits throughput. A native async
-  path eliminates the thread-pool bottleneck.
-  *Constraint:* Must remain backward-compatible — sync WSGI deployments
-  must continue working identically.
+- [x] **Async-native `RLSTenantMiddleware`** — A hand-written `__acall__` replaces
+  `MiddlewareMixin.__acall__` under ASGI (#38). One thread-sensitive hop reads
+  `request.user` and sets the GUCs, the tenant `ContextVar`s are set and reset with their
+  own tokens in the request coroutine, and one hop clears the GUCs. Django has no async
+  cursor, so the GUC work still needs those hops.
+  *Why:* `MiddlewareMixin.__acall__` ran the hooks in separate hops, each in its own copy
+  of the request context, which broke the token resets (#58; 1.3.4 added a fallback).
+  Setting the state in the request coroutine fixes that by construction and restores an
+  outer context instead of clearing it. The gain is correctness, not throughput.
+  *Constraint:* Sync WSGI deployments work exactly as before; `USE_LOCAL_SET=True` stays
+  WSGI-only.
 
 ### Tier 4: Async-safe decorator and testing helpers
 

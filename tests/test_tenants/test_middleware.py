@@ -5,16 +5,21 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
+import time
 from functools import partial
 from unittest.mock import MagicMock, call, patch
 
 import pytest
 from asgiref.sync import async_to_sync, iscoroutinefunction, sync_to_async
-from django.db import connection
+from django.core.signals import request_finished
+from django.db import OperationalError, close_old_connections, connection
+from django.http import HttpRequest
 from django.test import override_settings
+from django.utils.functional import SimpleLazyObject
 
-from django_rls_tenants.exceptions import RLSConfigurationError
+from django_rls_tenants.exceptions import NoTenantContextError, RLSConfigurationError
 from django_rls_tenants.rls.guc import get_guc, set_guc
+from django_rls_tenants.tenants import middleware as middleware_module
 from django_rls_tenants.tenants.conf import RLSTenantsConfig
 from django_rls_tenants.tenants.middleware import (
     RLSTenantMiddleware,
@@ -572,7 +577,12 @@ def _hop(func, *args):
 
 
 class TestTokenResetAcrossContexts:
-    """#58: tokens created in one sync_to_async hop are reset in another under ASGI."""
+    """#58: tokens created in one sync_to_async hop are reset in another under ASGI.
+
+    Since #38 the ``_run_async_middleware`` and cancellation tests run the native
+    ``__acall__``. The ``_hop`` tests cover the fallback that the hook-based path,
+    still used by subclasses that override the sync hooks, depends on.
+    """
 
     @staticmethod
     def _run_async_middleware(user):
@@ -774,3 +784,420 @@ class TestProcessExceptionRollback:
     )
     def test_session_mode_allows_downstream_exception_handlers(self):
         RLSTenantMiddleware(get_response=lambda r: MagicMock())
+
+
+# ---- Native async path (#38) ----
+
+
+def _async_mw(aget_response):
+    """Build the middleware the way Django does for an async downstream chain."""
+    mw = RLSTenantMiddleware(get_response=aget_response)
+    assert iscoroutinefunction(mw) is True
+    return mw
+
+
+def _record_hops(monkeypatch):
+    """Record the name of every function the middleware runs through ``sync_to_async``."""
+    hops = []
+    real = middleware_module.sync_to_async
+
+    def recording(func, *args, **kwargs):
+        hops.append(func.__name__)
+        return real(func, *args, **kwargs)
+
+    monkeypatch.setattr(middleware_module, "sync_to_async", recording)
+    return hops
+
+
+def _state():
+    return get_current_tenant_id(), get_rls_context_active(), _were_gucs_set()
+
+
+_AUTH_SIDE_EFFECT = contextvars.ContextVar("auth_side_effect", default=None)
+
+
+def _assert_async_request_left_nothing_behind():
+    assert _state() == (None, False, False)
+    assert get_guc("rls.current_tenant") is None
+    assert get_guc("rls.is_admin") is None
+
+
+class TestNativeAsyncPath:
+    """``__acall__`` serves ASGI requests itself instead of ``MiddlewareMixin.__acall__``."""
+
+    def test_sync_hooks_are_not_used(self, tenant_a_user):
+        async def aget_response(request):
+            return MagicMock(name="response")
+
+        with (
+            patch.object(RLSTenantMiddleware, "process_request", side_effect=AssertionError),
+            patch.object(RLSTenantMiddleware, "process_response", side_effect=AssertionError),
+        ):
+            response = async_to_sync(_async_mw(aget_response))(_make_request(user=tenant_a_user))
+
+        assert response._mock_name == "response"
+        _assert_async_request_left_nothing_behind()
+
+    def test_state_is_visible_in_downstream_hops(self, tenant_a_user):
+        """Sync code run by the chain (sync views, the ORM) sees the request's state."""
+        seen = {}
+
+        async def aget_response(request):
+            seen["hop"] = await sync_to_async(_state, thread_sensitive=True)()
+            return MagicMock()
+
+        async_to_sync(_async_mw(aget_response))(_make_request(user=tenant_a_user))
+
+        assert seen["hop"] == (tenant_a_user.rls_tenant_id, True, True)
+        _assert_async_request_left_nothing_behind()
+
+    def test_one_hop_on_entry_and_one_on_exit(self, tenant_a_user, monkeypatch):
+        hops = _record_hops(monkeypatch)
+
+        async def aget_response(request):
+            assert hops == ["_enter_request_gucs"]
+            return MagicMock()
+
+        async_to_sync(_async_mw(aget_response))(_make_request(user=tenant_a_user))
+
+        assert hops == ["_enter_request_gucs", "_clear_request_gucs"]
+
+    @pytest.mark.parametrize(
+        "user", [MagicMock(is_authenticated=False), None], ids=["anonymous", "no-user"]
+    )
+    def test_unauthenticated_request_makes_one_hop_and_sets_nothing(self, user, monkeypatch):
+        hops = _record_hops(monkeypatch)
+        seen = {}
+
+        async def aget_response(request):
+            seen["state"] = _state()
+            return MagicMock()
+
+        async_to_sync(_async_mw(aget_response))(_make_request(user=user))
+
+        assert seen["state"] == (None, False, False)
+        assert hops == ["_enter_request_gucs"]
+        _assert_async_request_left_nothing_behind()
+
+    def test_contextvars_set_while_resolving_the_user_reach_the_view(self, tenant_a_user):
+        """An auth backend's ContextVar writes survive the enter hop, as with process_request."""
+
+        def load_user():
+            _AUTH_SIDE_EFFECT.set("set by the auth backend")
+            return tenant_a_user
+
+        # A real HttpRequest: MagicMock.__setattr__ would evaluate the lazy object.
+        request = HttpRequest()
+        request.user = SimpleLazyObject(load_user)
+        seen = {}
+
+        async def aget_response(request):
+            seen["side_effect"] = _AUTH_SIDE_EFFECT.get()
+            seen["tenant_id"] = get_current_tenant_id()
+            return MagicMock()
+
+        async_to_sync(_async_mw(aget_response))(request)
+
+        assert seen == {
+            "side_effect": "set by the auth backend",
+            "tenant_id": tenant_a_user.rls_tenant_id,
+        }
+        _assert_async_request_left_nothing_behind()
+
+    @pytest.mark.parametrize(("outer_tenant", "outer_active"), [(None, False), (999, True)])
+    def test_tokens_restore_the_outer_context(
+        self, tenant_a_user, outer_tenant, outer_active, caplog
+    ):
+        """The tokens are reset in their own context: no #58 fallback, outer values return."""
+        tenant_token = set_current_tenant_id(outer_tenant)
+        active_token = set_rls_context_active(outer_active)
+        try:
+
+            async def aget_response(request):
+                assert get_current_tenant_id() == tenant_a_user.rls_tenant_id
+                return MagicMock()
+
+            with caplog.at_level(logging.DEBUG, logger="django_rls_tenants"):
+                async_to_sync(_async_mw(aget_response))(_make_request(user=tenant_a_user))
+
+            assert get_current_tenant_id() == outer_tenant
+            assert get_rls_context_active() is outer_active
+            assert not any("belongs to another Context" in m for m in caplog.messages)
+        finally:
+            reset_current_tenant_id(tenant_token)
+            reset_rls_context_active(active_token)
+
+    def test_logs_set_and_clear_at_debug(self, tenant_a_user, caplog):
+        async def aget_response(request):
+            return MagicMock()
+
+        with caplog.at_level(logging.DEBUG, logger="django_rls_tenants"):
+            async_to_sync(_async_mw(aget_response))(_make_request(user=tenant_a_user))
+
+        assert any("Middleware set GUCs" in m for m in caplog.messages)
+        assert any("Middleware cleared GUCs" in m for m in caplog.messages)
+
+    def test_process_exception_ends_context_before_error_handlers(
+        self, tenant_a_user, monkeypatch
+    ):
+        """Django runs process_exception in its own hop; error handlers then see no context."""
+        hops = _record_hops(monkeypatch)
+        seen = {}
+
+        async def aget_response(request):
+            # What BaseHandler._get_response_async does when the view raises.
+            await sync_to_async(mw.process_exception, thread_sensitive=True)(
+                request, RuntimeError("boom")
+            )
+            seen["state"] = _state()
+            seen["guc"] = await sync_to_async(get_guc, thread_sensitive=True)("rls.current_tenant")
+            return MagicMock(status_code=500)
+
+        mw = _async_mw(aget_response)
+        async_to_sync(mw)(_make_request(user=tenant_a_user))
+
+        assert seen == {"state": (None, False, False), "guc": None}
+        # process_exception already cleared the GUCs, so no exit hop is needed.
+        assert hops == ["_enter_request_gucs"]
+        _assert_async_request_left_nothing_behind()
+
+    def test_exception_from_chain_cleans_up_and_propagates(self, tenant_a_user):
+        """E.g. DEBUG_PROPAGATE_EXCEPTIONS: the chain raises instead of returning a 500."""
+
+        async def aget_response(request):
+            msg = "chain failed"
+            raise RuntimeError(msg)
+
+        with pytest.raises(RuntimeError, match="chain failed"):
+            async_to_sync(_async_mw(aget_response))(_make_request(user=tenant_a_user))
+        _assert_async_request_left_nothing_behind()
+
+    @override_settings(RLS_TENANTS=_LOCAL_SET)
+    def test_use_local_set_is_refused_before_anything_is_set(self, tenant_a_user):
+        async def aget_response(request):
+            pytest.fail("The chain must not run when USE_LOCAL_SET is refused")
+
+        with pytest.raises(RLSConfigurationError, match="under ASGI"):
+            async_to_sync(_async_mw(aget_response))(_make_request(user=tenant_a_user))
+        _assert_async_request_left_nothing_behind()
+
+    def test_enter_failure_skips_chain_and_leaves_nothing(self):
+        user = MagicMock(is_authenticated=True, is_tenant_admin=False, rls_tenant_id=None)
+
+        async def aget_response(request):
+            pytest.fail("The chain must not run after a failed entry")
+
+        with pytest.raises(NoTenantContextError):
+            async_to_sync(_async_mw(aget_response))(_make_request(user=user))
+        _assert_async_request_left_nothing_behind()
+
+    def test_guc_failure_in_enter_hop_clears_best_effort(self, tenant_a_user):
+        async def aget_response(request):
+            pytest.fail("The chain must not run after a failed entry")
+
+        with (
+            patch.object(middleware_module, "set_guc", side_effect=OperationalError("db down")),
+            patch.object(
+                middleware_module,
+                "_clear_gucs_on_all_databases",
+                wraps=middleware_module._clear_gucs_on_all_databases,
+            ) as best_effort,
+            pytest.raises(OperationalError, match="db down"),
+        ):
+            async_to_sync(_async_mw(aget_response))(_make_request(user=tenant_a_user))
+        best_effort.assert_called_once()
+        _assert_async_request_left_nothing_behind()
+
+    def test_cancel_during_enter_hop_undoes_it(self, tenant_a_user, monkeypatch):
+        """asgiref finishes a running hop after a cancel; the GUCs it set must be cleared."""
+        real_enter = RLSTenantMiddleware._enter_request_gucs
+        holder = {}
+
+        def slow_enter(self, request, conf):
+            # Cancel the awaiting task from inside the hop, then keep the hop busy
+            # long enough for the cancellation to arrive while it runs.
+            holder["loop"].call_soon_threadsafe(holder["task"].cancel)
+            time.sleep(0.05)
+            return real_enter(self, request, conf)
+
+        monkeypatch.setattr(RLSTenantMiddleware, "_enter_request_gucs", slow_enter)
+
+        async def aget_response(request):
+            pytest.fail("The chain must not run after a cancelled entry")
+
+        async def run():
+            holder["loop"] = asyncio.get_running_loop()
+            holder["task"] = asyncio.create_task(
+                _async_mw(aget_response)(_make_request(user=tenant_a_user))
+            )
+            with pytest.raises(asyncio.CancelledError):
+                await holder["task"]
+            return await sync_to_async(get_guc, thread_sensitive=True)("rls.current_tenant")
+
+        assert async_to_sync(run)() is None
+        _assert_async_request_left_nothing_behind()
+
+    def test_cancel_during_failing_enter_hop_keeps_the_cancellation(
+        self, tenant_a_user, monkeypatch
+    ):
+        """A hop that fails while the task is being cancelled must not replace the cancel."""
+        holder = {}
+
+        def failing_enter(self, request, conf):
+            holder["loop"].call_soon_threadsafe(holder["task"].cancel)
+            time.sleep(0.05)
+            msg = "enter failed"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(RLSTenantMiddleware, "_enter_request_gucs", failing_enter)
+
+        async def aget_response(request):
+            pytest.fail("The chain must not run after a cancelled entry")
+
+        async def run():
+            holder["loop"] = asyncio.get_running_loop()
+            holder["task"] = asyncio.create_task(
+                _async_mw(aget_response)(_make_request(user=tenant_a_user))
+            )
+            with pytest.raises(asyncio.CancelledError):
+                await holder["task"]
+
+        async_to_sync(run)()
+        _assert_async_request_left_nothing_behind()
+
+    def test_guc_clear_survives_a_failing_reset(self, tenant_a_user, monkeypatch):
+        """A token reset that raises must not skip the GUC clear (the error still propagates)."""
+
+        def failing_reset(token):
+            msg = "reset failed"
+            raise ValueError(msg)
+
+        monkeypatch.setattr(middleware_module, "reset_current_tenant_id", failing_reset)
+
+        async def aget_response(request):
+            return MagicMock()
+
+        with pytest.raises(ValueError, match="reset failed"):
+            async_to_sync(_async_mw(aget_response))(_make_request(user=tenant_a_user))
+
+        assert get_guc("rls.current_tenant") is None
+        assert get_guc("rls.is_admin") is None
+        assert _were_gucs_set() is False
+
+    def test_failed_clear_keeps_flag_for_the_safety_net(self, tenant_a_user, monkeypatch):
+        def failing_clear(conf):
+            msg = "clear failed"
+            raise OperationalError(msg)
+
+        monkeypatch.setattr(middleware_module, "_clear_request_gucs", failing_clear)
+
+        async def aget_response(request):
+            return MagicMock()
+
+        with pytest.raises(OperationalError, match="clear failed"):
+            async_to_sync(_async_mw(aget_response))(_make_request(user=tenant_a_user))
+
+        assert _state() == (None, False, True)
+        assert get_guc("rls.current_tenant") == str(tenant_a_user.rls_tenant_id)
+
+        # close_old_connections would close the test's connection.
+        request_finished.disconnect(close_old_connections)
+        try:
+            request_finished.send(sender=self.__class__)
+        finally:
+            request_finished.connect(close_old_connections)
+        _assert_async_request_left_nothing_behind()
+
+
+class _HookOverridingMiddleware(RLSTenantMiddleware):
+    """A project subclass that customises both synchronous hooks."""
+
+    def __init__(self, get_response):
+        super().__init__(get_response)
+        self.calls = []
+
+    def process_request(self, request):
+        self.calls.append("process_request")
+        return super().process_request(request)
+
+    def process_response(self, request, response):
+        self.calls.append("process_response")
+        return super().process_response(request, response)
+
+
+class TestSubclassWithSyncHooks:
+    """A subclass that overrides a sync hook keeps the hook-based async path (#38)."""
+
+    @pytest.mark.parametrize("hook", ["process_request", "process_response"])
+    def test_overriding_either_hook_selects_the_hook_path(self, hook):
+        def override(self, *args):
+            return getattr(RLSTenantMiddleware, hook)(self, *args)
+
+        subclass = type("Subclass", (RLSTenantMiddleware,), {hook: override})
+
+        def get_response(request):
+            return MagicMock()
+
+        assert subclass(get_response)._sync_hooks_overridden is True
+        assert RLSTenantMiddleware(get_response)._sync_hooks_overridden is False
+
+    def test_overridden_hooks_run_under_asgi(self, tenant_a_user, monkeypatch):
+        hops = _record_hops(monkeypatch)
+        seen = {}
+
+        async def aget_response(request):
+            seen["state"] = _state()
+            return MagicMock(name="response")
+
+        mw = _HookOverridingMiddleware(get_response=aget_response)
+        assert iscoroutinefunction(mw) is True
+        response = async_to_sync(mw)(_make_request(user=tenant_a_user))
+
+        assert response._mock_name == "response"
+        assert mw.calls == ["process_request", "process_response"]
+        assert seen["state"] == (tenant_a_user.rls_tenant_id, True, True)
+        # process_response already cleaned up, so the finally block makes no hop.
+        assert hops == []
+        _assert_async_request_left_nothing_behind()
+
+    def test_cancelled_request_is_cleaned_up(self, tenant_a_user):
+        """Cancellation skips Django's response hook; the finally block cleans up."""
+        seen = {}
+
+        async def run():
+            started = asyncio.Event()
+
+            async def aget_response(request):
+                started.set()
+                await asyncio.Event().wait()
+
+            mw = _HookOverridingMiddleware(get_response=aget_response)
+
+            async def serve_request():
+                try:
+                    await mw(_make_request(user=tenant_a_user))
+                finally:
+                    seen["calls"] = list(mw.calls)
+                    seen["state"] = _state()
+                    seen["guc"] = await sync_to_async(get_guc)("rls.current_tenant")
+
+            task = asyncio.create_task(serve_request())
+            await asyncio.wait_for(started.wait(), timeout=5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        async_to_sync(run)()
+
+        assert seen == {"calls": ["process_request"], "state": (None, False, False), "guc": None}
+
+    @override_settings(RLS_TENANTS=_LOCAL_SET)
+    def test_use_local_set_is_refused(self, tenant_a_user):
+        async def aget_response(request):
+            pytest.fail("The chain must not run when USE_LOCAL_SET is refused")
+
+        mw = _HookOverridingMiddleware(get_response=aget_response)
+        with pytest.raises(RLSConfigurationError, match="under ASGI"):
+            async_to_sync(mw)(_make_request(user=tenant_a_user))
+        assert mw.calls == []
+        _assert_async_request_left_nothing_behind()
