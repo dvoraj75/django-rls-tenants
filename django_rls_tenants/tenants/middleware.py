@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any
 from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.db import connections, transaction
-from django.utils.deprecation import MiddlewareMixin
 from django.utils.module_loading import import_string
 
 from django_rls_tenants.exceptions import RLSConfigurationError
@@ -33,6 +32,15 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from django.http import HttpRequest, HttpResponse
+    from django.utils.deprecation import MiddlewareMixin
+else:
+    # Django 6.2 moves MiddlewareMixin to django.middleware and deprecates the
+    # old import path (RemovedInDjango2029Warning). django-stubs still declares
+    # it under django.utils.deprecation, hence the TYPE_CHECKING split.
+    try:
+        from django.middleware import MiddlewareMixin
+    except ImportError:  # Django 5.2 - 6.1
+        from django.utils.deprecation import MiddlewareMixin
 
 logger = logging.getLogger("django_rls_tenants")
 

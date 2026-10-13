@@ -59,6 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   call. The warning now names the caller's line, and Django-internal callers (the admin
   changelist with `list_select_related = True`, which Django deprecates separately) are
   not warned twice. No warning on Django 5.2 or 6.0, where the form is not deprecated.
+- **`MiddlewareMixin` import path** (#114). Django 6.2 moves `MiddlewareMixin` to
+  `django.middleware` and deprecates importing it from `django.utils.deprecation`
+  (`RemovedInDjango2029Warning`). `RLSTenantMiddleware` now imports from the new location
+  when it exists and falls back to the old one on Django 5.2–6.1, so the warning never
+  points at this library.
 
 ## [1.3.4] - 2026-10-12
 
