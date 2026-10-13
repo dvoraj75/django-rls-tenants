@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from unittest.mock import MagicMock
@@ -980,3 +981,296 @@ def test_cancelled_during_enter_hop_restores_gucs(tenant_a, monkeypatch):
 
     assert async_to_sync(run)() == ((None, None), None, False)
     assert get_guc("rls.current_tenant") is None
+
+
+# ---------------------------------------------------------------------------
+# @with_rls_context on async functions, generators and coroutine results (#39)
+# ---------------------------------------------------------------------------
+
+
+def _tenant_user_mock(tenant_id):
+    """A non-admin ``TenantUser`` stand-in with the given ``rls_tenant_id``."""
+    user = MagicMock()
+    user.is_tenant_admin = False
+    user.rls_tenant_id = tenant_id
+    return user
+
+
+def _raw_order_count():
+    """Count ``test_order`` rows with raw SQL, which only the RLS policy (the GUCs) scopes."""
+    from django.db import connection  # noqa: PLC0415
+
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT count(*) FROM test_order")
+        return cursor.fetchone()[0]
+
+
+@with_rls_context
+async def _decorated_scope(as_user):
+    """Report the GUCs and tenant state the decorated body runs under."""
+    return await _gucs(), get_current_tenant_id(), get_rls_context_active()
+
+
+@with_rls_context
+async def _decorated_order_counts(as_user):
+    """Count orders through the async ORM and through raw SQL inside the decorator."""
+    from tests.test_app.models import Order  # noqa: PLC0415
+
+    return await Order.objects.acount(), await sync_to_async(_raw_order_count)()
+
+
+class TestWithRlsContextAsync:
+    """@with_rls_context on ``async def`` functions, driven through async_to_sync (#39)."""
+
+    def test_admin_user(self, admin_user):
+        """An admin user gets the admin context inside the awaited body."""
+        assert async_to_sync(_decorated_scope)(as_user=admin_user) == (
+            ("true", None),
+            None,
+            True,
+        )
+
+    def test_tenant_user(self, tenant_a_user):
+        """A tenant user gets that tenant's context inside the awaited body."""
+        tenant_id = tenant_a_user.rls_tenant_id
+        assert async_to_sync(_decorated_scope)(as_user=tenant_a_user) == (
+            ("false", str(tenant_id)),
+            tenant_id,
+            True,
+        )
+
+    def test_clears_after_return(self, tenant_a_user):
+        """GUCs and tenant state are back to empty after the call."""
+        async_to_sync(_decorated_scope)(as_user=tenant_a_user)
+        assert get_guc("rls.is_admin") is None
+        assert get_guc("rls.current_tenant") is None
+        assert get_current_tenant_id() is None
+        assert get_rls_context_active() is False
+
+    def test_positional_arg(self, tenant_a_user):
+        """The user is found when passed positionally."""
+
+        @with_rls_context
+        async def my_func(as_user, extra=None):
+            return await aget_guc("rls.current_tenant")
+
+        assert async_to_sync(my_func)(tenant_a_user) == str(tenant_a_user.rls_tenant_id)
+
+    def test_custom_user_param(self, tenant_a_user):
+        """``user_param`` works for async functions."""
+
+        @with_rls_context(user_param="current_user")
+        async def my_func(data, current_user):
+            return data, await aget_guc("rls.current_tenant")
+
+        assert async_to_sync(my_func)("x", current_user=tenant_a_user) == (
+            "x",
+            str(tenant_a_user.rls_tenant_id),
+        )
+
+    def test_none_user_warns_and_runs_without_context(self, caplog):
+        """``as_user=None`` logs the warning and awaits the body with no context."""
+        with caplog.at_level(logging.WARNING, logger="django_rls_tenants"):
+            result = async_to_sync(_decorated_scope)(as_user=None)
+        assert result == ((None, None), None, False)
+        assert "as_user is None in call to" in caplog.text
+
+    def test_non_admin_with_none_tenant_id_raises_when_awaited(self):
+        """The error is raised when the call is awaited, and the body never runs."""
+        ran = False
+
+        @with_rls_context
+        async def my_func(as_user):
+            nonlocal ran
+            ran = True
+
+        coro = my_func(as_user=_tenant_user_mock(None))
+
+        async def drive():
+            return await coro
+
+        with pytest.raises(NoTenantContextError, match="rls_tenant_id=None") as exc_info:
+            async_to_sync(drive)()
+        assert exc_info.value.hint is not None
+        assert "is_tenant_admin=True" in exc_info.value.hint
+        assert ran is False
+
+    def test_calling_without_await_sets_nothing(self, tenant_a_user):
+        """Creating the coroutine touches no GUC and no tenant state."""
+        coro = _decorated_scope(as_user=tenant_a_user)
+        try:
+            assert get_guc("rls.current_tenant") is None
+            assert get_current_tenant_id() is None
+            assert get_rls_context_active() is False
+        finally:
+            coro.close()
+
+    def test_body_exception_restores_and_propagates(self, tenant_a_user):
+        """An exception in the body propagates and the context is restored."""
+
+        @with_rls_context
+        async def my_func(as_user):
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            async_to_sync(my_func)(as_user=tenant_a_user)
+        assert get_guc("rls.current_tenant") is None
+        assert get_current_tenant_id() is None
+        assert get_rls_context_active() is False
+
+    def test_missing_param_warns_at_decoration(self, caplog):
+        """A signature without the user parameter warns once, then runs without context."""
+
+        async def my_func(data):
+            return data, await aget_guc("rls.current_tenant")
+
+        with caplog.at_level(logging.WARNING, logger="django_rls_tenants"):
+            decorated = with_rls_context(my_func)
+        assert "parameter 'as_user' not found in signature of" in caplog.text
+        assert async_to_sync(decorated)("x") == ("x", None)
+
+    def test_strict_mode_passes_inside_decorated_coroutine(
+        self, sample_orders, enforce_rls, tenant_a_user, settings
+    ):
+        """The decorator marks the context active, so STRICT_MODE lets the async ORM run."""
+        settings.RLS_TENANTS = {"TENANT_MODEL": "test_app.Tenant", "STRICT_MODE": True}
+        assert async_to_sync(_decorated_order_counts)(as_user=tenant_a_user) == (2, 2)
+
+    def test_stacks_under_django_async_aware_decorator(self, tenant_a_user):
+        """Django's async-aware decorators see the wrapper as a coroutine function."""
+        from django.http import HttpResponse  # noqa: PLC0415
+        from django.test import RequestFactory  # noqa: PLC0415
+        from django.views.decorators.http import require_GET  # noqa: PLC0415
+
+        @require_GET
+        @with_rls_context
+        async def view(request, as_user):
+            return HttpResponse(await aget_guc("rls.current_tenant"))
+
+        assert inspect.iscoroutinefunction(view)
+        response = async_to_sync(view)(RequestFactory().get("/"), as_user=tenant_a_user)
+        assert response.content == str(tenant_a_user.rls_tenant_id).encode()
+
+
+class TestWithRlsContextNarrowsOuterContext:
+    """Regression for #39: the decorated body must not run under the caller's context.
+
+    Before #39 the sync wrapper entered and left the tenant context before the
+    coroutine was awaited, so an outer admin context saw every tenant (the
+    sync caller case) or the call raised ``SynchronousOnlyOperation`` (the
+    async caller case). Raw SQL proves the database scope, not just the ORM
+    auto-scope filter.
+    """
+
+    def test_sync_caller_inside_admin_context(self, sample_orders, enforce_rls, tenant_a_user):
+        """async_to_sync(decorated)(...) inside admin_context() sees only the user's tenant."""
+        with admin_context():
+            assert async_to_sync(_decorated_order_counts)(as_user=tenant_a_user) == (2, 2)
+            assert get_guc("rls.is_admin") == "true"
+            assert get_current_tenant_id() is None
+            assert _raw_order_count() == 3
+
+    def test_async_caller_inside_async_admin_context(
+        self, sample_orders, enforce_rls, tenant_a_user
+    ):
+        """Awaiting the decorated function inside async_admin_context() narrows, then restores."""
+
+        async def run():
+            async with async_admin_context():
+                inner = await _decorated_order_counts(as_user=tenant_a_user)
+                after = await _gucs(), get_current_tenant_id()
+            return inner, after
+
+        assert async_to_sync(run)() == ((2, 2), (("true", None), None))
+
+
+@pytest.mark.django_db(transaction=True)
+def test_async_decorated_call_restores_outer_scope(guc_mode):
+    """A decorated coroutine narrows an outer tenant block and restores it, in both modes."""
+    from django.db import transaction  # noqa: PLC0415
+
+    with transaction.atomic(), tenant_context(101):
+        assert async_to_sync(_decorated_scope)(as_user=_tenant_user_mock(202)) == (
+            ("false", "202"),
+            202,
+            True,
+        )
+        assert get_guc("rls.is_admin") == "false"
+        assert get_guc("rls.current_tenant") == "101"
+        assert get_current_tenant_id() == 101
+
+
+class TestWithRlsContextRejectsGenerators:
+    """Generator bodies run after the wrapper returns, so decorating one is an error (#39)."""
+
+    def test_rejects_sync_generator_function(self):
+        """A ``def`` with ``yield`` raises TypeError at decoration time."""
+
+        def gen(as_user):
+            yield 1
+
+        with pytest.raises(TypeError, match=r"cannot decorate the generator function .*\.gen:"):
+            with_rls_context(gen)
+
+    def test_rejects_async_generator_function(self):
+        """An ``async def`` with ``yield`` raises TypeError at decoration time."""
+
+        async def agen(as_user):
+            yield 1
+
+        with pytest.raises(TypeError, match=r"cannot decorate the generator function .*\.agen:"):
+            with_rls_context(agen)
+
+    def test_rejects_with_user_param_form(self):
+        """The decorator-factory form rejects generators too."""
+
+        def gen(current_user):
+            yield 1
+
+        with pytest.raises(TypeError, match="cannot decorate the generator function"):
+            with_rls_context(user_param="current_user")(gen)
+
+
+class TestWithRlsContextCoroutineGuard:
+    """A sync-wrapped function that returns a coroutine fails instead of leaking (#39)."""
+
+    def test_sync_function_returning_coroutine_raises_and_closes_it(self, tenant_a_user):
+        """TypeError, the coroutine is closed, and the context is restored."""
+        created = []
+
+        async def body():
+            return "never"
+
+        def returns_coroutine(as_user):
+            created.append(body())
+            return created[0]
+
+        decorated = with_rls_context(returns_coroutine)
+        with pytest.raises(TypeError, match="returns_coroutine returned a coroutine"):
+            decorated(as_user=tenant_a_user)
+        assert inspect.getcoroutinestate(created[0]) == inspect.CORO_CLOSED
+        assert get_guc("rls.current_tenant") is None
+        assert get_rls_context_active() is False
+
+    def test_none_user_path_also_raises(self):
+        """The guard also applies when ``as_user`` is ``None``."""
+
+        async def body():
+            return "never"
+
+        def returns_coroutine(as_user):
+            return body()
+
+        with pytest.raises(TypeError, match="returned a coroutine"):
+            with_rls_context(returns_coroutine)(as_user=None)
+
+    def test_callable_object_with_async_call_raises(self, tenant_a_user):
+        """An object with ``async def __call__`` is named by its class in the error."""
+
+        class AsyncCallable:
+            async def __call__(self, as_user):
+                return "never"
+
+        decorated = with_rls_context(AsyncCallable())
+        with pytest.raises(TypeError, match=r"\.AsyncCallable returned a coroutine"):
+            decorated(as_user=tenant_a_user)

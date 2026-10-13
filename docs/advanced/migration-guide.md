@@ -123,6 +123,17 @@ migration that assigns the correct tenant to each existing record.
 
 ## Upgrading django-rls-tenants
 
+### From 1.3.4 to 1.4.0
+
+- **`@with_rls_context` rejects generator functions.** Decorating a `def` or
+  `async def` function that contains `yield` now raises `TypeError` when the module is
+  imported. Such a body never ran under the decorator's context. Remove the decorator
+  and enter `tenant_context()` / `admin_context()` inside the generator; see
+  [What the Decorator Rejects](../guides/context-managers.md#what-the-decorator-rejects).
+- **`@with_rls_context` works on `async def`.** The decorated coroutine now runs inside
+  `async_tenant_context()` / `async_admin_context()`; no change is needed. See
+  [Async Functions](../guides/context-managers.md#async-functions).
+
 ### From 1.3.3 to 1.3.4
 
 A **drop-in upgrade** -- no code, data or settings change is required. Under ASGI,

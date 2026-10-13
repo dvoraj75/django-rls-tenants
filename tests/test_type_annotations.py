@@ -146,3 +146,24 @@ class TestWithRlsContextAnnotations:
 
         assert my_func.__name__ == "my_func"
         assert callable(my_func)
+
+    def test_async_function_gets_async_wrapper(self):
+        """An ``async def`` keeps being a coroutine function after decoration (#39)."""
+
+        @with_rls_context
+        async def my_async_service(as_user):
+            """Async docstring."""
+
+        assert inspect.iscoroutinefunction(my_async_service)
+        assert my_async_service.__name__ == "my_async_service"
+        assert my_async_service.__doc__ == "Async docstring."
+        assert inspect.iscoroutinefunction(my_async_service.__wrapped__)
+
+    def test_sync_function_keeps_sync_wrapper(self):
+        """A plain ``def`` is still wrapped by a sync function."""
+
+        @with_rls_context
+        def my_service_function(as_user):
+            return "result"
+
+        assert not inspect.iscoroutinefunction(my_service_function)

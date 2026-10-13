@@ -131,6 +131,34 @@ synchronous code, wrap that call in `transaction.atomic()` and run the coroutine
 
 **See:** [`USE_LOCAL_SET=True` in async code](guides/context-managers.md#use_local_settrue-in-async-code).
 
+### `TypeError: @with_rls_context cannot decorate the generator function ...`
+
+**Symptom:** Importing a module fails with this error after upgrading to 1.4.0.
+
+**Cause:** A generator or async generator function is decorated with
+`@with_rls_context`. Its body runs while the caller iterates, after the decorator has
+left the context, so it never ran under the decorated user's context. Before 1.4.0 it
+silently used whatever context the caller had.
+
+**Fix:** Remove the decorator and enter `tenant_context()` / `admin_context()` (or
+`async_tenant_context()` / `async_admin_context()`) inside the generator body.
+
+**See:** [What the Decorator Rejects](guides/context-managers.md#what-the-decorator-rejects).
+
+### `TypeError: @with_rls_context: ... returned a coroutine, but it was decorated as a synchronous function`
+
+**Symptom:** Calling a decorated function raises this error.
+
+**Cause:** The function is async, but the decorator could not tell. It is either an object
+with `async def __call__`, or an `async def` that a decorator below `@with_rls_context`
+turned into a plain function. The sync wrapper would have left the context before the
+coroutine ran.
+
+**Fix:** Put `@with_rls_context` directly on the `async def`, as the innermost decorator,
+or enter `async_tenant_context()` / `async_admin_context()` inside the coroutine.
+
+**See:** [What the Decorator Rejects](guides/context-managers.md#what-the-decorator-rejects).
+
 ### `ValueError: ... Token was created in a different Context` under ASGI
 
 **Symptom:** Authenticated requests fail with a 500 and a `ValueError` from
