@@ -157,7 +157,7 @@ coroutine itself, so the auto-scope filter and [strict mode](#strict-mode) apply
 
 [Nesting](#nesting) and [exceptions](#exceptions-inside-a-context-block) behave exactly as
 for the sync managers, including the restore in both GUC modes. The restore also runs when
-the task is cancelled inside the block.
+the task is cancelled inside the block, or while the entry hop is still running.
 
 The generic layer has the same pair, `async_rls_context()` and `async_bypass_flag()`, plus
 the primitives `aset_guc()`, `aget_guc()`, `aclear_guc()` and `arestore_guc()` (see the

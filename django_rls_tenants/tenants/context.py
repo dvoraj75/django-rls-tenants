@@ -18,7 +18,7 @@ from asgiref.sync import sync_to_async
 from django.db import connections
 
 from django_rls_tenants.exceptions import NoTenantContextError, RLSConfigurationError
-from django_rls_tenants.rls.context import _enter_gucs, restore_gucs
+from django_rls_tenants.rls.context import _enter_gucs, _run_enter_hop, restore_gucs
 from django_rls_tenants.rls.guc import clear_guc, get_guc, set_guc
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.errors import HINT_TENANT_ID_NONE, HINT_USER_NO_TENANT
@@ -246,10 +246,10 @@ async def async_tenant_context(
     are not protected. Do not run context blocks concurrently in sibling
     tasks that share a connection.
 
-    The restore runs even when the task is cancelled inside the block; only
-    a second cancellation delivered during the restore itself can skip it
-    (under ASGI the ``RLSTenantMiddleware`` safety net clears the GUCs at the
-    end of the request).
+    The restore runs even when the task is cancelled while entering or
+    inside the block; only a second cancellation delivered during the
+    restore itself can skip it (for requests ``RLSTenantMiddleware`` set a
+    context for, its safety net clears the GUCs at the end of the request).
 
     Args:
         tenant_id: The tenant PK to scope queries to.
@@ -272,7 +272,8 @@ async def async_tenant_context(
     # a failed hop then leaves no ContextVar to unwind. The ContextVars are
     # set here in the coroutine, never inside the hop, because a token
     # created in the hop's context copy cannot be reset from here (#58).
-    previous = await sync_to_async(_enter_tenant_gucs, thread_sensitive=True)(
+    previous = await _run_enter_hop(
+        _enter_tenant_gucs,
         {conf.GUC_IS_ADMIN: "false", conf.GUC_CURRENT_TENANT: str(tenant_id)},
         is_local=is_local,
         using=using,
@@ -320,7 +321,8 @@ async def async_admin_context(
     is_local = conf.USE_LOCAL_SET
 
     # Same mapping as admin_context(): clear_guc() is set_guc(name, "").
-    previous = await sync_to_async(_enter_tenant_gucs, thread_sensitive=True)(
+    previous = await _run_enter_hop(
+        _enter_tenant_gucs,
         {conf.GUC_IS_ADMIN: "true", conf.GUC_CURRENT_TENANT: ""},
         is_local=is_local,
         using=using,

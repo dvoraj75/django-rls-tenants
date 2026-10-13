@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -949,4 +950,33 @@ def test_cancelled_task_restores_gucs(tenant_a):
         return await _gucs(), get_current_tenant_id()
 
     assert async_to_sync(run)() == ((None, None), None)
+    assert get_guc("rls.current_tenant") is None
+
+
+def test_cancelled_during_enter_hop_restores_gucs(tenant_a, monkeypatch):
+    """A cancel that lands while the enter hop runs still undoes the GUC change."""
+    import django_rls_tenants.tenants.context as ctx_mod  # noqa: PLC0415
+
+    real_enter = ctx_mod._enter_tenant_gucs
+    holder = {}
+
+    def slow_enter(variables, **kwargs):
+        holder["loop"].call_soon_threadsafe(holder["task"].cancel)
+        time.sleep(0.05)
+        return real_enter(variables, **kwargs)
+
+    monkeypatch.setattr(ctx_mod, "_enter_tenant_gucs", slow_enter)
+
+    async def body():
+        async with async_tenant_context(tenant_a.pk):
+            pytest.fail("The block must not run after a cancelled entry")
+
+    async def run():
+        holder["loop"] = asyncio.get_running_loop()
+        holder["task"] = asyncio.create_task(body())
+        with pytest.raises(asyncio.CancelledError):
+            await holder["task"]
+        return await _gucs(), get_current_tenant_id(), get_rls_context_active()
+
+    assert async_to_sync(run)() == ((None, None), None, False)
     assert get_guc("rls.current_tenant") is None

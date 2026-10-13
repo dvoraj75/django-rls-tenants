@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one on exit, set and reset the tenant `ContextVar`s in the calling coroutine (so the
   auto-scope filter and `STRICT_MODE` apply to `acount()` and friends, and the #58 token
   problem cannot occur), and support nesting with sync and async blocks in both GUC
-  modes, including restore on cancellation. With `USE_LOCAL_SET=True` the tenant
+  modes, including restore when the task is cancelled (even during entry). With `USE_LOCAL_SET=True` the tenant
   managers raise `RLSConfigurationError` unless the coroutine runs via `async_to_sync`
   inside a synchronous `transaction.atomic()`. Use one context per task: sibling tasks
   of one request share its connection, so `asyncio.gather` across tenants is not safe

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 from asgiref.sync import async_to_sync, sync_to_async
@@ -341,6 +342,41 @@ class TestAsyncRlsContext:
         with pytest.raises(asyncio.CancelledError):
             async_to_sync(run)()
         assert get_guc("rls.test_acancel") is None
+
+    def test_cancelled_during_enter_hop_restores(self, monkeypatch):
+        """A cancel that lands while the enter hop runs still undoes the GUC change.
+
+        asgiref cannot stop a sync function already running in its thread: the hop
+        completes, its result is discarded and ``CancelledError`` is raised. The
+        manager must wait for the snapshot and restore it before propagating.
+        """
+        import django_rls_tenants.rls.context as ctx_mod  # noqa: PLC0415
+
+        real_enter = ctx_mod._enter_gucs
+        holder = {}
+
+        def slow_enter(variables, **kwargs):
+            # Cancel the awaiting task from inside the hop, then keep the hop busy
+            # long enough for the cancellation to be delivered while it runs.
+            holder["loop"].call_soon_threadsafe(holder["task"].cancel)
+            time.sleep(0.05)
+            return real_enter(variables, **kwargs)
+
+        monkeypatch.setattr(ctx_mod, "_enter_gucs", slow_enter)
+
+        async def body():
+            async with async_rls_context({"rls.test_acancel_enter": "v"}):
+                pytest.fail("The block must not run after a cancelled entry")
+
+        async def run():
+            holder["loop"] = asyncio.get_running_loop()
+            holder["task"] = asyncio.create_task(body())
+            with pytest.raises(asyncio.CancelledError):
+                await holder["task"]
+            return await aget_guc("rls.test_acancel_enter")
+
+        assert async_to_sync(run)() is None
+        assert get_guc("rls.test_acancel_enter") is None
 
     def test_sync_rls_context_inside_hop_inside_async_block(self):
         """A sync rls_context run in a hop nests inside an async block and restores it."""

@@ -9,6 +9,7 @@ GUC modes (``set_config`` and ``SET LOCAL``). ``async_rls_context`` and
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING
@@ -19,7 +20,7 @@ from django.db import DatabaseError
 from django_rls_tenants.rls.guc import get_guc, restore_guc, set_guc
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator, Mapping
+    from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 
 logger = logging.getLogger("django_rls_tenants")
 
@@ -173,6 +174,50 @@ def _enter_gucs(
     return previous
 
 
+async def _run_enter_hop(
+    enter: Callable[..., dict[str, str | None]],
+    variables: Mapping[str, str],
+    *,
+    is_local: bool,
+    using: str,
+) -> dict[str, str | None]:
+    """Run an enter helper in one thread-sensitive hop, undoing it if cancelled meanwhile.
+
+    asgiref cannot stop a sync function that is already running in its
+    thread: when the awaiting task is cancelled, the hop completes anyway,
+    its result is discarded and ``CancelledError`` is raised. Without this
+    guard the GUCs the hop had just set would stay on the connection with
+    nothing left to restore them. The hop is therefore shielded: a
+    cancellation waits for the snapshot it returns, restores it in a second
+    hop and only then propagates.
+
+    Args:
+        enter: ``_enter_gucs`` or a wrapper with the same signature.
+        variables: Mapping of GUC name to the value to set.
+        is_local: If ``True``, use ``SET LOCAL`` (transaction-scoped).
+        using: Database alias.
+
+    Returns:
+        The snapshot returned by ``enter``, for :func:`restore_gucs`.
+    """
+    hop = asyncio.ensure_future(
+        sync_to_async(enter, thread_sensitive=True)(variables, is_local=is_local, using=using)
+    )
+    try:
+        return await asyncio.shield(hop)
+    except asyncio.CancelledError:
+        # The hop keeps running in its thread; wait for it so the change can
+        # be undone. A second cancellation here is the documented gap.
+        previous = await hop
+        await sync_to_async(restore_gucs, thread_sensitive=True)(
+            previous,
+            is_local=is_local,
+            using=using,
+            exc_pending=True,
+        )
+        raise
+
+
 @asynccontextmanager
 async def async_rls_context(
     variables: dict[str, str],
@@ -188,9 +233,10 @@ async def async_rls_context(
     is not a non-blocking call). Nesting, the restore in both GUC modes and
     the aborted-transaction behaviour are the same as for :func:`rls_context`.
 
-    The restore runs even when the task is cancelled while inside the block.
-    Only a second cancellation delivered during the restore itself can skip
-    it; wrap long-lived tasks in your own cleanup if that matters.
+    The restore runs even when the task is cancelled while entering or
+    inside the block. Only a second cancellation delivered during the
+    restore itself can skip it; wrap long-lived tasks in your own cleanup if
+    that matters.
 
     Args:
         variables: Dict of GUC variable names to values.
@@ -199,11 +245,7 @@ async def async_rls_context(
             ``RuntimeError`` from :func:`set_guc` propagates.
         using: Database alias. Default: ``"default"``.
     """
-    previous = await sync_to_async(_enter_gucs, thread_sensitive=True)(
-        variables,
-        is_local=is_local,
-        using=using,
-    )
+    previous = await _run_enter_hop(_enter_gucs, variables, is_local=is_local, using=using)
     exc_pending = False
     try:
         yield
