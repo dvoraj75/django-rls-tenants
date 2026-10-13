@@ -53,6 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `requires-python` is now `>=3.12` and the dependency `django>=5.2` (#114). The lockfile
   moves to Django 6.1.2 (django-stubs 6.1.2, mypy 2.4.0) and psycopg2-binary 2.9.13 (the
   first release with Python 3.15 wheels); the example Docker image installs Django 6.1.
+- **`@with_rls_context` rejects generator functions and coroutine results** (#39).
+  Decorating a generator or async generator function now raises `TypeError` at
+  decoration time: its body runs while the caller iterates, after the decorator has left
+  the context, so it never ran under the decorated user's context. A function decorated
+  as synchronous that returns a coroutine (an object with `async def __call__`, or an
+  `async def` under a decorator that hides it) now raises `TypeError` when called, after
+  closing the coroutine. Enter the context inside the generator or coroutine instead.
 
 ### Fixed
 
@@ -67,6 +74,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`RemovedInDjango2029Warning`). `RLSTenantMiddleware` now imports from the new location
   when it exists and falls back to the old one on Django 5.2–6.1, so the warning never
   points at this library.
+- **`@with_rls_context` on `async def` functions** (#39). The decorator now returns an
+  `async def` wrapper for coroutine functions, which enters `async_tenant_context()` /
+  `async_admin_context()` around the awaited body. Before, the sync wrapper entered and
+  left the context before the coroutine ran, so the body ran under the caller's context:
+  called from synchronous code inside `admin_context()` (for example via
+  `async_to_sync`), a coroutine decorated for a tenant user saw every tenant's rows, and
+  awaited from async code the call failed with `SynchronousOnlyOperation`.
+- **`@with_rls_context` type signature** (#39). Type checkers saw the decorator return a
+  union of "the decorated function" and "a decorator", so every call to a decorated
+  function failed type checking, and `@with_rls_context(user_param=...)` turned it into
+  `(*Never, **Never) -> Never`. Two `@overload`s now give each form its exact type: the
+  decorated function keeps its signature and return type (a coroutine for `async def`).
 
 ## [1.3.4] - 2026-10-12
 
