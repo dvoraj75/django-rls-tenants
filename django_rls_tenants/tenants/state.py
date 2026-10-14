@@ -14,6 +14,11 @@ RLS context is active (tenant or admin). This is needed by strict mode
 to distinguish "no context" from "admin context" -- both have
 ``_current_tenant_id=None``, but only the former should raise.
 
+A third, private ``ContextVar`` (``_context_gucs``) holds the admin and
+tenant GUC values the library applied for the active context. The GUC
+affinity guard (``tenants/affinity.py``) re-applies those values on whichever
+connection a statement runs on.
+
 The state is set/restored by ``tenant_context()``, ``admin_context()``,
 and ``RLSTenantMiddleware``. Users should not need to call these functions
 directly -- use the context managers or middleware instead.
@@ -102,3 +107,40 @@ def reset_rls_context_active(token: Token[bool]) -> None:
         token: The token returned by ``set_rls_context_active()``.
     """
     _rls_context_active.reset(token)
+
+
+# ---- GUC values of the active context (GUC affinity guard) ----
+
+# The admin and tenant GUC values the library applied for the innermost active
+# context, as ``(is_admin, current_tenant)``, or ``None`` outside one. Only the
+# library's own entry points set it (the context managers, the middleware and
+# ``TenantQuerySet._rls_scope()``), so the guard re-applies the contexts the
+# library set up and nothing else: code that drives the public functions above
+# by hand, and writes the GUCs itself, is left alone.
+_context_gucs: ContextVar[tuple[str, str] | None] = ContextVar("rls_context_gucs", default=None)
+
+
+def _get_context_gucs() -> tuple[str, str] | None:
+    """Return the ``(is_admin, current_tenant)`` GUC values of the active context, or ``None``."""
+    return _context_gucs.get()
+
+
+def _set_context_gucs(values: tuple[str, str] | None) -> Token[tuple[str, str] | None]:
+    """Record the GUC values of the context being entered; ``None`` for no context.
+
+    Args:
+        values: ``(is_admin, current_tenant)`` as the context sets them, or ``None``.
+
+    Returns:
+        A ``Token`` for restoring the previous values.
+    """
+    return _context_gucs.set(values)
+
+
+def _reset_context_gucs(token: Token[tuple[str, str] | None]) -> None:
+    """Restore the previous context GUC values using a token from ``_set_context_gucs()``.
+
+    Args:
+        token: The token returned by the corresponding ``_set_context_gucs()`` call.
+    """
+    _context_gucs.reset(token)

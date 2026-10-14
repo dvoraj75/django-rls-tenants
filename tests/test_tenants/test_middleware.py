@@ -154,8 +154,10 @@ class TestProcessResponse:
             response = MagicMock()
             mw.process_response(request, response)
 
-        # GUCs should still be set (SET LOCAL auto-clears at transaction end)
-        assert get_guc("rls.current_tenant") is not None
+        # GUCs should still be set (SET LOCAL auto-clears at transaction end). Read
+        # with a driver cursor: the patch reaches the middleware only, so the
+        # affinity guard, still in session mode, would clear them first.
+        assert _read_session_guc("rls.current_tenant") is not None
 
 
 class TestThreadLocalFlags:
@@ -851,6 +853,14 @@ def _record_hops(monkeypatch):
     return hops
 
 
+def _read_session_guc(name):
+    """Read a GUC with a driver cursor, which the GUC affinity guard never sees."""
+    connection.ensure_connection()
+    with connection.connection.cursor() as cursor:
+        cursor.execute("SELECT current_setting(%s, true)", [name])
+        return cursor.fetchone()[0] or None
+
+
 def _state():
     return get_current_tenant_id(), get_rls_context_active(), _were_gucs_set()
 
@@ -1159,7 +1169,9 @@ class TestNativeAsyncPath:
             async_to_sync(_async_mw(aget_response))(_make_request(user=tenant_a_user))
 
         assert _state() == (None, False, True)
-        assert get_guc("rls.current_tenant") == str(tenant_a_user.rls_tenant_id)
+        # Still on the session. A driver cursor reads it: the affinity guard would
+        # clear it before any statement outside the context.
+        assert _read_session_guc("rls.current_tenant") == str(tenant_a_user.rls_tenant_id)
 
         # close_old_connections would close the test's connection.
         request_finished.disconnect(close_old_connections)

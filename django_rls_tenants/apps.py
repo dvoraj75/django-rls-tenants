@@ -16,49 +16,32 @@ if TYPE_CHECKING:
 logger = logging.getLogger("django_rls_tenants")
 
 
-def _apply_request_gucs(db_alias: str, conf: RLSTenantsConfig) -> None:
-    """Set the request's GUCs on a new connection, from the tenant ``ContextVar``.
+def _apply_request_gucs(connection: BaseDatabaseWrapper, conf: RLSTenantsConfig) -> None:
+    """Set the active context's GUCs on a new connection, in one statement.
 
     Used on the thread where the middleware set the GUCs, whose cleanup clears
-    them again. Failures are logged, not raised.
+    them again. Writes to the connection the signal sent, which is not always
+    the thread's connection for its alias. Failures are logged, not raised;
+    with session GUCs the affinity guard applies the context again before the
+    connection's first statement, and raises if that fails too.
 
     Args:
-        db_alias: Alias of the new connection.
+        connection: The new connection, as sent by ``connection_created``.
         conf: ``RLSTenantsConfig`` instance.
     """
-    from django_rls_tenants.rls.guc import clear_guc, set_guc  # noqa: PLC0415
-    from django_rls_tenants.tenants.state import get_current_tenant_id  # noqa: PLC0415
+    from django_rls_tenants.tenants.affinity import set_gucs  # noqa: PLC0415
+    from django_rls_tenants.tenants.state import _get_context_gucs  # noqa: PLC0415
 
-    tenant_id = get_current_tenant_id()
+    context_gucs = _get_context_gucs()
+    if context_gucs is None:
+        return
     try:
-        if tenant_id is not None:
-            # Tenant context: set tenant ID and mark as non-admin
-            set_guc(
-                conf.GUC_CURRENT_TENANT,
-                str(tenant_id),
-                is_local=conf.USE_LOCAL_SET,
-                using=db_alias,
-            )
-            set_guc(
-                conf.GUC_IS_ADMIN,
-                "false",
-                is_local=conf.USE_LOCAL_SET,
-                using=db_alias,
-            )
-        else:
-            # Admin context (tenant_id is None but GUCs were set)
-            clear_guc(conf.GUC_CURRENT_TENANT, is_local=conf.USE_LOCAL_SET, using=db_alias)
-            set_guc(
-                conf.GUC_IS_ADMIN,
-                "true",
-                is_local=conf.USE_LOCAL_SET,
-                using=db_alias,
-            )
+        set_gucs(connection, context_gucs, is_local=conf.USE_LOCAL_SET)
     except Exception:
         logger.warning(
             "Failed to set RLS GUCs on new connection for alias %r. "
             "Queries on this connection may return empty results.",
-            db_alias,
+            connection.alias,
             exc_info=True,
         )
 
@@ -67,11 +50,12 @@ def _clear_new_connection_gucs(connection: BaseDatabaseWrapper, reason: str) -> 
     """Clear every GUC the RLS policies read on a connection that must start without context.
 
     Two kinds of connection get this. One opened off the thread that set the
-    request's GUCs: the middleware clears GUCs only on its own thread, so values
-    set on this connection would stay for the life of the thread and reach later
-    requests (#130). And one checked out of a connection pool, which may still
-    carry a previous borrower's session GUCs if that borrower's cleanup did not
-    reach it (#96). One statement, so one round trip.
+    request's GUCs, which the middleware's cleanup never reaches (#130): the
+    affinity guard applies the context to the statements run on it, and takes
+    it off again before the first statement run without one (#41). And one
+    checked out of a connection pool, which may still carry a previous
+    borrower's session GUCs if that borrower's cleanup did not reach it (#96).
+    One statement, so one round trip. The guard records the cleared GUCs.
 
     A failure on a pooled connection fails the checkout: its session is ended,
     so the pool discards it instead of reusing it, and the error is raised to
@@ -83,9 +67,11 @@ def _clear_new_connection_gucs(connection: BaseDatabaseWrapper, reason: str) -> 
         reason: Why the connection is cleared, completing the log messages.
     """
     from django_rls_tenants.pool import _clear_policy_gucs  # noqa: PLC0415
+    from django_rls_tenants.tenants.affinity import writing  # noqa: PLC0415
 
     try:
-        _clear_policy_gucs(connection)
+        with writing(connection, None):
+            _clear_policy_gucs(connection)
     except Exception:
         pooled = _is_pooled(connection)
         logger.warning(
@@ -114,6 +100,59 @@ def _is_pooled(connection: object) -> bool:
     from django_rls_tenants.pool import _pool_options  # noqa: PLC0415
 
     return _pool_options(getattr(connection, "settings_dict", {})) is not None
+
+
+def _prepare_new_connection(connection: BaseDatabaseWrapper) -> None:
+    """Set up a new database connection for RLS.
+
+    Runs on ``connection_created``. It installs the GUC affinity guard, which
+    applies the active context's GUCs before each statement on a connection of
+    an alias in ``RLS_TENANTS["DATABASES"]`` (#41); nothing else happens on
+    other aliases. When the connection opens mid-request on the thread where the
+    middleware set the GUCs (a replica opened lazily by a router, say), the
+    GUCs are also set right away. On any other thread holding a copy of the
+    request's context, the connection is cleared first (#130). Django sends
+    the signal on every checkout from a connection pool, and such a connection
+    is cleared first as well (#96).
+
+    Args:
+        connection: The new connection, as sent by ``connection_created``.
+    """
+    from django_rls_tenants.tenants.affinity import UNKNOWN, install  # noqa: PLC0415
+    from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
+    from django_rls_tenants.tenants.middleware import (  # noqa: PLC0415
+        _were_gucs_set,
+        _were_gucs_set_on_this_thread,
+    )
+
+    pooled = _is_pooled(connection)
+    # A pooled session may hold a previous borrower's GUCs until the clear below.
+    # Installed on every connection; the guard only acts on configured aliases,
+    # so an alias that joins RLS_TENANTS["DATABASES"] later is covered too.
+    install(connection, values=UNKNOWN if pooled else None)
+
+    conf = rls_tenants_config
+    if connection.alias not in conf.DATABASES:
+        return
+
+    on_request_thread = _were_gucs_set_on_this_thread()
+    if _were_gucs_set() and not on_request_thread:
+        # Another thread with a copy of the request's context, such as the
+        # thread_sensitive=False hop in which Django builds an error page under
+        # ASGI. The middleware's cleanup never reaches this connection. It starts
+        # clean, bypass flags included; the guard applies the context before each
+        # statement in the hop and clears it before the first statement run
+        # without one.
+        _clear_new_connection_gucs(connection, "opened outside the request's thread")
+        return
+
+    if pooled:
+        # A pooled connection keeps its session GUCs between borrowers; the
+        # previous one's cleanup may not have reached it. With or without a
+        # request context, the new borrower starts clean.
+        _clear_new_connection_gucs(connection, "checked out of a connection pool")
+    if on_request_thread:
+        _apply_request_gucs(connection, conf)
 
 
 class DjangoRlsTenantsConfig(AppConfig):
@@ -150,11 +189,16 @@ class DjangoRlsTenantsConfig(AppConfig):
             if not _were_gucs_set():
                 return
             try:
+                from django_rls_tenants.tenants.affinity import writing  # noqa: PLC0415
                 from django_rls_tenants.tenants.state import (  # noqa: PLC0415
+                    _set_context_gucs,
                     set_current_tenant_id,
                 )
 
                 set_current_tenant_id(None)
+                # Otherwise the affinity guard would apply the request's GUCs
+                # again before the next statement in this context.
+                _set_context_gucs(None)
                 conf = rls_tenants_config
                 if not conf.USE_LOCAL_SET:
                     for db_alias in conf.DATABASES:
@@ -165,8 +209,9 @@ class DjangoRlsTenantsConfig(AppConfig):
                         # another pooled connection and keep it.
                         if connections[db_alias].connection is None:
                             continue
-                        clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
-                        clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
+                        with writing(db_alias, None):
+                            clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
+                            clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
             except Exception:
                 logger.warning(
                     "Safety net: failed to clear RLS GUC variables on request_finished. "
@@ -178,45 +223,13 @@ class DjangoRlsTenantsConfig(AppConfig):
 
         request_finished.connect(_clear_rls_on_request_finished, weak=False)
 
-        # Signal handler for new database connections on a configured alias.
-        # When a connection is established mid-request, reads the current
-        # tenant state from ContextVars and sets GUCs on the new connection.
-        # This covers the case where a replica connection is lazily created
-        # after the middleware has already run on eagerly-opened connections.
-        # Only on the thread where the middleware set the GUCs: its cleanup
-        # clears them there. Django sends the signal on every checkout from a
-        # connection pool too; such a connection is cleared first (#96).
+        # Signal handler for new database connections; see _prepare_new_connection().
         def _set_guc_on_new_connection(
             sender: type,  # noqa: ARG001  -- Django signal API
             connection: BaseDatabaseWrapper,
             **kwargs: object,  # noqa: ARG001  -- Django signal API
         ) -> None:
-            from django_rls_tenants.tenants.middleware import (  # noqa: PLC0415
-                _were_gucs_set,
-                _were_gucs_set_on_this_thread,
-            )
-
-            db_alias = connection.alias
-            conf = rls_tenants_config
-
-            if db_alias not in conf.DATABASES:
-                return
-
-            on_request_thread = _were_gucs_set_on_this_thread()
-            if _were_gucs_set() and not on_request_thread:
-                # Another thread with a copy of the request's context, such as
-                # the thread_sensitive=False hop in which Django builds an
-                # error page under ASGI.
-                _clear_new_connection_gucs(connection, "opened outside the request's thread")
-                return
-
-            if _is_pooled(connection):
-                # A pooled connection keeps its session GUCs between borrowers;
-                # the previous one's cleanup may not have reached it. With or
-                # without a request context, the new borrower starts clean.
-                _clear_new_connection_gucs(connection, "checked out of a connection pool")
-            if on_request_thread:
-                _apply_request_gucs(db_alias, conf)
+            _prepare_new_connection(connection)
 
         connection_created.connect(_set_guc_on_new_connection, weak=False)
 

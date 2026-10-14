@@ -186,30 +186,45 @@ Under an ASGI request or a bare event loop, use the default `USE_LOCAL_SET=False
 generic `async_rls_context()` and `async_bypass_flag()` do not check this: with
 `is_local=True` outside a transaction the `RuntimeError` from `set_guc()` propagates.
 
-### One context per task
+### Concurrent tasks
 
-Sibling tasks of one request share the request's database connection. Their GUC writes
-interleave, so **do not** run blocks for different tenants concurrently:
+*Changed in 1.4.0.* Sibling tasks of one request share the request's database connection,
+but each has its own `ContextVar` state. Before each statement, the
+[GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) applies the context of
+the task that runs it, so blocks for different tenants can run concurrently:
 
 ```python
-# Do not: both tasks write rls.current_tenant on the same connection.
 await asyncio.gather(
     report_for(tenant_a),   # async with async_tenant_context(tenant_a.pk): ...
     report_for(tenant_b),   # async with async_tenant_context(tenant_b.pk): ...
 )
 ```
 
-Model queries stay scoped, because each task has its own `ContextVar` state and the ORM
-auto-scope filter uses it. Raw SQL, `safe_tenant_sql()` and M2M through tables rely on
-the GUCs alone and are not protected. Run such work one tenant after another.
+That covers raw SQL, `safe_tenant_sql()` and M2M through tables, which rely on the GUCs
+alone. It does not cover:
+
+- bypass flags and other GUCs set with `async_bypass_flag()` / `async_rls_context()`: they
+  stay on the shared connection while the block runs, and sibling tasks see them. Do not
+  run such a block concurrently with work that must not get the bypass;
+- `USE_LOCAL_SET=True` (see above), where the guard does nothing;
+- SQL that bypasses Django's cursor: a raw driver cursor, and the `FETCH`es of a
+  server-side cursor (`iterator()`) opened inside a transaction, whose rows PostgreSQL
+  computes as they are fetched. Outside a transaction, as under ASGI, it computes them when
+  the cursor opens.
+
+Before 1.4.0 the tasks' GUC writes interleaved: model queries stayed scoped by the ORM
+auto-scope filter, but raw SQL could see another task's tenant.
 
 ### Mixing sync and async code
 
 The sync and async managers nest in both directions. A sync `tenant_context()` inside a
 `sync_to_async(..., thread_sensitive=True)` call runs on the same connection and restores
 the outer async block when it exits; an async block run with `async_to_sync` inside a sync
-`tenant_context()` restores the sync scope. Always pass `thread_sensitive=True` (the
-default): a different thread means a different connection, which does not carry the GUCs.
+`tenant_context()` restores the sync scope. Prefer `thread_sensitive=True` (the default): a
+different thread means a different connection. The
+[GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) applies your context
+there too (session GUCs only), but that connection is outside any transaction your code
+has open.
 
 ## @with_rls_context Decorator
 
@@ -274,10 +289,9 @@ async def dashboard(request):
   `SynchronousOnlyOperation` in async code.
 - Everything in [Async Code](#async-code) applies: one thread hop on entry and one on exit,
   the [`USE_LOCAL_SET=True` limitation](#use_local_settrue-in-async-code), and
-  [one context per task](#one-context-per-task). In particular, do not run decorated calls
-  for different users concurrently, as in
-  `asyncio.gather(order_count(as_user=a), order_count(as_user=b))`: the tasks share the
-  request's connection, so raw SQL and M2M through tables can see the other user's rows.
+  [concurrent tasks](#concurrent-tasks). Decorated calls for different users can run
+  concurrently, as in `asyncio.gather(order_count(as_user=a), order_count(as_user=b))`,
+  within the limits listed there.
 
 !!! warning "Before 1.4.0"
     The decorator always returned a sync wrapper. On an `async def` it entered and left the
@@ -452,3 +466,12 @@ The `TenantQuerySet.for_user()` method automatically uses `self.db`, so chaining
 ```python
 Order.objects.using("replica").for_user(user)
 ```
+
+*Changed in 1.4.0:* `using` names the alias a context manager writes its GUCs to on entry
+and restores on exit. Every alias in `RLS_TENANTS["DATABASES"]` follows the context as well:
+the [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) applies it before
+each statement there. `tenant_context(42)` therefore also scopes a read that a router sends
+to a configured replica, and `admin_context(using="analytics")` gives the admin bypass on
+every configured alias. An alias outside `RLS_TENANTS["DATABASES"]` gets the GUCs only when
+you name it in `using`. With `USE_LOCAL_SET=True` the guard does nothing, and only the
+`using` alias gets them.

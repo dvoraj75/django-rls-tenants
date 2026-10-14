@@ -22,9 +22,12 @@ from django.utils.module_loading import import_string
 
 from django_rls_tenants.exceptions import RLSConfigurationError
 from django_rls_tenants.rls.guc import clear_guc, set_guc
+from django_rls_tenants.tenants.affinity import writing
 from django_rls_tenants.tenants.conf import rls_tenants_config
-from django_rls_tenants.tenants.context import _resolve_user_guc_vars
+from django_rls_tenants.tenants.context import _context_gucs_of, _resolve_user_guc_vars
 from django_rls_tenants.tenants.state import (
+    _reset_context_gucs,
+    _set_context_gucs,
     reset_current_tenant_id,
     reset_rls_context_active,
     set_current_tenant_id,
@@ -149,6 +152,25 @@ def _reset_or_clear[T](
     clear()
 
 
+def _end_context_gucs(token: Token[tuple[str, str] | None] | None) -> None:
+    """Reset the request's context GUC values through ``token``; clear them if that fails.
+
+    Left set, they would make the GUC affinity guard apply the request's GUCs
+    again after the cleanup has cleared them, on this thread's later
+    statements and, under WSGI, in later requests. The cleanup therefore does
+    this first, and still clears the values when the reset raises.
+
+    Args:
+        token: The token from ``_set_context_gucs()``, or ``None`` if the
+            values were never set.
+    """
+    try:
+        _reset_or_clear(token, _reset_context_gucs, partial(_set_context_gucs, None))
+    except BaseException:
+        _set_context_gucs(None)
+        raise
+
+
 def _is_authenticated(request: HttpRequest) -> bool:
     """Return ``True`` when the request carries an authenticated user.
 
@@ -169,8 +191,9 @@ def _clear_gucs_on_all_databases(conf: Any) -> None:
     """
     for db_alias in conf.DATABASES:
         try:
-            clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
-            clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
+            with writing(db_alias, None):
+                clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
+                clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
         except Exception:  # noqa: S110  -- best-effort cleanup, connection may be dead
             pass
 
@@ -187,8 +210,9 @@ def _clear_request_gucs(conf: RLSTenantsConfig) -> None:
     if conf.USE_LOCAL_SET:
         return
     for db_alias in conf.DATABASES:
-        clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
-        clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
+        with writing(db_alias, None):
+            clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
+            clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
     logger.debug("Middleware cleared GUCs on databases=%s", conf.DATABASES)
 
 
@@ -196,6 +220,7 @@ class _RequestScope(NamedTuple):
     """State of a request whose GUCs the async enter hop has set."""
 
     tenant_id: int | str | None
+    gucs: tuple[str, str]
     thread_marker: _ThreadMarker
 
 
@@ -343,12 +368,14 @@ class RLSTenantMiddleware(MiddlewareMixin):
             return await self._aget_response(request)
         tenant_token = set_current_tenant_id(scope.tenant_id)
         active_token = set_rls_context_active(True)
+        gucs_token = _set_context_gucs(scope.gucs)
         # The hop's thread, not the event loop's, owns the GUCs.
         _mark_gucs_set(scope.thread_marker)
         try:
             return await self._aget_response(request)
         finally:
             try:
+                _end_context_gucs(gucs_token)
                 reset_current_tenant_id(tenant_token)
                 reset_rls_context_active(active_token)
             finally:
@@ -376,8 +403,8 @@ class RLSTenantMiddleware(MiddlewareMixin):
 
         Returns:
             ``None`` for an unauthenticated request (nothing was set), otherwise
-            the auto-scope tenant ID (``None`` for an admin user) and the marker
-            of the thread that set the GUCs.
+            the auto-scope tenant ID (``None`` for an admin user), the GUC values
+            set, and the marker of the thread that set them.
 
         Raises:
             RLSConfigurationError: If ``USE_LOCAL_SET=True`` and the request is
@@ -403,7 +430,7 @@ class RLSTenantMiddleware(MiddlewareMixin):
             user.is_tenant_admin,
             getattr(user, "rls_tenant_id", None),
         )
-        return _RequestScope(tenant_id, _current_thread_marker())
+        return _RequestScope(tenant_id, _context_gucs_of(guc_vars, conf), _current_thread_marker())
 
     async def _aenter_request(
         self,
@@ -477,6 +504,7 @@ class RLSTenantMiddleware(MiddlewareMixin):
         # the failure.
         tenant_token: Token[int | str | None] | None = None
         active_token: Token[bool] | None = None
+        gucs_token: Token[tuple[str, str] | None] | None = None
         try:
             guc_vars = _resolve_user_guc_vars(user, conf)
             self._set_gucs_on_all_databases(guc_vars, conf)
@@ -502,12 +530,17 @@ class RLSTenantMiddleware(MiddlewareMixin):
             # distinguishes "middleware set context" from "no context".
             active_token = set_rls_context_active(True)
             setattr(request, "_rls_context_active_token", active_token)  # noqa: B010  -- dynamic attr on HttpRequest
+
+            # The values the GUC affinity guard re-applies on other connections.
+            gucs_token = _set_context_gucs(_context_gucs_of(guc_vars, conf))
+            setattr(request, "_rls_context_gucs_token", gucs_token)  # noqa: B010  -- dynamic attr on HttpRequest
             _mark_gucs_set()
         except Exception:
             logger.exception("Failed to set RLS GUC variables, clearing to prevent leak")
             # Reset via token when available to avoid stacking unreset
             # ContextVar values; _reset_or_clear falls back to clearing when
             # the token was never created (error occurred before set call).
+            _end_context_gucs(gucs_token)
             _reset_or_clear(
                 tenant_token,
                 reset_current_tenant_id,
@@ -569,25 +602,28 @@ class RLSTenantMiddleware(MiddlewareMixin):
             conf: ``RLSTenantsConfig`` instance.
         """
         completed_aliases: list[str] = []
+        gucs = _context_gucs_of(guc_vars, conf)
         try:
             for db_alias in conf.DATABASES:
-                for guc_name, guc_value in guc_vars.items():
-                    if guc_value:
-                        set_guc(
-                            guc_name,
-                            guc_value,
-                            is_local=conf.USE_LOCAL_SET,
-                            using=db_alias,
-                        )
-                    else:
-                        clear_guc(guc_name, is_local=conf.USE_LOCAL_SET, using=db_alias)
+                with writing(db_alias, gucs):
+                    for guc_name, guc_value in guc_vars.items():
+                        if guc_value:
+                            set_guc(
+                                guc_name,
+                                guc_value,
+                                is_local=conf.USE_LOCAL_SET,
+                                using=db_alias,
+                            )
+                        else:
+                            clear_guc(guc_name, is_local=conf.USE_LOCAL_SET, using=db_alias)
                 completed_aliases.append(db_alias)
         except Exception:
             # Rollback GUCs on databases that were already set.
             for done_alias in completed_aliases:
                 try:
-                    clear_guc(conf.GUC_IS_ADMIN, using=done_alias)
-                    clear_guc(conf.GUC_CURRENT_TENANT, using=done_alias)
+                    with writing(done_alias, None):
+                        clear_guc(conf.GUC_IS_ADMIN, using=done_alias)
+                        clear_guc(conf.GUC_CURRENT_TENANT, using=done_alias)
                 except Exception:  # noqa: S110  -- best-effort cleanup
                     pass
             raise
@@ -613,6 +649,7 @@ class RLSTenantMiddleware(MiddlewareMixin):
             if getattr(request, "_rls_state_reset", False) is not True:
                 # No token stored means an unauthenticated request or an error
                 # during process_request before the token was saved: clear.
+                _end_context_gucs(getattr(request, "_rls_context_gucs_token", None))
                 _reset_or_clear(
                     getattr(request, "_rls_tenant_token", None),
                     reset_current_tenant_id,

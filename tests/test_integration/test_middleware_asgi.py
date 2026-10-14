@@ -11,7 +11,7 @@ these requests on its own async path; ``TestNativeAsyncPath`` covers it with asy
 ``AsyncClientHandler`` fires ``request_finished`` on a throwaway connection, so the
 "nothing left behind" assertions below check the middleware's own cleanup, not the
 ``request_finished`` safety net. ``TestErrorPageOnWorkerThread`` covers the error pages
-Django builds on a worker thread while the request context is active (#130).
+Django builds on a worker thread while the request context is active (#130, #41).
 """
 
 from __future__ import annotations
@@ -422,7 +422,12 @@ _ASGI_MIDDLEWARE_PATHS = {
 @pytest.mark.integration
 @pytest.mark.django_db(transaction=True)
 class TestErrorPageOnWorkerThread:
-    """#130: an error page built on a worker thread gets no context, and leaves none behind.
+    """#130, #41: an error page built on a worker thread runs in the request's context.
+
+    The worker thread's connection gets the request's GUCs from the GUC affinity
+    guard, so the page sees what the request may see, and keeps them only until
+    its next statement: the anonymous page built after it on the same thread and
+    connection sees nothing.
 
     ``transaction=True``: the worker thread's connection is not the test's, so it
     sees committed rows only.
@@ -430,13 +435,14 @@ class TestErrorPageOnWorkerThread:
 
     @pytest.mark.parametrize("middleware_path", list(_ASGI_MIDDLEWARE_PATHS))
     @pytest.mark.parametrize("first_user", ["scoped", "admin"])
-    def test_unresolved_url_leaves_no_context_on_the_worker_connection(
+    def test_unresolved_url_inherits_the_context_and_leaves_none_behind(
         self,
         first_user,
         middleware_path,
         scoped_web_user,
         admin_web_user,
         sample_orders,
+        tenant_a,
         enforce_rls_on_other_threads,
         guc_probe_404,
     ):
@@ -455,10 +461,20 @@ class TestErrorPageOnWorkerThread:
         assert first["thread"] == second["thread"] != threading.get_ident()
         assert first["pid"] == second["pid"]
         assert [page["rls_context_active"] for page in (first, second)] == [True, False]
-        for page in (first, second):
-            assert page["tenant_guc"] is None
-            assert page["is_admin_guc"] is None
-            assert page["database_products"] == []
+        expected_first = {
+            "scoped": (str(tenant_a.pk), "false", ["Widget A1", "Widget A2"]),
+            "admin": (None, "true", ["Gadget B1", "Widget A1", "Widget A2"]),
+        }[first_user]
+        assert (
+            first["tenant_guc"],
+            first["is_admin_guc"],
+            first["database_products"],
+        ) == expected_first
+        assert (second["tenant_guc"], second["is_admin_guc"], second["database_products"]) == (
+            None,
+            None,
+            [],
+        )
         _assert_request_left_nothing_behind()
 
     @pytest.mark.parametrize("middleware_path", list(_ASGI_MIDDLEWARE_PATHS))
@@ -490,15 +506,18 @@ class TestErrorPageOnWorkerThread:
                 ],
             )
 
-        assert reopened == {
+        tenant_a_view = {
             "tenant_guc": str(tenant_a.pk),
             "is_admin_guc": "false",
             "database_products": ["Widget A1", "Widget A2"],
         }
+        assert reopened == tenant_a_view
         assert first["pid"] == second["pid"]
         assert [page["rls_context_active"] for page in (first, second)] == [True, False]
-        for page in (first, second):
-            assert page["tenant_guc"] is None
-            assert page["is_admin_guc"] is None
-            assert page["database_products"] == []
+        assert {key: first[key] for key in tenant_a_view} == tenant_a_view
+        assert (second["tenant_guc"], second["is_admin_guc"], second["database_products"]) == (
+            None,
+            None,
+            [],
+        )
         _assert_request_left_nothing_behind()

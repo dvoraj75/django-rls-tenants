@@ -224,10 +224,12 @@ handlers, so there is no double-entry.
 
 ## Multi-database tasks
 
-The propagated context is restored on the **`default`** database alias only.
-`RLSTenantMiddleware` sets the RLS GUC on every alias in
-`RLS_TENANTS["DATABASES"]`, but the task integration restores a single alias, so
-queries a task runs against any *other* alias are **not** scoped unless you
+The propagated context is restored on the **`default`** database alias.
+*Changed in 1.4.0:* every other alias in `RLS_TENANTS["DATABASES"]` follows it too,
+through the [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard), so a
+task's queries on a configured replica are scoped as well (with the default
+`USE_LOCAL_SET=False`). Queries on an alias *outside* `RLS_TENANTS["DATABASES"]`, or on
+any alias but `default` with `USE_LOCAL_SET=True`, are **not** scoped unless you
 re-enter the context for that alias yourself. Pass `using="..."` to the context
 manager inside the task body to scope queries on a specific alias:
 
@@ -243,11 +245,12 @@ def replicate() -> None:
         Order.objects.using("replica").all()
 ```
 
-!!! warning "Non-default aliases are not auto-scoped"
-    A task body that queries a replica or secondary database without an explicit
-    `tenant_context(..., using="<alias>")` runs **unscoped** on that alias (RLS
-    then returns zero rows, or every row in admin mode). Wrap every non-default
-    alias the task touches, as shown above.
+!!! warning "Aliases outside `RLS_TENANTS[\"DATABASES\"]` are not auto-scoped"
+    A task body that queries such an alias without an explicit
+    `tenant_context(..., using="<alias>")` runs **unscoped** on it (RLS then
+    returns zero rows, or every row in admin mode). Wrap every such alias the task
+    touches, as shown above. Before 1.4.0 this applied to every alias but `default`,
+    and it still does with `USE_LOCAL_SET=True`.
 
 See [Context Managers](context-managers.md#multi-database-support) for details.
 

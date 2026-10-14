@@ -187,11 +187,19 @@ Mitigations:
 - **Safety net**: `request_finished` signal clears GUCs if `process_response` is skipped,
   on a connection that is still open (with Django's pool the next checkout clears it
   instead).
-- **Other threads**: the `connection_created` handler sets the request's GUCs only on
-  connections opened on the thread that set them, where the cleanup above runs. A
+- **Other threads**: the `connection_created` handler sets the request's GUCs on connect
+  only on connections opened on the thread that set them, where the cleanup above runs. A
   connection opened on another thread during the request (an ASGI error page,
   `thread_sensitive=False` work) is cleared instead (#130; see
   [Running under ASGI](../guides/middleware.md#running-under-asgi)).
+- **GUC affinity guard**: before each statement on a configured alias, the guard applies
+  the active context's GUCs if the connection holds other values, and clears them if no
+  context is active. Work on another thread therefore runs with the context it was handed
+  and leaves nothing on that thread's connection for later work, and a connection whose
+  cleanup failed is corrected before its next statement (#41). It only applies contexts
+  the library itself set up (a private `ContextVar`), never one inferred from the public
+  state functions, and session GUCs only. See
+  [GUC Affinity Guard](architecture.md#guc-affinity-guard).
 - **Django's connection pool**: on each checkout from a pool (`OPTIONS["pool"]`) on a
   configured alias, the `connection_created` handler clears every GUC the policies read,
   with or without a request context, so a connection that the previous borrower's cleanup

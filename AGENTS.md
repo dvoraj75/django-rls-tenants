@@ -118,7 +118,8 @@ but only on the thread that set the request's GUCs: the "GUCs set" `ContextVar`
 holds that thread's marker (`_mark_gucs_set()`, `_were_gucs_set_on_this_thread()`
 in `middleware.py`). `ContextVar`s are copied into `thread_sensitive=False` hops,
 whose connections the cleanup never reaches, so on any other thread the handler
-clears the GUCs instead (#130). Code that sets the flag from a different thread
+clears the GUCs instead (#130), and the GUC affinity guard (below) then applies the
+copied context to that thread's statements (#41). Code that sets the flag from a different thread
 than the one that set the GUCs must pass that thread's marker (the async path
 takes it from the enter hop); `_mark_gucs_set()` alone marks the current thread.
 The safety-net `request_finished` handler clears GUCs on all configured aliases.
@@ -142,6 +143,42 @@ connection (with a pool, Django has already returned it). System check `W010` as
 
 When modifying middleware or GUC-related code, ensure all database iteration
 uses `conf.DATABASES` rather than hardcoding `"default"`.
+
+### GUC Affinity Guard
+
+`tenants/affinity.py` (#41). The `connection_created` handler (`_prepare_new_connection()`
+in `apps.py`) calls `install()` on every PostgreSQL connection: `_guard` goes first in
+`execute_wrappers` (Django's `execute_wrapper()` pops the last one on exit) and a
+`_SessionGUCs` tracker is attached to the connection. Before each statement on an alias in
+`conf.DATABASES` with `USE_LOCAL_SET=False`, the guard compares the active context's values
+(`state._get_context_gucs()`, a private `ContextVar` holding `(is_admin, current_tenant)` or
+`None`) with what the tracker says the session holds and, if they differ, runs `set_gucs()`
+(one `set_config()` pair) first; a failure propagates. So every configured alias follows
+the context, whichever alias it was entered on.
+
+Rules for code that sets a context or writes the admin/tenant GUCs:
+
+- Every library entry point that sets the tenant `ContextVar`s also sets
+  `_set_context_gucs()` to exactly the values it writes, and resets it with its token
+  (first, in the middleware: `_end_context_gucs()`). The guard never infers a context from
+  `get_current_tenant_id()` / `get_rls_context_active()`, which are public.
+- The library's own GUC writes run inside `writing(alias_or_connection, values)`, which
+  keeps the guard out of the way and records `values` (`UNKNOWN` if the block raises). A
+  restore records `_get_context_gucs()` read after the `ContextVar` reset
+  (`_restore_tenant_gucs()` in `context.py`): the guard reconciled the snapshot reads, so
+  the snapshot holds the enclosing context's values. A snapshot taken inside `writing()`
+  needs `reconcile()` first (`_enter_tenant_gucs()`).
+- Writes by other code (`set_guc()`, `rls_context()`) are deliberately not recorded.
+
+PostgreSQL undoes `set_config()` calls made in a rolled-back transaction or savepoint, so
+the tracker follows the libpq transaction status and the transaction-control statements
+that run through Django's cursor (savepoint stack, `ROLLBACK`/`COMMIT` as SQL,
+`RESET ALL`/`DISCARD ALL`/`RESET` of the two GUCs); what it cannot follow becomes `UNKNOWN`
+and is re-applied before the next statement. Transaction-control statements, failed
+transactions and `needs_rollback` are never reconciled. In tests, a test that leaves a
+context open must reset `_set_context_gucs(None)` (the autouse `_clear_gucs_after_test`
+fixture does), and a test that checks what a session holds regardless of the guard reads
+it with a driver cursor (`connection.connection.cursor()`).
 
 ### Strict Mode
 

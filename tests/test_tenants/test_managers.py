@@ -6,6 +6,7 @@ import inspect
 import itertools
 import json
 import warnings
+from contextlib import contextmanager
 from decimal import Decimal
 from unittest.mock import MagicMock
 
@@ -1701,18 +1702,27 @@ class TestForUserAliases:
         def query(self_inner, *args, **kwargs):
             used.append(("query", self_inner.db))
 
+        @contextmanager
+        def writing(using, values):
+            used.append(("writing", using))
+            yield
+
         monkeypatch.setattr(managers, "_snapshot_gucs", snapshot)
+        monkeypatch.setattr(managers, "writing", writing)
         monkeypatch.setattr(
             managers, "set_guc", lambda name, value, **kw: used.append(("set", kw["using"]))
         )
         monkeypatch.setattr(
-            managers, "restore_gucs", lambda changed, **kw: used.append(("restore", kw["using"]))
+            managers,
+            "_restore_tenant_gucs",
+            lambda changed, **kw: used.append(("restore", kw["using"])),
         )
         monkeypatch.setattr(QuerySet, method, query)
         with override_settings(DATABASE_ROUTERS=[_READS_ELSEWHERE]):
             getattr(Order.objects.for_user(tenant_a_user), method)()
         assert used == [
             ("snapshot", alias),
+            ("writing", alias),
             ("set", alias),
             ("set", alias),
             ("query", alias),

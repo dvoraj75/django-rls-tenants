@@ -22,7 +22,11 @@ from django_rls_tenants.tenants.middleware import (
     _mark_gucs_set,
     _were_gucs_set,
 )
-from django_rls_tenants.tenants.state import set_current_tenant_id
+from django_rls_tenants.tenants.state import (
+    _set_context_gucs,
+    set_current_tenant_id,
+    set_rls_context_active,
+)
 
 pytestmark = pytest.mark.django_db
 
@@ -166,6 +170,29 @@ class TestRequestFinishedSafetyNet:
         assert _were_gucs_set() is False
 
 
+def _enter_request_context(tenant_id):
+    """Set the state ``RLSTenantMiddleware`` sets for a request, on this thread.
+
+    The tenant ``ContextVar`` values, the GUC values the affinity guard applies,
+    and the flag that marks this thread as the one that set the GUCs. The autouse
+    ``_clear_gucs_after_test`` fixture resets them.
+    """
+    set_current_tenant_id(tenant_id)
+    set_rls_context_active(True)
+    _set_context_gucs(("true", "") if tenant_id is None else ("false", str(tenant_id)))
+    _mark_gucs_set()
+
+
+def _read_session_gucs(conn):
+    """Read the tenant and admin GUCs with a driver cursor, which the affinity guard never sees."""
+    with conn.connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT current_setting('rls.current_tenant', true), "
+            "current_setting('rls.is_admin', true)"
+        )
+        return tuple(value or None for value in cursor.fetchone())
+
+
 @pytest.mark.django_db(transaction=True)
 class TestConnectionCreatedSignalHandler:
     """Tests for the connection_created signal handler logic.
@@ -184,45 +211,26 @@ class TestConnectionCreatedSignalHandler:
         # At least one receiver should be registered (our handler)
         assert len(connection_created.receivers) >= 1
 
-    def test_tenant_context_sets_gucs_on_new_connection(self):
-        """When a new connection opens mid-request, GUCs are set from ContextVar."""
-        set_current_tenant_id(42)
-        _mark_gucs_set()
-        try:
-            # Force Django to create a new connection by resetting the wrapper.
-            connection.ensure_connection()
-            connection.connection.close()
-            connection.connection = None
+    @pytest.mark.parametrize(
+        ("tenant_id", "expected"),
+        [(42, ("42", "false")), (None, (None, "true"))],
+        ids=["tenant", "admin"],
+    )
+    def test_request_context_is_set_on_new_connection(self, tenant_id, expected):
+        """When a new connection opens mid-request, the context's GUCs are set on connect.
 
-            # cursor() triggers reconnection -> connection_created signal
-            with connection.cursor() as cur:
-                cur.execute("SELECT current_setting('rls.current_tenant', true)")
-                result = cur.fetchone()
+        Read with a driver cursor: the affinity guard would set them before a
+        statement anyway, so only that shows the handler did.
+        """
+        _enter_request_context(tenant_id)
+        # Force Django to create a new connection by resetting the wrapper.
+        connection.ensure_connection()
+        connection.connection.close()
+        connection.connection = None
 
-            assert result is not None
-            assert result[0] == "42"
-        finally:
-            set_current_tenant_id(None)
-            _clear_gucs_set_flag()
+        connection.ensure_connection()  # connection_created
 
-    def test_admin_context_sets_gucs_on_new_connection(self):
-        """Admin context (tenant_id=None) sets admin GUCs on new connections."""
-        set_current_tenant_id(None)
-        _mark_gucs_set()
-        try:
-            connection.ensure_connection()
-            connection.connection.close()
-            connection.connection = None
-
-            with connection.cursor() as cur:
-                cur.execute("SELECT current_setting('rls.is_admin', true)")
-                result = cur.fetchone()
-
-            assert result is not None
-            assert result[0] == "true"
-        finally:
-            set_current_tenant_id(None)
-            _clear_gucs_set_flag()
+        assert _read_session_gucs(connection) == expected
 
     def test_no_context_skips_guc_setting(self):
         """Without active context, handler does nothing on new connections."""
@@ -335,21 +343,40 @@ def _connect_on_broken_connection():
     conn.ensure_connection()
 
 
+def _read_session_gucs_on_connect():
+    """Open this thread's connection and read its GUCs before any statement runs."""
+    conn = connections["default"]
+    conn.ensure_connection()
+    return _read_session_gucs(conn)
+
+
 class TestConnectionCreatedOnAnotherThread:
-    """#130: GUCs go only on connections opened on the thread that set them.
+    """#130, #41: a connection opened on another thread starts clean, then inherits the context.
 
     The request's cleanup clears that thread's connections only. A connection
     opened on another thread holding a copy of the request's context (Django's
-    ``thread_sensitive=False`` error-page hop under ASGI) is left without one.
+    ``thread_sensitive=False`` error-page hop under ASGI) is cleared when it
+    opens and gets nothing from the handler. The affinity guard then applies the
+    context before each statement run in that copy of it, and clears it again
+    before the first one run without it (``TestAffinityGuardOnHops``).
     """
 
-    @pytest.mark.parametrize("tenant_id", [42, None], ids=["tenant", "admin"])
-    def test_connection_gets_no_gucs(self, tenant_id, caplog):
-        set_current_tenant_id(tenant_id)
-        _mark_gucs_set()
+    @pytest.mark.parametrize(
+        ("tenant_id", "inherited"),
+        [(42, ("42", "false")), (None, (None, "true"))],
+        ids=["tenant", "admin"],
+    )
+    def test_connection_starts_clean_and_inherits_the_context(
+        self,
+        tenant_id,
+        inherited,
+        caplog,
+    ):
+        _enter_request_context(tenant_id)
 
         with caplog.at_level(logging.DEBUG, logger="django_rls_tenants"):
-            assert _on_new_thread(_read_gucs) == (None, None)
+            assert _on_new_thread(_read_session_gucs_on_connect) == (None, None)
+            assert _on_new_thread(_read_gucs) == inherited
 
         assert any("outside the request's thread" in m for m in caplog.messages)
 
@@ -358,10 +385,14 @@ class TestConnectionCreatedOnAnotherThread:
         # simulated reused connection really does arrive with both GUCs set.
         assert _on_new_thread(_read_gucs_on_dirty_connection) == ("999", "true")
 
-        set_current_tenant_id(42)
-        _mark_gucs_set()
+        _enter_request_context(42)
 
-        assert _on_new_thread(_read_gucs_on_dirty_connection) == (None, None)
+        def read_on_connect():
+            _arrive_with(_STALE_GUCS_SQL)
+            return _read_session_gucs_on_connect()
+
+        assert _on_new_thread(read_on_connect) == (None, None)
+        assert _on_new_thread(_read_gucs_on_dirty_connection) == ("42", "false")
 
     def test_clear_runs_on_the_new_connections_alias(self):
         databases = {**django_settings.RLS_TENANTS, "DATABASES": ["default", "replica"]}
@@ -369,14 +400,12 @@ class TestConnectionCreatedOnAnotherThread:
             # Control, as above: the replica connection really arrives with the GUCs.
             assert _on_new_thread(_read_gucs_on_dirty_replica_connection) == ("999", "true")
 
-            set_current_tenant_id(42)
-            _mark_gucs_set()
+            _enter_request_context(42)
 
-            assert _on_new_thread(_read_gucs_on_dirty_replica_connection) == (None, None)
+            assert _on_new_thread(_read_gucs_on_dirty_replica_connection) == ("42", "false")
 
     def test_failed_clear_is_logged_not_raised(self, caplog):
-        set_current_tenant_id(42)
-        _mark_gucs_set()
+        _enter_request_context(42)
 
         with caplog.at_level(logging.WARNING, logger="django_rls_tenants"):
             _on_new_thread(_connect_on_broken_connection)
@@ -384,19 +413,17 @@ class TestConnectionCreatedOnAnotherThread:
         assert any("Failed to clear RLS GUCs" in m for m in caplog.messages)
 
     def test_clear_covers_every_policy_guc(self):
-        """Bypass flags a reused connection carries go too, not just the tenant GUCs."""
-        set_current_tenant_id(42)
-        _mark_gucs_set()
+        """Bypass flags a reused connection carries go too; the guard restores only the context."""
+        _enter_request_context(42)
 
-        assert _on_new_thread(_read_policy_gucs_on_dirty_connection) == (None, None, None)
+        assert _on_new_thread(_read_policy_gucs_on_dirty_connection) == ("42", "false", None)
 
     def test_owner_thread_still_gets_gucs(self):
         """The thread that set the flag keeps the lazily-opened-connection behaviour."""
 
         def owner():
-            set_current_tenant_id(42)
-            _mark_gucs_set()
-            return _read_gucs()
+            _enter_request_context(42)
+            return _read_session_gucs_on_connect()
 
         assert _on_new_thread(owner) == ("42", "false")
 
@@ -439,17 +466,16 @@ class TestConnectionCreatedOnPooledConnection:
         expected,
     ):
         def owner():
-            set_current_tenant_id(tenant_id)
-            _mark_gucs_set()
+            _enter_request_context(tenant_id)
             return _read_policy_gucs_on_dirty_connection()
 
         assert _on_new_thread(owner) == expected
 
     def test_checkout_on_another_thread_clears_every_policy_guc(self, pooled_connections):
-        set_current_tenant_id(42)
-        _mark_gucs_set()
+        """Every stale GUC goes; the guard then applies the copied context's own."""
+        _enter_request_context(42)
 
-        assert _on_new_thread(_read_policy_gucs_on_dirty_connection) == (None, None, None)
+        assert _on_new_thread(_read_policy_gucs_on_dirty_connection) == ("42", "false", None)
 
     def test_alias_outside_rls_databases_is_left_alone(self, pooled_connections):
         assert _on_new_thread(_read_gucs_on_dirty_replica_connection) == ("999", "true")

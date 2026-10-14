@@ -182,5 +182,6 @@ predicate lands.
     string and rely on the GUC set by the active context, which can be a sync
     context manager or, since 1.4.0, an
     [async one](context-managers.md#async-code). There is no separate async
-    variant. Do not run raw SQL while sibling tasks of one request hold
-    different contexts (see [One context per task](context-managers.md#one-context-per-task)).
+    variant. Sibling tasks of one request can hold different contexts: the GUC
+    affinity guard applies each task's context before its statements (see
+    [Concurrent tasks](context-managers.md#concurrent-tasks)).

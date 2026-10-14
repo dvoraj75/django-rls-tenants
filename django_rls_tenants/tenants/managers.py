@@ -28,12 +28,19 @@ from django.db import connections, models, router, transaction
 from django.db.models import Q
 
 from django_rls_tenants.exceptions import NoTenantContextError
-from django_rls_tenants.rls.context import restore_gucs
 from django_rls_tenants.rls.guc import set_guc
+from django_rls_tenants.tenants.affinity import writing
 from django_rls_tenants.tenants.conf import rls_tenants_config
-from django_rls_tenants.tenants.context import _resolve_user_guc_vars, _snapshot_gucs
+from django_rls_tenants.tenants.context import (
+    _context_gucs_of,
+    _resolve_user_guc_vars,
+    _restore_tenant_gucs,
+    _snapshot_gucs,
+)
 from django_rls_tenants.tenants.errors import HINT_NO_CONTEXT
 from django_rls_tenants.tenants.state import (
+    _reset_context_gucs,
+    _set_context_gucs,
     get_current_tenant_id,
     get_rls_context_active,
     reset_current_tenant_id,
@@ -382,22 +389,31 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
                 # get_guc() reads an empty variable as None; the admin tenant value is "".
                 if (previous[name] or "") != value
             }
+            gucs = _context_gucs_of(variables, conf)
             active_token = set_rls_context_active(True)
             tenant_token = set_current_tenant_id(
                 None if user.is_tenant_admin else user.rls_tenant_id,
             )
+            gucs_token = _set_context_gucs(gucs)
             exc_pending = False
             try:
-                for name in changed:
-                    set_guc(name, variables[name], is_local=is_local, using=using)
+                with writing(using, gucs):
+                    for name in changed:
+                        set_guc(name, variables[name], is_local=is_local, using=using)
                 yield
             except BaseException:
                 exc_pending = True
                 raise
             finally:
+                _reset_context_gucs(gucs_token)
                 reset_current_tenant_id(tenant_token)
                 reset_rls_context_active(active_token)
-                restore_gucs(changed, is_local=is_local, using=using, exc_pending=exc_pending)
+                _restore_tenant_gucs(
+                    changed,
+                    is_local=is_local,
+                    using=using,
+                    exc_pending=exc_pending,
+                )
 
     @contextmanager
     def _pinned_db(self, using: str) -> Iterator[None]:

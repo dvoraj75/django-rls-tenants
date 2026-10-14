@@ -28,9 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   problem cannot occur), and support nesting with sync and async blocks in both GUC
   modes, including restore when the task is cancelled (even during entry). With `USE_LOCAL_SET=True` the tenant
   managers raise `RLSConfigurationError` unless the coroutine runs via `async_to_sync`
-  inside a synchronous `transaction.atomic()`. Use one context per task: sibling tasks
-  of one request share its connection, so `asyncio.gather` across tenants is not safe
-  for raw SQL. No behaviour change for sync code.
+  inside a synchronous `transaction.atomic()`. Sibling tasks of one request share its
+  connection; the GUC affinity guard (#41, below) gives each task's statements its own
+  context. No behaviour change for sync code.
 - **Async testing helpers** (#40). `django_rls_tenants.tenants.testing` gains
   `async_rls_bypass()` and `async_rls_as_tenant()` for `async with`, plus
   `aassert_rls_enabled()`, `aassert_rls_policy_exists()` and
@@ -43,6 +43,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pytest-asyncio and anyio tests run on a separate connection outside the test
   transaction. With plain `django_db`, their fixture rows are invisible and their writes
   are committed.
+- **GUC affinity guard** (#41). Every connection of an alias in `RLS_TENANTS["DATABASES"]`
+  now follows the RLS context of the code that uses it. The `connection_created` handler
+  installs an execute wrapper that, before every statement, compares the admin and tenant
+  GUC values of the active context with the values the library last left on that database
+  session, and when they differ applies the context's values first, in one `set_config()`
+  statement on the same connection. Work handed to another thread with a copy of the
+  context (`sync_to_async(..., thread_sensitive=False)`, `asyncio.to_thread()`, the error
+  pages Django builds there under ASGI) now runs with that context instead of without one.
+  Sibling `asyncio` tasks of one request run their statements with their own contexts
+  although they share its connection, so `asyncio.gather` across tenants is safe for raw
+  SQL, `safe_tenant_sql()` and M2M through tables too. A connection used outside any
+  context loses what a context left on it before its next statement, so it never carries a
+  context into later work on its thread. Only contexts the library set up are applied
+  (`tenant_context()`, `admin_context()`, their async variants, `RLSTenantMiddleware`,
+  `for_user()`, which record their values in a private `ContextVar`); the guard never
+  infers one from `set_current_tenant_id()` / `set_rls_context_active()`, and GUCs other
+  code writes (`set_guc()`, `rls_context()`) stay in force until the context changes, as
+  before. The library records its own GUC writes, so code that stays on one connection
+  runs no extra statement. PostgreSQL undoes a `set_config()` made in a transaction or
+  savepoint that is rolled back: the guard follows savepoints, `ROLLBACK`, `COMMIT`,
+  `RESET ALL` and `DISCARD ALL` from Django's cursor and the transaction status from the
+  driver, and applies the context again whenever it cannot tell what the session holds.
+  If applying fails, the error is raised and the statement does not run. Limits: session
+  GUCs only (with `USE_LOCAL_SET=True` the guard does nothing); the admin and tenant GUCs
+  only, not bypass flags; SQL that bypasses Django's cursor (a raw driver cursor, the
+  `FETCH`es of an open server-side cursor) is not seen. It costs about 1.5 µs of Python
+  per statement. See "GUC Affinity Guard" in the architecture guide.
 - **`reset_rls_gucs()` for Django's connection pool** (#96).
   `django_rls_tenants.pool.reset_rls_gucs` is a `reset` callback for
   `DATABASES[alias]["OPTIONS"]["pool"]` (Django 5.1+, psycopg 3). `psycopg_pool` calls it
@@ -110,6 +137,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other methods raise `RuntimeError` outside `transaction.atomic()`, as iteration
   always did; before, they ran without the GUCs (empty results under RLS, or all rows on
   a superuser connection). Wrap such code in `transaction.atomic()`.
+- **Every alias in `RLS_TENANTS["DATABASES"]` follows the active context** (#41). A
+  context entered on one alias now applies to the other configured aliases too, through
+  the GUC affinity guard: a read that a router sends to a configured replica inside
+  `tenant_context(5)` is scoped to tenant 5 (before, it ran with whatever GUCs the replica
+  connection held, usually none, and found no rows), and `admin_context(using="replica")`
+  gives the admin bypass on every configured alias, as the tenant `ContextVar`s and the
+  ORM auto-scope filter already did. Aliases outside `RLS_TENANTS["DATABASES"]` are
+  unaffected. With `USE_LOCAL_SET=True` nothing changes.
 - **`@with_rls_context` rejects generator functions and coroutine results** (#39).
   Decorating a generator or async generator function now raises `TypeError` at
   decoration time: its body runs while the caller iterates, after the decorator has left
@@ -131,16 +166,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cleared them. Worker threads live as long as the server, so a later error page built on
   the same thread, an anonymous visitor's included, ran with the earlier user's tenant,
   or with the admin bypass, and could read that data if it queried RLS-protected tables.
-  The handler now applies the GUCs only on the thread that set them, where the
+  The handler now applies the GUCs on connect only on the thread that set them, where the
   middleware's cleanup runs, and clears the RLS GUCs (since #96, every GUC the policies
-  read) on a connection opened on any other thread during the request (which also drops
-  stale values a reused connection may carry). Such error pages now see no RLS-protected
-  rows, like error pages for view
-  exceptions already did. Database work a request hands to another thread with a copy of
-  its context (`sync_to_async(..., thread_sensitive=False)`, `asyncio.to_thread()`, under
-  WSGI too) is fail-closed the same way: open `tenant_context()` / `admin_context()`
-  inside it. Requests whose work stays on the request's thread, such as synchronous WSGI
-  views, are unchanged. Affects ASGI deployments since 1.2.0, which added the handler,
+  read) on a connection opened on any other thread during the request, which also drops
+  stale values a reused connection may carry. The GUC affinity guard (#41, see "Added")
+  then applies the request's context to each statement such an error page runs, so it
+  sees what the request may see, and takes the context off the worker thread's
+  connection before the first statement run without it, so a later page built on that
+  thread gets only its own request's context (none for an anonymous visitor). Database work a request hands to another thread with a copy of its
+  context (`sync_to_async(..., thread_sensitive=False)`, `asyncio.to_thread()`, under WSGI
+  too) behaves the same way. Requests whose work stays on the request's thread, such as
+  synchronous WSGI views, are unchanged. Affects ASGI deployments since 1.2.0, which added the handler,
   whose error handlers, templates or context processors query RLS-protected data.
 - **Security: a connection checked out of Django's connection pool could carry the
   previous request's tenant context** (#96). Closing a pooled connection
