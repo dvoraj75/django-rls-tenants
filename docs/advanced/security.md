@@ -243,8 +243,11 @@ RLS_TENANTS = {
 - `for_user()` on the queryset
 
 **Guarded methods:** `_fetch_all()` (iteration), `count()`, `exists()`,
-`aggregate()`, `update()`, `delete()`, `iterator()`, `bulk_create()`,
-`bulk_update()`, `get()`, `first()`, `last()`.
+`aggregate()`, `update()`, `delete()`, `iterator()`, `aiterator()`, `bulk_create()`,
+`bulk_update()`, `get()`, `first()`, `last()`. A queryset whose results are already
+cached answers iteration, `count()` and `exists()` without a query and is not checked,
+so results fetched inside a context (including `prefetch_related()` caches) can be read
+after it ends.
 
 !!! note
     Strict mode does **not** change database-level behavior. RLS policies

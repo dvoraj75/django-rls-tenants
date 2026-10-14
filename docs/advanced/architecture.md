@@ -173,19 +173,85 @@ Explicit through models are skipped -- users manage those via standard
 ## Lazy QuerySet Evaluation
 
 `TenantQuerySet.for_user()` solves a timing problem: Django querysets are lazy, so
-the GUC must be set when the query actually executes, not when `for_user()` is called.
+the GUCs must be set when the query actually executes, not when `for_user()` is called.
 
 ```python
 # qs is created here, but no SQL runs yet
 qs = Order.objects.for_user(user)
 
 # Query might be evaluated much later (e.g., in a template)
-for order in qs:  # <-- GUC is set HERE, just before the SELECT
+for order in qs:  # <-- GUCs are set HERE, around the SELECT
     print(order.title)
 ```
 
-The solution: `_fetch_all()` is overridden to set GUC variables immediately before
-calling `super()._fetch_all()`, with a `try/finally` block to clean up afterward.
+`for_user()` only stores the user. Every `TenantQuerySet` method that runs SQL wraps its
+statements in one private context manager, `_rls_scope()`, which:
+
+1. resolves the alias the SQL runs on (`self.db`, or the router's write alias for the
+   write methods) once, and pins it on the queryset for the call, so a router that
+   answers differently each time cannot split the GUCs from the query;
+2. reads the admin and tenant GUCs there, and sets those that differ from the user's
+   values. Inside a context that has already applied them (the middleware, for the same
+   user) it writes nothing;
+3. sets the tenant state `ContextVar`s, so code that runs during the call (the
+   `prefetch_related()` queries, `delete()` cascades, signal handlers, Celery tasks
+   enqueued there) is auto-scoped to the user's tenant, passes `STRICT_MODE` and, like
+   the SQL, runs as the user: as an admin, for an admin user;
+4. on exit, resets the `ContextVar`s and restores the GUCs it changed to the values it
+   read in step 2.
+
+Restoring instead of clearing keeps an enclosing `tenant_context()`, `admin_context()`
+or middleware context intact after a `for_user()` query, in both GUC modes, and lets
+scopes nest. When the statement fails and aborts the transaction, the restore fails too:
+that failure is logged and dropped, the rollback undoes the change, and the statement's
+own error propagates (the same rule as the context managers).
+
+| Methods | Where the scope is entered |
+|---|---|
+| Iteration, `len()`, `bool()`, indexing and slicing, `get()`, `first()`, `last()`, `earliest()`, `latest()`, `in_bulk()`, iterating the result of `values()` / `values_list()` | `_fetch_all()` |
+| `count()`, `exists()` (and `contains()`, which calls it), `aggregate()`, `explain()` | the method itself |
+| `iterator()`, `aiterator()` | once per chunk |
+| `update()`, `delete()`, `create()` (and `get_or_create()`, which calls it), `bulk_create()`, `bulk_update()`, `update_or_create()` | the method itself, on the write alias |
+| `acount()`, `aget()`, `acreate()`, `async for` and the other async methods | the sync method they run in a `sync_to_async` hop |
+
+`iterator()` fetches each chunk (2000 rows by default), together with its
+`prefetch_related()` lookups, inside its own scope, and closes the scope while your loop
+body runs. A server-side cursor inside a transaction produces its rows at fetch time, and
+a part of the plan that a later fetch reaches first (a `UNION ALL` branch, say) evaluates
+the RLS policy only then, so every fetch needs the GUCs. A scope held for the whole loop
+would also run the loop body as the user and leave the GUCs on the connection when the
+loop stops early. `aiterator()` pulls each chunk in one thread-sensitive hop and enters
+the scope inside that hop.
+
+A queryset that has already been evaluated answers iteration, `len()`, `count()`,
+`exists()` and an ordered `first()` from its result cache. That runs no SQL, so there is
+no scope and no `STRICT_MODE` check. The querysets `prefetch_related()` caches on each
+instance work the same way, so a template can read them after the scope has ended.
+
+A `for_user()` queryset does not cover SQL that runs outside its own methods:
+
+- `raw()` returns a `RawQuerySet`, which does not carry the user.
+- Used as a subquery (`.filter(order__in=Order.objects.for_user(user))`), it is compiled
+  into the outer query: its ORM filter applies, its GUCs do not.
+- Combining querysets with `|`, `&`, `^` or `union()` keeps only the left operand's user,
+  and a sliced operand turns the result into a plain queryset.
+- Instances it returned load deferred fields, foreign keys and related managers
+  (`order.items.all()`) later, after the call, under whatever context is active then.
+
+Use `tenant_context()` / `admin_context()` around such code.
+
+Each scope costs two `current_setting()` reads, plus one write and one restore for every
+GUC that differs from the user's value: six small statements for a tenant user outside
+any context, four for an admin (whose tenant GUC is already empty), two inside a matching
+context. With `USE_LOCAL_SET=True` the writes are `SET LOCAL`, which needs a
+transaction. `update_or_create()`, `bulk_create()`, `bulk_update()` and `delete()`,
+which Django runs in a transaction anyway, open one when none is open; any other method
+that has to change a GUC raises `RuntimeError` outside `transaction.atomic()`, as
+iteration always did.
+
+Before 1.4.0 only `_fetch_all()` applied the user's GUCs: `count()`, `exists()`,
+`aggregate()`, `iterator()`, the writes and their async variants ran without them, and
+found no rows under a role that RLS applies to (#131).
 
 ## Defense-in-Depth
 

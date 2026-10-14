@@ -151,18 +151,20 @@ with tenant_context(tenant_id=42):
 ```
 
 The following queryset methods are guarded: iteration (`_fetch_all()`), `count()`,
-`exists()`, `aggregate()`, `update()`, `delete()`, `iterator()`, `bulk_create()`,
-`bulk_update()`, `get()`, `first()`, `last()`.
+`exists()`, `aggregate()`, `update()`, `delete()`, `iterator()`, `aiterator()`,
+`bulk_create()`, `bulk_update()`, `get()`, `first()`, `last()`.
 
 Queryset *construction* (e.g., `Order.objects.filter(...)`) does not trigger the
-check -- only evaluation does. This matches Django's lazy queryset philosophy.
+check -- only evaluation does. This matches Django's lazy queryset philosophy. Reading a
+queryset whose results are already cached runs no query and is not checked either.
 
 See [Configuration](../getting-started/configuration.md#strict_mode) for setup.
 
 ## Using for_user()
 
-`for_user()` is still available and works as before. It scopes queries to a specific
-user's tenant and sets GUC variables at query evaluation time:
+`for_user()` is still available. It scopes queries to a specific user's tenant and sets
+the GUC variables only while each query runs, restoring the previous values afterwards
+(see [Lazy QuerySet Evaluation](../advanced/architecture.md#lazy-queryset-evaluation)):
 
 ```python
 # Explicit scoping (still works, useful outside context managers)

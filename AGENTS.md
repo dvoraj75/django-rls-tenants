@@ -50,6 +50,13 @@ fails the session if anything was skipped. Never add a runtime `pytest.skip()`. 
 need a superuser connection carry `@pytest.mark.superuser_only` (registered in
 `pyproject.toml`) and `pytest.fail()` on a plain role; deselect with `-m "not superuser_only"`.
 
+**Plain-role rule.** CI's `test-plain-role` job runs the whole library suite as a
+non-superuser role (`-m "not superuser_only"`). A superuser bypasses RLS, so any test that
+asserts database-level filtering (including `for_user()` results) must request the
+`enforce_rls` fixture: it switches a superuser connection to a plain role and is a no-op
+on one. Rows a test needs must be created inside `admin_context()` / `tenant_context()`,
+since a plain role cannot insert them without a context.
+
 ### Test Organization
 
 ```
@@ -107,9 +114,20 @@ When `STRICT_MODE=True`, `TenantQuerySet` evaluation methods raise
 (`_rls_context_active` in `state.py`) tracks whether `tenant_context()`,
 `admin_context()`, `RLSTenantMiddleware`, or `for_user()` has established
 context. This distinguishes "no context" (should raise) from "admin context"
-(both have `_current_tenant_id=None`). All entry points set the flag to `True`
-on entry and restore via token on exit. The guard is in
-`TenantQuerySet._check_strict_mode()`.
+(both have `_current_tenant_id=None`). All entry points (including
+`TenantQuerySet._rls_scope()`) set the flag to `True` on entry and restore via token on
+exit. The guard is in `TenantQuerySet._check_strict_mode()`.
+
+### `for_user()` Scope
+
+`for_user()` only stores the user. Every `TenantQuerySet` method that runs SQL does so
+inside `_rls_scope()` (`for_write=True` for writes, so the router's write alias is used),
+which pins that alias on the queryset for the call, sets the GUCs that differ from the
+user's values and the tenant `ContextVar`s, then restores the previous values. A new
+override that runs SQL must use it. `iterator()` / `aiterator()` enter it once per chunk
+and never across a `yield`. A queryset with cached results must skip both the scope and
+`_check_strict_mode()`. Methods Django runs in a transaction of their own pass
+`own_transaction=True`, so `SET LOCAL` mode works outside `transaction.atomic()`.
 
 ### Async Middleware Path
 
@@ -289,8 +307,12 @@ GitHub Actions runs lint + type-check, a strict mkdocs build (`mkdocs build --st
 a test matrix across Python {3.12, 3.13, 3.14} × Django {5.2, 6.0, 6.1} on PostgreSQL 16
 (psycopg2, no `exclude` rows) plus one psycopg 3 leg on Python 3.12 / Django 6.1, and a
 `test-postgres` job on PostgreSQL 15 and 18 with the oldest and newest supported Django
-(5.2 on Python 3.12 / 6.1 on Python 3.14) on every push/PR. Coverage is reported from the
-3.12 / 6.1 / psycopg2 leg. All PostgreSQL legs set `RLS_FAIL_ON_SKIPPED=1` (see Testing).
+(5.2 on Python 3.12 / 6.1 on Python 3.14) on every push/PR. Those legs connect as the
+`postgres` superuser; a `test-plain-role` job runs the suite once more as a plain role
+(PostgreSQL 16, Python 3.12, the locked Django, `-m "not superuser_only"`) after checking
+that the connection really is one (see the plain-role rule under Testing). Coverage is
+reported from the 3.12 / 6.1 / psycopg2 leg. All PostgreSQL legs set `RLS_FAIL_ON_SKIPPED=1`
+(see Testing).
 `tests/conftest.py` also turns every Django `RemovedIn*Warning` into a test error, so the
 newest Django leg fails as soon as Django deprecates something the library calls.
 

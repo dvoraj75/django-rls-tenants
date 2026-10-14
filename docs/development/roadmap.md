@@ -181,6 +181,13 @@ up through middleware and context managers.
   weekly canary runs Django `main`, the next Python and the next PostgreSQL.
   *Why:* The matrix had drifted (EOL Django series, a coverage gate pinned to one, an
   example image on 5.1), and nothing would have noticed the next drift.
+- [x] **`for_user()` applies the user's context to every SQL method, and a plain-role CI
+  leg** (#131) — `count()`, `exists()`, `aggregate()`, `iterator()`, the writes and their
+  async variants ran without the GUCs. Each now runs in a scope that sets them on the
+  alias the SQL uses and restores the previous values afterwards. A new CI job runs the
+  library suite as a non-superuser role.
+  *Why:* Every other CI leg connects as a superuser, which bypasses RLS, so the bug
+  passed every test.
 
 ### Tier 1: Async GUC primitives (`rls/guc.py`)
 

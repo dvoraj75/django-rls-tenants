@@ -20,7 +20,9 @@ an unauthenticated user.
 **Fix:** Establish a context around the code: `tenant_context(tenant_id)` or
 `admin_context()`, `.for_user(user)` on the queryset, or `RLSTenantMiddleware` for
 requests. While developing, set `STRICT_MODE=True` so this surfaces as a
-`NoTenantContextError` instead of an empty result.
+`NoTenantContextError` instead of an empty result. Before 1.4.0, `count()`, `exists()`,
+`iterator()` and the writes of a `.for_user()` queryset also returned nothing outside a
+context (#131); upgrade, or wrap them in a context manager.
 
 **See:** [Context Managers](guides/context-managers.md),
 [Middleware](guides/middleware.md#using-without-middleware),

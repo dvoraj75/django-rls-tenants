@@ -59,6 +59,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Weekly canary workflow** (`.github/workflows/canary.yml`, #114): Django `main`, the
   next Python (3.15) and the next PostgreSQL (19 beta). It blocks nothing; a red run
   means a matrix review is due.
+- **Non-superuser CI leg** (`test-plain-role`, #131). The library suite also runs as a
+  plain role (`LOGIN CREATEDB`, no `BYPASSRLS`) with `-m "not superuser_only"` on
+  PostgreSQL 16, after a step that fails if the connection is a superuser or has
+  `BYPASSRLS`. Every other leg connects as the `postgres` superuser, which bypasses RLS:
+  that is how #131 went unnoticed. The test fixtures no longer try to create a role on a
+  plain-role connection, `enforce_rls` now also switches a `BYPASSRLS` connection to a
+  plain role, the `for_user()` tests now request `enforce_rls`, and
+  `tests/test_support_matrix.py` keeps the new leg on a supported Python and on
+  PostgreSQL 16.
 
 ### Changed
 
@@ -77,6 +86,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overrides `process_request` or `process_response` keeps the 1.3.4 hook-based path, so
   its hooks still run under ASGI. The WSGI path, streaming bodies (iterated after cleanup,
   fail-closed) and the `USE_LOCAL_SET=True` refusal under ASGI are unchanged.
+- **`for_user()` with `USE_LOCAL_SET=True` outside a transaction** (#131). Every
+  `for_user()` method now sets the user's GUCs, with `SET LOCAL` in this mode, which
+  needs a transaction. `update_or_create()`, `bulk_create()`, `bulk_update()` and
+  `delete()`, which Django runs in a transaction anyway, open one when none is open.
+  `count()`, `exists()`, `aggregate()`, `iterator()`, `update()`, `create()` and the
+  other methods raise `RuntimeError` outside `transaction.atomic()`, as iteration
+  always did; before, they ran without the GUCs (empty results under RLS, or all rows on
+  a superuser connection). Wrap such code in `transaction.atomic()`.
 - **`@with_rls_context` rejects generator functions and coroutine results** (#39).
   Decorating a generator or async generator function now raises `TypeError` at
   decoration time: its body runs while the caller iterates, after the decorator has left
@@ -121,6 +138,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   context, leaves that context intact, and no longer needs a manager named `objects`.
   Default-manager filters no longer apply, so every row in the table must be hidden.
   `aassert_rls_blocks_without_context()` gets the same fix.
+- **`for_user()` applied the user's GUCs only when the queryset was iterated** (#131).
+  `TenantQuerySet` set them in `_fetch_all()` alone, so `count()`, `exists()`,
+  `aggregate()`, `iterator()`, `aiterator()`, `update()`, `delete()`, `create()` (and with
+  it `get_or_create()`), `bulk_create()`, `bulk_update()`, `update_or_create()`,
+  `explain()` and their async variants ran without them. Under a role that RLS applies to,
+  and outside any context, reads, updates and deletes returned zero rows or counts without
+  an error, and inserts were rejected by the policy. Each of these methods now runs its
+  SQL inside one private scope on the connection the SQL uses (the router's write alias
+  for writes), resolved once per call so a router that answers differently each time
+  cannot split the GUCs from the query. A `delete()` scope also covers its cascades,
+  `SET_NULL` updates and signal handlers. `iterator()` and `aiterator()` enter it once
+  per chunk, so it is not held while the loop body runs. A scope reads the two GUCs
+  first: outside a context a tenant user's call now issues six small statements around
+  its query and an admin's four (iteration issued four before, two with `SET LOCAL`);
+  inside a context that already has the user's values, two.
+- **A `for_user()` query overwrote the enclosing context** (#131). Evaluating a
+  `for_user()` queryset inside `RLSTenantMiddleware`, `tenant_context()` or
+  `admin_context()` cleared the GUCs afterwards, so the rest of the request or block saw
+  no rows. With `USE_LOCAL_SET=True` it left the `for_user()` user's values set for the
+  rest of the transaction, so later queries ran as that user (as an admin, if it was
+  one). The scope now restores the values it found, writes nothing when they already
+  match, and when a statement aborts the transaction, its own error propagates instead
+  of "current transaction is aborted" from the cleanup.
+- **A context's GUC restore was skipped while Django marked the transaction for
+  rollback** (#131). An exception leaving an inner `atomic(savepoint=False)` block (a
+  failing `pre_delete` receiver during `delete()`, for example) sets Django's rollback
+  flag, and Django then refuses every query, so `restore_gucs()` dropped the restore as if
+  the transaction were aborted. A caller that caught the exception and called
+  `transaction.set_rollback(False)` then committed with the GUCs still set, an admin
+  bypass included. The restore now runs past the flag and puts it back; only an error
+  from PostgreSQL itself is still dropped. This applies to every context manager.
+- **`STRICT_MODE` with `prefetch_related()`, cached querysets and `aiterator()`** (#131).
+  The prefetch queries of a `for_user()` queryset ran with no active context and raised
+  `NoTenantContextError`; the scope now marks the context active and sets the auto-scope
+  tenant while its SQL runs. Any `TenantQuerySet` whose results are already cached
+  (including relations prefetched earlier and read in a template) answers iteration,
+  `count()`, `exists()` and an ordered `first()` without a query, so those no longer get
+  the strict-mode check. `aiterator()`, which never goes through `iterator()`, is now
+  guarded too.
+- **`TenantQuerySet.delete()` lost Django's `queryset_only` flag** (#131). A manager built
+  with `TenantQuerySet.as_manager()` or `RLSManager.from_queryset()` therefore had a
+  `delete()` method that empties the table in one call, which Django deliberately leaves
+  out. The flag is set again.
 
 ## [1.3.4] - 2026-10-12
 

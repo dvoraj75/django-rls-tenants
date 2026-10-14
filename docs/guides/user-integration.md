@@ -132,7 +132,12 @@ orders = Order.objects.for_user(request.user)
 ```
 
 The `for_user()` method reads the same properties to apply both a Django ORM filter
-(defense-in-depth) and set GUC variables at query evaluation time.
+(defense-in-depth) and the GUC variables. The GUCs are set only while the queryset runs
+SQL, by every method that does: iteration, `count()`, `exists()`, `aggregate()`,
+`iterator()`, `update()`, `delete()`, `create()`, the bulk methods and their async
+variants. Afterwards the values the connection had before are restored, so a
+`for_user()` query inside the middleware or a context manager leaves that context
+intact. See [Lazy QuerySet Evaluation](../advanced/architecture.md#lazy-queryset-evaluation).
 
 ### 3. @with_rls_context Decorator
 
@@ -174,9 +179,16 @@ class ServiceContext:
 def process_batch(tenant_id: int):
     ctx = ServiceContext(tenant_id=tenant_id)
     orders = Order.objects.for_user(ctx)
-    for order in orders:
+    if not orders.exists():
+        return
+    for order in orders.iterator():
         ...
+    orders.filter(amount__lt=0).update(amount=0)
 ```
+
+Each of these calls applies the context for its own SQL. Before 1.4.0 only iteration did:
+`exists()`, `count()`, `iterator()`, `update()` and the other methods ran without the
+GUCs, so outside a context they saw no rows (#131).
 
 For a full Celery integration pattern using `tenant_context()` directly, see [Celery Tasks](celery-tasks.md).
 

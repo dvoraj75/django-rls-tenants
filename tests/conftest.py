@@ -11,6 +11,7 @@ from django.db import DEFAULT_DB_ALIAS, connection, connections
 
 from django_rls_tenants.rls.guc import clear_guc
 from django_rls_tenants.tenants.context import admin_context
+from django_rls_tenants.tenants.middleware import _clear_gucs_set_flag
 from django_rls_tenants.tenants.state import set_current_tenant_id, set_rls_context_active
 from tests.test_app.models import (
     Document,
@@ -99,10 +100,23 @@ def _clear_gucs_after_test(db):
     try:
         set_current_tenant_id(None)
         set_rls_context_active(False)
+        # A middleware test can leave this set; the connection_created handler
+        # would then put GUCs on the next new connection, outside any test
+        # transaction.
+        _clear_gucs_set_flag()
     finally:
         for name in _GUC_NAMES_TO_CLEAR:
             with contextlib.suppress(Exception):
                 clear_guc(name)
+
+
+def _connection_bypasses_rls(cursor):
+    """Return whether the test connection's role bypasses RLS (superuser or ``BYPASSRLS``)."""
+    cursor.execute(
+        "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user",
+    )
+    row = cursor.fetchone()
+    return bool(row and row[0])
 
 
 @pytest.fixture(scope="session")
@@ -112,8 +126,14 @@ def _rls_role(django_db_setup, django_db_blocker):
     PostgreSQL superusers always bypass RLS, even with FORCE ROW LEVEL
     SECURITY.  This fixture creates a plain role and grants it full DML
     access so that ``SET ROLE`` makes the connection subject to RLS.
+
+    On a connection RLS applies to (the CI leg run with ``-m "not superuser_only"``)
+    it already applies and ``enforce_rls`` never switches roles, so nothing
+    is created: such a role usually lacks ``CREATEROLE``.
     """
     with django_db_blocker.unblock(), connection.cursor() as cur:
+        if not _connection_bypasses_rls(cur):
+            return
         cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", [_RLS_ROLE])
         if cur.fetchone() is None:
             cur.execute(f"CREATE ROLE {_RLS_ROLE} NOLOGIN")
@@ -122,27 +142,28 @@ def _rls_role(django_db_setup, django_db_blocker):
 
 
 def _switch_to_rls_role(conn):
-    """Run ``conn`` as the RLS test role if it connects as a superuser.
+    """Run ``conn`` as the RLS test role if its role bypasses RLS.
 
     Returns:
         ``True`` if the role was switched (the caller resets it), ``False``
         if the connection's role is already subject to RLS.
     """
     with conn.cursor() as cur:
-        cur.execute("SELECT usesuper FROM pg_user WHERE usename = current_user")
-        row = cur.fetchone()
-        is_super = row is not None and row[0]
-        if is_super:
+        bypasses = _connection_bypasses_rls(cur)
+        if bypasses:
             cur.execute(f"SET ROLE {_RLS_ROLE}")
-    return is_super
+    return bypasses
 
 
 @pytest.fixture
 def enforce_rls(_rls_role, db):
-    """Switch to a non-superuser role so PostgreSQL RLS is enforced.
+    """Switch to a plain role so PostgreSQL RLS is enforced.
 
     Use this fixture (or the autouse version in test_integration/) for any
-    test that verifies database-level row filtering without ``for_user()``.
+    test that verifies database-level row filtering, including ``for_user()``:
+    under a superuser connection RLS is bypassed and such a test passes
+    whether or not the GUCs were set (#131). Only a connection that bypasses
+    RLS (superuser or ``BYPASSRLS``) is switched; on a plain role it is a no-op.
     """
     switched = _switch_to_rls_role(connection)
     yield

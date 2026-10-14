@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING
 
 from asgiref.sync import sync_to_async
-from django.db import DatabaseError
+from django.db import DatabaseError, connections
 
 from django_rls_tenants.rls.guc import get_guc, restore_guc, set_guc
 
@@ -51,24 +51,41 @@ def restore_gucs(
     rollback restores what the failed statement could not. On a normal exit
     a restore failure propagates as usual.
 
+    Django's own "needs rollback" flag does not stop the restore. An
+    exception leaving an inner ``atomic(savepoint=False)`` block sets it,
+    and Django then refuses every query with ``TransactionManagementError``
+    even though PostgreSQL's transaction is healthy. If the caller catches
+    that exception and clears the flag with ``transaction.set_rollback(False)``,
+    the transaction commits, and with it any GUC left unrestored. The flag
+    is therefore lifted for the restore statements and put back afterwards;
+    a transaction that PostgreSQL really aborted still fails them, as above.
+
     Args:
         previous: Mapping of GUC name to the value read before the block.
         is_local: Scope the block used; ``True`` re-issues ``SET LOCAL``.
         using: Database alias. Default: ``"default"``.
         exc_pending: ``True`` when called while an exception is propagating.
     """
-    for name, prev in previous.items():
-        try:
-            restore_guc(name, prev, is_local=is_local, using=using)
-        except DatabaseError:
-            if not exc_pending:
-                raise
-            logger.debug(
-                "Skipping GUC restore for %s: the transaction is already aborted and "
-                "will be rolled back; the original exception is propagated instead.",
-                name,
-                exc_info=True,
-            )
+    if not previous:
+        return
+    conn = connections[using]
+    needs_rollback = conn.needs_rollback
+    conn.needs_rollback = False
+    try:
+        for name, prev in previous.items():
+            try:
+                restore_guc(name, prev, is_local=is_local, using=using)
+            except DatabaseError:
+                if not exc_pending:
+                    raise
+                logger.debug(
+                    "Skipping GUC restore for %s: the transaction is already aborted and "
+                    "will be rolled back; the original exception is propagated instead.",
+                    name,
+                    exc_info=True,
+                )
+    finally:
+        conn.needs_rollback = needs_rollback
 
 
 @contextmanager

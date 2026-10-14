@@ -133,6 +133,18 @@ Deselect them when your test database role is not a superuser:
 uv run pytest -m "not superuser_only"
 ```
 
+CI runs the suite this way too, so a test that checks database-level filtering must hold
+under a plain role. Under the superuser it should use the `enforce_rls` fixture, which
+switches the connection to a plain role for the test (a no-op when it already is one).
+Without it the superuser bypasses RLS and the test passes whatever the GUCs are.
+
+To run the suite the way that CI leg does, create a plain role once
+(`CREATE ROLE app LOGIN PASSWORD 'app' CREATEDB`) and point the tests at it:
+
+```bash
+POSTGRES_USER=app POSTGRES_PASSWORD=app uv run pytest -m "not superuser_only"
+```
+
 Locally `RLS_FAIL_ON_SKIPPED` is unset and skips behave as usual. New markers must be
 registered in `pyproject.toml` (`--strict-markers` is on).
 
@@ -171,6 +183,11 @@ Every push and pull request runs:
 - **PostgreSQL 15 and 18 legs** -- the oldest and newest supported Django (5.2 on
   Python 3.12, 6.1 on Python 3.14) on both, so the supported PostgreSQL range is
   verified at each end rather than assumed.
+- **Non-superuser leg** -- the legs above connect as the `postgres` superuser, which
+  bypasses every RLS policy, so a test of RLS behaviour can pass there without the
+  policies ever applying. This leg creates a plain role (`LOGIN CREATEDB`, no
+  `BYPASSRLS`), checks that the tests really connect as it, and runs the suite with
+  `-m "not superuser_only"` (PostgreSQL 16, Python 3.12, the locked Django).
 - **Example app against the built wheel** -- `uv build`, an assertion on the wheel's
   file list (only `django_rls_tenants/` and `*.dist-info/`, every package directory has
   an `__init__.py`, `py.typed`, the management commands and `contrib.celery` are present,

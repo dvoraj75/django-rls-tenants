@@ -74,8 +74,11 @@ if no RLS context is active. This catches accidental queries outside a
 scope at the point of query execution rather than silently returning zero rows.
 
 **Guarded methods:** `_fetch_all()` (iteration), `count()`, `exists()`,
-`aggregate()`, `update()`, `delete()`, `iterator()`, `bulk_create()`,
-`bulk_update()`, `get()`, `first()`, `last()`.
+`aggregate()`, `update()`, `delete()`, `iterator()`, `aiterator()`, `bulk_create()`,
+`bulk_update()`, `get()`, `first()`, `last()`. A queryset whose results are already
+cached answers iteration, `count()` and `exists()` without a query and is not checked,
+so results fetched inside a context (including `prefetch_related()` caches) can be read
+after it ends.
 
 ```python
 RLS_TENANTS = {
@@ -233,7 +236,9 @@ When `True`, uses `SET LOCAL` (transaction-scoped) instead of `set_config()`
   cleared at commit/rollback. `ATOMIC_REQUESTS` is not required (it nests as a
   savepoint if you keep it).
 - Outside a request (Celery tasks, management commands, scripts) you must wrap the
-  context manager in `transaction.atomic()` yourself.
+  context manager in `transaction.atomic()` yourself, and the queries of a `for_user()`
+  queryset too (`update_or_create()`, `bulk_create()`, `bulk_update()` and `delete()`
+  open a transaction of their own when none is open).
 - Middleware implementing `process_exception`, and function-based middleware factories,
   must precede `RLSTenantMiddleware`; unsafe ordering raises `RLSConfigurationError`
   when the middleware is loaded. See [middleware ordering](../guides/middleware.md#setup).
