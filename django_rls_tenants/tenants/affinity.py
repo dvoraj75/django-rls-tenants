@@ -56,7 +56,7 @@ import threading
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
-from django.db import connections
+from django.db import DatabaseError, connections
 from django.utils.connection import ConnectionDoesNotExist
 
 from django_rls_tenants.tenants.conf import rls_tenants_config
@@ -335,21 +335,45 @@ def _transaction_end(
     *,
     committed: bool,
 ) -> Callable[[], Any]:
-    """Wrap Django's ``_commit`` or ``_rollback`` of ``connection`` to update its tracker."""
+    """Wrap Django's ``_commit`` or ``_rollback`` of ``connection`` to update its tracker.
+
+    The transaction status before and after tells what happened: only a
+    transaction that was open and is now closed has ended (psycopg2 sends
+    nothing in autocommit mode), and PostgreSQL turns the commit of a failed
+    transaction into a rollback, without an error.
+    """
 
     def end_and_follow() -> Any:  # Any: what Django's _commit / _rollback return
         raw = connection.connection
+        tracker = _tracker_of(connection)
+        if tracker is None or raw is None or raw is not tracker.raw:
+            return end()
+        before = tracker.read_status()
         try:
             result = end()
         except BaseException:
-            _forget(connection)
+            # A commit that failed (a deferred constraint, say) rolled back.
+            _follow_end(tracker, before, committed=False)
             raise
-        tracker = _tracker_of(connection)
-        if tracker is not None and raw is not None and raw is tracker.raw:
-            tracker.end_transaction(committed=committed)
+        _follow_end(tracker, before, committed=committed)
         return result
 
     return end_and_follow
+
+
+def _follow_end(tracker: _SessionGUCs, before: int, *, committed: bool) -> None:
+    """Follow a commit or rollback the driver was asked for, from the status before and after.
+
+    Args:
+        tracker: The connection's tracker.
+        before: The transaction status before the call.
+        committed: Whether it was a commit.
+    """
+    after = tracker.read_status()
+    if before != _IDLE and after == _IDLE:
+        tracker.end_transaction(committed=committed and before != _IN_ERROR)
+    elif before != after:
+        tracker.forget()
 
 
 # ---- The library's own writes ----
@@ -516,12 +540,23 @@ def settle_other_aliases(using: str) -> None:
         connection = _connection_of(alias)
         tracker = _tracker_of(connection)
         if (
-            connection is not None
-            and connection.connection is not None
-            and tracker is not None
-            and isinstance(tracker.values, tuple)
+            connection is None
+            or connection.connection is None
+            or tracker is None
+            or not isinstance(tracker.values, tuple)
         ):
+            continue
+        try:
             _apply_if_stale(connection, tracker)
+        except DatabaseError:
+            # Not this block's connection: its own exit, or error, goes first.
+            # The guard applies the context there before its next statement.
+            tracker.forget()
+            logger.debug(
+                "GUC affinity guard: could not settle alias %r on exit",
+                alias,
+                exc_info=True,
+            )
 
 
 # ---- Following the SQL that runs ----
@@ -551,7 +586,7 @@ def _skip_leading_comments(sql: str) -> str:
                 depth, index = depth - 1, index + 2
             else:
                 index += 1
-        text = text[index:].lstrip() if not depth else ""
+        text = text[index:].lstrip()
     return text
 
 
@@ -561,7 +596,7 @@ def _parse(sql: object) -> _Statement | None:
         sql = sql.decode("latin-1")  # only ASCII keywords are looked at
     if not isinstance(sql, str):
         return None
-    words = _skip_leading_comments(sql[:_SQL_HEAD]).split(None, 4)
+    words = _skip_leading_comments(sql[:_SQL_HEAD]).split()
     if not words:
         return None if sql.strip() else _Statement("", [], compound=False)
     semicolon = sql.find(";")
@@ -613,14 +648,38 @@ def _follow(
         tracker.forget()
     # Picks up a transaction this statement opened or closed.
     _observe(connection, tracker)
-    if statement.command == "SAVEPOINT" and len(words) > 1:
-        tracker.savepoints.append((_identifier(words[1]), tracker.values))
+    if statement.command == "SAVEPOINT":
+        name = _savepoint_name(words, after="SAVEPOINT")
+        if name is None:
+            tracker.forget()
+        else:
+            tracker.savepoints.append((name, tracker.values))
     elif statement.command == "RELEASE" or rolls_back_to:
-        _follow_savepoint_end(_identifier(words[-1]), tracker, rolled_back=rolls_back_to)
+        name = _savepoint_name(words, after="TO" if rolls_back_to else "RELEASE")
+        _follow_savepoint_end(name, tracker, rolled_back=rolls_back_to)
 
 
-def _follow_savepoint_end(name: str, tracker: _SessionGUCs, *, rolled_back: bool) -> None:
-    """Follow ``RELEASE`` or ``ROLLBACK TO`` of the savepoint ``name``."""
+def _savepoint_name(words: list[str], *, after: str) -> str | None:
+    """Return the savepoint named after the keyword ``after``, or ``None`` if unclear.
+
+    ``SAVEPOINT name``, ``RELEASE [SAVEPOINT] name`` and
+    ``ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] name``. Anything after the
+    name (a comment, say) makes it unclear; a semicolon right after it does not.
+    """
+    upper = [word.upper() for word in words]
+    index = upper.index(after) + 1
+    if after != "SAVEPOINT" and index < len(words) and upper[index] == "SAVEPOINT":
+        index += 1
+    if index != len(words) - 1:
+        return None
+    return _identifier(words[index])
+
+
+def _follow_savepoint_end(name: str | None, tracker: _SessionGUCs, *, rolled_back: bool) -> None:
+    """Follow ``RELEASE`` or ``ROLLBACK TO`` of the savepoint ``name`` (``None``: unclear)."""
+    if name is None:
+        tracker.forget()
+        return
     index = tracker.savepoint_index(name)
     if index is None:
         # A savepoint set where the guard could not see it: nothing to go back to.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from decimal import Decimal
@@ -24,6 +25,7 @@ from django.db import (
     connections,
     transaction,
 )
+from django.db.backends.postgresql.psycopg_any import sql as pg_sql
 from django.db.transaction import TransactionManagementError
 from django.http import HttpRequest
 from django.test import override_settings
@@ -42,6 +44,7 @@ from django_rls_tenants.tenants.middleware import RLSTenantMiddleware
 from django_rls_tenants.tenants.state import (
     ADMIN_GUCS,
     ContextGucs,
+    _clear_context_gucs,
     _get_context_gucs,
     _reset_context_gucs,
     _set_context_gucs,
@@ -999,3 +1002,488 @@ class TestSafetyNet:
 
         assert _get_context_gucs() is None
         assert _gucs() == _NO_GUCS
+
+
+@pytest.mark.django_db(transaction=True)
+class TestDjangoTransactionEnds:
+    """What Django's commit and rollback really did, read from the transaction status."""
+
+    def test_commit_of_a_failed_transaction_is_a_rollback(self, tenant_a, tenant_b):
+        """A raw SQL error caught inside atomic(): Django commits, PostgreSQL rolls back."""
+
+        def fail_and_carry_on():
+            _gucs()  # tenant A applied in the transaction
+            with pytest.raises(DatabaseError), connection.cursor() as cursor:
+                cursor.execute("SELECT 1 / 0")
+
+        with admin_context(), _context_of(tenant_a):  # the admin bypass is committed
+            _in_atomic(fail_and_carry_on, roll_back=False)
+
+            assert session_gucs() == _ADMIN_READ
+            assert _gucs() == _read_as(tenant_a)
+
+    def test_commit_that_ends_nothing_is_not_followed(self, tenant_a, tenant_b):
+        """psycopg2 sends nothing for commit() in autocommit mode; a SQL BEGIN stays open."""
+        with tenant_context(tenant_a.pk), _context_of(tenant_b):
+            with connection.cursor() as cursor:
+                cursor.execute("BEGIN")
+                _gucs()  # tenant B applied in the transaction
+                connection.commit()
+                cursor.execute("ROLLBACK")
+
+            assert _gucs() == _read_as(tenant_b)
+
+
+class TestContextThatEndsFirst:
+    """A block in a copy of a context that ends before the block does."""
+
+    @pytest.mark.django_db(transaction=True)
+    def test_block_in_a_thread_does_not_bring_back_an_ended_context(
+        self,
+        sample_orders,
+        tenant_b,
+        worker,
+        enforce_rls_on_other_threads,
+    ):
+        entered, outer_ended = threading.Event(), threading.Event()
+
+        def nested_block():
+            with tenant_context(tenant_b.pk):
+                entered.set()
+                outer_ended.wait(timeout=10)
+
+        with admin_context():
+            job = worker.submit(contextvars.copy_context().run, nested_block)
+            entered.wait(timeout=10)
+        outer_ended.set()
+        job.result(timeout=10)
+
+        assert _hop(worker, lambda: (session_gucs(), _products()), contextvars.Context()) == (
+            _NO_GUCS,
+            [],
+        )
+
+    def test_block_in_a_task_does_not_bring_back_an_ended_context(
+        self,
+        sample_orders,
+        tenant_b,
+        enforce_rls,
+    ):
+        async def run():
+            entered, outer_ended = asyncio.Event(), asyncio.Event()
+
+            async def nested_block():
+                async with async_tenant_context(tenant_b.pk):
+                    entered.set()
+                    await outer_ended.wait()
+
+            async with async_admin_context():
+                task = asyncio.ensure_future(nested_block())
+                await entered.wait()
+            outer_ended.set()
+            await task
+            return await sync_to_async(lambda: (session_gucs(), _products()))()
+
+        assert async_to_sync(run)() == (_NO_GUCS, [])
+
+
+class TestCancelledHop:
+    """asgiref copies a cancelled ``sync_to_async`` call's context into its caller."""
+
+    def test_caller_keeps_its_own_context(self, sample_orders, tenant_a, enforce_rls):
+        started, release, done = threading.Event(), threading.Event(), threading.Event()
+
+        def admin_work():
+            try:
+                with admin_context():
+                    started.set()
+                    release.wait(timeout=10)
+            finally:
+                connections.close_all()
+                done.set()
+
+        async def run():
+            async with async_tenant_context(tenant_a.pk):
+                hop = sync_to_async(admin_work, thread_sensitive=False)()
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(hop, timeout=0.2)
+                assert started.is_set()  # the admin block is still running
+                products = await sync_to_async(_products)()
+                gucs = _get_context_gucs()
+            release.set()
+            await sync_to_async(done.wait, thread_sensitive=False)(timeout=10)
+            return products, gucs
+
+        assert async_to_sync(run)() == (_TENANT_A_PRODUCTS, ContextGucs.for_tenant(tenant_a.pk))
+
+    @staticmethod
+    def _set_and_return(block):
+        _set_context_gucs(ContextGucs.for_tenant(9), block=block)  # never reset: as if cut short
+
+    @pytest.mark.parametrize(("block", "copied_back"), [(True, False), (False, True)])
+    def test_only_the_middlewares_holder_reaches_the_caller(self, block, copied_back):
+        """Pins asgiref's rule: a value is copied back when it compares unequal (``!=``)."""
+
+        async def run():
+            await sync_to_async(self._set_and_return)(block)
+            return _get_context_gucs()
+
+        values = contextvars.Context().run(async_to_sync(run))
+
+        assert values == (ContextGucs.for_tenant(9) if copied_back else None)
+
+
+class TestSettleWithABrokenAlias:
+    @pytest.fixture
+    def with_replica(self, replica):
+        databases = {**django_settings.RLS_TENANTS, "DATABASES": [DEFAULT_DB_ALIAS, replica]}
+        with override_settings(RLS_TENANTS=databases):
+            yield replica
+
+    def test_block_exit_is_not_failed_by_another_alias(self, with_replica, tenant_a, monkeypatch):
+        with tenant_context(tenant_a.pk):
+            _gucs(with_replica)  # tenant A applied on the replica
+            self._break(with_replica, monkeypatch)
+
+        assert _tracker(connections[with_replica]).values is affinity.UNKNOWN
+
+    def test_block_error_is_not_replaced(self, with_replica, tenant_a, monkeypatch):
+        def raise_in_the_block():
+            with tenant_context(tenant_a.pk):
+                _gucs(with_replica)
+                self._break(with_replica, monkeypatch)
+                raise _Failed
+
+        with pytest.raises(_Failed):
+            raise_in_the_block()
+
+    @staticmethod
+    def _break(alias, monkeypatch):
+        apply_if_stale = affinity._apply_if_stale
+
+        def fail_on_the_alias(conn, tracker):
+            if conn.alias == alias:
+                msg = "server closed the connection unexpectedly"
+                raise OperationalError(msg)
+            return apply_if_stale(conn, tracker)
+
+        monkeypatch.setattr(affinity, "_apply_if_stale", fail_on_the_alias)
+
+
+class TestSavepointNames:
+    def test_anything_after_the_name_makes_it_unclear(self, tenant_a, tenant_b):
+        """``ROLLBACK TO s1 -- s2`` goes back to s1; the guard must not take s2's values."""
+
+        def roll_back_with_a_trailing_comment():
+            with connection.cursor() as cursor:
+                cursor.execute("SAVEPOINT s1")  # tenant A
+                with _context_of(tenant_b):
+                    _gucs()  # tenant B applied
+                    cursor.execute("SAVEPOINT s2")  # tenant B
+                    cursor.execute("ROLLBACK TO s1 -- s2")
+                    return session_gucs(), _gucs()
+
+        with tenant_context(tenant_a.pk):
+            session, gucs = _in_atomic(roll_back_with_a_trailing_comment, roll_back=True)
+
+        assert (session, gucs) == (_read_as(tenant_a), _read_as(tenant_b))
+
+    @pytest.mark.parametrize(
+        ("sql", "name"),
+        [
+            ("SAVEPOINT a", "a"),
+            ('RELEASE SAVEPOINT "A"', "A"),
+            ("RELEASE b;", "b"),
+            ("ROLLBACK TRANSACTION TO SAVEPOINT c", "c"),
+            ("ROLLBACK TO d -- e", None),
+            ('SAVEPOINT "two words"', None),
+        ],
+    )
+    def test_savepoint_name(self, sql, name):
+        statement = affinity._parse(sql)
+        after = {"SAVEPOINT": "SAVEPOINT", "RELEASE": "RELEASE", "ROLLBACK": "TO"}
+
+        assert affinity._savepoint_name(statement.words, after=after[statement.command]) == name
+
+
+class TestContextEnd:
+    def test_clear_ends_the_context_for_every_copy(self):
+        """The middleware's fallback and the safety net end copies too (fail-closed)."""
+
+        def start_then_clear():
+            _set_context_gucs(ContextGucs.for_tenant(1))
+            escaped = contextvars.copy_context()
+            _clear_context_gucs()
+            return escaped.run(_get_context_gucs), _get_context_gucs()
+
+        assert contextvars.copy_context().run(start_then_clear) == (None, None)
+
+
+class TestInstallWrapsOnce:
+    def test_commit_and_rollback_are_wrapped_once_however_often_install_runs(self):
+        """Django's pool sends connection_created on every checkout: wrappers must not nest."""
+        commit, rollback = connection._commit, connection._rollback
+
+        affinity.install(connection, values=None)
+        affinity.install(connection, values=affinity.UNKNOWN)
+
+        assert (connection._commit, connection._rollback) == (commit, rollback)
+
+
+class TestMoreSessionResets:
+    @pytest.mark.django_db(transaction=True)
+    def test_discard_all_makes_the_guard_apply_the_context_again(self, tenant_a):
+        with tenant_context(tenant_a.pk):
+            with connection.cursor() as cursor:
+                cursor.execute("DISCARD ALL")  # not allowed inside a transaction
+            assert session_gucs() == _NO_GUCS
+            assert _gucs() == _read_as(tenant_a)
+
+    def test_reset_of_the_admin_guc_makes_the_guard_apply_the_context_again(self, tenant_a):
+        with tenant_context(tenant_a.pk):
+            with connection.cursor() as cursor:
+                cursor.execute("RESET rls.is_admin")
+            assert session_gucs() == (str(tenant_a.pk), None)
+            assert _gucs() == _read_as(tenant_a)
+
+
+@pytest.mark.django_db(transaction=True)
+class TestDriverCommits:
+    """Commits on the driver connection, which the guard does not see."""
+
+    def test_rollback_after_a_driver_commit_goes_back_to_what_it_committed(
+        self,
+        tenant_a,
+        tenant_b,
+    ):
+        with tenant_context(tenant_a.pk):  # tenant A, committed in autocommit
+            with _context_of(tenant_b):
+                connection.set_autocommit(False)
+                try:
+                    _gucs()  # tenant B applied in the first transaction
+                    connection.connection.commit()  # tenant B stays
+                    _gucs()  # the guard sees the end, applies tenant B in the second one
+                finally:
+                    connection.rollback()  # Django's: tenant B (committed) is still there
+                    connection.set_autocommit(True)
+                assert session_gucs() == _read_as(tenant_b)
+
+            assert _gucs() == _read_as(tenant_a)
+
+    def test_driver_commit_is_not_taken_for_a_rollback(self, tenant_a, tenant_b):
+        with tenant_context(tenant_a.pk):
+            with _context_of(tenant_b):
+                connection.set_autocommit(False)
+                try:
+                    _gucs()  # tenant B applied in the transaction
+                    connection.connection.commit()
+                finally:
+                    connection.connection.rollback()
+                    connection.set_autocommit(True)
+                assert session_gucs() == _read_as(tenant_b)
+
+            assert _gucs() == _read_as(tenant_a)
+
+    def test_driver_commit_without_a_change_needs_no_statement(self, tenant_a):
+        with tenant_context(tenant_a.pk):
+            connection.set_autocommit(False)
+            try:
+                _gucs()  # the session already holds tenant A
+                connection.connection.commit()
+                with CaptureQueriesContext(connection) as queries:
+                    _gucs()
+            finally:
+                connection.connection.rollback()
+                connection.set_autocommit(True)
+
+        assert _guard_statements(queries) == []
+
+
+class TestSavepointBookkeeping:
+    def test_released_savepoints_leave_no_entry(self):
+        """A long transaction of many nested atomic() blocks must not grow the stack."""
+
+        def nested_blocks():
+            for _ in range(3):
+                with transaction.atomic():
+                    pass
+            return _tracker().savepoints
+
+        assert _in_atomic(nested_blocks, roll_back=True) == []
+
+    def test_duplicate_savepoint_names_roll_back_to_the_newest(self, tenant_a, tenant_b):
+        """PostgreSQL rolls back to the most recent savepoint of that name."""
+
+        def run():
+            with connection.cursor() as cursor:
+                cursor.execute("SAVEPOINT dup")  # holds tenant A
+                with _context_of(tenant_b):
+                    _gucs()  # tenant B applied
+                    cursor.execute("SAVEPOINT dup")  # holds tenant B
+                    with _context(ADMIN_GUCS):
+                        _gucs()  # admin applied
+                    cursor.execute("ROLLBACK TO dup")
+                    return session_gucs(), _tracker().values
+
+        with tenant_context(tenant_a.pk):
+            session, tracked = _in_atomic(run, roll_back=True)
+
+        assert session == _read_as(tenant_b)
+        assert tracked == ContextGucs.for_tenant(tenant_b.pk)
+
+    @pytest.mark.django_db(transaction=True)
+    def test_unseen_savepoint_rollback_needs_no_statement_after_an_earlier_change(
+        self,
+        tenant_a,
+        tenant_b,
+    ):
+        """Whether values changed is judged per transaction, not over the connection's life."""
+
+        def roll_back_to_a_driver_savepoint():
+            with connection.connection.cursor() as driver_cursor:
+                driver_cursor.execute("SAVEPOINT driver_sp")
+            with connection.cursor() as cursor:
+                cursor.execute("ROLLBACK TO SAVEPOINT driver_sp")
+            with CaptureQueriesContext(connection) as queries:
+                _gucs()
+            return _guard_statements(queries)
+
+        with tenant_context(tenant_a.pk), _context_of(tenant_b):
+            _in_atomic(_gucs, roll_back=False)  # tenant B applied and committed: a change
+
+            assert _in_atomic(roll_back_to_a_driver_savepoint, roll_back=True) == []
+
+
+class TestCompoundAndUnreadableStatements:
+    def test_compound_statement_that_resets_makes_the_values_unknown(self, tenant_a):
+        with tenant_context(tenant_a.pk):
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1; RESET ALL")
+
+            assert session_gucs() == _NO_GUCS
+            assert _gucs() == _read_as(tenant_a)
+
+    def test_statement_that_is_not_text_is_reconciled_before_and_forgotten_after(
+        self,
+        tenant_a,
+        tenant_b,
+    ):
+        with tenant_context(tenant_a.pk), _context_of(tenant_b):
+            with connection.cursor() as cursor:
+                cursor.execute(pg_sql.SQL("SELECT current_setting('rls.current_tenant', true)"))
+                seen = cursor.fetchone()[0]
+            with connection.cursor() as cursor:
+                cursor.execute(pg_sql.SQL("RESET ALL"))
+
+            assert seen == str(tenant_b.pk)
+            assert _gucs() == _read_as(tenant_b)
+
+    def test_parse_sees_a_semicolon_after_a_long_head(self):
+        sql = "SELECT '" + "x" * 300 + "'; RESET ALL"
+
+        assert affinity._parse(sql).compound is True
+
+    @pytest.mark.parametrize("sql", ["-- a\n  -- b\n  ROLLBACK", "/* a */\n\t-- b\n\tROLLBACK"])
+    def test_indented_comments_are_skipped(self, sql):
+        assert affinity._parse(sql).command == "ROLLBACK"
+
+
+@pytest.mark.django_db(transaction=True)
+class TestAsyncEnterOnAClosedConnection:
+    def test_inner_block_snapshots_the_enclosing_context(self, tenant_a):
+        """The hop's connection is new: the enclosing context must be on it before the snapshot."""
+
+        def close_the_hop_threads_connection():
+            # Looked up in the hop: connections are per thread.
+            connections[DEFAULT_DB_ALIAS].close()
+
+        async def run():
+            async with async_admin_context():
+                await sync_to_async(close_the_hop_threads_connection)()
+                async with async_tenant_context(tenant_a.pk):
+                    pass
+                return await sync_to_async(_gucs)()
+
+        assert async_to_sync(run)() == _ADMIN_READ
+
+
+class TestMoreFlowsWithoutStatements:
+    def test_for_user_matching_the_context_leaves_the_connection_as_it_was(
+        self,
+        tenant_a,
+        tenant_a_user,
+    ):
+        with tenant_context(tenant_a.pk):
+            Order.objects.for_user(tenant_a_user).count()
+            with CaptureQueriesContext(connection) as queries:
+                list(Order.objects.all())
+
+        assert _guard_statements(queries) == []
+
+
+class TestOtherAliasesOnExit:
+    @pytest.fixture
+    def with_replica(self, replica):
+        databases = {**django_settings.RLS_TENANTS, "DATABASES": [DEFAULT_DB_ALIAS, replica]}
+        with override_settings(RLS_TENANTS=databases):
+            yield replica
+
+    def test_alias_closed_inside_the_block_is_not_reopened_on_exit(self, with_replica):
+        with admin_context():
+            _gucs(with_replica)  # applied there: the tracker holds the admin values
+            connections[with_replica].close()
+
+        assert connections[with_replica].connection is None
+
+    def test_safety_net_clears_every_configured_alias(self, with_replica, tenant_a_user):
+        middleware = RLSTenantMiddleware(get_response=lambda request: None)
+        middleware.process_request(_request_for(tenant_a_user))  # process_response never runs
+
+        request_finished.disconnect(close_old_connections)
+        try:
+            with CaptureQueriesContext(connection) as queries:
+                request_finished.send(sender=self.__class__)
+        finally:
+            request_finished.connect(close_old_connections)
+
+        assert session_gucs(with_replica) == _NO_GUCS
+        assert session_gucs() == _NO_GUCS
+        assert _guard_statements(queries) == []
+
+
+class TestRecordOnAClosedConnection:
+    @pytest.mark.django_db(transaction=True)
+    def test_is_a_no_op_and_does_not_reopen(self):
+        connection.close()
+
+        affinity._record(DEFAULT_DB_ALIAS, None)
+
+        assert connection.connection is None
+
+
+class TestTransactionEndBranches:
+    @pytest.mark.django_db(transaction=True)
+    def test_rollback_of_a_closed_connection_is_passed_through(self):
+        connection.close()
+
+        connection._rollback()  # Django's own no-op on a closed connection
+
+        assert connection.connection is None
+
+    def test_status_change_that_is_no_end_makes_the_values_unknown(self):
+        tracker = affinity._SessionGUCs()
+        tracker.attach(connection.connection, ContextGucs.for_tenant(1))
+        tracker.read_status = lambda: affinity._IN_ERROR
+
+        affinity._follow_end(tracker, affinity._IDLE, committed=True)
+
+        assert tracker.values is affinity.UNKNOWN
+
+    def test_savepoint_whose_name_cannot_be_read_makes_the_values_unknown(self, tenant_a):
+        def set_it():
+            with connection.cursor() as cursor:
+                cursor.execute('SAVEPOINT "two words"')
+            return _tracker().values
+
+        with tenant_context(tenant_a.pk):
+            assert _in_atomic(set_it, roll_back=True) is affinity.UNKNOWN

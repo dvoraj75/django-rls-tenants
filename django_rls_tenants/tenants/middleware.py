@@ -8,10 +8,9 @@ synchronous (WSGI) path and on its own native async (ASGI) path.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import threading
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from contextvars import ContextVar, Token
 from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -28,6 +27,7 @@ from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import _context_gucs_of, _resolve_user_guc_vars
 from django_rls_tenants.tenants.state import (
     _clear_context_gucs,
+    _ContextGucsToken,
     _reset_context_gucs,
     _set_context_gucs,
     reset_current_tenant_id,
@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from django.utils.deprecation import MiddlewareMixin
 
     from django_rls_tenants.tenants.conf import RLSTenantsConfig
-    from django_rls_tenants.tenants.state import ContextGucs, _Live
+    from django_rls_tenants.tenants.state import ContextGucs
 else:
     # Django 6.2 moves MiddlewareMixin to django.middleware and deprecates the
     # old import path (RemovedInDjango2029Warning). django-stubs still declares
@@ -155,23 +155,28 @@ def _reset_or_clear[T](
     clear()
 
 
-def _end_context_gucs(token: Token[_Live | None] | None) -> None:
-    """Reset the request's context GUC values through ``token``; clear them if that fails.
+def _end_context_gucs(entered: _ContextGucsToken | None) -> None:
+    """End the request's context for the GUC affinity guard, and restore the outer one.
 
-    Left set, they would make the GUC affinity guard apply the request's GUCs
-    again after the cleanup has cleared them, on this thread's later
-    statements and, under WSGI, in later requests. The cleanup therefore does
-    this first, and still clears the values when the reset raises.
+    Left live, the request's values would make the guard apply its GUCs again
+    after the cleanup has cleared them, on this thread's later statements and,
+    under WSGI, in later requests. The cleanup therefore does this first.
+    :func:`state._reset_context_gucs` ends the context before it resets the
+    ``ContextVar``, so even a reset that fails leaves no context live; one
+    with a token from another ``Context`` (a hook run in its own
+    ``sync_to_async`` hop, see ``_reset_or_clear``) records none instead.
 
     Args:
-        token: The token from ``_set_context_gucs()``, or ``None`` if the
+        entered: What ``_set_context_gucs()`` returned, or ``None`` if the
             values were never set.
     """
-    try:
-        _reset_or_clear(token, _reset_context_gucs, _clear_context_gucs)
-    except BaseException:
+    if not isinstance(entered, _ContextGucsToken):
         _clear_context_gucs()
-        raise
+        return
+    try:
+        _reset_context_gucs(entered)
+    except ValueError:
+        _clear_context_gucs()
 
 
 def _is_authenticated(request: HttpRequest) -> bool:
@@ -201,7 +206,7 @@ def _clear_gucs_on_all_databases(conf: Any) -> None:
     """
     for db_alias in conf.DATABASES:
         # Best-effort cleanup: the connection may be dead.
-        with contextlib.suppress(Exception):
+        with suppress(Exception):
             _clear_alias_gucs(conf, db_alias)
 
 
@@ -329,7 +334,7 @@ class RLSTenantMiddleware(MiddlewareMixin):
                 # timeout) that skipped process_response, or a failure in it.
                 # Under WSGI the thread's next request would start inside this
                 # request's context; the GUC affinity guard would apply it.
-                with contextlib.suppress(Exception):  # the original error wins
+                with suppress(Exception):  # the original error wins
                     self._cleanup_rls_state(request)
                 raise
         with ExitStack() as stack:
@@ -519,7 +524,7 @@ class RLSTenantMiddleware(MiddlewareMixin):
         # the failure.
         tenant_token: Token[int | str | None] | None = None
         active_token: Token[bool] | None = None
-        gucs_token: Token[_Live | None] | None = None
+        gucs_token: _ContextGucsToken | None = None
         try:
             guc_vars = _resolve_user_guc_vars(user, conf)
             self._set_gucs_on_all_databases(guc_vars, conf)
@@ -547,7 +552,9 @@ class RLSTenantMiddleware(MiddlewareMixin):
             setattr(request, "_rls_context_active_token", active_token)  # noqa: B010  -- dynamic attr on HttpRequest
 
             # The values the GUC affinity guard re-applies on other connections.
-            gucs_token = _set_context_gucs(_context_gucs_of(guc_vars, conf))
+            # Not a block's holder: under ASGI, MiddlewareMixin runs this hook in a
+            # sync_to_async hop of its own, which must hand the values back.
+            gucs_token = _set_context_gucs(_context_gucs_of(guc_vars, conf), block=False)
             setattr(request, "_rls_context_gucs_token", gucs_token)  # noqa: B010  -- dynamic attr on HttpRequest
             _mark_gucs_set()
         except Exception:
@@ -635,7 +642,7 @@ class RLSTenantMiddleware(MiddlewareMixin):
         except Exception:
             # Rollback GUCs on databases that were already set.
             for done_alias in completed_aliases:
-                with contextlib.suppress(Exception):  # best-effort cleanup
+                with suppress(Exception):  # best-effort cleanup
                     _clear_alias_gucs(conf, done_alias)
             raise
 

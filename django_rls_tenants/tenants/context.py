@@ -31,6 +31,7 @@ from django_rls_tenants.tenants.errors import HINT_TENANT_ID_NONE, HINT_USER_NO_
 from django_rls_tenants.tenants.state import (
     ADMIN_GUCS,
     ContextGucs,
+    _current_live,
     _get_context_gucs,
     _reset_context_gucs,
     _set_context_gucs,
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 
     from django_rls_tenants.tenants.conf import RLSTenantsConfig
+    from django_rls_tenants.tenants.state import _Live
     from django_rls_tenants.tenants.types import TenantUser
 
 logger = logging.getLogger("django_rls_tenants")
@@ -108,12 +110,12 @@ def _rls_state(tenant_id: int | str | None, gucs: ContextGucs) -> Iterator[None]
     """
     active_token = set_rls_context_active(True)
     tenant_token = set_current_tenant_id(tenant_id)
-    gucs_token = _set_context_gucs(gucs)
+    entered = _set_context_gucs(gucs)
     try:
         yield
     finally:
         try:
-            _reset_context_gucs(gucs_token)
+            _reset_context_gucs(entered)
         finally:
             try:
                 reset_current_tenant_id(tenant_token)
@@ -155,6 +157,7 @@ def tenant_context(
     # Save previous state for nesting support (both modes: a SET LOCAL made
     # by an enclosing block is visible here and must be re-issued on exit).
     previous = _snapshot_gucs(conf, using=using)
+    enclosing = _current_live()
 
     gucs = ContextGucs.for_tenant(tenant_id)
     exc_pending = False
@@ -174,7 +177,13 @@ def tenant_context(
         exc_pending = True
         raise
     finally:
-        _restore_tenant_gucs(previous, is_local=is_local, using=using, exc_pending=exc_pending)
+        _restore_tenant_gucs(
+            previous,
+            is_local=is_local,
+            using=using,
+            exc_pending=exc_pending,
+            enclosing=enclosing,
+        )
         logger.debug("tenant_context exited: tenant_id=%s, using=%s", tenant_id, using)
 
 
@@ -200,6 +209,7 @@ def admin_context(
 
     # Save previous state for nesting support (both modes).
     previous = _snapshot_gucs(conf, using=using)
+    enclosing = _current_live()
 
     exc_pending = False
     try:
@@ -216,7 +226,13 @@ def admin_context(
         exc_pending = True
         raise
     finally:
-        _restore_tenant_gucs(previous, is_local=is_local, using=using, exc_pending=exc_pending)
+        _restore_tenant_gucs(
+            previous,
+            is_local=is_local,
+            using=using,
+            exc_pending=exc_pending,
+            enclosing=enclosing,
+        )
         logger.debug("admin_context exited: using=%s", using)
 
 
@@ -239,6 +255,7 @@ def _restore_tenant_gucs(
     is_local: bool,
     using: str,
     exc_pending: bool,
+    enclosing: _Live | None = None,
 ) -> None:
     """Restore a context block's snapshot of the admin and tenant GUCs, on exit.
 
@@ -248,7 +265,9 @@ def _restore_tenant_gucs(
     a failed restore was skipped (see
     :func:`django_rls_tenants.rls.context.restore_gucs`): the values are then
     unknown, and the guard applies the enclosing context before the next
-    statement. The other configured aliases, on which the guard may have
+    statement. If the enclosing context has ended meanwhile (the block ran in
+    a task or thread that outlived it), its values do not come back: both GUCs
+    are cleared. The other configured aliases, on which the guard may have
     applied the block's context, are brought back to the enclosing one too.
 
     Args:
@@ -256,7 +275,12 @@ def _restore_tenant_gucs(
         is_local: Scope the block used.
         using: Database alias.
         exc_pending: ``True`` when called while an exception is propagating.
+        enclosing: The enclosing context's holder when the block was entered,
+            from ``state._current_live()``.
     """
+    if enclosing is not None and not enclosing.alive:
+        conf = rls_tenants_config
+        previous = dict.fromkeys((conf.GUC_IS_ADMIN, conf.GUC_CURRENT_TENANT))
     with writing(using, _get_context_gucs()):
         restored = restore_gucs(previous, is_local=is_local, using=using, exc_pending=exc_pending)
     if not restored:
@@ -365,11 +389,13 @@ async def async_tenant_context(
     # set here in the coroutine, never inside the hop, because a token
     # created in the hop's context copy cannot be reset from here (#58).
     gucs = ContextGucs.for_tenant(tenant_id)
+    enclosing = _current_live()
     previous = await _run_enter_hop(
         _enter_tenant_gucs,
         {conf.GUC_IS_ADMIN: gucs.is_admin, conf.GUC_CURRENT_TENANT: gucs.current_tenant},
         is_local=is_local,
         using=using,
+        undo=functools.partial(_restore_tenant_gucs, enclosing=enclosing),
     )
     exc_pending = False
     try:
@@ -389,6 +415,7 @@ async def async_tenant_context(
             is_local=is_local,
             using=using,
             exc_pending=exc_pending,
+            enclosing=enclosing,
         )
         logger.debug("async_tenant_context exited: tenant_id=%s, using=%s", tenant_id, using)
 
@@ -417,11 +444,13 @@ async def async_admin_context(
     is_local = conf.USE_LOCAL_SET
 
     # Same mapping as admin_context(): clear_guc() is set_guc(name, "").
+    enclosing = _current_live()
     previous = await _run_enter_hop(
         _enter_tenant_gucs,
         {conf.GUC_IS_ADMIN: ADMIN_GUCS.is_admin, conf.GUC_CURRENT_TENANT: ""},
         is_local=is_local,
         using=using,
+        undo=functools.partial(_restore_tenant_gucs, enclosing=enclosing),
     )
     exc_pending = False
     try:
@@ -437,6 +466,7 @@ async def async_admin_context(
             is_local=is_local,
             using=using,
             exc_pending=exc_pending,
+            enclosing=enclosing,
         )
         logger.debug("async_admin_context exited: using=%s", using)
 

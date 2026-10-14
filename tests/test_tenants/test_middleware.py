@@ -22,6 +22,7 @@ from django_rls_tenants.exceptions import NoTenantContextError, RLSConfiguration
 from django_rls_tenants.rls.guc import get_guc, set_guc
 from django_rls_tenants.tenants import middleware as middleware_module
 from django_rls_tenants.tenants.conf import RLSTenantsConfig
+from django_rls_tenants.tenants.context import tenant_context
 from django_rls_tenants.tenants.middleware import (
     RLSTenantMiddleware,
     _clear_gucs_set_flag,
@@ -818,6 +819,54 @@ class TestContextGucsCleanup:
         assert get_current_tenant_id() is None
         assert get_guc("rls.current_tenant") is None
         assert _were_gucs_set() is False
+
+
+class TestMiddlewareContextValues:
+    """The context values the GUC affinity guard applies, as the middleware sets and ends them."""
+
+    def test_request_inside_a_context_gives_the_outer_context_back(self, tenant_a, tenant_b_user):
+        middleware = RLSTenantMiddleware(get_response=lambda request: None)
+        request = _make_request(user=tenant_b_user)
+
+        with tenant_context(tenant_a.pk):
+            middleware.process_request(request)
+            middleware.process_response(request, MagicMock())
+
+            assert _get_context_gucs() == ContextGucs.for_tenant(tenant_a.pk)
+            assert get_guc("rls.current_tenant") == str(tenant_a.pk)
+
+    def test_failed_request_setup_leaves_no_context_values(self, tenant_a_user, monkeypatch):
+        def fail():
+            msg = "setup failed"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(middleware_module, "_mark_gucs_set", fail)
+        middleware = RLSTenantMiddleware(get_response=lambda request: None)
+
+        with pytest.raises(RuntimeError, match="setup failed"):
+            middleware.process_request(_make_request(user=tenant_a_user))
+
+        assert _get_context_gucs() is None
+
+    def test_cleanup_error_does_not_replace_a_base_exception(self, tenant_a_user, monkeypatch):
+        class _Abort(BaseException):
+            pass
+
+        def abort(request):
+            raise _Abort
+
+        def failing_cleanup(request):
+            msg = "cleanup failed"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(
+            RLSTenantMiddleware,
+            "_cleanup_rls_state",
+            staticmethod(failing_cleanup),
+        )
+
+        with pytest.raises(_Abort):
+            RLSTenantMiddleware(get_response=abort)(_make_request(user=tenant_a_user))
 
 
 class TestProcessExceptionRollback:

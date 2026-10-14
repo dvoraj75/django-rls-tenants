@@ -53,7 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Django builds there under ASGI) runs with that context, on that thread's own
     connection, instead of with whatever GUCs the connection happened to hold. A copy that
     outlives its block (a task started and not awaited inside it) gets nothing once the
-    block ends.
+    block ends, and a `sync_to_async` call cancelled while its function is inside a block
+    does not hand that block to its caller.
   - Sibling `asyncio` tasks of one request run their statements with their own contexts,
     so `asyncio.gather` across tenants is safe for raw SQL, `safe_tenant_sql()` and M2M
     through tables too.
@@ -70,8 +71,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - If applying fails, the error is raised and the statement does not run.
   - Limits: session GUCs only (with `USE_LOCAL_SET=True` the guard does nothing); the admin
     and tenant GUCs only, not bypass flags; SQL that bypasses Django's execute wrappers (a
-    driver cursor, `callproc()`, the driver's `copy` methods) is not seen. It costs about
-    1.5 µs of Python per statement. See "GUC Affinity Guard" in the architecture guide.
+    driver cursor, `callproc()`, the driver's `copy` methods) is not seen. It costs a few
+    microseconds of Python per statement. See "GUC Affinity Guard" in the architecture
+    guide.
 - **`RLSTenantMiddleware` ends the request context when a `BaseException` escapes the view**
   (#41). Under WSGI, Django turns every `Exception` into a response, but a
   `BaseException` (`KeyboardInterrupt`, a server's timeout) skipped `process_response`, and

@@ -40,6 +40,7 @@ from django_rls_tenants.tenants.context import (
 )
 from django_rls_tenants.tenants.errors import HINT_NO_CONTEXT
 from django_rls_tenants.tenants.state import (
+    _current_live,
     get_current_tenant_id,
     get_rls_context_active,
 )
@@ -386,6 +387,7 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
             }
             gucs = _context_gucs_of(variables, conf)
             tenant_id = None if user.is_tenant_admin else user.rls_tenant_id
+            enclosing = _current_live()
             exc_pending = False
             try:
                 with _rls_state(tenant_id, gucs):
@@ -402,6 +404,7 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
                     is_local=is_local,
                     using=using,
                     exc_pending=exc_pending,
+                    enclosing=enclosing,
                 )
 
     @contextmanager

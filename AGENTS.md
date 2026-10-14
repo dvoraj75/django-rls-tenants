@@ -158,16 +158,23 @@ tuple, or `None`) with what the tracker says the session holds and, if they diff
 `write_gucs()` (one `set_config()` pair) first; a failure propagates. So every configured
 alias follows the context, whichever alias it was entered on. The `ContextVar` holds a
 `_Live` holder that `_reset_context_gucs()` / `_clear_context_gucs()` end for every copy,
-so a hop or task inherits a context only while its block is live.
+so a hop or task inherits a context only while its block is live. A block's holder
+(`block=True`) compares equal to anything, so asgiref's copy-back (`!=`) never hands a
+cancelled `sync_to_async` call's still-running block to its caller; only
+`process_request` sets `block=False`, since `MiddlewareMixin` runs it in a hop of its own.
+The wrapped `_commit` / `_rollback` read the libpq status before and after (a commit of a
+failed transaction is a rollback; a call that ended nothing is ignored).
 
 Rules for code that sets a context or writes the admin/tenant GUCs:
 
 - Every library entry point that sets the tenant `ContextVar`s sets the guard's too, to
   exactly the values it writes: the context managers and `_rls_scope()` use
-  `context._rls_state()`, which sets and resets all three; the middleware keeps the token
-  on the request (or in `__acall__`) and resets it first, with `_end_context_gucs()`. The
-  guard never infers a context from `get_current_tenant_id()` / `get_rls_context_active()`,
-  which are public.
+  `context._rls_state()`, which sets and resets all three; the middleware keeps what
+  `_set_context_gucs()` returned on the request (or in `__acall__`) and ends it first, with
+  `_end_context_gucs()`. They also pass the enclosing holder (`state._current_live()`, read
+  on entry) to `_restore_tenant_gucs(..., enclosing=...)`, which clears instead of
+  restoring when that context has ended meanwhile. The guard never infers a context from
+  `get_current_tenant_id()` / `get_rls_context_active()`, which are public.
 - The library's own GUC writes run inside `writing(alias_or_connection, values)`, which
   keeps the guard out of the way and records `values` (`UNKNOWN` if the block raises). A
   restore records `_get_context_gucs()` read after the `ContextVar` reset

@@ -140,9 +140,16 @@ tenant_context(42)
 **Live contexts only.** A copy of the context (a hop, a task, `copy_context()`) shares the
 context's entry in that `ContextVar` with the block that made it, and the block's exit ends
 it for every copy. A hop or task awaited inside the block inherits the context; one that
-runs after the block has ended gets nothing, as on a connection without a context. When a
-block exits, the guard also takes its context off this thread's other configured aliases
-right away, if it applied it there.
+runs after the block has ended gets nothing, as on a connection without a context. A block
+such a copy entered itself, and that exits after the enclosing block has ended, clears the
+GUCs instead of restoring the ended context's values. `asgiref` copies the `ContextVar`
+values of a `sync_to_async` call back into its caller, also when the call is cancelled
+while its function is still inside a block; a block's entry compares equal to any value,
+so `asgiref` leaves the caller's own context in place (only the middleware's
+`process_request`, which runs in a hop of its own under `MiddlewareMixin`, hands its
+context back). When a block exits, the guard also takes its context off this thread's
+other configured aliases right away, if it applied it there; a connection that fails then
+is left for its next statement.
 
 **What it records.** The library's own GUC writes (context entry and exit, the middleware,
 `for_user()`, the `connection_created` handler) run with the guard out of the way and record
@@ -158,14 +165,18 @@ at the library's first GUC write on it.
 rolled back. The guard follows:
 
 - Django's commit and rollback of the connection (`atomic()`, `transaction.commit()` /
-  `rollback()`): `install()` wraps the connection's `_commit()` and `_rollback()`. A commit
-  keeps the values; a rollback brings back those from before the transaction.
+  `rollback()`): `install()` wraps the connection's `_commit()` and `_rollback()` and reads
+  the transaction status before and after. A commit keeps the values; a rollback, or a
+  commit of a failed transaction (which PostgreSQL turns into a rollback without an
+  error), brings back those from before the transaction; a call that ended nothing
+  (psycopg2 sends nothing in autocommit mode) changes nothing.
 - the transaction-control statements that run through Django's cursor: a savepoint records
   the values at that point and `ROLLBACK TO` it puts them back; `ROLLBACK` and `COMMIT` sent
   as SQL are followed like Django's, and a `COMMIT` of a failed transaction, which
   PostgreSQL turns into a rollback, as one. `RESET ALL`, `DISCARD ALL` and `RESET` of the
   admin or tenant GUC make the values unknown. Leading comments are skipped; a string with
-  several statements makes them unknown.
+  several statements, a statement that is not text, or a savepoint name the guard cannot
+  read makes them unknown.
 - the transaction status the driver reports (libpq, without a round trip), for a transaction
   that ended where the guard could not see it (a commit on the driver connection): the
   values recorded during it are kept only if they equal those from before it, since commit
@@ -198,7 +209,7 @@ has marked the transaction for rollback: those statements succeed or fail on the
 - A transaction that ends where the guard cannot see it and is followed by one it cannot see
   start (both on the driver connection) can leave it trusting values the rollback undid; the
   next statement through Django's cursor after a visible boundary corrects it.
-- The cost is about 1.5 µs of Python per statement, and no extra round trip while the
+- The cost is a few microseconds of Python per statement, and no extra round trip while the
   connection already holds the context's values.
 
 ## Policy Generation

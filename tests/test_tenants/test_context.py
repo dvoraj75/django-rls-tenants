@@ -13,6 +13,7 @@ from asgiref.sync import async_to_sync, sync_to_async
 
 from django_rls_tenants.exceptions import NoTenantContextError, RLSConfigurationError
 from django_rls_tenants.rls.guc import aget_guc, get_guc, set_guc
+from django_rls_tenants.tenants import context as context_module
 from django_rls_tenants.tenants.context import (
     _resolve_user_guc_vars,
     admin_context,
@@ -22,7 +23,12 @@ from django_rls_tenants.tenants.context import (
     with_rls_context,
 )
 from django_rls_tenants.tenants.errors import HINT_TENANT_ID_NONE
-from django_rls_tenants.tenants.state import get_current_tenant_id, get_rls_context_active
+from django_rls_tenants.tenants.state import (
+    ContextGucs,
+    _get_context_gucs,
+    get_current_tenant_id,
+    get_rls_context_active,
+)
 
 pytestmark = pytest.mark.django_db
 
@@ -1293,3 +1299,36 @@ class TestWithRlsContextCoroutineGuard:
         decorated = with_rls_context(AsyncCallable())
         with pytest.raises(TypeError, match=r"\.AsyncCallable returned a coroutine"):
             decorated(as_user=tenant_a_user)
+
+
+class TestRlsStateResets:
+    """``_rls_state`` resets every ``ContextVar`` it set, even when one reset fails."""
+
+    @staticmethod
+    def _fail(token):
+        msg = "reset failed"
+        raise RuntimeError(msg)
+
+    @staticmethod
+    def _enter_and_leave():
+        with (
+            pytest.raises(RuntimeError, match="reset failed"),
+            context_module._rls_state(5, ContextGucs.for_tenant(5)),
+        ):
+            pass
+
+    def test_failing_guc_reset_does_not_skip_the_tenant_and_flag_resets(self, monkeypatch):
+        monkeypatch.setattr(context_module, "_reset_context_gucs", self._fail)
+
+        self._enter_and_leave()
+
+        assert get_current_tenant_id() is None
+        assert get_rls_context_active() is False
+
+    def test_failing_tenant_reset_does_not_skip_the_flag_reset(self, monkeypatch):
+        monkeypatch.setattr(context_module, "reset_current_tenant_id", self._fail)
+
+        self._enter_and_leave()
+
+        assert get_rls_context_active() is False
+        assert _get_context_gucs() is None

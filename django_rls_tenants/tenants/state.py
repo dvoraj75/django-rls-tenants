@@ -141,13 +141,38 @@ class _Live:
     block holds this same object, so ending the block ends the context for
     every copy: work that outlives the block runs without it (fail-closed)
     instead of keeping its tenant or admin rights.
+
+    ``asgiref``'s ``sync_to_async`` copies the ``ContextVar`` values of the
+    call back into its caller when they compare unequal (``!=``), also when
+    the call is cancelled while its function still runs. A holder set by a
+    context block (``block=True``) compares equal to anything, so a
+    cancelled call never hands its caller a block that still runs on in
+    another thread; a normal call has reset the block's value by the time it
+    returns. Only ``RLSTenantMiddleware.process_request`` sets a holder that
+    must reach its caller (``block=False``): ``MiddlewareMixin`` runs it in a
+    hop of its own under ASGI.
     """
 
-    __slots__ = ("alive", "values")
+    __slots__ = ("alive", "block", "values")
 
-    def __init__(self, values: ContextGucs) -> None:
+    def __init__(self, values: ContextGucs, *, block: bool) -> None:
         self.values = values
+        self.block = block
         self.alive = True
+
+    def __eq__(self, other: object) -> bool:
+        if self.block or self is other:
+            return True
+        return NotImplemented
+
+    __hash__ = object.__hash__
+
+
+class _ContextGucsToken(NamedTuple):
+    """What :func:`_set_context_gucs` returns: the ``ContextVar`` token and the holder it set."""
+
+    token: Token[_Live | None]
+    live: _Live
 
 
 # The GUC values of the innermost active context the library set up, or
@@ -164,6 +189,11 @@ def _get_context_gucs() -> ContextGucs | None:
     return live.values if live is not None and live.alive else None
 
 
+def _current_live() -> _Live | None:
+    """Return the holder of the context that is current, live or not, or ``None``."""
+    return _context_gucs.get()
+
+
 def _end_live_context() -> None:
     """End the context whose values are current, for every copy that holds them."""
     live = _context_gucs.get()
@@ -171,26 +201,35 @@ def _end_live_context() -> None:
         live.alive = False
 
 
-def _set_context_gucs(values: ContextGucs) -> Token[_Live | None]:
+def _set_context_gucs(values: ContextGucs, *, block: bool = True) -> _ContextGucsToken:
     """Record the GUC values of the context being entered.
 
     Args:
         values: The values the context sets.
+        block: ``False`` only for a holder that a ``sync_to_async`` call must
+            hand back to its caller (see :class:`_Live`).
 
     Returns:
-        A ``Token`` for :func:`_reset_context_gucs`.
+        What :func:`_reset_context_gucs` takes to end the context.
     """
-    return _context_gucs.set(_Live(values))
+    live = _Live(values, block=block)
+    return _ContextGucsToken(_context_gucs.set(live), live)
 
 
-def _reset_context_gucs(token: Token[_Live | None]) -> None:
-    """End the context entered with ``token`` and restore the enclosing one.
+def _reset_context_gucs(entered: _ContextGucsToken) -> None:
+    """End the context entered with ``entered`` and restore the enclosing one.
+
+    The context's own holder is ended, and so is whatever holder is current
+    if that is another one, before the ``ContextVar`` is reset: if the reset
+    fails (a token from another ``Context``, or one used twice), no context
+    stays live.
 
     Args:
-        token: The token returned by the corresponding ``_set_context_gucs()`` call.
+        entered: What the corresponding ``_set_context_gucs()`` call returned.
     """
+    entered.live.alive = False
     _end_live_context()
-    _context_gucs.reset(token)
+    _context_gucs.reset(entered.token)
 
 
 def _clear_context_gucs() -> None:

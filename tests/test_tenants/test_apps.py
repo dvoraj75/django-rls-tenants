@@ -11,13 +11,14 @@ from types import SimpleNamespace
 import pytest
 from django.conf import settings as django_settings
 from django.core.signals import request_finished
-from django.db import Error, close_old_connections, connection, connections
+from django.db import Error, OperationalError, close_old_connections, connection, connections
 from django.db.backends.signals import connection_created
 from django.test import override_settings
 
 from django_rls_tenants.apps import _is_pooled
 from django_rls_tenants.pool import reset_rls_gucs
 from django_rls_tenants.rls.guc import get_guc, set_guc
+from django_rls_tenants.tenants import affinity
 from django_rls_tenants.tenants.middleware import (
     _clear_gucs_set_flag,
     _mark_gucs_set,
@@ -254,6 +255,38 @@ class TestConnectionCreatedSignalHandler:
         connection.ensure_connection()  # connection_created
 
         assert session_gucs(connection) == (None, None)
+
+
+@pytest.mark.django_db(transaction=True)
+class TestFailedApplyOnConnect:
+    def test_failure_is_logged_and_the_guard_applies_the_context_later(
+        self,
+        monkeypatch,
+        caplog,
+    ):
+        """The handler logs and goes on; the first statement gets the context from the guard."""
+        _enter_request_context(42)
+        connection.ensure_connection()
+        connection.connection.close()
+        connection.connection = None
+        write_gucs = affinity.write_gucs
+        attempts = []
+
+        def fail_the_first_write(conn, values, *, is_local=False):
+            attempts.append(values)
+            if len(attempts) == 1:
+                msg = "injected"
+                raise OperationalError(msg)
+            return write_gucs(conn, values, is_local=is_local)
+
+        monkeypatch.setattr(affinity, "write_gucs", fail_the_first_write)
+
+        with caplog.at_level(logging.WARNING, logger="django_rls_tenants"):
+            connection.ensure_connection()  # connection_created
+
+        assert "Failed to set RLS GUCs on new connection" in caplog.text
+        assert session_gucs(connection) == (None, None)
+        assert _read_gucs() == ("42", "false")
 
 
 def _on_new_thread(func):
