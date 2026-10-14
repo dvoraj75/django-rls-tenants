@@ -138,6 +138,12 @@ migration that assigns the correct tenant to each existing record.
   a decorator that returns a plain function) now raises `TypeError` when called, instead
   of returning a coroutine that ran outside the context. Put `@with_rls_context` directly
   on the `async def`.
+- **`assert_rls_blocks_without_context()` counts with raw SQL.** It now works with
+  `STRICT_MODE=True` and inside `rls_bypass()` / `rls_as_tenant()`, so a test that turned
+  strict mode off around it can drop that override. The count no longer goes through the
+  model's default manager: every row in the table must be hidden, including rows a
+  filtering manager would have excluded. See
+  [assert_rls_blocks_without_context](../guides/testing.md#assert_rls_blocks_without_context).
 
 ### From 1.3.3 to 1.3.4
 

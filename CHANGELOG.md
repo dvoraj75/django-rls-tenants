@@ -110,6 +110,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   function failed type checking, and `@with_rls_context(user_param=...)` turned it into
   `(*Never, **Never) -> Never`. Two `@overload`s now give each form its exact type: the
   decorated function keeps its signature and return type (a coroutine for `async def`).
+- **`assert_rls_blocks_without_context()` under `STRICT_MODE` and inside a context**
+  (#126). Its no-context count was an ORM query run with the caller's state. With
+  `STRICT_MODE=True` it raised `NoTenantContextError` before reaching PostgreSQL, so suites
+  that run with strict mode could not use it. Inside `rls_bypass()` or `rls_as_tenant()`
+  it counted with that context and failed with "RLS may not be enforced". Both counts are
+  now raw SQL on the model's table, and the no-context count runs with the admin and
+  tenant GUCs cleared, then restored (with `SET LOCAL` under `USE_LOCAL_SET=True`). The
+  helper works under strict mode, gives the same result inside an admin or tenant
+  context, leaves that context intact, and no longer needs a manager named `objects`.
+  Default-manager filters no longer apply, so every row in the table must be hidden.
+  `aassert_rls_blocks_without_context()` gets the same fix.
 
 ## [1.3.4] - 2026-10-12
 

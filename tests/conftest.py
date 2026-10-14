@@ -7,7 +7,7 @@ import os
 from decimal import Decimal
 
 import pytest
-from django.db import connection
+from django.db import DEFAULT_DB_ALIAS, connection, connections
 
 from django_rls_tenants.rls.guc import clear_guc
 from django_rls_tenants.tenants.context import admin_context
@@ -121,6 +121,22 @@ def _rls_role(django_db_setup, django_db_blocker):
         cur.execute(f"GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {_RLS_ROLE}")
 
 
+def _switch_to_rls_role(conn):
+    """Run ``conn`` as the RLS test role if it connects as a superuser.
+
+    Returns:
+        ``True`` if the role was switched (the caller resets it), ``False``
+        if the connection's role is already subject to RLS.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT usesuper FROM pg_user WHERE usename = current_user")
+        row = cur.fetchone()
+        is_super = row is not None and row[0]
+        if is_super:
+            cur.execute(f"SET ROLE {_RLS_ROLE}")
+    return is_super
+
+
 @pytest.fixture
 def enforce_rls(_rls_role, db):
     """Switch to a non-superuser role so PostgreSQL RLS is enforced.
@@ -128,17 +144,31 @@ def enforce_rls(_rls_role, db):
     Use this fixture (or the autouse version in test_integration/) for any
     test that verifies database-level row filtering without ``for_user()``.
     """
-    with connection.cursor() as cur:
-        cur.execute("SELECT usesuper FROM pg_user WHERE usename = current_user")
-        row = cur.fetchone()
-        is_super = row is not None and row[0]
-    if is_super:
-        with connection.cursor() as cur:
-            cur.execute(f"SET ROLE {_RLS_ROLE}")
+    switched = _switch_to_rls_role(connection)
     yield
-    if is_super:
+    if switched:
         with connection.cursor() as cur:
             cur.execute("RESET ROLE")
+
+
+@pytest.fixture
+def replica(_rls_role, transactional_db):
+    """A second connection to the test database, registered as the ``replica`` alias.
+
+    It is a separate session, so it sees committed rows only (hence
+    ``transactional_db``), and it runs as a role RLS applies to, like
+    ``enforce_rls`` does for ``default``. Only ``connections`` knows the
+    alias, not ``settings.DATABASES``, so the teardown flush never touches it.
+    """
+    default = connections[DEFAULT_DB_ALIAS]
+    conn = type(default)(default.settings_dict, alias="replica")
+    connections["replica"] = conn
+    try:
+        _switch_to_rls_role(conn)
+        yield "replica"
+    finally:
+        del connections["replica"]
+        conn.close()
 
 
 @pytest.fixture
