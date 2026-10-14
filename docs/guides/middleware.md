@@ -52,7 +52,8 @@ work in its own async path; see [Running under ASGI](#running-under-asgi).
    auto-scoped queries; admin users and unauthenticated requests do not).
 6. Sets `_rls_context_active=True` to mark that an RLS context is active. This is used
    by strict mode to distinguish "middleware set context" from "no context at all".
-7. Marks a `ContextVar` flag that GUCs were set (used by the safety-net signal handler).
+7. Records in a `ContextVar` that GUCs were set, and on which thread (read by the
+   safety-net and `connection_created` signal handlers).
 
 ### Transaction Per Request (`USE_LOCAL_SET=True`)
 
@@ -125,6 +126,27 @@ response on a different thread and database connection. The hook ends the reques
 first, so error pages run fail-closed, as under WSGI. If a synchronous-only middleware is
 listed after `RLSTenantMiddleware`, Django runs `RLSTenantMiddleware` on its synchronous path
 inside a hop instead, which works too.
+
+Some failures never reach `process_exception`: a URL that does not resolve (Django resolves
+it outside the code that calls the hook), a view that returns `None`, or an exception from a
+`process_view` or `process_template_response` hook or from an async-capable middleware listed
+after `RLSTenantMiddleware`. Django builds those error responses on a worker thread as well,
+while the request context is still active. *Changed in 1.4.0:* the request's GUCs go only on
+connections opened on the thread that set them, where the middleware clears them again. A
+connection opened on any other thread during the request is left without a context, so these
+error pages see no RLS-protected rows either (#130). Before 1.4.0 the worker thread's
+connection kept the request's GUCs for the life of the thread, and a later error page built on
+that thread, for an anonymous visitor too, ran with them. Under WSGI, and for an exception
+from a synchronous-only middleware listed after `RLSTenantMiddleware`, Django builds the
+error response on the request's own thread, inside its context. A custom error handler,
+template or context processor that needs the visitor's tenant data under ASGI must open
+`tenant_context()` / `admin_context()` itself, for an authenticated `request.user`.
+
+The same rule applies to database work handed to another thread, under ASGI or WSGI:
+`sync_to_async(..., thread_sensitive=False)`, `asyncio.to_thread()` or a thread pool runs on
+that thread's own connection, without the request's GUCs. With `DJANGO_ALLOW_ASYNC_UNSAFE`,
+so do queries an async view runs on the event-loop thread itself. Open `tenant_context()` /
+`admin_context()` inside that work if it needs tenant data.
 
 The async path does not call `process_request` or `process_response`. A subclass that
 overrides either hook therefore keeps the hook-based path that 1.3.4 used, so its hooks
@@ -241,7 +263,10 @@ RLS_TENANTS = {
 The middleware sets GUCs on all configured aliases during `process_request` and
 clears them during `process_response`. A `connection_created` signal handler
 also sets GUCs on lazily-created connections that don't exist when the middleware
-runs (e.g., a replica connection opened by a database router mid-request).
+runs (e.g., a replica connection opened by a database router mid-request). It does
+so only on the thread that set the request's GUCs, where the middleware's cleanup
+clears them; a connection opened on another thread during the request gets no
+context (see [Running under ASGI](#running-under-asgi)).
 
 See [Configuration](../getting-started/configuration.md#databases) for details.
 

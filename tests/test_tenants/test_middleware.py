@@ -6,6 +6,7 @@ import asyncio
 import contextvars
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from unittest.mock import MagicMock, call, patch
 
@@ -24,8 +25,10 @@ from django_rls_tenants.tenants.conf import RLSTenantsConfig
 from django_rls_tenants.tenants.middleware import (
     RLSTenantMiddleware,
     _clear_gucs_set_flag,
+    _mark_gucs_set,
     _reset_or_clear,
     _were_gucs_set,
+    _were_gucs_set_on_this_thread,
 )
 from django_rls_tenants.tenants.state import (
     get_current_tenant_id,
@@ -170,6 +173,45 @@ class TestThreadLocalFlags:
         request = _make_request(user=tenant_a_user)
         mw.process_request(request)
         assert _were_gucs_set() is True
+
+    def test_flag_belongs_to_the_thread_that_set_it(self):
+        """A thread with a copy of the context sees the flag but does not own the GUCs (#130)."""
+        _mark_gucs_set()
+
+        def other_thread():
+            return _were_gucs_set(), _were_gucs_set_on_this_thread()
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            other = executor.submit(contextvars.copy_context().run, other_thread).result()
+
+        assert (_were_gucs_set(), _were_gucs_set_on_this_thread()) == (True, True)
+        assert other == (True, False)
+
+    def test_unset_flag_is_owned_by_no_thread(self):
+        """Also on a thread that has no marker yet."""
+        _clear_gucs_set_flag()
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            owned = executor.submit(
+                contextvars.copy_context().run, _were_gucs_set_on_this_thread
+            ).result()
+
+        assert owned is False
+        assert _were_gucs_set_on_this_thread() is False
+
+    def test_finished_threads_marker_matches_no_later_thread(self):
+        """A later thread may reuse a finished thread's ident (glibc does), never its marker."""
+
+        def owner():
+            _mark_gucs_set()
+            return _were_gucs_set_on_this_thread()
+
+        context = contextvars.copy_context()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            assert executor.submit(context.run, owner).result() is True
+        # Leaving the block joined that thread; this executor starts a new one.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            assert executor.submit(context.run, _were_gucs_set_on_this_thread).result() is False
 
 
 class TestAutoScopeState:
@@ -927,6 +969,25 @@ class TestNativeAsyncPath:
             reset_current_tenant_id(tenant_token)
             reset_rls_context_active(active_token)
 
+    def test_only_the_enter_hop_thread_owns_the_gucs(self, tenant_a_user):
+        """Not the event loop's thread, nor a ``thread_sensitive=False`` worker (#130)."""
+        seen = {}
+
+        async def aget_response(request):
+            seen["loop"] = _were_gucs_set_on_this_thread()
+            seen["hop"] = await sync_to_async(
+                _were_gucs_set_on_this_thread, thread_sensitive=True
+            )()
+            seen["worker"] = await sync_to_async(
+                _were_gucs_set_on_this_thread, thread_sensitive=False
+            )()
+            return MagicMock()
+
+        async_to_sync(_async_mw(aget_response))(_make_request(user=tenant_a_user))
+
+        assert seen == {"loop": False, "hop": True, "worker": False}
+        _assert_async_request_left_nothing_behind()
+
     def test_logs_set_and_clear_at_debug(self, tenant_a_user, caplog):
         async def aget_response(request):
             return MagicMock()
@@ -1158,6 +1219,26 @@ class TestSubclassWithSyncHooks:
         assert seen["state"] == (tenant_a_user.rls_tenant_id, True, True)
         # process_response already cleaned up, so the finally block makes no hop.
         assert hops == []
+        _assert_async_request_left_nothing_behind()
+
+    def test_hook_hop_thread_owns_the_gucs(self, tenant_a_user):
+        """``process_request`` runs in a thread-sensitive hop; that thread owns the GUCs (#130)."""
+        seen = {}
+
+        async def aget_response(request):
+            seen["hop"] = await sync_to_async(
+                _were_gucs_set_on_this_thread, thread_sensitive=True
+            )()
+            seen["worker"] = await sync_to_async(
+                _were_gucs_set_on_this_thread, thread_sensitive=False
+            )()
+            return MagicMock()
+
+        async_to_sync(_HookOverridingMiddleware(get_response=aget_response))(
+            _make_request(user=tenant_a_user)
+        )
+
+        assert seen == {"hop": True, "worker": False}
         _assert_async_request_left_nothing_behind()
 
     def test_cancelled_request_is_cleaned_up(self, tenant_a_user):

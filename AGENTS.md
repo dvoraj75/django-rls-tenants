@@ -101,7 +101,14 @@ avoid duplication. All SQL-interpolated inputs are validated via
 
 The middleware sets GUC variables on all database aliases listed in
 `RLS_TENANTS["DATABASES"]` (default: `["default"]`). A `connection_created`
-signal handler in `apps.py` also sets GUCs on lazily-created connections.
+signal handler in `apps.py` also sets GUCs on lazily-created connections,
+but only on the thread that set the request's GUCs: the "GUCs set" `ContextVar`
+holds that thread's marker (`_mark_gucs_set()`, `_were_gucs_set_on_this_thread()`
+in `middleware.py`). `ContextVar`s are copied into `thread_sensitive=False` hops,
+whose connections the cleanup never reaches, so on any other thread the handler
+clears the GUCs instead (#130). Code that sets the flag from a different thread
+than the one that set the GUCs must pass that thread's marker (the async path
+takes it from the enter hop); `_mark_gucs_set()` alone marks the current thread.
 The safety-net `request_finished` handler clears GUCs on all configured aliases.
 
 When modifying middleware or GUC-related code, ensure all database iteration
@@ -138,6 +145,8 @@ clears the GUCs. Never set or reset a `ContextVar` inside a `sync_to_async` hop 
 belongs to a copied context, #58), and never use `thread_sensitive=False` in library code
 (another thread means another connection). `process_exception` must keep ending the context
 under ASGI, because Django builds the error response on another thread and connection.
+Errors Django builds without calling `process_exception` (an unresolvable URL, for one) rely
+on the `connection_created` thread check instead (#130).
 A subclass that overrides `process_request` or `process_response` is detected in `__init__`
 and served by `_acall_through_sync_hooks` (`MiddlewareMixin.__acall__`), so changes to the
 sync hooks must keep that path working too.

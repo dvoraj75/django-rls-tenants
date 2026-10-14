@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import contextlib
 import os
+import threading
 from decimal import Decimal
 
 import pytest
 from django.db import DEFAULT_DB_ALIAS, connection, connections
+from django.db.backends.signals import connection_created
 
 from django_rls_tenants.rls.guc import clear_guc
 from django_rls_tenants.tenants.context import admin_context
@@ -190,6 +192,29 @@ def replica(_rls_role, transactional_db):
     finally:
         del connections["replica"]
         conn.close()
+
+
+@pytest.fixture
+def enforce_rls_on_other_threads(_rls_role):
+    """Run connections opened on other threads as a role RLS applies to.
+
+    ``enforce_rls`` switches the test thread's connection only. Under ASGI,
+    Django runs some work (error pages, ``thread_sensitive=False`` hops) on
+    worker threads with connections of their own; this receiver switches each
+    of those as it opens. Connected after the library's ``connection_created``
+    handler, so it runs after that handler has applied or cleared the GUCs.
+    """
+    test_thread = threading.get_ident()
+
+    def switch_role(sender, connection, **kwargs):
+        if threading.get_ident() != test_thread:
+            _switch_to_rls_role(connection)
+
+    connection_created.connect(switch_role, weak=False)
+    try:
+        yield
+    finally:
+        connection_created.disconnect(switch_role)
 
 
 @pytest.fixture

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from contextlib import ExitStack
 from contextvars import ContextVar, Token
 from functools import partial
@@ -48,26 +49,65 @@ else:
 
 logger = logging.getLogger("django_rls_tenants")
 
-# Flag indicating whether GUCs were set during this request.
-# Uses ``ContextVar`` for proper isolation in both WSGI (threaded)
-# and ASGI (async task) deployments. Previous versions used
-# ``threading.local`` which shared state across coroutines in ASGI.
-_gucs_set_var: ContextVar[bool] = ContextVar("rls_gucs_set", default=False)
+
+class _ThreadMarker:
+    """Identity token for one thread; compared with ``is``."""
+
+    __slots__ = ()
 
 
-def _mark_gucs_set() -> None:
-    """Mark that GUCs were set in the current context."""
-    _gucs_set_var.set(True)
+# Whether GUCs were set during this request: the marker of the thread that set
+# them, or ``None``. A ``ContextVar`` gives each request its own value, in WSGI
+# threads and in ASGI tasks alike; 1.1.0 replaced a ``threading.local`` flag,
+# which the coroutines on one event-loop thread shared.
+_gucs_set_var: ContextVar[_ThreadMarker | None] = ContextVar("rls_gucs_set", default=None)
+
+# Holds one marker per thread (per-thread by design). ``sync_to_async`` copies
+# the request's ``ContextVar``s into every hop, including the
+# ``thread_sensitive=False`` hops that run on other threads. Those threads have
+# connections of their own, which the request's cleanup never reaches (#130);
+# the marker tells them apart from the thread that set the GUCs. Compared by
+# identity, since a ``threading.get_ident()`` value can be reused once its
+# thread has exited.
+_thread_state = threading.local()
+
+
+def _current_thread_marker() -> _ThreadMarker:
+    """Return the current thread's marker, creating it on first use."""
+    marker: _ThreadMarker | None = getattr(_thread_state, "marker", None)
+    if marker is None:
+        marker = _thread_state.marker = _ThreadMarker()
+    return marker
+
+
+def _mark_gucs_set(thread_marker: _ThreadMarker | None = None) -> None:
+    """Mark that GUCs were set in the current context.
+
+    Args:
+        thread_marker: Marker of the thread that set them, from
+            ``_current_thread_marker()``. Defaults to the current thread's.
+    """
+    _gucs_set_var.set(_current_thread_marker() if thread_marker is None else thread_marker)
 
 
 def _clear_gucs_set_flag() -> None:
     """Clear the GUC flag in the current context."""
-    _gucs_set_var.set(False)
+    _gucs_set_var.set(None)
 
 
 def _were_gucs_set() -> bool:
     """Check whether GUCs were set in the current context."""
-    return _gucs_set_var.get()
+    return _gucs_set_var.get() is not None
+
+
+def _were_gucs_set_on_this_thread() -> bool:
+    """Check whether the current thread is the one that set the context's GUCs.
+
+    ``False`` when no GUCs were set, and on any other thread, such as a
+    ``thread_sensitive=False`` hop that only holds a copy of the request's
+    ``ContextVar``s.
+    """
+    return _gucs_set_var.get() is _current_thread_marker()
 
 
 def _reset_or_clear[T](
@@ -153,9 +193,10 @@ def _clear_request_gucs(conf: RLSTenantsConfig) -> None:
 
 
 class _RequestScope(NamedTuple):
-    """Auto-scope state for a request whose GUCs the async enter hop has set."""
+    """State of a request whose GUCs the async enter hop has set."""
 
     tenant_id: int | str | None
+    thread_marker: _ThreadMarker
 
 
 _ASGI_LOCAL_SET_MESSAGE = (
@@ -302,7 +343,8 @@ class RLSTenantMiddleware(MiddlewareMixin):
             return await self._aget_response(request)
         tenant_token = set_current_tenant_id(scope.tenant_id)
         active_token = set_rls_context_active(True)
-        _mark_gucs_set()
+        # The hop's thread, not the event loop's, owns the GUCs.
+        _mark_gucs_set(scope.thread_marker)
         try:
             return await self._aget_response(request)
         finally:
@@ -334,7 +376,8 @@ class RLSTenantMiddleware(MiddlewareMixin):
 
         Returns:
             ``None`` for an unauthenticated request (nothing was set), otherwise
-            the auto-scope tenant ID (``None`` for an admin user).
+            the auto-scope tenant ID (``None`` for an admin user) and the marker
+            of the thread that set the GUCs.
 
         Raises:
             RLSConfigurationError: If ``USE_LOCAL_SET=True`` and the request is
@@ -360,7 +403,7 @@ class RLSTenantMiddleware(MiddlewareMixin):
             user.is_tenant_admin,
             getattr(user, "rls_tenant_id", None),
         )
-        return _RequestScope(tenant_id)
+        return _RequestScope(tenant_id, _current_thread_marker())
 
     async def _aenter_request(
         self,
