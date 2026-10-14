@@ -49,20 +49,11 @@ class TestFailClosed:
     """Verify that queries without RLS context return zero rows.
 
     These tests verify the **database-level** RLS enforcement (PostgreSQL
-    returns zero rows when no GUC context is set). We temporarily disable
-    ``STRICT_MODE`` so the ORM-level guard does not fire first -- this
-    isolates the database-layer behavior.
+    returns zero rows when no GUC context is set). They run with the demo's
+    ``STRICT_MODE=True``: ``assert_rls_blocks_without_context`` counts rows
+    with raw SQL, which the ORM-level strict-mode guard does not see
+    (django-rls-tenants 1.4.0+).
     """
-
-    @pytest.fixture(autouse=True)
-    def _disable_strict_mode(self, settings):
-        """Disable strict mode so database-layer RLS is tested in isolation.
-
-        The library re-reads ``RLS_TENANTS`` whenever Django's
-        ``setting_changed`` signal fires, so the pytest-django ``settings``
-        fixture is all that is needed (django-rls-tenants 1.3.2+).
-        """
-        settings.RLS_TENANTS = {**settings.RLS_TENANTS, "STRICT_MODE": False}
 
     def test_notes_blocked_without_context(self, tenant_acme):
         from notes.models import Note

@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING
 from asgiref.sync import sync_to_async
 from django.db import connections
 
+from django_rls_tenants.rls.context import rls_context
+from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import (
     admin_context,
     async_admin_context,
@@ -111,15 +113,56 @@ def assert_rls_policy_exists(
         )
 
 
+def _count_rows(model_class: type[models.Model], *, using: str) -> int:
+    """Count the rows of ``model_class``'s table that the ``using`` connection can see.
+
+    Raw SQL, so the result depends only on the table's RLS policy, the
+    connection's role and its GUCs: the ``STRICT_MODE`` guard, the ORM
+    auto-scope filter and any filter of the model's default manager are not
+    involved.
+
+    Args:
+        model_class: The model whose ``_meta.db_table`` is counted.
+        using: Database alias.
+
+    Returns:
+        The number of rows the connection can see.
+    """
+    conn = connections[using]
+    table = conn.ops.quote_name(model_class._meta.db_table)  # noqa: SLF001  -- standard Django _meta access
+    with conn.cursor() as cursor:
+        # Developer-controlled name from the model's Meta, quoted by the backend.
+        cursor.execute(f"SELECT COUNT(*) FROM {table}")
+        count: int = cursor.fetchone()[0]
+    return count
+
+
 def assert_rls_blocks_without_context(
     model_class: type[models.Model],
     *,
     using: str = "default",
 ) -> None:
-    """Assert that querying with no GUC context returns zero rows.
+    """Assert that the database returns zero rows of ``model_class`` with no RLS context.
 
-    Verifies the fail-closed behavior. Requires at least one row
-    to exist in the table (caller must set up test data first).
+    Verifies the fail-closed behavior of the table's RLS policy. Requires at
+    least one row in the table (the caller must set up test data first).
+
+    1. Inside :func:`~django_rls_tenants.tenants.context.admin_context`, the
+       table must hold at least one row, so the assertion cannot pass
+       vacuously.
+    2. With the admin and tenant GUCs cleared on the ``using`` connection, the
+       table must return zero rows. The GUCs are restored before the
+       assertion (with ``SET LOCAL`` when ``USE_LOCAL_SET=True``), so the
+       result does not depend on the caller's admin or tenant context, and
+       such a context (for example :func:`rls_bypass` or
+       :func:`rls_as_tenant`) is intact when the helper returns or fails.
+       Other GUCs, such as a flag set with ``bypass_flag()``, are left as they
+       are.
+
+    Both counts are raw SQL on ``model_class._meta.db_table``, so the
+    ``STRICT_MODE`` guard, the ORM auto-scope filter and the filters of the
+    model's default manager are not involved: the helper works with
+    ``STRICT_MODE=True``, and every row in the table must be hidden.
 
     Args:
         model_class: The RLS-protected model class to query.
@@ -128,22 +171,34 @@ def assert_rls_blocks_without_context(
     Raises:
         AssertionError: If any rows are returned, or if the table is empty
             (which would make the assertion pass vacuously).
+        RuntimeError: If ``USE_LOCAL_SET=True`` and the ``using`` connection is
+            not inside ``transaction.atomic()``.
     """
+    conf = rls_tenants_config
+
     # Pre-check: verify the table has data (via admin bypass) so the
     # assertion is not vacuously true on an empty table.
     with admin_context(using=using):
-        total = model_class.objects.using(using).count()  # type: ignore[attr-defined]
+        total = _count_rows(model_class, using=using)
     assert total > 0, (
         f"assert_rls_blocks_without_context requires at least one row in "
         f"{model_class.__name__}, but the table is empty. "
         f"Set up test data before calling this helper."
     )
 
-    qs = model_class.objects.using(using).all()  # type: ignore[attr-defined]
-    count = qs.count()
+    # Clear the admin and tenant GUCs for the count only, so a context the
+    # caller holds cannot make rows visible, then restore them.
+    no_context = {conf.GUC_IS_ADMIN: "", conf.GUC_CURRENT_TENANT: ""}
+    with rls_context(no_context, is_local=conf.USE_LOCAL_SET, using=using):
+        count = _count_rows(model_class, using=using)
+    table = model_class._meta.db_table  # noqa: SLF001  -- standard Django _meta access
     assert count == 0, (
-        f"Expected 0 rows from {model_class.__name__} without "
-        f"RLS context, got {count}. RLS may not be enforced."
+        f"Expected 0 rows from {model_class.__name__} (table '{table}') without RLS "
+        f"context, got {count}, so RLS may not be enforced. Check that the connection "
+        f"role is not a superuser and has no BYPASSRLS (system check W005). Check that "
+        f"RLS is enabled and forced on the table and that it has a policy "
+        f"(assert_rls_enabled(), assert_rls_policy_exists()). Check that no bypass flag "
+        f"is set."
     )
 
 
@@ -253,9 +308,12 @@ async def aassert_rls_blocks_without_context(
     """Async counterpart of :func:`assert_rls_blocks_without_context`.
 
     Runs the sync assertion in one ``thread_sensitive`` ``sync_to_async``
-    hop: the admin pre-check and the unscoped count both happen inside it,
-    and the count sees the caller's RLS state exactly as the sync helper
-    does. Requires at least one row in the table.
+    hop: the admin pre-check, the clearing of the admin and tenant GUCs, the
+    no-context count and the restore all happen inside it, on the connection
+    that holds the caller's GUCs. Like the sync helper it works with
+    ``STRICT_MODE=True`` and inside :func:`async_rls_bypass` or
+    :func:`async_rls_as_tenant`, and leaves their context intact. Requires at
+    least one row in the table.
 
     Args:
         model_class: The RLS-protected model class to query.
@@ -264,6 +322,8 @@ async def aassert_rls_blocks_without_context(
     Raises:
         AssertionError: If any rows are returned, or if the table is empty
             (which would make the assertion pass vacuously).
+        RuntimeError: If ``USE_LOCAL_SET=True`` and the hop thread's
+            connection is not inside ``transaction.atomic()``.
     """
     await sync_to_async(assert_rls_blocks_without_context, thread_sensitive=True)(
         model_class,

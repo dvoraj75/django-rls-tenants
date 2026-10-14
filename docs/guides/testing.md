@@ -121,12 +121,35 @@ This function:
 
 1. Enters `admin_context()` to verify the table has at least one row (prevents
    vacuous passes on empty tables).
-2. Queries without any GUC context and asserts zero rows are returned.
+2. Clears the admin and tenant GUCs on the `using` connection, counts the rows again and
+   restores the GUCs to their previous values (with `SET LOCAL` when
+   `USE_LOCAL_SET=True`). The restore happens before the assertion, so the caller's
+   context is intact even when the assertion fails.
+3. Asserts that the second count is zero.
+
+Both counts are raw SQL on the model's table (`SELECT COUNT(*)`), not ORM queries. The
+result therefore depends only on the database: the `STRICT_MODE` guard, the auto-scope
+filter and the filters of the model's default manager are not involved.
+
+*Changed in 1.4.0.* The helper works with `STRICT_MODE=True`, and its result no longer
+depends on the admin or tenant context it is called from. Inside `rls_bypass()` or
+`rls_as_tenant()` it checks the same no-context state and leaves that context intact.
+Before, it raised `NoTenantContextError` under strict mode, and inside `rls_bypass()` or
+`rls_as_tenant()` it counted with the caller's context and failed with "RLS may not be
+enforced". Only the admin and tenant GUCs are cleared: a flag set with `bypass_flag()`
+stays set and can make rows visible.
 
 Raises `AssertionError` if:
 
-- Rows are returned (RLS is not enforcing isolation).
+- Rows are returned (RLS is not enforcing isolation). Common causes: the test connects as
+  a superuser or a role with `BYPASSRLS` (see
+  [W005](../troubleshooting.md#w005-the-connection-role-is-a-superuser-or-has-bypassrls)),
+  or RLS is not enabled and forced on the table.
 - The table is empty (would pass vacuously).
+
+Raises `RuntimeError` if:
+
+- `USE_LOCAL_SET=True` and the `using` connection is not inside `transaction.atomic()`.
 
 ## pytest Integration
 
@@ -349,6 +372,11 @@ def sample_data():
         Order.objects.create(tenant=tenant, title="Order 1", amount=100)
     return tenant
 ```
+
+The assertion functions work under strict mode. `assert_rls_enabled()` and
+`assert_rls_policy_exists()` only read the PostgreSQL catalog, and
+`assert_rls_blocks_without_context()` counts rows with raw SQL, which the guard does not
+see. You do not have to turn `STRICT_MODE` off to use these helpers.
 
 To explicitly test that strict mode raises, use `pytest.raises`:
 

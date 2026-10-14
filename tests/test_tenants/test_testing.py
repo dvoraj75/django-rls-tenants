@@ -9,11 +9,13 @@ from decimal import Decimal
 import pytest
 from asgiref.sync import async_to_sync, sync_to_async
 from django.conf import settings
-from django.db import connection
+from django.db import DEFAULT_DB_ALIAS, DataError, connection, connections, models, transaction
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext, isolate_apps
 from django.utils.connection import ConnectionDoesNotExist
 
 from django_rls_tenants.exceptions import NoTenantContextError
+from django_rls_tenants.rls.context import bypass_flag
 from django_rls_tenants.rls.guc import aget_guc, get_guc
 from django_rls_tenants.tenants import testing as testing_mod
 from django_rls_tenants.tenants.conf import rls_tenants_config
@@ -31,9 +33,82 @@ from django_rls_tenants.tenants.testing import (
     rls_as_tenant,
     rls_bypass,
 )
-from tests.test_app.models import Order, Tenant
+from tests.test_app.models import Order, ProtectedUser, Tenant
 
 pytestmark = pytest.mark.django_db
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers and fixtures
+# ---------------------------------------------------------------------------
+
+
+def _read_gucs(using="default"):
+    """Read both tenant GUCs on the database connection itself."""
+    return get_guc("rls.is_admin", using=using), get_guc("rls.current_tenant", using=using)
+
+
+async def _aread_gucs():
+    """Read both tenant GUCs from a coroutine (one hop each)."""
+    return await aget_guc("rls.is_admin"), await aget_guc("rls.current_tenant")
+
+
+def _raw_order_count():
+    """Count ``test_order`` rows with raw SQL: RLS applies, the ORM auto-scope filter does not."""
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT count(*) FROM test_order")
+        return cursor.fetchone()[0]
+
+
+def _context_state():
+    """Return the tenant ``ContextVar`` state: (tenant ID, context active flag)."""
+    return get_current_tenant_id(), get_rls_context_active()
+
+
+def _break_second_count(monkeypatch, fail):
+    """Make the helper's second row count (the no-context one) call ``fail(using)`` instead."""
+    count_rows = testing_mod._count_rows
+    calls = []
+
+    def count_or_fail(model_class, *, using):
+        calls.append(using)
+        if len(calls) == 2:
+            return fail(using)
+        return count_rows(model_class, using=using)
+
+    monkeypatch.setattr(testing_mod, "_count_rows", count_or_fail)
+
+
+@pytest.fixture
+def strict_mode_on(settings):
+    """Turn ``STRICT_MODE`` on; the config reloads on ``setting_changed``."""
+    settings.RLS_TENANTS = {**settings.RLS_TENANTS, "STRICT_MODE": True}
+    assert rls_tenants_config.STRICT_MODE is True
+
+
+@pytest.fixture(params=[False, True], ids=["default_mode", "strict_mode"])
+def strict_mode(request):
+    """Run a test with ``STRICT_MODE`` off and on."""
+    if request.param:
+        request.getfixturevalue("strict_mode_on")
+    assert rls_tenants_config.STRICT_MODE is request.param
+
+
+@pytest.fixture
+def myco_admin_policy(request, db):
+    """Add a ``test_order`` policy that admits every row while ``myco.is_admin`` is ``'true'``.
+
+    The policy is created inside the test transaction (the rollback drops it)
+    as the connecting role, a superuser or the table owner. ``enforce_rls``
+    is entered only afterwards, because the RLS test role may not create
+    policies.
+    """
+    with connection.cursor() as cur:
+        cur.execute(
+            "CREATE POLICY test_order_myco_admin ON test_order "
+            "USING (current_setting('myco.is_admin', true) = 'true')",
+        )
+    request.getfixturevalue("enforce_rls")
 
 
 class TestRlsBypass:
@@ -112,23 +187,166 @@ class TestAssertRlsBlocksWithoutContext:
         # sample_orders fixture creates data but no context is active here
         assert_rls_blocks_without_context(Order)
 
+    def test_passes_under_strict_mode(self, enforce_rls, sample_orders, strict_mode_on):
+        """Works with STRICT_MODE=True, where an ORM query with no context raises (#126)."""
+        with pytest.raises(NoTenantContextError, match="strict mode"):
+            Order.objects.count()
+        assert_rls_blocks_without_context(Order)
+        assert _read_gucs() == (None, None)
+        assert _context_state() == (None, False)
+
+    def test_fails_on_empty_table(self, strict_mode):
+        """Fails instead of passing vacuously when the table is empty."""
+        with pytest.raises(AssertionError, match="the table is empty"):
+            assert_rls_blocks_without_context(Order)
+
+    def test_fails_without_rls(self, tenant_a, strict_mode):
+        """Fails on a table without RLS, where rows stay visible with no context."""
+        with pytest.raises(AssertionError, match=r"table 'test_tenant'.*RLS may not be enforced"):
+            assert_rls_blocks_without_context(Tenant)
+
+    def test_passes_inside_rls_bypass(self, enforce_rls, sample_orders):
+        """The admin bypass is lifted for the count only and is intact afterwards (#126)."""
+        with rls_bypass():
+            assert_rls_blocks_without_context(Order)
+            assert _read_gucs() == ("true", None)
+            assert _raw_order_count() == 3
+            assert _context_state() == (None, True)
+
+    def test_passes_inside_rls_as_tenant(self, enforce_rls, sample_orders, tenant_a):
+        """The tenant scope is lifted for the count only and is intact afterwards."""
+        with rls_as_tenant(tenant_a.pk):
+            assert_rls_blocks_without_context(Order)
+            assert _read_gucs() == ("false", str(tenant_a.pk))
+            assert _raw_order_count() == 2
+            assert _context_state() == (tenant_a.pk, True)
+
+    def test_clears_the_gucs_of_the_configured_prefix(
+        self,
+        myco_admin_policy,
+        sample_orders,
+        settings,
+    ):
+        """The cleared GUCs follow ``GUC_PREFIX``; a hard-coded ``rls.`` would leave ``myco.``."""
+        settings.RLS_TENANTS = {**settings.RLS_TENANTS, "GUC_PREFIX": "myco"}
+        with rls_bypass():
+            assert _raw_order_count() == 3  # admitted by the myco policy alone
+            assert_rls_blocks_without_context(Order)
+            assert get_guc("myco.is_admin") == "true"
+
+    def test_leaves_bypass_flags_set(self, enforce_rls, sample_protected_users):
+        """Only the admin and tenant GUCs are cleared: a bypass flag still makes rows visible."""
+        with bypass_flag("rls.is_login_request"):
+            with pytest.raises(AssertionError, match="got 2"):
+                assert_rls_blocks_without_context(ProtectedUser)
+            assert get_guc("rls.is_login_request") == "true"
+        assert_rls_blocks_without_context(ProtectedUser)
+
+    def test_quotes_the_table_name(self):
+        """A table named after a reserved word (``order``) is counted, not a syntax error."""
+        with connection.cursor() as cur:
+            cur.execute('CREATE TABLE "order" (id serial PRIMARY KEY)')
+            cur.execute('INSERT INTO "order" DEFAULT VALUES')
+        with isolate_apps("tests.test_app"):
+
+            class Keyword(models.Model):  # noqa: DJ008  -- throwaway model, never printed
+                class Meta:
+                    app_label = "test_app"
+                    db_table = "order"
+                    managed = False
+
+            with pytest.raises(AssertionError, match=r"table 'order'.*got 1"):
+                assert_rls_blocks_without_context(Keyword)
+
+    def test_restores_context_when_the_assertion_fails(self, tenant_a):
+        """A failing assertion leaves the caller's context as it was."""
+        with rls_as_tenant(tenant_a.pk):
+            with pytest.raises(AssertionError, match="RLS may not be enforced"):
+                assert_rls_blocks_without_context(Tenant)
+            assert _read_gucs() == ("false", str(tenant_a.pk))
+            assert _context_state() == (tenant_a.pk, True)
+
+    def test_restores_context_when_the_count_raises(self, monkeypatch, sample_orders):
+        """An error in the no-context count still restores the caller's GUCs."""
+
+        def boom(using):
+            raise RuntimeError("boom")
+
+        _break_second_count(monkeypatch, boom)
+        with rls_bypass():
+            with pytest.raises(RuntimeError, match="boom"):
+                assert_rls_blocks_without_context(Order)
+            assert _read_gucs() == ("true", None)
+            assert _context_state() == (None, True)
+
+    @pytest.mark.parametrize("use_local_set", [False, True], ids=["set_config", "set_local"])
+    def test_database_error_in_the_count_keeps_the_context(
+        self,
+        monkeypatch,
+        sample_orders,
+        settings,
+        use_local_set,
+    ):
+        """A failed count surfaces as itself, and the caller's context survives the rollback.
+
+        The error aborts the transaction, so the restore cannot run; rolling
+        back to the savepoint undoes the cleared GUCs instead.
+        """
+        settings.RLS_TENANTS = {**settings.RLS_TENANTS, "USE_LOCAL_SET": use_local_set}
+
+        def divide_by_zero(using):
+            with connections[using].cursor() as cursor:
+                cursor.execute("SELECT 1/0")
+
+        _break_second_count(monkeypatch, divide_by_zero)
+        with rls_bypass():
+            with pytest.raises(DataError, match="division by zero"), transaction.atomic():
+                assert_rls_blocks_without_context(Order)
+            assert _read_gucs() == ("true", None)
+            assert _context_state() == (None, True)
+
+    @pytest.mark.django_db(transaction=True)
+    def test_use_local_set_restores_with_set_local(self, enforce_rls, sample_orders, settings):
+        """With USE_LOCAL_SET=True the clear and the restore are transaction-local.
+
+        A session-level restore inside the transaction would outlive the commit
+        and leave the admin bypass on the connection.
+        """
+        settings.RLS_TENANTS = {**settings.RLS_TENANTS, "USE_LOCAL_SET": True}
+        with transaction.atomic(), rls_bypass():
+            assert_rls_blocks_without_context(Order)
+            assert _read_gucs() == ("true", None)
+            assert _raw_order_count() == 3
+        assert _read_gucs() == (None, None)
+
+    @pytest.mark.django_db(transaction=True)
+    def test_use_local_set_outside_a_transaction_raises(self, sample_orders, settings):
+        """With USE_LOCAL_SET=True and no transaction.atomic(), SET LOCAL fails loudly."""
+        settings.RLS_TENANTS = {**settings.RLS_TENANTS, "USE_LOCAL_SET": True}
+        with pytest.raises(RuntimeError, match="SET LOCAL"):
+            assert_rls_blocks_without_context(Order)
+        assert _read_gucs() == (None, None)
+        assert _context_state() == (None, False)
+
+    @pytest.mark.django_db(transaction=True)
+    def test_runs_every_query_on_the_using_alias(self, replica, sample_orders):
+        """The pre-check, the GUC clear, the count and the restore all use ``using``."""
+        with (
+            CaptureQueriesContext(connections[DEFAULT_DB_ALIAS]) as on_default,
+            CaptureQueriesContext(connections[replica]) as on_replica,
+            rls_bypass(using=replica),
+        ):
+            assert_rls_blocks_without_context(Order, using=replica)
+            assert _read_gucs(using=replica) == ("true", None)
+        assert on_default.captured_queries == []
+        counts = [q["sql"] for q in on_replica.captured_queries if "test_order" in q["sql"]]
+        assert len(counts) == 2
+
 
 # ---------------------------------------------------------------------------
 # Async helpers (#40), driven through async_to_sync so the hops run on the
 # test thread and use the test's connection and transaction.
 # ---------------------------------------------------------------------------
-
-
-async def _gucs():
-    """Read both tenant GUCs from a coroutine (one hop each)."""
-    return await aget_guc("rls.is_admin"), await aget_guc("rls.current_tenant")
-
-
-def _raw_order_count():
-    """Count ``test_order`` rows with raw SQL: RLS applies, the ORM auto-scope filter does not."""
-    with connection.cursor() as cursor:
-        cursor.execute("SELECT count(*) FROM test_order")
-        return cursor.fetchone()[0]
 
 
 class TestAsyncRlsBypass:
@@ -139,7 +357,7 @@ class TestAsyncRlsBypass:
 
         async def run():
             async with async_rls_bypass():
-                return await _gucs(), get_current_tenant_id(), get_rls_context_active()
+                return await _aread_gucs(), get_current_tenant_id(), get_rls_context_active()
 
         assert async_to_sync(run)() == (("true", None), None, True)
 
@@ -149,7 +367,7 @@ class TestAsyncRlsBypass:
         async def run():
             async with async_rls_bypass():
                 pass
-            return await _gucs(), get_current_tenant_id(), get_rls_context_active()
+            return await _aread_gucs(), get_current_tenant_id(), get_rls_context_active()
 
         assert async_to_sync(run)() == ((None, None), None, False)
 
@@ -173,7 +391,7 @@ class TestAsyncRlsBypass:
             async with async_rls_as_tenant(tenant_a.pk):
                 async with async_rls_bypass():
                     pass
-                return await _gucs(), get_current_tenant_id()
+                return await _aread_gucs(), get_current_tenant_id()
 
         assert async_to_sync(run)() == (("false", str(tenant_a.pk)), tenant_a.pk)
 
@@ -198,7 +416,7 @@ class TestAsyncRlsAsTenant:
 
         async def run():
             async with async_rls_as_tenant(tenant_a.pk):
-                return await _gucs(), get_current_tenant_id(), get_rls_context_active()
+                return await _aread_gucs(), get_current_tenant_id(), get_rls_context_active()
 
         assert async_to_sync(run)() == (("false", str(tenant_a.pk)), tenant_a.pk, True)
 
@@ -208,7 +426,7 @@ class TestAsyncRlsAsTenant:
         async def run():
             async with async_rls_as_tenant(tenant_a.pk):
                 pass
-            return await _gucs(), get_current_tenant_id(), get_rls_context_active()
+            return await _aread_gucs(), get_current_tenant_id(), get_rls_context_active()
 
         assert async_to_sync(run)() == ((None, None), None, False)
 
@@ -349,6 +567,67 @@ class TestAsyncAssertions:
         with pytest.raises(AssertionError, match="RLS may not be enforced"):
             async_to_sync(aassert_rls_blocks_without_context)(Tenant)
 
+    def test_blocks_without_context_passes_under_strict_mode(
+        self,
+        enforce_rls,
+        sample_orders,
+        strict_mode_on,
+    ):
+        """Works with STRICT_MODE=True, like the sync helper (#126)."""
+
+        async def unscoped_count():
+            return await Order.objects.acount()
+
+        with pytest.raises(NoTenantContextError, match="strict mode"):
+            async_to_sync(unscoped_count)()
+        async_to_sync(aassert_rls_blocks_without_context)(Order)
+
+    def test_blocks_without_context_inside_async_rls_bypass(self, enforce_rls, sample_orders):
+        """Passes inside async_rls_bypass() and leaves the bypass intact."""
+
+        async def run():
+            async with async_rls_bypass():
+                await aassert_rls_blocks_without_context(Order)
+                return (
+                    await _aread_gucs(),
+                    _context_state(),
+                    await sync_to_async(_raw_order_count, thread_sensitive=True)(),
+                )
+
+        assert async_to_sync(run)() == (("true", None), (None, True), 3)
+
+    def test_blocks_without_context_inside_async_rls_as_tenant(
+        self,
+        enforce_rls,
+        sample_orders,
+        tenant_a,
+    ):
+        """Passes inside async_rls_as_tenant() and leaves the tenant scope intact."""
+
+        async def run():
+            async with async_rls_as_tenant(tenant_a.pk):
+                await aassert_rls_blocks_without_context(Order)
+                return (
+                    await _aread_gucs(),
+                    _context_state(),
+                    await sync_to_async(_raw_order_count, thread_sensitive=True)(),
+                )
+
+        expected = (("false", str(tenant_a.pk)), (tenant_a.pk, True), 2)
+        assert async_to_sync(run)() == expected
+
+    @pytest.mark.django_db(transaction=True)
+    def test_blocks_without_context_use_local_set_outside_a_transaction_raises(
+        self,
+        sample_orders,
+        settings,
+    ):
+        """With USE_LOCAL_SET=True and no transaction.atomic() on the hop thread, it raises."""
+        settings.RLS_TENANTS = {**settings.RLS_TENANTS, "USE_LOCAL_SET": True}
+        with pytest.raises(RuntimeError, match="SET LOCAL"):
+            async_to_sync(aassert_rls_blocks_without_context)(Order)
+        assert _read_gucs() == (None, None)
+
 
 @pytest.mark.usefixtures("enforce_rls")
 class TestAsyncHelpersInDjangoTestCase(TestCase):
@@ -386,6 +665,6 @@ class TestAsyncHelpersInDjangoTestCase(TestCase):
         with self.settings(RLS_TENANTS={**settings.RLS_TENANTS, "USE_LOCAL_SET": True}):
             assert rls_tenants_config.USE_LOCAL_SET is True
             async with async_rls_as_tenant(self.tenant_a.pk):
-                assert await _gucs() == ("false", str(self.tenant_a.pk))
+                assert await _aread_gucs() == ("false", str(self.tenant_a.pk))
                 assert await sync_to_async(_raw_order_count, thread_sensitive=True)() == 1
-            assert await _gucs() == (None, None)
+            assert await _aread_gucs() == (None, None)
