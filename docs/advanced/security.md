@@ -184,13 +184,24 @@ Mitigations:
 
 - **Default behavior**: middleware clears GUCs in `process_response` (WSGI) or at the end
   of its async path (ASGI).
-- **Safety net**: `request_finished` signal clears GUCs if `process_response` is skipped.
+- **Safety net**: `request_finished` signal clears GUCs if `process_response` is skipped,
+  on a connection that is still open (with Django's pool the next checkout clears it
+  instead).
 - **Other threads**: the `connection_created` handler sets the request's GUCs only on
   connections opened on the thread that set them, where the cleanup above runs. A
   connection opened on another thread during the request (an ASGI error page,
   `thread_sensitive=False` work) is cleared instead (#130; see
   [Running under ASGI](../guides/middleware.md#running-under-asgi)).
-- **USE_LOCAL_SET**: `SET LOCAL` scopes GUCs to the transaction, preventing leaks.
+- **Django's connection pool**: on each checkout from a pool (`OPTIONS["pool"]`) on a
+  configured alias, the `connection_created` handler clears every GUC the policies read,
+  with or without a request context, so a connection that the previous borrower's cleanup
+  did not reach starts clean (#96). The pool's `reset` callback
+  `django_rls_tenants.pool.reset_rls_gucs` clears them again as the connection goes back,
+  and system check `W010` asks for it. GUCs read only by hand-written policies, or by
+  `AddM2MRLSPolicy` with non-default names, are not cleared.
+- **USE_LOCAL_SET**: `SET LOCAL` scopes GUCs to the transaction, preventing leaks. An
+  external pooler such as PgBouncer in transaction mode still needs it: the handler does
+  not see that pooler hand the server connection to another client.
 
 See [Connection Pooling](../guides/connection-pooling.md) for details.
 
@@ -219,7 +230,7 @@ See [Connection Pooling](../guides/connection-pooling.md) for details.
 | Cross-tenant uniqueness probes | Unique indexes are exempt from RLS and span all tenants |
 | Schema-level information leaks | Shared tables, sequences, indexes |
 | Timing side channels | Query duration may reveal data volume |
-| GUC leak via connection pooling | Mitigated but not eliminated (see above) |
+| GUC leak via connection pooling | Mitigated but not eliminated (see above): cleanup can fail, and an external pooler in transaction mode needs `USE_LOCAL_SET` |
 | Application-level logic bugs | RLS filters rows, not application behavior |
 | Denial of service | RLS does not rate-limit or throttle |
 
@@ -265,7 +276,8 @@ See [Configuration](../getting-started/configuration.md#strict_mode) for setup.
 
 1. **Connect as a `NOSUPERUSER NOBYPASSRLS` role** in production, and keep `W005` unsilenced.
 2. **Enable `STRICT_MODE`** in development and staging to catch missing context early.
-3. **Enable `USE_LOCAL_SET`** if using connection pooling.
+3. **Enable `USE_LOCAL_SET`** behind an external pooler in transaction mode (PgBouncer),
+   and set `reset_rls_gucs` as the `reset` callback of Django's connection pool.
 4. **Use UUIDs** for tenant PKs if sequence-based leaks are a concern.
 5. **Include tenant FK in unique constraints** that should be per-tenant.
 6. **Validate FK targets through tenant-scoped managers** (or composite FKs) -- RLS

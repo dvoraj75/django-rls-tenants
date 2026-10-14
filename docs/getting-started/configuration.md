@@ -57,7 +57,10 @@ The middleware sets GUCs on all configured aliases during each request. A
 `connection_created` signal handler also sets GUCs on connections created lazily,
 after the middleware ran, but only on the thread that set the request's GUCs. A
 connection opened on another thread during the request gets none (see
-[Running under ASGI](../guides/middleware.md#running-under-asgi)).
+[Running under ASGI](../guides/middleware.md#running-under-asgi)). A connection checked
+out of Django's connection pool (`OPTIONS["pool"]`) is cleared of every RLS GUC first,
+whether or not a request is active (see
+[Django's Connection Pool](../guides/connection-pooling.md#djangos-connection-pool)).
 
 !!! warning
     Each alias must exist in Django's `DATABASES` setting. A typo (e.g., `"replca"`)
@@ -270,6 +273,7 @@ django-rls-tenants registers Django system checks that warn about common misconf
 | `W007` | — | *Retired in 1.3.2; the middleware opens its own transaction, so `ATOMIC_REQUESTS` is no longer required for `USE_LOCAL_SET`* |
 | `W008` | Warning | `RLS_TENANTS['TENANT_MODEL']` does not resolve to an installed model |
 | `W009` | Warning | Tenant field referenced by an `RLSProtectedModel`'s RLS policy is missing |
+| `W010` | Warning | Django's connection pool (`OPTIONS["pool"]`) with `USE_LOCAL_SET=False` and no pool `reset` callback |
 
 Run `python manage.py check` to see any warnings.
 

@@ -145,6 +145,15 @@ To run the suite the way that CI leg does, create a plain role once
 POSTGRES_USER=app POSTGRES_PASSWORD=app uv run pytest -m "not superuser_only"
 ```
 
+Tests that need Django's connection pool (psycopg 3 and `psycopg_pool`) carry
+`@pytest.mark.psycopg3_only`. Django uses psycopg 3 whenever it is importable, so the
+default environment runs psycopg2 and `tests/conftest.py` **deselects** these tests there.
+They show up as "deselected", not skipped, so the zero-skipped rule holds. Only the
+psycopg 3 CI leg, which installs `psycopg[binary,pool]` and asserts the driver, runs them,
+and a missing `psycopg_pool` there fails them. To run them locally, install
+`psycopg[binary,pool]` into a separate virtual environment: installing psycopg 3 switches
+Django's driver for the whole process.
+
 Locally `RLS_FAIL_ON_SKIPPED` is unset and skips behave as usual. New markers must be
 registered in `pyproject.toml` (`--strict-markers` is on).
 
@@ -179,7 +188,8 @@ Every push and pull request runs:
 - **Lint & Type Check** -- `uv lock --check`, Ruff (check + format) and mypy.
 - **Docs** -- `mkdocs build --strict`.
 - **Test matrix** -- Python 3.12-3.14 x Django 5.2-6.1 on PostgreSQL 16 with psycopg2,
-  plus a psycopg 3 leg on Python 3.12 / Django 6.1 that keeps the library driver-neutral.
+  plus a psycopg 3 leg on Python 3.12 / Django 6.1 that keeps the library driver-neutral
+  and runs the `psycopg3_only` connection-pool tests.
 - **PostgreSQL 15 and 18 legs** -- the oldest and newest supported Django (5.2 on
   Python 3.12, 6.1 on Python 3.14) on both, so the supported PostgreSQL range is
   verified at each end rather than assumed.

@@ -108,7 +108,8 @@ with transaction.atomic(), tenant_context(tenant.pk):
     ...
 ```
 
-Or keep the default `USE_LOCAL_SET=False` if you do not pool connections.
+Or keep the default `USE_LOCAL_SET=False` unless you run behind an external pooler in
+transaction mode (PgBouncer).
 
 **See:** [Connection Pooling](guides/connection-pooling.md#the-solution-use_local_set),
 [Testing](guides/testing.md#overriding-rls_tenants-per-test).
@@ -376,6 +377,38 @@ per-request transaction), or set `CONN_MAX_AGE=0`. The middleware's transaction 
 is unavailable under ASGI; use `CONN_MAX_AGE=0` there.
 
 **See:** [W004 in Connection Pooling](guides/connection-pooling.md#w004-conn_max_age-with-session-gucs).
+
+### W010: Django's connection pool without a `reset` callback
+
+**Symptom:** `DATABASES['default'] uses Django's connection pool with USE_LOCAL_SET=False
+and no pool 'reset' callback. A connection that a request's cleanup did not reach goes back
+to the pool still holding that request's RLS GUCs, until its next checkout clears them.`
+
+**Cause:** With `OPTIONS["pool"]`, closing a connection hands it back to the pool, which
+keeps its session GUCs. If the request's cleanup did not reach that connection, it sits in
+the pool holding that request's tenant (or admin bypass) until its next checkout, where the
+`connection_created` handler clears it. `W004` does not cover this: Django rejects a
+non-zero `CONN_MAX_AGE` together with a pool.
+
+**Fix:** Set the pool's `reset` callback, so the GUCs are cleared when the connection goes
+back:
+
+```python
+from django_rls_tenants.pool import reset_rls_gucs
+
+DATABASES = {
+    "default": {
+        # ...
+        "OPTIONS": {"pool": {"reset": reset_rls_gucs}},
+    },
+}
+```
+
+Or, under WSGI, set `USE_LOCAL_SET=True`. Any `reset`, including your own, silences the
+warning.
+
+**See:** [Django's Connection Pool](guides/connection-pooling.md#djangos-connection-pool),
+[W010 in Connection Pooling](guides/connection-pooling.md#w010-djangos-connection-pool-without-a-reset-callback).
 
 ### W006 / W008 / W009: alias, tenant model or tenant field not found
 

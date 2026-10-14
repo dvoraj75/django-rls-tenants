@@ -10,10 +10,12 @@ from django.core.checks import Warning as CheckWarning
 from django.db import connection
 from django.test import override_settings
 
+from django_rls_tenants.pool import reset_rls_gucs
 from django_rls_tenants.tenants.checks import (
     _check_conn_max_age_with_session_gucs,
     _check_databases_alias_exists,
     _check_guc_prefix_mismatch,
+    _check_pool_without_reset,
     _check_superuser_connection,
     _check_tenant_fk_field_exists,
     _check_tenant_model_resolves,
@@ -69,6 +71,7 @@ class TestCheckRlsConfig:
         "_check_superuser_connection",
         "_check_guc_prefix_mismatch",
         "_check_conn_max_age_with_session_gucs",
+        "_check_pool_without_reset",
         "_check_databases_alias_exists",
         "_check_tenant_model_resolves",
         "_check_tenant_fk_field_exists",
@@ -120,6 +123,22 @@ class TestCheckRlsConfig:
         ids = {w.id for w in warnings}
         assert ids == {"django_rls_tenants.W009"}
         assert len(warnings) >= 2  # one per concrete RLSProtectedModel subclass
+
+    def test_w010_surfaces_from_real_config(self):
+        """A pooled alias without a reset reaches the aggregated result as W010."""
+        with (
+            override_settings(
+                RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant"},
+                DATABASES={"default": _pooled_database({"max_size": 4})},
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+            patch(
+                "django_rls_tenants.tenants.checks._check_superuser_connection",
+                return_value=[],
+            ),
+        ):
+            warnings = check_rls_config()
+        assert [w.id for w in warnings] == ["django_rls_tenants.W010"]
 
     def test_w006_surfaces_from_real_config(self):
         """An unknown alias in RLS_TENANTS['DATABASES'] reaches the result as W006."""
@@ -353,6 +372,82 @@ class TestCheckConnMaxAgeWithSessionGucs:
         assert "ATOMIC_REQUESTS" not in warnings[0].msg
         assert "ATOMIC_REQUESTS" not in str(warnings[0].hint)
         assert "USE_LOCAL_SET'] = True" in str(warnings[0].hint)
+
+
+def _pooled_database(pool):
+    """A ``settings.DATABASES`` entry with ``OPTIONS["pool"] = pool``."""
+    return {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": "test",
+        "OPTIONS": {"pool": pool},
+    }
+
+
+def _run_pool_check(databases, **rls_tenants):
+    with (
+        override_settings(
+            RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant", **rls_tenants},
+            DATABASES=databases,
+        ),
+        patch(_CONF_PATCH, RLSTenantsConfig()),
+    ):
+        return _check_pool_without_reset()
+
+
+def _reset(conn):
+    """A pool ``reset`` callback that is not the library's own."""
+
+
+class TestCheckPoolWithoutReset:
+    """Tests for _check_pool_without_reset (W010, #96)."""
+
+    @pytest.mark.parametrize(
+        "pool",
+        [True, {"max_size": 4}, {"max_size": 4, "reset": None}],
+        ids=["true", "options", "reset-none"],
+    )
+    def test_w010_pool_without_reset(self, pool):
+        warnings = _run_pool_check({"default": _pooled_database(pool)})
+
+        assert [w.id for w in warnings] == ["django_rls_tenants.W010"]
+        assert "DATABASES['default']" in warnings[0].msg
+        assert "reset_rls_gucs" in str(warnings[0].hint)
+        assert "USE_LOCAL_SET'] = True" in str(warnings[0].hint)
+
+    @pytest.mark.parametrize("reset", [reset_rls_gucs, _reset], ids=["library", "custom"])
+    def test_no_warning_with_a_reset(self, reset):
+        """A reset of the user's own is not second-guessed."""
+        assert _run_pool_check({"default": _pooled_database({"reset": reset})}) == []
+
+    @pytest.mark.parametrize("pool", [False, None, {}], ids=["false", "none", "empty-dict"])
+    def test_no_warning_without_a_pool(self, pool):
+        """Django treats a falsy ``OPTIONS["pool"]``, including ``{}``, as no pool."""
+        assert _run_pool_check({"default": _pooled_database(pool)}) == []
+
+    def test_no_warning_with_use_local_set(self):
+        warnings = _run_pool_check({"default": _pooled_database(True)}, USE_LOCAL_SET=True)
+
+        assert warnings == []
+
+    def test_checks_only_configured_aliases(self):
+        databases = {
+            "default": _pooled_database({"reset": _reset}),
+            "replica": _pooled_database(True),
+            "analytics": _pooled_database(True),
+        }
+
+        warnings = _run_pool_check(databases, DATABASES=["default", "replica"])
+
+        assert [w.id for w in warnings] == ["django_rls_tenants.W010"]
+        assert "DATABASES['replica']" in warnings[0].msg
+
+    def test_unknown_alias_is_left_to_w006(self):
+        warnings = _run_pool_check(
+            {"default": _pooled_database({"reset": _reset})},
+            DATABASES=["default", "nope"],
+        )
+
+        assert warnings == []
 
 
 def _run_superuser_check_with_row(row):

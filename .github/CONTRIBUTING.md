@@ -91,7 +91,9 @@ uv run pytest -m "not superuser_only"
 
 CI fails any PostgreSQL leg that skips a test (`RLS_FAIL_ON_SKIPPED=1`, hook in
 `tests/conftest.py`), so never add a runtime `pytest.skip()`; use a registered marker such
-as `superuser_only` and deselect it. Django deprecation warnings are test errors.
+as `superuser_only` and deselect it. Django deprecation warnings are test errors. Tests that
+need Django's connection pool carry `psycopg3_only`; they are deselected (not skipped) on
+psycopg2, and only the psycopg 3 CI leg runs them.
 
 CI runs Python 3.12-3.14 x Django 5.2-6.1 on PostgreSQL 16 with psycopg2, plus a psycopg 3
 leg, and PostgreSQL 15 and 18 legs with the oldest and newest supported Django. Those legs

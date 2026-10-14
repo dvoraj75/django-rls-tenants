@@ -6,6 +6,7 @@ silent failures at runtime:
 - Superuser or ``BYPASSRLS`` database connections (RLS is completely bypassed — warning).
 - ``GUC_PREFIX`` mismatch between runtime config and ``RLSConstraint`` defaults.
 - ``CONN_MAX_AGE > 0`` with ``USE_LOCAL_SET=False`` (connection-pool GUC leak risk).
+- Django's connection pool with ``USE_LOCAL_SET=False`` and no pool ``reset``.
 - ``DATABASES`` contains aliases not in ``settings.DATABASES``.
 - ``TENANT_MODEL`` does not resolve to an installed model.
 - ``TENANT_FK_FIELD`` missing on an ``RLSProtectedModel`` subclass.
@@ -41,6 +42,7 @@ def check_rls_config(
     errors.extend(_check_superuser_connection())
     errors.extend(_check_guc_prefix_mismatch())
     errors.extend(_check_conn_max_age_with_session_gucs())
+    errors.extend(_check_pool_without_reset())
     errors.extend(_check_databases_alias_exists())
     errors.extend(_check_tenant_model_resolves())
     errors.extend(_check_tenant_fk_field_exists())
@@ -193,6 +195,47 @@ def _check_conn_max_age_with_session_gucs() -> list[CheckWarning]:
                     hint=f"Set RLS_TENANTS['USE_LOCAL_SET'] = True, "
                     f"or set DATABASES[{alias!r}]['CONN_MAX_AGE'] = 0.",
                     id="django_rls_tenants.W004",
+                )
+            )
+    return warnings
+
+
+def _check_pool_without_reset() -> list[CheckWarning]:
+    """Warn if a pooled alias has no ``reset`` callback with ``USE_LOCAL_SET=False``.
+
+    Checks all aliases in ``RLS_TENANTS["DATABASES"]``. Django rejects a
+    non-zero ``CONN_MAX_AGE`` with ``OPTIONS["pool"]``, so ``W004`` never fires
+    for a working pool, yet a pooled connection keeps its session GUCs across
+    requests just like a persistent one. The ``connection_created`` handler
+    clears them on the next checkout; a ``reset`` callback also clears them on
+    the way back into the pool, so idle connections hold no tenant state.
+    """
+    from django.conf import settings  # noqa: PLC0415
+
+    from django_rls_tenants.pool import _pool_options  # noqa: PLC0415
+    from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
+
+    warnings: list[CheckWarning] = []
+    if rls_tenants_config.USE_LOCAL_SET:
+        return warnings
+
+    django_databases = getattr(settings, "DATABASES", {})
+    for alias in rls_tenants_config.DATABASES:
+        pool_options = _pool_options(django_databases.get(alias, {}))
+        if pool_options is not None and pool_options.get("reset") is None:
+            warnings.append(
+                CheckWarning(
+                    f"DATABASES[{alias!r}] uses Django's connection pool with "
+                    f"USE_LOCAL_SET=False and no pool 'reset' callback. A connection "
+                    f"that a request's cleanup did not reach goes back to the pool "
+                    f"still holding that request's RLS GUCs, until its next checkout "
+                    f"clears them.",
+                    hint=(
+                        f"Set DATABASES[{alias!r}]['OPTIONS']['pool']['reset'] to "
+                        f"django_rls_tenants.pool.reset_rls_gucs, or set "
+                        f"RLS_TENANTS['USE_LOCAL_SET'] = True (WSGI only)."
+                    ),
+                    id="django_rls_tenants.W010",
                 )
             )
     return warnings

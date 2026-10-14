@@ -43,6 +43,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pytest-asyncio and anyio tests run on a separate connection outside the test
   transaction. With plain `django_db`, their fixture rows are invisible and their writes
   are committed.
+- **`reset_rls_gucs()` for Django's connection pool** (#96).
+  `django_rls_tenants.pool.reset_rls_gucs` is a `reset` callback for
+  `DATABASES[alias]["OPTIONS"]["pool"]` (Django 5.1+, psycopg 3). `psycopg_pool` calls it
+  when a connection goes back to the pool, and it clears every GUC the library's RLS
+  policies read in one statement, so an idle pooled connection holds no tenant state. Unlike
+  `DISCARD ALL` or `RESET ALL`, it keeps the session settings Django applies only once per
+  pooled connection, such as the time zone. If it raises, the pool discards the connection.
+  See "Django's Connection Pool" in the connection pooling guide.
+- **System check `W010`** (#96) warns for each alias in `RLS_TENANTS["DATABASES"]` that
+  uses Django's connection pool with `USE_LOCAL_SET=False` and no pool `reset` callback.
+  Any `reset`, including your own, silences it. `W004` never covered this case: Django
+  rejects a non-zero `CONN_MAX_AGE` together with a pool.
 - **Django 6.1 support** (#114), with classifiers and CI legs.
 - **Explicit PostgreSQL 15–18 support** (#114). The requirements tables list every
   supported major; CI runs 16 by default and 15 and 18 as the edges.
@@ -68,6 +80,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plain role, the `for_user()` tests now request `enforce_rls`, and
   `tests/test_support_matrix.py` keeps the new leg on a supported Python and on
   PostgreSQL 16.
+- **`psycopg3_only` test marker** (#96). Tests that need psycopg 3 and `psycopg_pool`
+  (the real-pool tests) carry it, and `tests/conftest.py` deselects them when Django runs
+  on psycopg2. They are deselected, not skipped, so the zero-skipped rule still holds. Only
+  the psycopg 3 CI leg runs them; a missing `psycopg_pool` there fails them.
 
 ### Changed
 
@@ -116,15 +132,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same thread, an anonymous visitor's included, ran with the earlier user's tenant,
   or with the admin bypass, and could read that data if it queried RLS-protected tables.
   The handler now applies the GUCs only on the thread that set them, where the
-  middleware's cleanup runs, and clears both GUCs on a connection opened on any other
-  thread during the request (which also drops stale values a reused connection may
-  carry). Such error pages now see no RLS-protected rows, like error pages for view
+  middleware's cleanup runs, and clears the RLS GUCs (since #96, every GUC the policies
+  read) on a connection opened on any other thread during the request (which also drops
+  stale values a reused connection may carry). Such error pages now see no RLS-protected
+  rows, like error pages for view
   exceptions already did. Database work a request hands to another thread with a copy of
   its context (`sync_to_async(..., thread_sensitive=False)`, `asyncio.to_thread()`, under
   WSGI too) is fail-closed the same way: open `tenant_context()` / `admin_context()`
   inside it. Requests whose work stays on the request's thread, such as synchronous WSGI
   views, are unchanged. Affects ASGI deployments since 1.2.0, which added the handler,
   whose error handlers, templates or context processors query RLS-protected data.
+- **Security: a connection checked out of Django's connection pool could carry the
+  previous request's tenant context** (#96). Closing a pooled connection
+  (`OPTIONS["pool"]`, Django 5.1+, psycopg 3) hands it back to `psycopg_pool`, which only
+  rolls back an open transaction, so session GUCs set with `set_config()`
+  (`USE_LOCAL_SET=False`, the default) survive into the next checkout. The middleware's
+  cleanup normally clears them, but not when it failed or reached another connection: a
+  view that closed its connection before the response ended (a long-lived SSE stream, for
+  one), a crash or a cancelled request. The `request_finished` safety net runs after
+  Django's own `close_old_connections` has already returned the connection to the pool.
+  The `connection_created` handler did nothing when no request context was active, so the
+  next borrower ran with the previous request's tenant or admin bypass when it set no
+  context of its own (an anonymous request, a Celery task, any code outside a context),
+  and with its `extra_bypass_flags` (such as `rls.is_login_request`) in any case, even
+  inside a context, since nothing else clears them, and could read that data. `W004` never
+  fired, because Django rejects a non-zero `CONN_MAX_AGE` with a pool. Django sends
+  `connection_created` on every checkout, and the handler now clears every GUC the
+  policies read (the configured tenant and admin GUCs, plus each constraint's GUC names
+  and `extra_bypass_flags`) on each checkout from a pool on an alias in
+  `RLS_TENANTS["DATABASES"]`, in one statement, with or without a request context, before
+  the new borrower's first query. On the thread that set the request's GUCs it then
+  applies them as before. That is one extra round trip per checkout, about one per
+  request. It runs in both GUC modes and even when a pool `reset` callback is set. If the
+  clear fails, the checkout fails closed: the connection is discarded and the error
+  raised, so the borrower's query never runs on it. Names that are not custom GUC names
+  (an `extra_bypass_flags` entry without a dot) are left out of the statement. The
+  other-thread clear of #130 now uses the same statement, so it also drops bypass flags.
+  Affects every earlier release used with Django's connection pool: with
+  `USE_LOCAL_SET=False`, and in either mode for bypass flags, which `bypass_flag()`,
+  `set_bypass_flag()` and `rls_context()` set session-wide by default. GUCs read only by
+  hand-written policies, or by `AddM2MRLSPolicy` with non-default names, are not cleared.
+  Also set `reset_rls_gucs` as the pool's `reset` callback (see "Added").
+- **The `request_finished` safety net no longer reopens a closed connection** (#96). With
+  Django's connection pool, Django's own `request_finished` receiver has already returned
+  the request's connection when the safety net runs, so its clear checked out another
+  pooled connection, briefly set the admin GUCs on it, and kept it checked out: until the
+  thread's next request under WSGI, and for good under ASGI, where each request runs on its
+  own thread, so each such request cost the pool a connection. A closed connection's
+  session is gone, and a pooled one is cleared on its next checkout, so the safety net now
+  skips both. It only runs when the middleware's own cleanup failed.
 - **`select_related()` with no arguments on Django 6.1** (#114). Django 6.1 deprecates
   that form, and the `RemovedInDjango2028Warning` blamed
   `TenantQuerySet.select_related` in `managers.py` instead of the code that made the

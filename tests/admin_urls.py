@@ -16,6 +16,8 @@ from tests.rls_views import (
     async_widen_to_admin_view,
     boom_view,
     orders_view,
+    pool_probe_view,
+    pool_reconnect_view,
     reconnect_view,
     write_then_404_view,
     write_then_500_view,
@@ -31,6 +33,8 @@ urlpatterns = [
     path("rls/async-stream/", async_stream_view, name="rls-async-stream"),
     path("rls/boom/", boom_view, name="rls-boom"),
     path("rls/reconnect/", reconnect_view, name="rls-reconnect"),
+    path("rls/pool-probe/", pool_probe_view, name="rls-pool-probe"),
+    path("rls/pool-reconnect/", pool_reconnect_view, name="rls-pool-reconnect"),
     path("rls/write-then-boom/", write_then_boom_view, name="rls-write-then-boom"),
     path("rls/write-then-500/", write_then_500_view, name="rls-write-then-500"),
 ]
