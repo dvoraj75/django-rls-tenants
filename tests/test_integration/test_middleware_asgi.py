@@ -338,6 +338,14 @@ def guc_probe_404(monkeypatch):
     )
 
 
+@pytest.fixture
+def guc_probe_500(monkeypatch):
+    """Serve 500 pages with ``guc_probe_500_handler``."""
+    monkeypatch.setattr(
+        admin_urls, "handler500", "tests.rls_views.guc_probe_500_handler", raising=False
+    )
+
+
 async def _on_one_worker(*fetches):
     """Await each fetch in turn with a one-thread default executor; return the results.
 
@@ -476,6 +484,31 @@ class TestErrorPageOnWorkerThread:
             [],
         )
         _assert_request_left_nothing_behind()
+
+    @pytest.mark.parametrize("middleware_path", list(_ASGI_MIDDLEWARE_PATHS))
+    def test_500_page_runs_without_a_block_the_view_left_open(
+        self,
+        middleware_path,
+        scoped_web_user,
+        sample_orders,
+        enforce_rls_on_other_threads,
+        guc_probe_500,
+    ):
+        """No ``process_exception`` here: ``got_request_exception`` ends the block (#41)."""
+        client = AsyncClient(raise_request_exception=False)
+        client.force_login(scoped_web_user)
+
+        with override_settings(MIDDLEWARE=_ASGI_MIDDLEWARE_PATHS[middleware_path]):
+            (page,) = async_to_sync(_on_one_worker)(
+                partial(_client_get_json, client, "/rls/async-left-open/"),
+            )
+
+        assert page["thread"] != threading.get_ident()
+        assert (page["tenant_guc"], page["is_admin_guc"], page["database_products"]) == (
+            None,
+            None,
+            [],
+        )
 
     @pytest.mark.parametrize("middleware_path", list(_ASGI_MIDDLEWARE_PATHS))
     def test_through_asgi_handler(

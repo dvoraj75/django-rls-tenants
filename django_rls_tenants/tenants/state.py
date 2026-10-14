@@ -28,6 +28,7 @@ directly -- use the context managers or middleware instead.
 from __future__ import annotations
 
 from contextvars import ContextVar, Token
+from itertools import count
 from typing import Final, NamedTuple
 
 # ---- Tenant ID state ----
@@ -134,6 +135,9 @@ class ContextGucs(NamedTuple):
 ADMIN_GUCS: Final = ContextGucs("true", "")
 
 
+_serials = count()
+
+
 class _Live:
     """A context's GUC values, shared by every copy of the context's ``ContextVar`` values.
 
@@ -142,30 +146,38 @@ class _Live:
     every copy: work that outlives the block runs without it (fail-closed)
     instead of keeping its tenant or admin rights.
 
-    ``asgiref``'s ``sync_to_async`` copies the ``ContextVar`` values of the
-    call back into its caller when they compare unequal (``!=``), also when
-    the call is cancelled while its function still runs. A holder set by a
-    context block (``block=True``) compares equal to anything, so a
-    cancelled call never hands its caller a block that still runs on in
-    another thread; a normal call has reset the block's value by the time it
-    returns. Only ``RLSTenantMiddleware.process_request`` sets a holder that
-    must reach its caller (``block=False``): ``MiddlewareMixin`` runs it in a
-    hop of its own under ASGI.
+    ``asgiref`` copies ``ContextVar`` values from one context into another
+    where they differ (``!=``): into a coroutine ``async_to_sync`` starts, and
+    back from a ``sync_to_async`` call into its caller, also when the call is
+    cancelled while its function still runs. ``!=`` is therefore defined so
+    that a block's holder (``block=True``) never replaces a holder the
+    destination has: a cancelled call cannot hand a caller that is inside a
+    context (or a request ``RLSTenantMiddleware`` serves on its async path) a
+    block that still runs on in another thread. A destination without a
+    holder receives it, so ``async_to_sync`` called inside a block inherits
+    the block. Only ``RLSTenantMiddleware.process_request`` sets a holder
+    that must replace one (``block=False``): ``MiddlewareMixin`` runs it in a
+    ``sync_to_async`` hop of its own under ASGI. ``==`` is identity.
+
+    ``serial`` orders holders by creation: a holder that is current where a
+    newer one was expected (see :func:`_reset_context_gucs`) is an enclosing
+    context brought back by an exit out of order, not a block left open.
     """
 
-    __slots__ = ("alive", "block", "values")
+    __slots__ = ("alive", "block", "serial", "values")
 
-    def __init__(self, values: ContextGucs, *, block: bool) -> None:
+    def __init__(self, values: ContextGucs | None, *, block: bool) -> None:
         self.values = values
         self.block = block
         self.alive = True
+        self.serial = next(_serials)
 
-    def __eq__(self, other: object) -> bool:
-        if self.block or self is other:
-            return True
-        return NotImplemented
-
-    __hash__ = object.__hash__
+    def __ne__(self, other: object) -> bool:
+        if self is other:
+            return False
+        if isinstance(other, _Live):
+            return not other.block
+        return True
 
 
 class _ContextGucsToken(NamedTuple):
@@ -183,15 +195,29 @@ class _ContextGucsToken(NamedTuple):
 _context_gucs: ContextVar[_Live | None] = ContextVar("rls_context_gucs", default=None)
 
 
+def _values_of(live: _Live | None) -> ContextGucs | None:
+    """Return the GUC values a holder records, or ``None`` if it has ended (or is ``None``)."""
+    return live.values if live is not None and live.alive else None
+
+
 def _get_context_gucs() -> ContextGucs | None:
     """Return the GUC values of the active context, or ``None`` if none is live."""
-    live = _context_gucs.get()
-    return live.values if live is not None and live.alive else None
+    return _values_of(_context_gucs.get())
 
 
 def _current_live() -> _Live | None:
     """Return the holder of the context that is current, live or not, or ``None``."""
     return _context_gucs.get()
+
+
+def _end_if_newer(live: _Live | None, than: _Live | None) -> None:
+    """End ``live``, a holder left current, if it is newer than ``than`` (or ``than`` is ``None``).
+
+    An older one is an enclosing context that an exit out of order (an inner
+    block reset below another one) made current again: it stays.
+    """
+    if live is not None and live is not than and (than is None or live.serial > than.serial):
+        live.alive = False
 
 
 def _end_live_context() -> None:
@@ -219,17 +245,58 @@ def _set_context_gucs(values: ContextGucs, *, block: bool = True) -> _ContextGuc
 def _reset_context_gucs(entered: _ContextGucsToken) -> None:
     """End the context entered with ``entered`` and restore the enclosing one.
 
-    The context's own holder is ended, and so is whatever holder is current
-    if that is another one, before the ``ContextVar`` is reset: if the reset
-    fails (a token from another ``Context``, or one used twice), no context
-    stays live.
+    The context's own holder is ended first, so the context is over for every
+    copy even if the reset fails. A newer holder that was current in its place
+    (an inner block left without its exit) is ended too, and so is the current
+    one when the token was used before. A token from another ``Context`` (a
+    generator closed there, a hook run in a hop of its own) raises
+    ``ValueError`` and leaves that context's current holder alone: it is not
+    this block's.
 
     Args:
         entered: What the corresponding ``_set_context_gucs()`` call returned.
+
+    Raises:
+        ValueError: If ``entered`` was created in another ``Context``.
+        RuntimeError: If ``entered`` was used before.
     """
     entered.live.alive = False
-    _end_live_context()
-    _context_gucs.reset(entered.token)
+    current = _context_gucs.get()
+    try:
+        _context_gucs.reset(entered.token)
+    except RuntimeError:
+        _end_live_context()
+        raise
+    _end_if_newer(current, entered.live)
+
+
+def _hold_context_gucs() -> _ContextGucsToken:
+    """Hold the current context's holder until the reset, or a holder of no context if none.
+
+    For a scope that enters no context but needs a holder (see
+    ``middleware._holder_for_the_request``): what ``asgiref`` copies in
+    replaces it only where :class:`_Live` lets it, and
+    :func:`_release_context_gucs` restores the holder that was current
+    before, whatever replaced it meanwhile, without ending it.
+
+    Returns:
+        What :func:`_release_context_gucs` takes; its ``live`` is the holder held.
+    """
+    live = _context_gucs.get()
+    held = _Live(None, block=True) if live is None else live
+    return _ContextGucsToken(_context_gucs.set(held), held)
+
+
+def _release_context_gucs(held: _ContextGucsToken) -> None:
+    """Restore the holder that was current when :func:`_hold_context_gucs` returned ``held``.
+
+    A newer holder current in the held one's place at that point is a context
+    block the scope left open, a generator suspended inside one, say: it is
+    ended.
+    """
+    current = _context_gucs.get()
+    _context_gucs.reset(held.token)
+    _end_if_newer(current, held.live)
 
 
 def _clear_context_gucs() -> None:

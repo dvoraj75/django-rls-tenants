@@ -158,23 +158,48 @@ tuple, or `None`) with what the tracker says the session holds and, if they diff
 `write_gucs()` (one `set_config()` pair) first; a failure propagates. So every configured
 alias follows the context, whichever alias it was entered on. The `ContextVar` holds a
 `_Live` holder that `_reset_context_gucs()` / `_clear_context_gucs()` end for every copy,
-so a hop or task inherits a context only while its block is live. A block's holder
-(`block=True`) compares equal to anything, so asgiref's copy-back (`!=`) never hands a
-cancelled `sync_to_async` call's still-running block to its caller; only
-`process_request` sets `block=False`, since `MiddlewareMixin` runs it in a hop of its own.
+so a hop or task inherits a context only while its block is live. `_reset_context_gucs()`
+also ends a newer holder left current in its place, and the current one for a token used
+twice, but not on `ValueError` (a token from another `Context`): that context's holder is
+not the block's. asgiref copies a value into the coroutine `async_to_sync` runs and back
+from a `sync_to_async` call where it compares unequal (`!=`). `_Live.__ne__` keeps a
+block's holder (`block=True`) from replacing a holder the destination has, so a cancelled
+call's still-running block never reaches a caller that holds one, while `async_to_sync`
+inside a block inherits it (its task holds no holder, or a copy of the same one); `==` is
+identity. Only `process_request` sets `block=False`, since `MiddlewareMixin` runs it in a
+hop of its own. A request always holds a holder: its own context's (native path,
+authenticated) or `_holder_for_the_request()`'s (the one found, or one of no context; WSGI,
+the native anonymous path, the hook path), restored by token, on the hook path after the
+cleanup hop.
 The wrapped `_commit` / `_rollback` read the libpq status before and after (a commit of a
-failed transaction is a rollback; a call that ended nothing is ignored).
+failed transaction is a rollback; a call that ended nothing is ignored; an exception other
+than `DatabaseError` from a commit leaves values the transaction changed unknown).
 
 Rules for code that sets a context or writes the admin/tenant GUCs:
 
 - Every library entry point that sets the tenant `ContextVar`s sets the guard's too, to
   exactly the values it writes: the context managers and `_rls_scope()` use
   `context._rls_state()`, which sets and resets all three; the middleware keeps what
-  `_set_context_gucs()` returned on the request (or in `__acall__`) and ends it first, with
-  `_end_context_gucs()`. They also pass the enclosing holder (`state._current_live()`, read
-  on entry) to `_restore_tenant_gucs(..., enclosing=...)`, which clears instead of
-  restoring when that context has ended meanwhile. The guard never infers a context from
-  `get_current_tenant_id()` / `get_rls_context_active()`, which are public.
+  `_set_context_gucs()` returned on the request (`__acall__` too, for `process_exception`'s
+  hop) and ends it first, with `_end_context_gucs()`. The context managers pass the
+  enclosing holder (`state._current_live()`, read on entry) and the DB-API connection they
+  entered on (`_session_of()`) to `_restore_tenant_gucs(..., enclosing=..., session=...)`,
+  which clears instead of restoring when that context has ended meanwhile. When the
+  current holder is not `enclosing`, the block exited in another `Context`: it restores the
+  snapshot only on `session`, recording `UNKNOWN`, and only forgets on any other session.
+  The guard never infers a context from `get_current_tenant_id()` /
+  `get_rls_context_active()`, which are public.
+- The middleware records the holder a request found (`_FoundContext` on
+  `request._rls_found_context`). `_end_blocks_left_open()` ends a newer current holder
+  that is not the request's own (a block the view left open) before Django builds the
+  error response: from `process_exception` (in a `finally` after the cleanup) and from the
+  `got_request_exception` receiver in `apps.py` (500s `process_exception` does not see).
+  `_release_context_gucs()` ends one at the end of the request, and `_cleanup_rls_state()`
+  scrubs the tenant values of a request that set none only when it was not served inside
+  a live context.
+- `_Live.serial` orders holders: `_end_if_newer()` ends a holder left current only if it is
+  newer than the one being reset or released, so an exit out of order (an inner block whose
+  enclosing request context was reset below it) does not end an older enclosing context.
 - The library's own GUC writes run inside `writing(alias_or_connection, values)`, which
   keeps the guard out of the way and records `values` (`UNKNOWN` if the block raises). A
   restore records `_get_context_gucs()` read after the `ContextVar` reset

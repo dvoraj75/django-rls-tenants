@@ -142,12 +142,38 @@ context's entry in that `ContextVar` with the block that made it, and the block'
 it for every copy. A hop or task awaited inside the block inherits the context; one that
 runs after the block has ended gets nothing, as on a connection without a context. A block
 such a copy entered itself, and that exits after the enclosing block has ended, clears the
-GUCs instead of restoring the ended context's values. `asgiref` copies the `ContextVar`
-values of a `sync_to_async` call back into its caller, also when the call is cancelled
-while its function is still inside a block; a block's entry compares equal to any value,
-so `asgiref` leaves the caller's own context in place (only the middleware's
-`process_request`, which runs in a hop of its own under `MiddlewareMixin`, hands its
-context back). When a block exits, the guard also takes its context off this thread's
+GUCs instead of restoring the ended context's values. A block that exits in another
+`contextvars.Context` than the one it entered in (a generator suspended inside it and closed
+or garbage-collected elsewhere) finds another context current: it restores its snapshot
+only on the database session it entered on (a `SET LOCAL` there would otherwise outlive
+the block; an ended enclosing context's values are cleared instead, as above), and leaves
+the values unknown, so the guard applies the current context before the next statement.
+A block the view leaves open in a request (a generator suspended inside it) is ended
+before Django builds the error response for an exception, by `process_exception` or, for a
+500 response it did not see (a view that returns `None`), by a `got_request_exception`
+receiver, and when the request ends. The request's own context is not ended there: the
+error page inherits it. A block that a middleware listed after `RLSTenantMiddleware` holds
+around the rest of the chain cannot be told apart from one left open, so it ends too when
+a 500 response is built inside it (fail-closed for the rest of that block). Not covered: a
+4xx response Django builds for an exception raised outside the view (`Http404` from a
+later middleware), which sends no signal; a response an exception middleware listed after
+`RLSTenantMiddleware` returns, which stops its `process_exception` (list exception
+middleware before it); and, with `USE_LOCAL_SET=True`, the left-open block's `SET LOCAL`
+values, which stay until the transaction ends.
+
+`asgiref` copies `ContextVar` values from one context into another where they differ: into
+the coroutine `async_to_sync` runs, which therefore inherits the block it is called in,
+and back from a `sync_to_async` call into its caller, also when the call is cancelled
+while its function is still inside a block. A block's entry never replaces an entry the
+caller already has, so a cancelled call cannot hand its still-running block to a caller
+inside a context, nor to a request the middleware serves: a request always holds an entry,
+its own context's, the one it is served in, or one of no context, and a coroutine its view
+runs with `async_to_sync` inherits it. Only the middleware's `process_request`, which runs
+in a hop of its own under `MiddlewareMixin`, hands its context back. A coroutine outside
+both (one started with `asyncio.run()`, say) does get the block of a call it cancels,
+until that block ends.
+
+When a block exits, the guard also takes its context off this thread's
 other configured aliases right away, if it applied it there; a connection that fails then
 is left for its next statement.
 

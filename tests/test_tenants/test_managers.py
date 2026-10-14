@@ -1708,6 +1708,7 @@ class TestForUserAliases:
             yield
 
         monkeypatch.setattr(managers, "_snapshot_gucs", snapshot)
+        monkeypatch.setattr(managers, "_session_of", lambda using: used.append(("session", using)))
         monkeypatch.setattr(managers, "writing", writing)
         monkeypatch.setattr(
             managers, "set_guc", lambda name, value, **kw: used.append(("set", kw["using"]))
@@ -1722,6 +1723,7 @@ class TestForUserAliases:
             getattr(Order.objects.for_user(tenant_a_user), method)()
         assert used == [
             ("snapshot", alias),
+            ("session", alias),
             ("writing", alias),
             ("set", alias),
             ("set", alias),

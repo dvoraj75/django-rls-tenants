@@ -225,10 +225,18 @@ class _SessionGUCs:
         """Record that the values are not known."""
         self.set_values(UNKNOWN)
 
-    def end_transaction(self, *, committed: bool) -> None:
-        """Follow the end of the transaction: a commit keeps the values, a rollback undoes them."""
+    def end_transaction(self, *, committed: bool | None) -> None:
+        """Follow the end of the transaction: a commit keeps the values, a rollback undoes them.
+
+        Args:
+            committed: Whether the transaction committed; ``None`` if that is
+                not known, which keeps the values only when both agree.
+        """
         if self.in_transaction:
-            if not committed:
+            if committed is None:
+                if self.values != self.base:
+                    self.values = UNKNOWN
+            elif not committed:
                 self.values = self.base
             self.in_transaction = False
         self.savepoints.clear()
@@ -351,9 +359,13 @@ def _transaction_end(
         before = tracker.read_status()
         try:
             result = end()
-        except BaseException:
+        except DatabaseError:
             # A commit that failed (a deferred constraint, say) rolled back.
             _follow_end(tracker, before, committed=False)
+            raise
+        except BaseException:
+            # Raised around a commit that may have gone through (an interruption).
+            _follow_end(tracker, before, committed=None if committed else False)
             raise
         _follow_end(tracker, before, committed=committed)
         return result
@@ -361,17 +373,18 @@ def _transaction_end(
     return end_and_follow
 
 
-def _follow_end(tracker: _SessionGUCs, before: int, *, committed: bool) -> None:
+def _follow_end(tracker: _SessionGUCs, before: int, *, committed: bool | None) -> None:
     """Follow a commit or rollback the driver was asked for, from the status before and after.
 
     Args:
         tracker: The connection's tracker.
         before: The transaction status before the call.
-        committed: Whether it was a commit.
+        committed: Whether it was a commit; ``None`` for a commit that may
+            or may not have gone through.
     """
     after = tracker.read_status()
     if before != _IDLE and after == _IDLE:
-        tracker.end_transaction(committed=committed and before != _IN_ERROR)
+        tracker.end_transaction(committed=False if before == _IN_ERROR else committed)
     elif before != after:
         tracker.forget()
 

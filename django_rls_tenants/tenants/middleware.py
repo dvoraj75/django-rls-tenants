@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from contextvars import ContextVar, Token
 from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
@@ -26,10 +26,14 @@ from django_rls_tenants.tenants.affinity import writing
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import _context_gucs_of, _resolve_user_guc_vars
 from django_rls_tenants.tenants.state import (
-    _clear_context_gucs,
     _ContextGucsToken,
+    _current_live,
+    _end_if_newer,
+    _hold_context_gucs,
+    _release_context_gucs,
     _reset_context_gucs,
     _set_context_gucs,
+    _values_of,
     reset_current_tenant_id,
     reset_rls_context_active,
     set_current_tenant_id,
@@ -37,13 +41,13 @@ from django_rls_tenants.tenants.state import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Iterator
 
     from django.http import HttpRequest, HttpResponse, HttpResponseBase
     from django.utils.deprecation import MiddlewareMixin
 
     from django_rls_tenants.tenants.conf import RLSTenantsConfig
-    from django_rls_tenants.tenants.state import ContextGucs
+    from django_rls_tenants.tenants.state import ContextGucs, _Live
 else:
     # Django 6.2 moves MiddlewareMixin to django.middleware and deprecates the
     # old import path (RemovedInDjango2029Warning). django-stubs still declares
@@ -162,21 +166,79 @@ def _end_context_gucs(entered: _ContextGucsToken | None) -> None:
     after the cleanup has cleared them, on this thread's later statements and,
     under WSGI, in later requests. The cleanup therefore does this first.
     :func:`state._reset_context_gucs` ends the context before it resets the
-    ``ContextVar``, so even a reset that fails leaves no context live; one
-    with a token from another ``Context`` (a hook run in its own
-    ``sync_to_async`` hop, see ``_reset_or_clear``) records none instead.
+    ``ContextVar``, so even a reset that fails leaves it ended. A token from
+    another ``Context`` (a hook, or Django's ``process_exception``, run in a
+    ``sync_to_async`` hop of its own, see ``_reset_or_clear``) cannot reset
+    the variable: the ended holder stays current there, and asgiref leaves it
+    in the request too. The request so keeps a holder, which a cancelled call's
+    block cannot replace (see :class:`state._Live`); a ``None`` copied back would
+    let one in. A request that never set its values (an anonymous one) leaves
+    an enclosing context alone.
 
     Args:
         entered: What ``_set_context_gucs()`` returned, or ``None`` if the
             values were never set.
     """
     if not isinstance(entered, _ContextGucsToken):
-        _clear_context_gucs()
         return
-    try:
+    with suppress(ValueError):
         _reset_context_gucs(entered)
-    except ValueError:
-        _clear_context_gucs()
+
+
+class _FoundContext(NamedTuple):
+    """The context holder a request found when it started (``None`` for none)."""
+
+    live: _Live | None
+
+
+@contextmanager
+def _holder_for_the_request(request: HttpRequest) -> Iterator[None]:
+    """Hold a context holder for a request, and restore the one it found.
+
+    The request keeps the context it is served in, or gets a holder of no
+    context if there is none: without one, a ``sync_to_async`` call that the
+    request (or a coroutine its view runs with ``async_to_sync``) cancels
+    while the call's function is inside a context block would leave that
+    block's context in the request (see :class:`state._Live`). On exit
+    the holder found on entry is current again, whatever a hop of the request
+    handed back (``process_request``'s holder, on the hook path), and a context
+    block the view left open is ended (``state._release_context_gucs``).
+    """
+    held = _hold_context_gucs()
+    setattr(request, "_rls_found_context", _FoundContext(held.live))  # noqa: B010  -- dynamic attr on HttpRequest
+    try:
+        yield
+    finally:
+        _release_context_gucs(held)
+
+
+def _served_inside_a_context(request: HttpRequest) -> bool:
+    """Return whether the request started inside a live context (a test's block, say)."""
+    found = getattr(request, "_rls_found_context", None)
+    return isinstance(found, _FoundContext) and _values_of(found.live) is not None
+
+
+def _end_blocks_left_open(request: HttpRequest) -> None:
+    """End a context block the view left open, before Django builds the error response.
+
+    A view that keeps a generator suspended inside a context block leaves that
+    block's context current in the request, and Django builds the error
+    response in a copy of the request's context (under ASGI, on a worker
+    thread, where the GUC affinity guard would apply it). A holder current
+    there that is newer than the one the request found, and not the request's
+    own context, is such a block, or a block that a middleware listed after
+    this one holds around the rest of the chain: it cannot tell the two apart,
+    and ends both (fail-closed). Called by ``process_exception`` and, for the
+    errors it does not see, from Django's ``got_request_exception`` (``apps.py``).
+    """
+    found = getattr(request, "_rls_found_context", None)
+    if not isinstance(found, _FoundContext):
+        return
+    current = _current_live()
+    own = getattr(request, "_rls_context_gucs_token", None)
+    if isinstance(own, _ContextGucsToken) and current is own.live:
+        return
+    _end_if_newer(current, found.live)
 
 
 def _is_authenticated(request: HttpRequest) -> bool:
@@ -313,7 +375,19 @@ class RLSTenantMiddleware(MiddlewareMixin):
                 )
 
     def __call__(self, request: HttpRequest) -> Any:
-        """Run the request, inside a transaction per alias when ``USE_LOCAL_SET``.
+        """Serve the request: on the WSGI path here, on the ASGI path in ``__acall__``.
+
+        The WSGI request holds a context holder for its duration (see
+        ``_holder_for_the_request``), which a coroutine the view runs with
+        ``async_to_sync`` inherits.
+        """
+        if self.async_mode:
+            return self.__acall__(request)
+        with _holder_for_the_request(request):
+            return self._call_sync(request)
+
+    def _call_sync(self, request: HttpRequest) -> Any:
+        """Run a WSGI request, inside a transaction per alias when ``USE_LOCAL_SET``.
 
         Django's ``ATOMIC_REQUESTS`` wraps only the view callable, never
         ``process_request``, so ``SET LOCAL`` issued there would run in
@@ -322,8 +396,6 @@ class RLSTenantMiddleware(MiddlewareMixin):
         ``process_response``. Unauthenticated requests get no transaction
         (no GUCs are set for them either).
         """
-        if self.async_mode:
-            return self.__acall__(request)
         conf = rls_tenants_config
         if not conf.USE_LOCAL_SET or not _is_authenticated(request):
             try:
@@ -385,16 +457,21 @@ class RLSTenantMiddleware(MiddlewareMixin):
         conf = rls_tenants_config
         scope = await self._aenter_request(request, conf)
         if scope is None:
-            return await self._aget_response(request)
+            with _holder_for_the_request(request):
+                return await self._aget_response(request)
+        setattr(request, "_rls_found_context", _FoundContext(_current_live()))  # noqa: B010  -- dynamic attr on HttpRequest
         tenant_token = set_current_tenant_id(scope.tenant_id)
         active_token = set_rls_context_active(True)
         gucs_token = _set_context_gucs(scope.gucs)
+        # For process_exception, which ends the context from a hop of its own.
+        setattr(request, "_rls_context_gucs_token", gucs_token)  # noqa: B010  -- dynamic attr on HttpRequest
         # The hop's thread, not the event loop's, owns the GUCs.
         _mark_gucs_set(scope.thread_marker)
         try:
             return await self._aget_response(request)
         finally:
             try:
+                setattr(request, "_rls_context_gucs_token", None)  # noqa: B010  -- dynamic attr on HttpRequest
                 _end_context_gucs(gucs_token)
                 reset_current_tenant_id(tenant_token)
                 reset_rls_context_active(active_token)
@@ -495,11 +572,14 @@ class RLSTenantMiddleware(MiddlewareMixin):
             thread_sensitive=True,
         )(request):
             raise RLSConfigurationError(_ASGI_LOCAL_SET_MESSAGE)
-        try:
-            return await super().__acall__(request)
-        finally:
-            if getattr(request, "_rls_state_reset", False) is not True or _were_gucs_set():
-                await sync_to_async(self._cleanup_rls_state, thread_sensitive=True)(request)
+        # process_request's values replace the holder; a cancelled call's block
+        # cannot. Held until the cleanup below has run.
+        with _holder_for_the_request(request):
+            try:
+                return await super().__acall__(request)
+            finally:
+                if getattr(request, "_rls_state_reset", False) is not True or _were_gucs_set():
+                    await sync_to_async(self._cleanup_rls_state, thread_sensitive=True)(request)
 
     async def _aget_response(self, request: HttpRequest) -> HttpResponseBase:
         """Await the downstream chain; ``async_mode`` guarantees it is a coroutine function."""
@@ -610,7 +690,10 @@ class RLSTenantMiddleware(MiddlewareMixin):
         if getattr(request, "_rls_owns_transaction", False) is True:
             setattr(request, "_rls_rollback_transaction", True)  # noqa: B010 -- dynamic request marker
         else:
-            self._cleanup_rls_state(request)
+            try:
+                self._cleanup_rls_state(request)
+            finally:
+                _end_blocks_left_open(request)
 
     @staticmethod
     def _set_gucs_on_all_databases(guc_vars: dict[str, str], conf: Any) -> None:
@@ -665,19 +748,28 @@ class RLSTenantMiddleware(MiddlewareMixin):
             # single-use, and resetting to defaults on a second pass would also lose
             # any outer context restored by the first pass.
             if getattr(request, "_rls_state_reset", False) is not True:
-                # No token stored means an unauthenticated request or an error
-                # during process_request before the token was saved: clear.
-                _end_context_gucs(getattr(request, "_rls_context_gucs_token", None))
-                _reset_or_clear(
-                    getattr(request, "_rls_tenant_token", None),
-                    reset_current_tenant_id,
-                    partial(set_current_tenant_id, None),
+                entered = getattr(request, "_rls_context_gucs_token", None)
+                tenant_token = getattr(request, "_rls_tenant_token", None)
+                active_token = getattr(request, "_rls_context_active_token", None)
+                # A request that set nothing (an anonymous one) leaves the live
+                # context it is served in alone (a test's block). Otherwise what
+                # has no token is cleared: values a view left behind, or the
+                # tenant and flag the native path keeps tokens for itself.
+                set_any = isinstance(entered, _ContextGucsToken) or any(
+                    isinstance(token, Token) for token in (tenant_token, active_token)
                 )
-                _reset_or_clear(
-                    getattr(request, "_rls_context_active_token", None),
-                    reset_rls_context_active,
-                    partial(set_rls_context_active, False),
-                )
+                if set_any or not _served_inside_a_context(request):
+                    _end_context_gucs(entered)
+                    _reset_or_clear(
+                        tenant_token,
+                        reset_current_tenant_id,
+                        partial(set_current_tenant_id, None),
+                    )
+                    _reset_or_clear(
+                        active_token,
+                        reset_rls_context_active,
+                        partial(set_rls_context_active, False),
+                    )
                 setattr(request, "_rls_state_reset", True)  # noqa: B010 -- request cleanup marker
         finally:
             if _were_gucs_set():

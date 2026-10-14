@@ -178,7 +178,10 @@ a synchronous one.
 2. Resets the `_rls_context_active` flag (via saved token or, when the token belongs to
    another `contextvars.Context`, by clearing the variable, #58) to prevent cross-request
    leaks.
-3. Clears the `ContextVar` auto-scope state to prevent cross-request leaks.
+3. Clears the `ContextVar` auto-scope state to prevent cross-request leaks. An
+   unauthenticated request served inside a context block (a test that wraps the test
+   client in `tenant_context()`, say) leaves that block's values alone (*changed in
+   1.4.0*).
 4. If `USE_LOCAL_SET` is `False` (default): clears both GUC variables on **all
    configured database aliases** to prevent cross-request leaks on persistent connections.
 5. If `USE_LOCAL_SET` is `True`: GUCs are automatically cleared at transaction end
@@ -203,6 +206,20 @@ request's tokens stay with `__acall__`, so it clears the variables:
    cleared the same way).
 3. Clears GUC variables (same logic as `process_response`). The GUCs are cleared even if
    resetting a `ContextVar` fails.
+4. Ends a context block the view left open, such as a generator suspended inside
+   `async_admin_context()`, so the error response is not built in that block's context
+   (*added in 1.4.0*). A `got_request_exception` receiver does the same for a 500
+   response that `process_exception` does not see (a view that returns `None`, an
+   exception from a later middleware), and the end of the request ends such a block too.
+   A 4xx response Django builds for an exception raised outside the view (`Http404` from
+   a later middleware, say) sends no signal, and an exception middleware listed after
+   `RLSTenantMiddleware` that returns a response stops this hook from running (Django
+   calls `process_exception` innermost first): list such middleware before
+   `RLSTenantMiddleware`. With `USE_LOCAL_SET=True` the block's `SET LOCAL` values stay
+   until the transaction ends. Keep context blocks inside the code that needs them rather
+   than in a generator the view leaves suspended. A block that a middleware listed after
+   `RLSTenantMiddleware` holds around the rest of the chain is ended as well when a 500
+   response is built inside it, so the rest of that block runs without a context.
 
 This prevents `ContextVar` leaks that could affect subsequent requests on the same
 thread (WSGI) or async task (ASGI).

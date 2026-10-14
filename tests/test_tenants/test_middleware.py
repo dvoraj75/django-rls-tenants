@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import logging
 import time
@@ -819,6 +820,47 @@ class TestContextGucsCleanup:
         assert get_current_tenant_id() is None
         assert get_guc("rls.current_tenant") is None
         assert _were_gucs_set() is False
+
+
+class TestCleanupOfTheTenantValues:
+    """What the cleanup does to the tenant ``ContextVar`` and the strict-mode flag."""
+
+    @pytest.mark.parametrize("inside_a_block", [False, True])
+    def test_base_exception_in_process_request_resets_what_it_set(
+        self,
+        inside_a_block,
+        tenant_a,
+        tenant_b_user,
+        monkeypatch,
+    ):
+        """A signal-raised exception after the tenant was set and before the rest."""
+
+        class _Abort(BaseException):
+            pass
+
+        def abort(active):
+            raise _Abort
+
+        middleware = RLSTenantMiddleware(get_response=lambda request: None)
+        block = tenant_context(tenant_a.pk) if inside_a_block else contextlib.nullcontext()
+
+        with block:
+            monkeypatch.setattr(middleware_module, "set_rls_context_active", abort)
+            with pytest.raises(_Abort):
+                middleware(_make_request(user=tenant_b_user))
+            monkeypatch.undo()
+            tenant_id = get_current_tenant_id()
+
+        assert tenant_id == (tenant_a.pk if inside_a_block else None)
+
+    def test_anonymous_request_clears_what_its_view_left(self):
+        def view(request):
+            set_current_tenant_id(7)
+            set_rls_context_active(True)
+
+        RLSTenantMiddleware(get_response=view)(_make_request())
+
+        assert (get_current_tenant_id(), get_rls_context_active()) == (None, False)
 
 
 class TestMiddlewareContextValues:

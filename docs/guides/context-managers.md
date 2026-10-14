@@ -206,7 +206,10 @@ alone. It does not cover:
 - bypass flags and other GUCs set with `async_bypass_flag()` / `async_rls_context()`: they
   stay on the shared connection while the block runs, and sibling tasks see them. Do not
   run such a block concurrently with work that must not get the bypass;
-- `USE_LOCAL_SET=True` (see above), where the guard does nothing;
+- `USE_LOCAL_SET=True` (see above), where the guard does nothing. A block that exits in
+  another `contextvars.Context` than it entered in (a generator suspended inside it and
+  closed elsewhere) restores, on the session it entered on, the values of the context it
+  was entered in while that context is live, even if another context is current there;
 - SQL that bypasses Django's execute wrappers: a driver cursor, `callproc()`, the driver's
   `copy` methods, and the `FETCH`es of a server-side cursor (`iterator()`) opened inside a
   transaction, whose rows PostgreSQL computes as they are fetched. Outside a transaction
@@ -215,6 +218,12 @@ alone. It does not cover:
 A task that a block starts and does not await gets the block's context only while the
 block is live: once the block has ended, that task's statements run without it
 (fail-closed). Enter the context inside the task if it outlives the block.
+
+A `sync_to_async` call cancelled while its function is still inside a block (an
+`asyncio.wait_for()` that times out, say) leaves the caller's own context in place. A
+coroutine outside any context and outside a request that `RLSTenantMiddleware` serves is
+the exception: it runs with the cancelled call's block until that block ends, so do not
+run code there that must not have it, or enter a context first.
 
 ### Mixing sync and async code
 

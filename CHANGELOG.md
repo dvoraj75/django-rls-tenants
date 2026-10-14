@@ -54,7 +54,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     connection, instead of with whatever GUCs the connection happened to hold. A copy that
     outlives its block (a task started and not awaited inside it) gets nothing once the
     block ends, and a `sync_to_async` call cancelled while its function is inside a block
-    does not hand that block to its caller.
+    does not hand that block to a caller inside a context or a request the middleware
+    serves. A block that exits in another `contextvars.Context` than it entered in (a
+    generator closed or garbage-collected there) restores its snapshot only on the
+    database session it entered on (the snapshot of the enclosing context only while
+    that context is live), and the guard then applies the context that is current
+    there. A block the view leaves open (a generator suspended inside it) ends before
+    Django builds the error response for an exception (in `process_exception`, or on
+    `got_request_exception` for a 500 response `process_exception` did not see), and
+    when the request ends. Not covered: a 4xx response for an exception raised outside
+    the view (`Http404` from a later middleware, say), and a response that an exception
+    middleware listed after `RLSTenantMiddleware` returns; with `USE_LOCAL_SET=True`, the
+    block's `SET LOCAL` values stay until the transaction ends.
   - Sibling `asyncio` tasks of one request run their statements with their own contexts,
     so `asyncio.gather` across tenants is safe for raw SQL, `safe_tenant_sql()` and M2M
     through tables too.
@@ -189,6 +200,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   synchronous WSGI views, are unchanged. Affects ASGI deployments since 1.2.0, which added
   the handler, whose error handlers, templates or context processors query RLS-protected
   data.
+- **An anonymous request served inside a context block left the block without its tenant
+  scope** (#41). `RLSTenantMiddleware`'s cleanup cleared the tenant `ContextVar` and the
+  strict-mode flag also for a request that had set no context, so after an anonymous
+  request served inside `tenant_context()` or `admin_context()` (a test that wraps the test
+  client, say), the rest of the block lost its auto-scope filter and `STRICT_MODE` raised.
+  Such a request now leaves a live context it is served in alone; outside one, it still
+  clears values its view left behind.
 - **Security: a connection checked out of Django's connection pool could carry the
   previous request's tenant context** (#96). Closing a pooled connection
   (`OPTIONS["pool"]`, Django 5.1+, psycopg 3) hands it back to `psycopg_pool`, which only

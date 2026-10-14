@@ -14,7 +14,8 @@ from types import SimpleNamespace
 import pytest
 from asgiref.sync import async_to_sync, sync_to_async
 from django.conf import settings as django_settings
-from django.core.signals import request_finished
+from django.contrib.auth.models import AnonymousUser
+from django.core.signals import got_request_exception, request_finished
 from django.db import (
     DEFAULT_DB_ALIAS,
     DatabaseError,
@@ -34,6 +35,7 @@ from django.test.utils import CaptureQueriesContext
 from django_rls_tenants.rls.context import rls_context
 from django_rls_tenants.rls.guc import get_guc, set_guc
 from django_rls_tenants.tenants import affinity
+from django_rls_tenants.tenants import middleware as middleware_module
 from django_rls_tenants.tenants.context import (
     admin_context,
     async_admin_context,
@@ -46,8 +48,11 @@ from django_rls_tenants.tenants.state import (
     ContextGucs,
     _clear_context_gucs,
     _get_context_gucs,
+    _hold_context_gucs,
     _reset_context_gucs,
     _set_context_gucs,
+    get_current_tenant_id,
+    get_rls_context_active,
     set_current_tenant_id,
     set_rls_context_active,
 )
@@ -1087,50 +1092,609 @@ class TestContextThatEndsFirst:
         assert async_to_sync(run)() == (_NO_GUCS, [])
 
 
+async def _context_and_products():
+    """What a coroutine sees: the active context's values, and the rows raw SQL returns."""
+    return _get_context_gucs(), await sync_to_async(_products)()
+
+
+class _AdminBlockOnAWorker:
+    """An admin block that a ``thread_sensitive=False`` call runs, and its caller gives up on."""
+
+    def __init__(self):
+        self._release = threading.Event()
+        self._done = threading.Event()
+
+    def _run(self, give_up):
+        try:
+            with admin_context():
+                give_up()
+                self._release.wait(timeout=10)
+        finally:
+            connections.close_all()
+            self._done.set()
+
+    async def give_up_while_it_runs(self):
+        """Await the call in this task, and cancel the await once the block has started.
+
+        asgiref then copies the call's context, which holds the block's, back here.
+        """
+        with pytest.raises(TimeoutError):
+            await self._await_until_the_block_runs()
+
+    async def _await_until_the_block_runs(self):
+        loop = asyncio.get_running_loop()
+        async with asyncio.timeout(None) as deadline:
+
+            def give_up():
+                loop.call_soon_threadsafe(lambda: deadline.reschedule(loop.time()))
+
+            await sync_to_async(self._run, thread_sensitive=False)(give_up)
+
+    def finish(self):
+        """Let the block end, and wait until it has."""
+        self._release.set()
+        assert self._done.wait(timeout=10)
+
+
 class TestCancelledHop:
     """asgiref copies a cancelled ``sync_to_async`` call's context into its caller."""
 
     def test_caller_keeps_its_own_context(self, sample_orders, tenant_a, enforce_rls):
-        started, release, done = threading.Event(), threading.Event(), threading.Event()
-
-        def admin_work():
-            try:
-                with admin_context():
-                    started.set()
-                    release.wait(timeout=10)
-            finally:
-                connections.close_all()
-                done.set()
+        block = _AdminBlockOnAWorker()
 
         async def run():
-            async with async_tenant_context(tenant_a.pk):
-                hop = sync_to_async(admin_work, thread_sensitive=False)()
-                with pytest.raises(TimeoutError):
-                    await asyncio.wait_for(hop, timeout=0.2)
-                assert started.is_set()  # the admin block is still running
-                products = await sync_to_async(_products)()
-                gucs = _get_context_gucs()
-            release.set()
-            await sync_to_async(done.wait, thread_sensitive=False)(timeout=10)
-            return products, gucs
+            try:
+                async with async_tenant_context(tenant_a.pk):
+                    await block.give_up_while_it_runs()
+                    return await _context_and_products()
+            finally:
+                await sync_to_async(block.finish, thread_sensitive=False)()
 
-        assert async_to_sync(run)() == (_TENANT_A_PRODUCTS, ContextGucs.for_tenant(tenant_a.pk))
+        assert async_to_sync(run)() == (ContextGucs.for_tenant(tenant_a.pk), _TENANT_A_PRODUCTS)
 
     @staticmethod
     def _set_and_return(block):
         _set_context_gucs(ContextGucs.for_tenant(9), block=block)  # never reset: as if cut short
 
-    @pytest.mark.parametrize(("block", "copied_back"), [(True, False), (False, True)])
-    def test_only_the_middlewares_holder_reaches_the_caller(self, block, copied_back):
-        """Pins asgiref's rule: a value is copied back when it compares unequal (``!=``)."""
+    @pytest.mark.parametrize(
+        ("caller_holds", "block", "copied_back"),
+        [(True, True, False), (True, False, True), (False, True, True), (False, False, True)],
+    )
+    def test_a_blocks_holder_never_replaces_the_callers(self, caller_holds, block, copied_back):
+        """Pins asgiref's rule: a value is copied back where it compares unequal (``!=``)."""
 
         async def run():
+            if caller_holds:
+                _hold_context_gucs()
             await sync_to_async(self._set_and_return)(block)
             return _get_context_gucs()
 
         values = contextvars.Context().run(async_to_sync(run))
 
         assert values == (ContextGucs.for_tenant(9) if copied_back else None)
+
+    def test_anonymous_async_request_keeps_out_a_cancelled_hops_block(
+        self,
+        sample_orders,
+        enforce_rls,
+    ):
+        """Served outside any context, the request holds one of no context."""
+        block = _AdminBlockOnAWorker()
+
+        async def view(request):
+            await block.give_up_while_it_runs()
+            return await _context_and_products()
+
+        async def run():
+            try:
+                return await RLSTenantMiddleware(view)(_request_for(AnonymousUser()))
+            finally:
+                await sync_to_async(block.finish, thread_sensitive=False)()
+
+        assert contextvars.Context().run(async_to_sync(run)) == (None, [])
+
+    def test_coroutine_of_an_anonymous_wsgi_view_keeps_out_a_cancelled_hops_block(
+        self,
+        sample_orders,
+        enforce_rls,
+    ):
+        """``async_to_sync`` hands the coroutine the WSGI request's holder."""
+        block = _AdminBlockOnAWorker()
+
+        async def give_up_then_read():
+            await block.give_up_while_it_runs()
+            return await _context_and_products()
+
+        def view(request):
+            try:
+                return async_to_sync(give_up_then_read)()
+            finally:
+                block.finish()
+
+        middleware = RLSTenantMiddleware(view)
+
+        seen = contextvars.Context().run(middleware, _request_for(AnonymousUser()))
+
+        assert seen == (None, [])
+
+
+def _products_on_this_thread_then_close():
+    """``_products()`` on the calling thread's connection, then close it (a worker's)."""
+    try:
+        return _products()
+    finally:
+        connections.close_all()
+
+
+class TestAsyncToSyncInsideABlock:
+    """``async_to_sync`` called in a block (a Celery task, say) runs in the block's context."""
+
+    @pytest.mark.parametrize("block", ["tenant", "admin"])
+    def test_coroutine_inherits_the_block(self, block, sample_orders, tenant_a, enforce_rls):
+        if block == "tenant":
+            context, values, products = (
+                tenant_context(tenant_a.pk),
+                ContextGucs.for_tenant(tenant_a.pk),
+                _TENANT_A_PRODUCTS,
+            )
+        else:
+            context, values, products = admin_context(), ADMIN_GUCS, _ALL_PRODUCTS
+
+        async def count_orders():
+            return await Order.objects.acount()
+
+        with context:
+            seen = async_to_sync(_context_and_products)()
+            count = async_to_sync(count_orders)()
+
+        assert seen == (values, products)
+        assert count == len(products)
+
+    @pytest.mark.django_db(transaction=True)
+    def test_coroutines_worker_hop_gets_the_block(
+        self,
+        sample_orders,
+        tenant_a,
+        enforce_rls_on_other_threads,
+    ):
+        async def on_a_worker():
+            return await sync_to_async(
+                _products_on_this_thread_then_close,
+                thread_sensitive=False,
+            )()
+
+        with tenant_context(tenant_a.pk):
+            products = async_to_sync(on_a_worker)()
+
+        assert products == _TENANT_A_PRODUCTS
+
+
+class _HookPathMiddleware(RLSTenantMiddleware):
+    """Overrides a sync hook, so ``MiddlewareMixin.__acall__`` serves its async requests."""
+
+    def process_request(self, request):
+        assert self._sync_hooks_overridden
+        return super().process_request(request)
+
+
+def _scope():
+    """The tenant ``ContextVar`` values and the guard's: what a block's code runs with."""
+    return get_current_tenant_id(), get_rls_context_active(), _get_context_gucs()
+
+
+async def _view_products(request):
+    return await sync_to_async(_products)()
+
+
+async def _admin_rows():
+    """An async generator that suspends inside an admin block."""
+    async with async_admin_context():
+        yield 1
+        yield 2
+
+
+def _admin_rows_sync():
+    """A generator that suspends inside an admin block."""
+    with admin_context():
+        yield 1
+        yield 2
+
+
+_PATHS = [
+    pytest.param(RLSTenantMiddleware, True, id="native-user"),
+    pytest.param(RLSTenantMiddleware, False, id="native-anonymous"),
+    pytest.param(_HookPathMiddleware, True, id="hooks-user"),
+    pytest.param(_HookPathMiddleware, False, id="hooks-anonymous"),
+]
+
+
+class TestBlockLeftOpenByTheView:
+    """A view that keeps a generator suspended inside a context block (#41).
+
+    The block's context stays current in the request. It must not reach the
+    error response Django builds after ``process_exception``, nor outlive the request.
+    """
+
+    @pytest.mark.parametrize(("middleware_class", "authenticated"), _PATHS)
+    def test_async_error_response_runs_without_it(
+        self,
+        middleware_class,
+        authenticated,
+        sample_orders,
+        tenant_a_user,
+        enforce_rls,
+    ):
+        async def view(request):
+            rows = _admin_rows()
+            await anext(rows)
+            # What Django does when the view raises: process_exception in a hop.
+            await sync_to_async(middleware.process_exception)(request, RuntimeError("boom"))
+            seen = await _context_and_products()  # what the error response would see
+            await rows.aclose()
+            return seen
+
+        middleware = middleware_class(view)
+        user = tenant_a_user if authenticated else AnonymousUser()
+
+        assert async_to_sync(middleware)(_request_for(user)) == (None, [])
+
+    @pytest.mark.parametrize("authenticated", [True, False])
+    def test_wsgi_error_response_runs_without_it(
+        self,
+        authenticated,
+        sample_orders,
+        tenant_a_user,
+        enforce_rls,
+    ):
+        def view(request):
+            rows = _admin_rows_sync()
+            next(rows)
+            middleware.process_exception(request, RuntimeError("boom"))
+            seen = _get_context_gucs(), _products()
+            rows.close()
+            return seen
+
+        middleware = RLSTenantMiddleware(view)
+        user = tenant_a_user if authenticated else AnonymousUser()
+
+        assert middleware(_request_for(user)) == (None, [])
+
+    @pytest.mark.parametrize("left_open", [True, False])
+    @pytest.mark.parametrize(("middleware_class", "authenticated"), _PATHS)
+    def test_500_response_runs_without_it(
+        self,
+        middleware_class,
+        authenticated,
+        left_open,
+        tenant_a_user,
+    ):
+        """Errors ``process_exception`` does not see (a view that returns ``None``, say)."""
+
+        async def view(request):
+            rows = _admin_rows()
+            if left_open:
+                await anext(rows)
+
+            def build_500_response():
+                # What Django does first in the hop that builds the 500 response.
+                got_request_exception.send(sender=None, request=request)
+                return _get_context_gucs()
+
+            seen = await sync_to_async(build_500_response, thread_sensitive=False)()
+            await rows.aclose()
+            return seen
+
+        user = tenant_a_user if authenticated else AnonymousUser()
+        own = ContextGucs.for_tenant(tenant_a_user.rls_tenant_id) if authenticated else None
+
+        seen = async_to_sync(middleware_class(view))(_request_for(user))
+
+        # The request's own context is inherited (#41); a block left open is not.
+        assert seen == (None if left_open else own)
+
+    def test_error_signal_without_a_request_ends_nothing(self, tenant_a):
+        with tenant_context(tenant_a.pk):
+            got_request_exception.send(sender=None)
+            assert _get_context_gucs() == ContextGucs.for_tenant(tenant_a.pk)
+
+    def test_process_exception_ends_it_even_if_the_cleanup_fails(
+        self,
+        tenant_a_user,
+        monkeypatch,
+    ):
+        """Native path: the request's token reset fails in the hop, so nothing else ends it."""
+
+        def clear_fails(conf):
+            msg = "connection lost"
+            raise OperationalError(msg)
+
+        async def view(request):
+            rows = _admin_rows()
+            await anext(rows)
+            monkeypatch.setattr(middleware_module, "_clear_request_gucs", clear_fails)
+            with pytest.raises(OperationalError, match="connection lost"):
+                await sync_to_async(middleware.process_exception)(request, RuntimeError("boom"))
+            monkeypatch.undo()
+            seen = _get_context_gucs()
+            await rows.aclose()
+            return seen
+
+        middleware = RLSTenantMiddleware(view)
+
+        assert async_to_sync(middleware)(_request_for(tenant_a_user)) is None
+
+    @pytest.mark.parametrize(("middleware_class", "authenticated"), _PATHS)
+    def test_async_request_ends_it(self, middleware_class, authenticated, tenant_a_user):
+        left_open = []
+
+        async def view(request):
+            rows = _admin_rows()
+            await anext(rows)
+            left_open.append((rows, contextvars.copy_context()))
+            return "response"
+
+        user = tenant_a_user if authenticated else AnonymousUser()
+
+        async def run():
+            await middleware_class(view)(_request_for(user))
+            rows, escaped = left_open[0]
+            try:
+                return escaped.run(_get_context_gucs)
+            finally:
+                await rows.aclose()
+
+        assert async_to_sync(run)() is None
+
+    @pytest.mark.parametrize("authenticated", [True, False])
+    def test_wsgi_request_ends_it(self, authenticated, tenant_a_user):
+        left_open = []
+
+        def view(request):
+            rows = _admin_rows_sync()
+            next(rows)
+            left_open.append((rows, contextvars.copy_context()))
+            return "response"
+
+        user = tenant_a_user if authenticated else AnonymousUser()
+        RLSTenantMiddleware(view)(_request_for(user))
+        rows, escaped = left_open[0]
+
+        assert escaped.run(_get_context_gucs) is None
+        rows.close()
+
+
+class TestRequestHolderAfterProcessException:
+    """``process_exception`` runs in a hop of its own; the request keeps a holder after it."""
+
+    @pytest.mark.parametrize(("middleware_class", "authenticated"), _PATHS)
+    def test_cancelled_call_cannot_hand_its_block_to_the_request(
+        self,
+        middleware_class,
+        authenticated,
+        sample_orders,
+        tenant_a_user,
+        enforce_rls,
+    ):
+        block = _AdminBlockOnAWorker()
+
+        async def view(request):
+            try:
+                await sync_to_async(middleware.process_exception)(request, RuntimeError("boom"))
+                # An error handler inside admin_context(), given up on (the client went away).
+                await block.give_up_while_it_runs()
+                return await _context_and_products()
+            finally:
+                await sync_to_async(block.finish, thread_sensitive=False)()
+
+        middleware = middleware_class(view)
+        user = tenant_a_user if authenticated else AnonymousUser()
+
+        assert async_to_sync(middleware)(_request_for(user)) == (None, [])
+
+
+class TestRequestInsideABlock:
+    """A request served inside a context block (a test that wraps the client, say)."""
+
+    @pytest.mark.parametrize("middleware_class", [RLSTenantMiddleware, _HookPathMiddleware])
+    def test_async_request_runs_as_its_user_and_gives_the_block_back(
+        self,
+        middleware_class,
+        sample_orders,
+        tenant_a_user,
+        enforce_rls,
+    ):
+        async def run():
+            async with async_admin_context():
+                products = await middleware_class(_view_products)(_request_for(tenant_a_user))
+                return products, await _context_and_products()
+
+        assert async_to_sync(run)() == (_TENANT_A_PRODUCTS, (ADMIN_GUCS, _ALL_PRODUCTS))
+
+    @pytest.mark.parametrize("middleware_class", [RLSTenantMiddleware, _HookPathMiddleware])
+    def test_async_request_that_raises_gives_the_block_back(
+        self,
+        middleware_class,
+        sample_orders,
+        tenant_a_user,
+        enforce_rls,
+    ):
+        async def failing_view(request):
+            raise _Failed
+
+        async def run():
+            async with async_admin_context():
+                with pytest.raises(_Failed):
+                    await middleware_class(failing_view)(_request_for(tenant_a_user))
+                return await _context_and_products()
+
+        assert async_to_sync(run)() == (ADMIN_GUCS, _ALL_PRODUCTS)
+
+    @pytest.mark.parametrize("view_fails", [False, True])
+    @pytest.mark.parametrize("middleware_class", [RLSTenantMiddleware, _HookPathMiddleware])
+    def test_anonymous_async_request_keeps_the_block(
+        self,
+        middleware_class,
+        view_fails,
+        sample_orders,
+        tenant_a,
+        enforce_rls,
+    ):
+        async def view(request):
+            if view_fails:
+                # What Django does when the view raises: process_exception in a hop.
+                await sync_to_async(middleware.process_exception)(request, RuntimeError("boom"))
+            return await sync_to_async(_products)()
+
+        middleware = middleware_class(view)
+
+        async def run():
+            async with async_tenant_context(tenant_a.pk):
+                products = await middleware(_request_for(AnonymousUser()))
+                return products, _scope(), await sync_to_async(_products)()
+
+        assert async_to_sync(run)() == (
+            _TENANT_A_PRODUCTS,
+            (tenant_a.pk, True, ContextGucs.for_tenant(tenant_a.pk)),
+            _TENANT_A_PRODUCTS,
+        )
+
+    def test_cancelled_hook_path_request_gives_the_block_back(
+        self,
+        sample_orders,
+        tenant_a_user,
+        enforce_rls,
+    ):
+        """The cleanup Django's hooks skip runs before the request lets go of its holder."""
+
+        async def run():
+            started = asyncio.Event()
+
+            async def view(request):
+                started.set()
+                await asyncio.Event().wait()
+
+            async with async_admin_context():
+                request = _HookPathMiddleware(view)(_request_for(tenant_a_user))
+                task = asyncio.ensure_future(request)
+                await asyncio.wait_for(started.wait(), timeout=5)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                return await _context_and_products()
+
+        assert async_to_sync(run)() == (ADMIN_GUCS, _ALL_PRODUCTS)
+
+    def test_request_cancelled_in_process_request_gives_the_block_back(
+        self,
+        sample_orders,
+        tenant_a_user,
+        enforce_rls,
+    ):
+        """Cancelled before the hook's hop hands its values back: they never become current."""
+        entered, release = threading.Event(), threading.Event()
+
+        class SlowHook(RLSTenantMiddleware):
+            def process_request(self, request):
+                entered.set()
+                release.wait(timeout=10)
+                return super().process_request(request)
+
+        async def run():
+            async with async_admin_context():
+                task = asyncio.ensure_future(SlowHook(_view_products)(_request_for(tenant_a_user)))
+                assert await sync_to_async(entered.wait, thread_sensitive=False)(timeout=10)
+                task.cancel()
+                release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                return await _context_and_products()
+
+        assert async_to_sync(run)() == (ADMIN_GUCS, _ALL_PRODUCTS)
+
+    def test_request_object_served_twice_does_not_end_the_block(
+        self,
+        sample_orders,
+        tenant_a_user,
+        enforce_rls,
+    ):
+        """The native path takes its token off the request once the request is over."""
+
+        async def view(request):
+            if not request.user.is_authenticated:
+                # What Django does when the view raises: process_exception in a hop.
+                await sync_to_async(middleware.process_exception)(request, RuntimeError("boom"))
+            return "response"
+
+        middleware = RLSTenantMiddleware(view)
+        request = _request_for(tenant_a_user)
+
+        async def run():
+            async with async_admin_context():
+                await middleware(request)
+                request.user = AnonymousUser()
+                await middleware(request)
+                return await _context_and_products()
+
+        assert async_to_sync(run)() == (ADMIN_GUCS, _ALL_PRODUCTS)
+
+    def test_inner_middlewares_block_does_not_end_the_block(
+        self,
+        sample_orders,
+        tenant_a,
+        tenant_b,
+        tenant_a_user,
+        enforce_rls,
+    ):
+        """``process_exception`` runs inside a block an inner middleware opened for the view.
+
+        The request's context is reset below that block, which then exits out of order.
+        """
+
+        def view(request):
+            raise _Failed
+
+        def scoping_middleware(request):
+            with tenant_context(tenant_b.pk):
+                try:
+                    return view(request)
+                except _Failed as exc:
+                    # What Django does inside the chain when the view raises.
+                    middleware.process_exception(request, exc)
+                    return "error response"
+
+        middleware = RLSTenantMiddleware(scoping_middleware)
+
+        with tenant_context(tenant_a.pk):
+            middleware(_request_for(tenant_a_user))
+            after = _get_context_gucs(), _products()
+
+        assert after == (ContextGucs.for_tenant(tenant_a.pk), _TENANT_A_PRODUCTS)
+
+    @pytest.mark.parametrize("view_fails", [False, True])
+    def test_anonymous_request_keeps_the_block(
+        self,
+        view_fails,
+        sample_orders,
+        tenant_a,
+        enforce_rls,
+    ):
+        """WSGI: the request sets no context, so its cleanup has none to end."""
+
+        def view(request):
+            if view_fails:
+                middleware.process_exception(request, RuntimeError("boom"))
+            return _products()
+
+        middleware = RLSTenantMiddleware(view)
+
+        with tenant_context(tenant_a.pk):
+            products = middleware(_request_for(AnonymousUser()))
+            after = _scope(), _products()
+
+        assert (products, after) == (
+            _TENANT_A_PRODUCTS,
+            ((tenant_a.pk, True, ContextGucs.for_tenant(tenant_a.pk)), _TENANT_A_PRODUCTS),
+        )
 
 
 class TestSettleWithABrokenAlias:
@@ -1218,6 +1782,18 @@ class TestContextEnd:
 
         assert contextvars.copy_context().run(start_then_clear) == (None, None)
 
+    def test_reset_ends_an_inner_context_left_current(self):
+        """An inner block left without its exit (a generator never closed) ends with the outer."""
+
+        def outer_then_inner():
+            outer = _set_context_gucs(ContextGucs.for_tenant(1))
+            _set_context_gucs(ContextGucs.for_tenant(2))  # never reset
+            escaped = contextvars.copy_context()
+            _reset_context_gucs(outer)
+            return escaped.run(_get_context_gucs), _get_context_gucs()
+
+        assert contextvars.copy_context().run(outer_then_inner) == (None, None)
+
 
 class TestInstallWrapsOnce:
     def test_commit_and_rollback_are_wrapped_once_however_often_install_runs(self):
@@ -1297,6 +1873,206 @@ class TestDriverCommits:
                 connection.set_autocommit(True)
 
         assert _guard_statements(queries) == []
+
+
+class TestBlockExitedInAnotherContext:
+    """A generator suspended inside a block, closed in another ``Context`` (GC, a finalizer)."""
+
+    def test_generator_closed_in_another_context(
+        self,
+        sample_orders,
+        tenant_a,
+        tenant_b,
+        enforce_rls,
+    ):
+        def stream():
+            with admin_context():
+                yield
+
+        context_b = contextvars.Context()
+        outer = tenant_context(tenant_b.pk)
+
+        def start_in_b():
+            outer.__enter__()
+            generator = stream()
+            next(generator)  # snapshot: tenant B's values
+            return generator
+
+        def close_in_a(generator):
+            with tenant_context(tenant_a.pk):
+                with pytest.raises(ValueError, match="different Context"):
+                    generator.close()
+                return _get_context_gucs(), _products()
+
+        generator = context_b.run(start_in_b)
+        try:
+            seen = contextvars.Context().run(close_in_a, generator)
+        finally:
+            context_b.run(outer.__exit__, None, None, None)
+
+        assert seen == (ContextGucs.for_tenant(tenant_a.pk), _TENANT_A_PRODUCTS)
+
+    def test_generator_closed_on_another_thread_writes_nothing_there(self, tenant_b, worker):
+        """That thread's session is not the one the block's snapshot describes."""
+
+        def stream():
+            with admin_context():
+                yield
+
+        context_b = contextvars.Context()
+        outer = tenant_context(tenant_b.pk)
+
+        def start_in_b():
+            outer.__enter__()
+            generator = stream()
+            next(generator)  # snapshot: tenant B's values
+            return generator
+
+        def close_here(generator):
+            with pytest.raises(ValueError, match="different Context"):
+                generator.close()
+            return session_gucs()
+
+        generator = context_b.run(start_in_b)
+        try:
+            seen = _hop(worker, lambda: close_here(generator), contextvars.Context())
+        finally:
+            context_b.run(outer.__exit__, None, None, None)
+
+        assert seen == _NO_GUCS
+
+    def test_local_mode_restores_on_the_session_it_entered_on(
+        self,
+        sample_orders,
+        tenant_a,
+        enforce_rls,
+    ):
+        """The guard does nothing with ``USE_LOCAL_SET=True``: the restore must still run."""
+
+        async def stream():
+            async with async_admin_context():
+                yield
+
+        async def close_in_another_task():
+            generator = stream()
+            await anext(generator)
+            with pytest.raises(ValueError, match="different Context"):
+                await asyncio.create_task(generator.aclose())
+
+        local = {**django_settings.RLS_TENANTS, "USE_LOCAL_SET": True}
+        with (
+            override_settings(RLS_TENANTS=local),
+            transaction.atomic(),
+            tenant_context(tenant_a.pk),
+        ):
+            async_to_sync(close_in_another_task)()
+            seen = session_gucs(), _products()
+
+        assert seen == (_read_as(tenant_a), _TENANT_A_PRODUCTS)
+
+    def test_local_mode_restores_no_ended_context(
+        self,
+        sample_orders,
+        tenant_a,
+        tenant_b,
+        enforce_rls,
+    ):
+        """Closed after its enclosing block ended, the block restores no values of that block."""
+
+        def stream():
+            with admin_context():
+                yield
+
+        def start_inside_b():
+            with tenant_context(tenant_b.pk):
+                generator = stream()
+                next(generator)  # snapshot: tenant B's values
+            return generator
+
+        def close_inside_a(generator):
+            with tenant_context(tenant_a.pk):
+                with pytest.raises(ValueError, match="different Context"):
+                    contextvars.copy_context().run(generator.close)
+                return session_gucs(), _products()
+
+        local = {**django_settings.RLS_TENANTS, "USE_LOCAL_SET": True}
+        with override_settings(RLS_TENANTS=local), transaction.atomic():
+            generator = contextvars.Context().run(start_inside_b)
+            seen = contextvars.Context().run(close_inside_a, generator)
+
+        assert seen == (_NO_GUCS, [])  # fail-closed: the guard is off in local mode
+
+    def test_async_generator_closed_in_another_task(
+        self,
+        sample_orders,
+        tenant_a,
+        tenant_b,
+        enforce_rls,
+    ):
+        async def stream():
+            async with async_admin_context():
+                yield
+
+        async def run():
+            started, done = asyncio.Event(), asyncio.Event()
+            generators = []
+
+            async def in_b():
+                async with async_tenant_context(tenant_b.pk):
+                    generator = stream()
+                    await anext(generator)  # snapshot: tenant B's values
+                    generators.append(generator)
+                    started.set()
+                    await done.wait()
+
+            task = asyncio.create_task(in_b(), context=contextvars.Context())
+            await started.wait()
+            try:
+                async with async_tenant_context(tenant_a.pk):
+                    with pytest.raises(ValueError, match="different Context"):
+                        await generators[0].aclose()
+                    return await _context_and_products()
+            finally:
+                done.set()
+                await task
+
+        assert async_to_sync(run)() == (ContextGucs.for_tenant(tenant_a.pk), _TENANT_A_PRODUCTS)
+
+
+@pytest.mark.django_db(transaction=True)
+class TestCommitThatRaises:
+    """A commit that raises: a failed one rolled back, an interrupted one may have committed."""
+
+    @staticmethod
+    def _commit_then_raise():
+        """Commit on the driver, then fail, as an interruption after the server committed."""
+        connection.connection.commit()
+        raise _Failed
+
+    def _values_after_the_commit(self):
+        commit = affinity._transaction_end(connection, self._commit_then_raise, committed=True)
+        connection.set_autocommit(False)
+        try:
+            _gucs()  # starts the transaction, with the context's values
+            with pytest.raises(_Failed):
+                commit()
+            return _tracker().values
+        finally:
+            connection.connection.rollback()
+            connection.set_autocommit(True)
+
+    def test_values_set_in_the_transaction_become_unknown(self, tenant_a, tenant_b):
+        with tenant_context(tenant_a.pk), _context_of(tenant_b):
+            values = self._values_after_the_commit()  # tenant B, set in the transaction
+            assert session_gucs() == _read_as(tenant_b)  # committed
+
+        assert values is affinity.UNKNOWN
+
+    def test_values_the_transaction_did_not_change_are_kept(self, tenant_a):
+        with tenant_context(tenant_a.pk):
+            values = self._values_after_the_commit()
+
+        assert values == ContextGucs.for_tenant(tenant_a.pk)
 
 
 class TestSavepointBookkeeping:

@@ -10,6 +10,7 @@ from django.apps import AppConfig
 
 if TYPE_CHECKING:
     from django.db.backends.base.base import BaseDatabaseWrapper
+    from django.http import HttpRequest
 
 
 logger = logging.getLogger("django_rls_tenants")
@@ -163,7 +164,11 @@ class DjangoRlsTenantsConfig(AppConfig):
 
     def ready(self) -> None:
         """Connect signal handlers and validate configuration on startup."""
-        from django.core.signals import request_finished, setting_changed  # noqa: PLC0415
+        from django.core.signals import (  # noqa: PLC0415
+            got_request_exception,
+            request_finished,
+            setting_changed,
+        )
         from django.db import connections  # noqa: PLC0415
         from django.db.backends.signals import connection_created  # noqa: PLC0415
 
@@ -221,6 +226,28 @@ class DjangoRlsTenantsConfig(AppConfig):
                 _clear_gucs_set_flag()
 
         request_finished.connect(_clear_rls_on_request_finished, weak=False)
+
+        # Django sends this before it builds a 500 response, in the context the
+        # response is built in (under ASGI, a worker thread's hop). A context
+        # block the view left open (a generator suspended inside one) is ended
+        # first; process_exception does the same for a view that raises.
+        def _end_blocks_left_open_on_error(
+            sender: object,  # noqa: ARG001  -- Django signal API
+            request: HttpRequest | None = None,
+            **kwargs: object,  # noqa: ARG001  -- Django signal API
+        ) -> None:
+            from django_rls_tenants.tenants.middleware import (  # noqa: PLC0415
+                _end_blocks_left_open,
+            )
+
+            if request is not None:
+                _end_blocks_left_open(request)
+
+        got_request_exception.connect(
+            _end_blocks_left_open_on_error,
+            weak=False,
+            dispatch_uid="django_rls_tenants.end_blocks_left_open_on_error",
+        )
 
         # Signal handler for new database connections; see _prepare_new_connection().
         def _set_guc_on_new_connection(
