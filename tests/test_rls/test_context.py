@@ -7,13 +7,14 @@ import time
 
 import pytest
 from asgiref.sync import async_to_sync, sync_to_async
-from django.db import DataError
+from django.db import DataError, transaction
 
 from django_rls_tenants.rls.context import (
     _enter_gucs,
     async_bypass_flag,
     async_rls_context,
     bypass_flag,
+    restore_gucs,
     rls_context,
 )
 from django_rls_tenants.rls.guc import aget_guc, get_guc, set_guc
@@ -248,6 +249,30 @@ def test_partial_setup_failure_restores_previous_values():
 
     assert get_guc("rls.is_admin") == "false"
     assert get_guc("statement_timeout") == previous_timeout
+
+
+def test_restore_runs_while_django_marks_the_transaction_for_rollback():
+    """Django's rollback flag does not block the restore (#131).
+
+    An exception leaving an inner ``atomic(savepoint=False)`` sets the flag
+    while PostgreSQL's transaction is healthy. A caller that catches it and
+    clears the flag commits, so a skipped restore would commit the GUC too.
+    """
+    with transaction.atomic():
+        set_guc("rls.is_admin", "true")
+        transaction.set_rollback(True)
+        restore_gucs({"rls.is_admin": None}, exc_pending=True)
+        assert transaction.get_rollback() is True
+        transaction.set_rollback(False)
+        assert get_guc("rls.is_admin") is None
+
+
+def test_restore_of_nothing_touches_no_connection(monkeypatch):
+    """An empty mapping returns before looking up the connection."""
+    import django_rls_tenants.rls.context as ctx_mod  # noqa: PLC0415
+
+    monkeypatch.setattr(ctx_mod, "connections", None)
+    restore_gucs({}, using="nowhere")
 
 
 # ---------------------------------------------------------------------------

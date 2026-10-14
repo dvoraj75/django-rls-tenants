@@ -144,6 +144,15 @@ migration that assigns the correct tenant to each existing record.
   model's default manager: every row in the table must be hidden, including rows a
   filtering manager would have excluded. See
   [assert_rls_blocks_without_context](../guides/testing.md#assert_rls_blocks_without_context).
+- **`for_user()` sets the user's GUCs for every method that runs SQL.** `count()`,
+  `exists()`, `aggregate()`, `update()`, `delete()`, `create()` and the other methods now
+  run as the user, not only iteration. With `USE_LOCAL_SET=True` that means `SET LOCAL`,
+  which needs a transaction: `update_or_create()`, `bulk_create()`, `bulk_update()` and
+  `delete()` open one of their own, and the other methods raise `RuntimeError` outside
+  `transaction.atomic()`, as iteration always did (before, they ran without the GUCs).
+  Wrap such code in `transaction.atomic()`. With `STRICT_MODE=True`, `aiterator()`
+  without a context now raises `NoTenantContextError`, like `iterator()`. See
+  [Lazy QuerySet Evaluation](architecture.md#lazy-queryset-evaluation).
 
 ### From 1.3.3 to 1.3.4
 

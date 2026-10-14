@@ -178,11 +178,27 @@ def test_ci_postgres_edges():
         assert inc["python-version"] in PYTHON, (
             f"{rel}: test-postgres include {inc} names an unsupported Python"
         )
-    for job in ("test", "example-smoke"):
+    for job in ("test", "example-smoke", "test-plain-role"):
         image = jobs[job]["services"]["postgres"]["image"]
         assert image == f"postgres:{DEFAULT_POSTGRES}", (
             f"{rel}: {job} runs {image}, expected postgres:{DEFAULT_POSTGRES}"
         )
+
+
+def test_ci_plain_role_leg():
+    """The non-superuser leg (#131) runs a supported Python and deselects superuser tests."""
+    rel = ".github/workflows/ci.yml"
+    job = _workflow(rel)["jobs"]["test-plain-role"]
+    assert job["env"]["UV_PYTHON"] in PYTHON, (
+        f"{rel}: test-plain-role runs Python {job['env']['UV_PYTHON']}, not one of {PYTHON}"
+    )
+    assert job["env"]["POSTGRES_USER"] != "postgres", (
+        f"{rel}: test-plain-role must connect as a plain role, not the postgres superuser"
+    )
+    runs = " ".join(step.get("run", "") for step in job["steps"])
+    assert '-m "not superuser_only"' in runs, (
+        f"{rel}: test-plain-role must deselect the superuser_only tests"
+    )
 
 
 def test_ci_coverage_gate_names_a_real_leg():

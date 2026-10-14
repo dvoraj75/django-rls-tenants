@@ -390,3 +390,86 @@ jobs:
 
       - name: Run tests
         run: uv run --no-sync python -m pytest
+
+  test-plain-role:
+    # Every other library leg connects as the postgres superuser, which bypasses
+    # RLS: a test of database-enforced behaviour passes there whether or not the
+    # policies applied, which is how #131 went unnoticed. This leg runs the suite
+    # as a plain role, so every query is subject to RLS. Tests that need a
+    # superuser carry the superuser_only marker and are deselected.
+    name: Test (non-superuser role, PostgreSQL 16)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: django_rls_tenants_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      UV_PYTHON: "3.12"
+      RLS_FAIL_ON_SKIPPED: "1"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --locked --no-default-groups --group test
+
+      - name: Create a non-superuser role for RLS enforcement
+        # CREATEDB lets pytest-django create the test database; no CREATEROLE,
+        # no BYPASSRLS. The role owns the tables it migrates, and the policies
+        # use FORCE ROW LEVEL SECURITY, so RLS applies to the owner too.
+        env:
+          PGPASSWORD: postgres
+        run: >-
+          psql -h 127.0.0.1 -U postgres -d django_rls_tenants_test -v ON_ERROR_STOP=1
+          -c "CREATE ROLE app LOGIN PASSWORD 'app' CREATEDB"
+
+      - name: Verify the tests connect as a role RLS applies to
+        # A mistake in the env above would fall back to the superuser and turn
+        # this leg into a copy of the others.
+        run: |
+          uv run --no-sync python - <<'PY'
+          import os
+
+          import django
+
+          os.environ["DJANGO_SETTINGS_MODULE"] = "tests.settings"
+          django.setup()
+
+          from django.db import connection
+
+          with connection.cursor() as cursor:
+              cursor.execute(
+                  "SELECT rolname, rolsuper, rolbypassrls FROM pg_roles "
+                  "WHERE rolname = current_user"
+              )
+              role, superuser, bypassrls = cursor.fetchone()
+          print(f"Connected as {role}: superuser={superuser}, bypassrls={bypassrls}")
+          assert not superuser and not bypassrls, f"{role} bypasses RLS"
+          PY
+
+      - name: Run tests
+        run: uv run --no-sync python -m pytest -m "not superuser_only"

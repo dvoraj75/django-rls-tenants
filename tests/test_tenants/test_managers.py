@@ -2,21 +2,36 @@
 
 from __future__ import annotations
 
+import inspect
+import itertools
+import json
 import warnings
 from decimal import Decimal
 from unittest.mock import MagicMock
 
 import django
 import pytest
+from asgiref.sync import async_to_sync
 from django.core.exceptions import FieldError
-from django.db import NotSupportedError
-from django.db.models import Sum
+from django.db import DatabaseError, DataError, NotSupportedError, connection, transaction
+from django.db.models import Count, F, QuerySet, Sum
+from django.db.models.signals import pre_delete
 from django.test import override_settings
+from django.test.utils import CaptureQueriesContext
+from django.utils.connection import ConnectionDoesNotExist
 
 from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.guc import get_guc
-from django_rls_tenants.tenants.context import admin_context, tenant_context
+from django_rls_tenants.tenants import managers
+from django_rls_tenants.tenants.context import (
+    admin_context,
+    async_tenant_context,
+    tenant_context,
+)
 from django_rls_tenants.tenants.managers import (
+    _ITERATOR_CHUNK_SIZE,
+    RLSManager,
+    TenantQuerySet,
     _is_rls_protected,
     _resolve_related_model,
     _resolve_related_path,
@@ -29,12 +44,14 @@ from django_rls_tenants.tenants.state import (
     set_current_tenant_id,
 )
 from tests.test_app.models import (
+    Document,
     NoteRevision,
     Order,
     OrderItem,
     OrderNote,
     OrderNoteAttachment,
     Tenant,
+    TenantUser,
 )
 
 pytestmark = pytest.mark.django_db
@@ -43,13 +60,13 @@ pytestmark = pytest.mark.django_db
 class TestForUserTenantUser:
     """Tests for TenantQuerySet.for_user() with tenant users."""
 
-    def test_returns_only_tenant_rows(self, sample_orders, tenant_a_user):
+    def test_returns_only_tenant_rows(self, sample_orders, tenant_a_user, enforce_rls):
         """Tenant user sees only their own tenant's rows."""
         qs = Order.objects.for_user(tenant_a_user)
         products = list(qs.values_list("product", flat=True))
         assert sorted(products) == ["Widget A1", "Widget A2"]
 
-    def test_does_not_return_other_tenant_rows(self, sample_orders, tenant_b_user):
+    def test_does_not_return_other_tenant_rows(self, sample_orders, tenant_b_user, enforce_rls):
         """Tenant B user does not see Tenant A's rows."""
         qs = Order.objects.for_user(tenant_b_user)
         products = list(qs.values_list("product", flat=True))
@@ -59,7 +76,7 @@ class TestForUserTenantUser:
 class TestForUserAdmin:
     """Tests for TenantQuerySet.for_user() with admin users."""
 
-    def test_returns_all_rows(self, sample_orders, admin_user):
+    def test_returns_all_rows(self, sample_orders, admin_user, enforce_rls):
         """Admin user sees all tenants' rows."""
         qs = Order.objects.for_user(admin_user)
         assert qs.count() == 3
@@ -68,24 +85,23 @@ class TestForUserAdmin:
 class TestForUserLazy:
     """Tests for lazy evaluation behavior."""
 
-    def test_chainable(self, sample_orders, tenant_a_user):
+    def test_chainable(self, sample_orders, tenant_a_user, enforce_rls):
         """for_user() result is chainable with standard queryset methods."""
         qs = Order.objects.for_user(tenant_a_user).order_by("product")
         products = list(qs.values_list("product", flat=True))
         assert products == ["Widget A1", "Widget A2"]
 
-    def test_filter_after_for_user(self, sample_orders, tenant_a_user):
+    def test_filter_after_for_user(self, sample_orders, tenant_a_user, enforce_rls):
         """filter() after for_user() preserves the user reference."""
         qs = Order.objects.for_user(tenant_a_user).filter(amount__gte=Decimal("15.00"))
         products = list(qs.values_list("product", flat=True))
         assert products == ["Widget A2"]
 
-    def test_lazy_evaluation(self, sample_orders, tenant_a_user):
+    def test_lazy_evaluation(self, sample_orders, tenant_a_user, enforce_rls):
         """QuerySet from for_user() works when evaluated later (lazy).
 
-        This is the critical test for Decision 1 (RFC comment 1.2):
-        GUC must NOT be set when for_user() is called. It must be set
-        only at evaluation time, inside _fetch_all().
+        The GUCs must NOT be set when for_user() is called, only while the
+        query runs (here count(), which bypasses _fetch_all()).
         """
         # Create queryset (no SQL executed yet)
         qs = Order.objects.for_user(tenant_a_user)
@@ -97,7 +113,7 @@ class TestForUserLazy:
         # GUC should be cleared after evaluation
         assert get_guc("rls.current_tenant") is None
 
-    def test_clone_propagates_user(self, sample_orders, tenant_a_user):
+    def test_clone_propagates_user(self, sample_orders, tenant_a_user, enforce_rls):
         """Cloned querysets (from .filter(), .order_by()) keep the user ref."""
         qs1 = Order.objects.for_user(tenant_a_user)
         qs2 = qs1.filter(product="Widget A1")
@@ -930,3 +946,796 @@ class TestStrictModeContextVarLifecycle:
         assert get_rls_context_active() is True
         mw.process_exception(request, RuntimeError("view error"))
         assert get_rls_context_active() is False
+
+
+# ---- for_user() scope on every method that runs SQL (#131) ----
+#
+# Every test below that checks rows runs under enforce_rls: a superuser
+# connection bypasses RLS, so there a for_user() test passes whether or not
+# the GUCs were set. Each test also builds a fresh queryset; an evaluated one
+# answers count() and exists() from its result cache and would hide a
+# missing scope.
+
+
+@pytest.fixture(params=["admin", "tenant_a"])
+def scoped_user(request, admin_user, tenant_a_user):
+    """A ``for_user()`` user and how many of the three sample orders RLS shows it."""
+    if request.param == "admin":
+        return admin_user, 3
+    return tenant_a_user, 2
+
+
+@pytest.fixture(params=[False, True], ids=["set_config", "set_local"])
+def guc_mode(request, settings):
+    """Run the test in both GUC modes.
+
+    pytest-django wraps each test in a transaction, which ``SET LOCAL`` needs.
+    """
+    settings.RLS_TENANTS = {**settings.RLS_TENANTS, "USE_LOCAL_SET": request.param}
+    return request.param
+
+
+async def _collect(aiterable):
+    """Drain an async iterable into a list."""
+    return [item async for item in aiterable]
+
+
+def _explain_rows(plan_json):
+    """Rows the top plan node returned, from ``EXPLAIN (ANALYZE, FORMAT JSON)`` output."""
+    (plan,) = json.loads(plan_json)
+    return plan["Plan"]["Actual Rows"]
+
+
+def _assert_no_rls_context():
+    """Neither the connection nor the tenant state carries a context."""
+    assert get_guc("rls.is_admin") is None
+    assert get_guc("rls.current_tenant") is None
+    assert get_current_tenant_id() is None
+    assert get_rls_context_active() is False
+
+
+def _new_order(tenant_id, **fields):
+    """An unsaved order for ``tenant_id``."""
+    return Order(product="New", amount=Decimal(1), tenant_id=tenant_id, **fields)
+
+
+_READ_MEASURES = [
+    pytest.param(lambda qs: len(list(qs)), id="iteration"),
+    pytest.param(lambda qs: len(list(qs.values_list("id", flat=True))), id="values_list"),
+    pytest.param(lambda qs: qs.count(), id="count"),
+    pytest.param(lambda qs: qs.aggregate(n=Count("id"))["n"], id="aggregate"),
+    pytest.param(lambda qs: len(list(qs.iterator())), id="iterator"),
+    pytest.param(lambda qs: len(list(qs.iterator(chunk_size=1))), id="iterator_one_row_chunks"),
+    pytest.param(lambda qs: len(qs.in_bulk()), id="in_bulk"),
+    pytest.param(
+        lambda qs: _explain_rows(qs.explain(format="json", analyze=True)),
+        id="explain_analyze",
+    ),
+    pytest.param(lambda qs: len(async_to_sync(_collect)(qs)), id="async_for"),
+    pytest.param(lambda qs: async_to_sync(qs.acount)(), id="acount"),
+    pytest.param(lambda qs: async_to_sync(qs.aaggregate)(n=Count("id"))["n"], id="aaggregate"),
+    pytest.param(lambda qs: len(async_to_sync(_collect)(qs.aiterator())), id="aiterator"),
+    pytest.param(
+        lambda qs: len(async_to_sync(_collect)(qs.aiterator(chunk_size=1))),
+        id="aiterator_one_row_chunks",
+    ),
+    pytest.param(lambda qs: len(async_to_sync(qs.ain_bulk)()), id="ain_bulk"),
+    pytest.param(
+        lambda qs: _explain_rows(async_to_sync(qs.aexplain)(format="json", analyze=True)),
+        id="aexplain_analyze",
+    ),
+]
+
+_PRESENCE_CHECKS = [
+    pytest.param(lambda qs, row: qs.exists(), id="exists"),
+    pytest.param(lambda qs, row: async_to_sync(qs.aexists)(), id="aexists"),
+    pytest.param(lambda qs, row: qs.contains(row), id="contains"),
+    pytest.param(lambda qs, row: async_to_sync(qs.acontains)(row), id="acontains"),
+    pytest.param(lambda qs, row: qs.get(pk=row.pk) == row, id="get"),
+    pytest.param(lambda qs, row: async_to_sync(qs.aget)(pk=row.pk) == row, id="aget"),
+    pytest.param(lambda qs, row: qs.first() is not None, id="first"),
+    pytest.param(lambda qs, row: async_to_sync(qs.afirst)() is not None, id="afirst"),
+    pytest.param(lambda qs, row: async_to_sync(qs.alast)() is not None, id="alast"),
+    pytest.param(lambda qs, row: async_to_sync(qs.alatest)("pk") is not None, id="alatest"),
+]
+
+_INSERTS = [
+    pytest.param(lambda qs, **fields: qs.create(**fields), id="create"),
+    pytest.param(lambda qs, **fields: async_to_sync(qs.acreate)(**fields), id="acreate"),
+    pytest.param(lambda qs, **fields: qs.bulk_create([Order(**fields)])[0], id="bulk_create"),
+    pytest.param(
+        lambda qs, **fields: async_to_sync(qs.abulk_create)([Order(**fields)])[0],
+        id="abulk_create",
+    ),
+    pytest.param(
+        lambda qs, product, **fields: qs.get_or_create(product=product, defaults=fields)[0],
+        id="get_or_create",
+    ),
+    pytest.param(
+        lambda qs, product, **fields: async_to_sync(qs.aget_or_create)(
+            product=product,
+            defaults=fields,
+        )[0],
+        id="aget_or_create",
+    ),
+    pytest.param(
+        lambda qs, product, **fields: qs.update_or_create(product=product, defaults=fields)[0],
+        id="update_or_create",
+    ),
+    pytest.param(
+        lambda qs, product, **fields: async_to_sync(qs.aupdate_or_create)(
+            product=product,
+            defaults=fields,
+        )[0],
+        id="aupdate_or_create",
+    ),
+]
+
+
+class TestForUserScopeReads:
+    """Every read method applies the ``for_user()`` user's context (#131)."""
+
+    @pytest.mark.parametrize("measure", _READ_MEASURES)
+    def test_sees_the_users_rows(self, sample_orders, scoped_user, guc_mode, enforce_rls, measure):
+        """Each method returns what ``list(qs)`` returns: 3 rows for an admin, 2 for tenant A."""
+        user, expected = scoped_user
+        assert measure(Order.objects.for_user(user)) == expected
+        _assert_no_rls_context()
+
+    @pytest.mark.parametrize("check", _PRESENCE_CHECKS)
+    def test_finds_a_visible_row(self, sample_orders, scoped_user, guc_mode, enforce_rls, check):
+        """Methods answering "is it there?" find a row both users may see."""
+        user, _ = scoped_user
+        assert check(Order.objects.for_user(user), sample_orders["a1"]) is True
+        _assert_no_rls_context()
+
+    def test_tenant_user_without_tenant_raises(self, db, enforce_rls):
+        """A non-admin user with ``rls_tenant_id=None`` fails as iteration always did."""
+        user = TenantUser.objects.create(username="orphan", tenant=None, is_admin=False)
+        with pytest.raises(NoTenantContextError):
+            Order.objects.for_user(user).count()
+        _assert_no_rls_context()
+
+
+class TestForUserScopeWrites:
+    """Every write method applies the ``for_user()`` user's context (#131)."""
+
+    @pytest.mark.parametrize(
+        "run",
+        [
+            pytest.param(lambda qs: qs.update(amount=F("amount")), id="update"),
+            pytest.param(
+                lambda qs: async_to_sync(qs.aupdate)(amount=F("amount")),
+                id="aupdate",
+            ),
+        ],
+    )
+    def test_update_reaches_the_users_rows(
+        self, sample_orders, scoped_user, guc_mode, enforce_rls, run
+    ):
+        """``update()`` reports every row the user may see as updated."""
+        user, expected = scoped_user
+        assert run(Order.objects.for_user(user)) == expected
+        _assert_no_rls_context()
+
+    @pytest.mark.parametrize(
+        "run",
+        [
+            pytest.param(lambda qs: qs.delete(), id="delete"),
+            pytest.param(lambda qs: async_to_sync(qs.adelete)(), id="adelete"),
+        ],
+    )
+    def test_delete_runs_cascades_in_the_scope(
+        self, sample_order_items, sample_order_notes, scoped_user, guc_mode, enforce_rls, run
+    ):
+        """The rows, their CASCADE children and the SET_NULL updates are all reached."""
+        user, expected = scoped_user
+        _, per_model = run(Order.objects.for_user(user))
+        assert per_model["test_app.Order"] == expected
+        assert per_model["test_app.OrderItem"] == expected  # one item per order
+        _assert_no_rls_context()
+        with admin_context():
+            assert Order.objects.count() == 3 - expected
+            linked = OrderNote.objects.get(pk=sample_order_notes["a_linked"].pk)
+            assert linked.order_id is None
+
+    @pytest.mark.parametrize("run", _INSERTS)
+    def test_insert_passes_the_policy_check(
+        self, tenant_a, scoped_user, guc_mode, enforce_rls, run
+    ):
+        """The ``INSERT`` satisfies the policy's ``WITH CHECK`` for both users."""
+        user, _ = scoped_user
+        obj = run(Order.objects.for_user(user), product="New", amount=Decimal(1), tenant=tenant_a)
+        assert obj.pk is not None
+        _assert_no_rls_context()
+        with admin_context():
+            assert Order.objects.get(pk=obj.pk).tenant_id == tenant_a.pk
+
+    def test_insert_into_another_tenant_is_rejected(self, tenant_b, tenant_a_user, enforce_rls):
+        """The scope sets the user's own tenant, so RLS still rejects a foreign row."""
+        with pytest.raises(DatabaseError, match="row-level security"), transaction.atomic():
+            Order.objects.for_user(tenant_a_user).create(
+                product="Foreign", amount=Decimal(1), tenant=tenant_b
+            )
+        _assert_no_rls_context()
+
+    @pytest.mark.parametrize(
+        "run",
+        [
+            pytest.param(lambda qs, objs: qs.bulk_update(objs, ["amount"]), id="bulk_update"),
+            pytest.param(
+                lambda qs, objs: async_to_sync(qs.abulk_update)(objs, ["amount"]),
+                id="abulk_update",
+            ),
+        ],
+    )
+    def test_bulk_update_reaches_only_the_users_rows(
+        self, sample_orders, scoped_user, guc_mode, enforce_rls, run
+    ):
+        """All three orders are passed in; only those the user may see change."""
+        user, expected = scoped_user
+        with admin_context():
+            orders = list(Order.objects.all())
+        for order in orders:
+            order.amount = Decimal(99)
+        assert run(Order.objects.for_user(user), orders) == expected
+        _assert_no_rls_context()
+        with admin_context():
+            assert Order.objects.filter(amount=Decimal(99)).count() == expected
+
+    @pytest.mark.parametrize(
+        "run",
+        [
+            pytest.param(lambda qs, **kw: qs.update_or_create(**kw), id="update_or_create"),
+            pytest.param(
+                lambda qs, **kw: async_to_sync(qs.aupdate_or_create)(**kw),
+                id="aupdate_or_create",
+            ),
+        ],
+    )
+    def test_update_or_create_saves_an_existing_row(
+        self, sample_orders, scoped_user, guc_mode, enforce_rls, run
+    ):
+        """``Model.save()`` writes through the base manager, inside the same scope."""
+        user, _ = scoped_user
+        pk = sample_orders["a1"].pk
+        _, created = run(Order.objects.for_user(user), pk=pk, defaults={"amount": Decimal(77)})
+        assert created is False
+        _assert_no_rls_context()
+        with admin_context():
+            assert Order.objects.get(pk=pk).amount == Decimal(77)
+
+
+class TestForUserScopeState:
+    """What the scope leaves on the connection and in the tenant state (#131)."""
+
+    @pytest.mark.parametrize("method", ["count", "exists", "aggregate", "update"])
+    def test_users_gucs_replace_the_enclosing_context_while_the_query_runs(
+        self, tenant_a_user, monkeypatch, method
+    ):
+        """Inside ``admin_context()`` a tenant user's query runs with the tenant's GUCs.
+
+        The ORM filter of a tenant user's queryset would hide an admin bypass
+        left in place, so the GUCs are read while the query runs.
+        """
+        seen = {}
+
+        def spy(self_inner, *args, **kwargs):
+            seen["is_admin"] = get_guc("rls.is_admin")
+            seen["tenant"] = get_guc("rls.current_tenant")
+
+        monkeypatch.setattr(QuerySet, method, spy)
+        with admin_context():
+            getattr(Order.objects.for_user(tenant_a_user), method)()
+            assert get_guc("rls.is_admin") == "true"
+        assert seen == {"is_admin": "false", "tenant": str(tenant_a_user.rls_tenant_id)}
+
+    @pytest.mark.parametrize(
+        "measure",
+        [
+            pytest.param(lambda qs: len(list(qs)), id="iteration"),
+            pytest.param(lambda qs: qs.count(), id="count"),
+            pytest.param(lambda qs: len(list(qs.iterator())), id="iterator"),
+            pytest.param(lambda qs: async_to_sync(qs.acount)(), id="acount"),
+            pytest.param(lambda qs: qs.update(amount=F("amount")), id="update"),
+        ],
+    )
+    def test_enclosing_admin_context_is_restored(
+        self, sample_orders, tenant_a_user, guc_mode, enforce_rls, measure
+    ):
+        """A tenant user's query inside ``admin_context()`` hands the admin GUCs back."""
+        with admin_context():
+            assert measure(Order.objects.for_user(tenant_a_user)) == 2
+            assert get_guc("rls.is_admin") == "true"
+            assert get_guc("rls.current_tenant") is None
+            assert get_current_tenant_id() is None
+            assert get_rls_context_active() is True
+            assert Order.objects.count() == 3
+        _assert_no_rls_context()
+
+    def test_enclosing_tenant_context_is_restored(
+        self, sample_orders, admin_user, tenant_b, guc_mode, enforce_rls
+    ):
+        """An admin user's query inside ``tenant_context()`` leaves no admin bypass behind."""
+        with tenant_context(tenant_b.pk):
+            # The enclosing context's auto-scope filter still applies.
+            assert len(list(Order.objects.for_user(admin_user))) == 1
+            assert Order.objects.for_user(admin_user).count() == 1
+            assert get_guc("rls.is_admin") == "false"
+            assert get_guc("rls.current_tenant") == str(tenant_b.pk)
+            assert get_current_tenant_id() == tenant_b.pk
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT count(*) FROM test_order")
+                assert cursor.fetchone()[0] == 1
+        _assert_no_rls_context()
+
+    def test_same_users_context_is_left_untouched(
+        self, sample_orders, tenant_a, tenant_a_user, enforce_rls, monkeypatch
+    ):
+        """Inside the user's own context (the middleware case) no GUC is written.
+
+        Before #131, evaluating the queryset cleared the request's GUCs, and
+        every later query of the request returned nothing.
+        """
+        writes = []
+        monkeypatch.setattr(managers, "set_guc", lambda *args, **kwargs: writes.append(args))
+        with tenant_context(tenant_a.pk):
+            assert len(list(Order.objects.for_user(tenant_a_user))) == 2
+            assert Order.objects.for_user(tenant_a_user).count() == 2
+            assert Order.objects.count() == 2
+        assert writes == []
+        _assert_no_rls_context()
+
+    def test_plain_queryset_adds_no_queries(self, sample_orders, tenant_a):
+        """Without ``for_user()`` the scope is a no-op: one query, nothing else."""
+        with tenant_context(tenant_a.pk), CaptureQueriesContext(connection) as queries:
+            assert Order.objects.count() == 2
+        assert len(queries.captured_queries) == 1
+
+    def test_cached_queryset_runs_no_sql(self, sample_orders, tenant_a_user, enforce_rls):
+        """An evaluated queryset answers from its cache without touching the GUCs."""
+        qs = Order.objects.for_user(tenant_a_user).order_by("pk")
+        assert len(list(qs)) == 2
+        with CaptureQueriesContext(connection) as queries:
+            assert len(qs) == 2
+            assert qs.count() == 2
+            assert qs.exists() is True
+            assert bool(qs) is True
+            assert qs.first() == sample_orders["a1"]
+        assert queries.captured_queries == []
+
+    def test_exception_restores_the_state(self, tenant_a_user, monkeypatch):
+        """The context is active while the query runs and fully undone when it raises."""
+        seen = {}
+
+        def exploding_count(self_inner):
+            seen["guc"] = get_guc("rls.current_tenant")
+            seen["tenant"] = get_current_tenant_id()
+            seen["active"] = get_rls_context_active()
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(QuerySet, "count", exploding_count)
+        with pytest.raises(RuntimeError, match="boom"):
+            Order.objects.for_user(tenant_a_user).count()
+        tenant_id = tenant_a_user.rls_tenant_id
+        assert seen == {"guc": str(tenant_id), "tenant": tenant_id, "active": True}
+        _assert_no_rls_context()
+
+    def test_exception_right_after_a_write_still_restores(self, admin_user, monkeypatch):
+        """A GUC the server has set is restored even if the call then raises."""
+        real_set_guc = managers.set_guc
+
+        def set_then_fail(*args, **kwargs):
+            real_set_guc(*args, **kwargs)
+            raise RuntimeError("interrupted")
+
+        monkeypatch.setattr(managers, "set_guc", set_then_fail)
+        with pytest.raises(RuntimeError, match="interrupted"):
+            Order.objects.for_user(admin_user).count()
+        _assert_no_rls_context()
+
+    def test_aborted_transaction_keeps_the_original_error(
+        self, sample_orders, tenant_a_user, enforce_rls
+    ):
+        """A failing statement's own error propagates, not "current transaction is aborted".
+
+        The restore cannot run in the aborted transaction; the rollback undoes
+        the GUC change instead.
+        """
+        with pytest.raises(DataError, match="division by zero"), transaction.atomic():
+            Order.objects.for_user(tenant_a_user).update(amount=F("amount") / 0)
+        _assert_no_rls_context()
+
+    def test_restore_survives_a_caught_signal_error(self, sample_orders, admin_user, enforce_rls):
+        """A receiver error leaves Django's rollback flag set; the restore still runs.
+
+        ``delete()`` sends its signals inside ``atomic(savepoint=False)``, so the
+        error marks the enclosing block for rollback. A caller that catches it
+        and clears the flag commits the transaction, so the admin GUCs must
+        not still be set.
+        """
+
+        def fail(sender, instance, **kwargs):
+            raise ValueError("receiver failed")
+
+        pre_delete.connect(fail, sender=Order)
+        try:
+            with transaction.atomic():
+                with pytest.raises(ValueError, match="receiver failed"):
+                    Order.objects.for_user(admin_user).delete()
+                assert transaction.get_rollback() is True
+                transaction.set_rollback(False)
+                assert get_guc("rls.is_admin") is None
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT count(*) FROM test_order")
+                    assert cursor.fetchone()[0] == 0
+        finally:
+            pre_delete.disconnect(fail, sender=Order)
+
+    def test_local_set_mode_does_not_outlive_the_query(
+        self, sample_orders, tenant_a_user, admin_user, tenant_b, settings, enforce_rls
+    ):
+        """With ``SET LOCAL`` the GUCs no longer stay set for the rest of the transaction."""
+        settings.RLS_TENANTS = {**settings.RLS_TENANTS, "USE_LOCAL_SET": True}
+        assert Order.objects.for_user(admin_user).count() == 3
+        assert get_guc("rls.is_admin") is None
+        with tenant_context(tenant_b.pk):
+            assert len(list(Order.objects.for_user(admin_user))) == 1
+            assert get_guc("rls.is_admin") == "false"
+            assert get_guc("rls.current_tenant") == str(tenant_b.pk)
+        _assert_no_rls_context()
+
+
+@pytest.mark.django_db(transaction=True)
+class TestForUserOutsideATransaction:
+    """No transaction open: a Celery task, a management command, a script (#131)."""
+
+    def test_iterators_work_in_autocommit(self, sample_orders, scoped_user, enforce_rls):
+        """Autocommit cursors are ``WITH HOLD``; the first scope covers the whole result."""
+        user, expected = scoped_user
+        qs = Order.objects.for_user(user)
+        assert len(list(qs.iterator(chunk_size=1))) == expected
+        assert len(async_to_sync(_collect)(qs.aiterator(chunk_size=1))) == expected
+        _assert_no_rls_context()
+
+    def test_local_set_mode_query_raises(self, sample_orders, admin_user, settings, enforce_rls):
+        """``SET LOCAL`` needs a transaction, as it always did for iteration."""
+        settings.RLS_TENANTS = {**settings.RLS_TENANTS, "USE_LOCAL_SET": True}
+        with pytest.raises(RuntimeError, match="outside a transaction"):
+            Order.objects.for_user(admin_user).count()
+        _assert_no_rls_context()
+
+    @pytest.mark.parametrize(
+        "run",
+        [
+            pytest.param(
+                lambda qs, orders: (
+                    qs.update_or_create(
+                        pk=orders["a1"].pk,
+                        defaults={"amount": Decimal(5)},
+                    )[1]
+                    is False
+                ),
+                id="update_or_create",
+            ),
+            pytest.param(
+                lambda qs, orders: qs.bulk_update([orders["a1"]], ["amount"]) == 1,
+                id="bulk_update",
+            ),
+            pytest.param(
+                lambda qs, orders: len(qs.bulk_create([_new_order(orders["a1"].tenant_id)])) == 1,
+                id="bulk_create",
+            ),
+            pytest.param(
+                lambda qs, orders: qs.filter(pk=orders["a1"].pk).delete()[0] == 1,
+                id="delete",
+            ),
+        ],
+    )
+    def test_local_set_mode_transactional_methods_open_one(
+        self, sample_orders, tenant_a_user, settings, enforce_rls, run
+    ):
+        """Methods Django runs in a transaction of their own get it before their ``SET LOCAL``.
+
+        ``update_or_create()`` worked here before #131: its lookup set the
+        GUCs inside Django's transaction, and they lasted for the save.
+        """
+        settings.RLS_TENANTS = {**settings.RLS_TENANTS, "USE_LOCAL_SET": True}
+        assert run(Order.objects.for_user(tenant_a_user), sample_orders) is True
+        _assert_no_rls_context()
+
+
+class TestForUserIterators:
+    """``iterator()`` and ``aiterator()`` apply the scope per chunk (#131)."""
+
+    def test_scope_is_not_held_in_the_loop_body(
+        self, sample_orders, scoped_user, guc_mode, enforce_rls
+    ):
+        """The caller's code between chunks runs without the user's context."""
+        user, expected = scoped_user
+        states = [
+            (
+                get_guc("rls.is_admin"),
+                get_guc("rls.current_tenant"),
+                get_current_tenant_id(),
+                get_rls_context_active(),
+            )
+            for _ in Order.objects.for_user(user).iterator(chunk_size=1)
+        ]
+        assert len(states) == expected
+        assert set(states) == {(None, None, None, False)}
+
+    def test_every_fetch_runs_in_the_scope(self, sample_orders, scoped_user, enforce_rls):
+        """A ``UNION ALL`` branch first reached by a later fetch still sees the user's GUCs.
+
+        In the test transaction the cursor produces rows at fetch time, and
+        PostgreSQL evaluates the policy of the second branch only when a fetch
+        reaches it.
+        """
+        user, _ = scoped_user
+        qs = Order.objects.for_user(user)
+        both = qs.filter(product="Widget A1").union(qs.filter(product="Widget A2"), all=True)
+        assert sorted(o.product for o in both.iterator(chunk_size=1)) == ["Widget A1", "Widget A2"]
+
+    def test_breaking_out_leaves_no_context(self, sample_orders, tenant_a_user, enforce_rls):
+        """Stopping early leaves nothing set: no scope was open between chunks."""
+        for _ in Order.objects.for_user(tenant_a_user).iterator(chunk_size=1):
+            break
+        _assert_no_rls_context()
+
+    def test_iterator_validates_chunk_size_eagerly(self, tenant_a_user):
+        """Like Django, a bad ``chunk_size`` fails at the call, before any query."""
+        with pytest.raises(ValueError, match="strictly positive"):
+            Order.objects.for_user(tenant_a_user).iterator(chunk_size=0)
+
+    @pytest.mark.parametrize(
+        ("chunk_size", "error"),
+        [(0, ValueError), (-1, ValueError), (None, TypeError)],
+    )
+    def test_aiterator_validates_chunk_size(self, tenant_a_user, chunk_size, error):
+        """``aiterator()`` keeps Django's ``chunk_size`` check, before any query."""
+        with pytest.raises(error):
+            async_to_sync(_collect)(
+                Order.objects.for_user(tenant_a_user).aiterator(chunk_size=chunk_size),
+            )
+
+    def test_default_chunk_size_matches_django(self):
+        """The scope's chunk follows Django's own default, so one scope covers one fetch."""
+        assert f"chunk_size or {_ITERATOR_CHUNK_SIZE}" in inspect.getsource(QuerySet._iterator)
+        default = inspect.signature(QuerySet.aiterator).parameters["chunk_size"].default
+        assert default == _ITERATOR_CHUNK_SIZE
+
+    @pytest.mark.usefixtures("_strict_mode")
+    @pytest.mark.parametrize(
+        "collect",
+        [
+            pytest.param(lambda qs: list(qs.iterator(chunk_size=1)), id="iterator"),
+            pytest.param(
+                lambda qs: async_to_sync(_collect)(qs.aiterator(chunk_size=1)),
+                id="aiterator",
+            ),
+        ],
+    )
+    def test_prefetch_related_runs_in_the_scope(
+        self, sample_order_items, tenant_a_user, enforce_rls, collect
+    ):
+        """Each chunk's prefetch query is scoped and passes ``STRICT_MODE``."""
+        qs = Order.objects.for_user(tenant_a_user).prefetch_related("orderitem_set")
+        orders = collect(qs)
+        items = sorted(item.description for order in orders for item in order.orderitem_set.all())
+        assert items == ["Part A1-1", "Part A2-1"]
+        _assert_no_rls_context()
+
+    def test_aiterator_without_for_user_uses_the_enclosing_context(
+        self, sample_orders, tenant_a, enforce_rls
+    ):
+        """Without ``for_user()``, ``aiterator()`` is Django's, under the caller's context."""
+
+        async def products():
+            async with async_tenant_context(tenant_a.pk):
+                return [order.product async for order in Order.objects.aiterator()]
+
+        assert sorted(async_to_sync(products)()) == ["Widget A1", "Widget A2"]
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_aiterator_without_context_raises_in_strict_mode(self, sample_orders):
+        """``aiterator()`` is guarded like ``iterator()``."""
+        with pytest.raises(NoTenantContextError):
+            async_to_sync(_collect)(Order.objects.aiterator())
+
+
+class TestForUserStrictMode:
+    """``STRICT_MODE`` with ``for_user()`` and cached querysets (#131)."""
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_prefetch_related_results_are_readable_later(
+        self, sample_order_items, tenant_a_user, enforce_rls
+    ):
+        """Prefetched querysets are cached: read after the scope, as a template would."""
+        orders = list(Order.objects.for_user(tenant_a_user).prefetch_related("orderitem_set"))
+        items = sorted(item.description for order in orders for item in order.orderitem_set.all())
+        assert items == ["Part A1-1", "Part A2-1"]
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_cached_queryset_is_readable_outside_its_context(self, sample_orders, tenant_a):
+        """Reading a cached queryset runs no query, so the guard has nothing to stop."""
+        with tenant_context(tenant_a.pk):
+            qs = Order.objects.order_by("pk")
+            assert len(qs) == 2
+        assert len(qs) == 2
+        assert qs.count() == 2
+        assert qs.exists() is True
+        assert qs.first() == sample_orders["a1"]
+        with pytest.raises(NoTenantContextError):
+            qs.last()  # queries a reversed clone
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_fast_delete_is_guarded(self, sample_documents):
+        """A model without relations is deleted without ``_fetch_all()``; it is still guarded."""
+        with pytest.raises(NoTenantContextError):
+            Document.objects.all().delete()
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_signal_handlers_run_in_the_users_context(
+        self, sample_order_items, tenant_a_user, enforce_rls
+    ):
+        """Code that ``delete()`` calls back into is scoped to the user and passes the guard."""
+        seen = []
+
+        def count_items(sender, instance, **kwargs):
+            seen.append(OrderItem.objects.count())
+
+        pre_delete.connect(count_items, sender=Order)
+        try:
+            Order.objects.for_user(tenant_a_user).delete()
+        finally:
+            pre_delete.disconnect(count_items, sender=Order)
+        assert seen == [2, 2]
+
+
+class TestTenantQuerySetDeleteFlag:
+    """``delete()`` keeps the ``queryset_only`` flag of the method it overrides.
+
+    (Django's ``AltersData`` already copies ``alters_data`` onto overrides.)
+    """
+
+    def test_managers_built_from_the_queryset_have_no_delete(self):
+        """No ``Manager.delete()``, which would empty the table in one call."""
+        assert not hasattr(TenantQuerySet.as_manager(), "delete")
+        assert not hasattr(RLSManager.from_queryset(TenantQuerySet)(), "delete")
+
+
+class _ReadsElsewhereRouter:
+    """Routes reads to an alias that does not exist and writes to ``default``."""
+
+    def db_for_read(self, model, **hints):
+        return "reads_elsewhere"
+
+    def db_for_write(self, model, **hints):
+        return "default"
+
+
+class _AlternatingReadRouter:
+    """Answers ``default``, then an alias that does not exist, in turn, for every read."""
+
+    answers = itertools.cycle(["default", "reads_elsewhere"])
+
+    def db_for_read(self, model, **hints):
+        return next(self.answers)
+
+    def db_for_write(self, model, **hints):
+        return "default"
+
+
+_READS_ELSEWHERE = f"{__name__}._ReadsElsewhereRouter"
+_ALTERNATING_READS = f"{__name__}._AlternatingReadRouter"
+
+
+class TestForUserAliases:
+    """The scope sets the GUCs on the alias the SQL runs on (#131)."""
+
+    @pytest.mark.parametrize(
+        "run",
+        [
+            pytest.param(lambda qs, orders: qs.update(amount=F("amount")) == 2, id="update"),
+            pytest.param(lambda qs, orders: qs.delete()[0] == 2, id="delete"),
+            pytest.param(
+                lambda qs, orders: (
+                    qs.create(
+                        product="New", amount=Decimal(1), tenant_id=orders["a1"].tenant_id
+                    ).pk
+                    is not None
+                ),
+                id="create",
+            ),
+            pytest.param(
+                lambda qs, orders: len(qs.bulk_create([_new_order(orders["a1"].tenant_id)])) == 1,
+                id="bulk_create",
+            ),
+            pytest.param(
+                lambda qs, orders: qs.bulk_update([orders["a1"]], ["amount"]) == 1,
+                id="bulk_update",
+            ),
+            pytest.param(
+                lambda qs, orders: (
+                    qs.update_or_create(pk=orders["a1"].pk, defaults={"amount": Decimal(5)})[1]
+                    is False
+                ),
+                id="update_or_create",
+            ),
+        ],
+    )
+    def test_writes_use_the_write_alias(self, sample_orders, tenant_a_user, enforce_rls, run):
+        """A read alias that does not exist proves no write touches it."""
+        with override_settings(DATABASE_ROUTERS=[_READS_ELSEWHERE]):
+            assert run(Order.objects.for_user(tenant_a_user), sample_orders) is True
+        _assert_no_rls_context()
+
+    def test_write_alias_follows_the_router(self, db):
+        """``_db_for_write()`` is the router's write alias; ``db`` stays the read alias."""
+        with override_settings(DATABASE_ROUTERS=[_READS_ELSEWHERE]):
+            qs = Order.objects.all()
+            assert qs.db == "reads_elsewhere"
+            assert qs._db_for_write() == "default"
+            assert qs.using("default")._db_for_write() == "default"
+
+    def test_reads_use_the_querysets_own_alias(self, tenant_a_user):
+        """``.using()`` names the alias the scope works on."""
+        with pytest.raises(ConnectionDoesNotExist):
+            Order.objects.for_user(tenant_a_user).using("nowhere").count()
+
+    @pytest.mark.parametrize(
+        ("method", "alias"),
+        [("count", "reads_elsewhere"), ("update", "default")],
+    )
+    def test_every_statement_of_the_scope_uses_one_alias(
+        self, tenant_a_user, monkeypatch, method, alias
+    ):
+        """Snapshot, writes, restore and the query itself all run on the same alias."""
+        used = []
+
+        def snapshot(conf, *, using):
+            used.append(("snapshot", using))
+            return {conf.GUC_IS_ADMIN: None, conf.GUC_CURRENT_TENANT: None}
+
+        def query(self_inner, *args, **kwargs):
+            used.append(("query", self_inner.db))
+
+        monkeypatch.setattr(managers, "_snapshot_gucs", snapshot)
+        monkeypatch.setattr(
+            managers, "set_guc", lambda name, value, **kw: used.append(("set", kw["using"]))
+        )
+        monkeypatch.setattr(
+            managers, "restore_gucs", lambda changed, **kw: used.append(("restore", kw["using"]))
+        )
+        monkeypatch.setattr(QuerySet, method, query)
+        with override_settings(DATABASE_ROUTERS=[_READS_ELSEWHERE]):
+            getattr(Order.objects.for_user(tenant_a_user), method)()
+        assert used == [
+            ("snapshot", alias),
+            ("set", alias),
+            ("set", alias),
+            ("query", alias),
+            ("restore", alias),
+        ]
+
+    @pytest.mark.parametrize(
+        "check",
+        [
+            pytest.param(lambda qs: len(list(qs)) == 2, id="iteration"),
+            pytest.param(lambda qs: qs.count() == 2, id="count"),
+            pytest.param(lambda qs: qs.exists(), id="exists"),
+            pytest.param(lambda qs: qs.aggregate(n=Count("id"))["n"] == 2, id="aggregate"),
+            pytest.param(lambda qs: len(list(qs.iterator(chunk_size=1))) == 2, id="iterator"),
+        ],
+    )
+    def test_alias_is_resolved_once_per_call(
+        self, sample_orders, tenant_a_user, enforce_rls, monkeypatch, check
+    ):
+        """A router that answers differently each time cannot split the GUCs from the query."""
+        monkeypatch.setattr(
+            _AlternatingReadRouter, "answers", itertools.cycle(["default", "reads_elsewhere"])
+        )
+        with override_settings(DATABASE_ROUTERS=[_ALTERNATING_READS]):
+            assert check(Order.objects.for_user(tenant_a_user)) is True
+        _assert_no_rls_context()

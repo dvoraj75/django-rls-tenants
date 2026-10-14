@@ -94,7 +94,9 @@ CI fails any PostgreSQL leg that skips a test (`RLS_FAIL_ON_SKIPPED=1`, hook in
 as `superuser_only` and deselect it. Django deprecation warnings are test errors.
 
 CI runs Python 3.12-3.14 x Django 5.2-6.1 on PostgreSQL 16 with psycopg2, plus a psycopg 3
-leg, and PostgreSQL 15 and 18 legs with the oldest and newest supported Django. It also
+leg, and PostgreSQL 15 and 18 legs with the oldest and newest supported Django. Those legs
+connect as a superuser, which bypasses RLS, so one more leg runs the suite as a plain role
+with `-m "not superuser_only"`: a test of RLS behaviour must pass there too. CI also
 installs the built wheel into a clean virtualenv and runs the example app against it, and
 the release workflow refuses a tag whose version has no `## [X.Y.Z]` heading in
 `CHANGELOG.md`. See the full

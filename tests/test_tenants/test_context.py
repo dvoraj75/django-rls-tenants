@@ -907,8 +907,11 @@ def test_async_orm_is_scoped_and_strict_mode_applies(tenant_a, tenant_b, setting
     """The async ORM honours the coroutine's tenant state and STRICT_MODE."""
     from tests.test_app.models import Order  # noqa: PLC0415
 
-    Order.objects.create(tenant=tenant_a, product="A", amount=1)
-    Order.objects.create(tenant=tenant_b, product="B", amount=2)
+    # Under a plain role the policy's WITH CHECK rejects rows inserted without
+    # a context; only a superuser could create them bare.
+    with admin_context():
+        Order.objects.create(tenant=tenant_a, product="A", amount=1)
+        Order.objects.create(tenant=tenant_b, product="B", amount=2)
 
     async def scoped_count():
         async with async_tenant_context(tenant_a.pk):

@@ -1,8 +1,10 @@
 """Tenant-aware manager and queryset.
 
-``TenantQuerySet`` solves the lazy evaluation problem: it stores the
-user reference from ``for_user()`` and sets GUC variables at query
-evaluation time (in ``_fetch_all``), not at queryset creation time.
+``TenantQuerySet`` solves the lazy evaluation problem: ``for_user()``
+stores the user, and every method that executes SQL applies that user's
+RLS context (the GUC variables and the tenant state ``ContextVar``
+values) around the statements it runs, not when the queryset is created.
+See ``TenantQuerySet._rls_scope()``.
 
 Auto-scope support: when a tenant context is active (via
 ``tenant_context()``, ``admin_context()``, or ``RLSTenantMiddleware``),
@@ -10,41 +12,39 @@ the queryset automatically adds ``WHERE tenant_id = X`` to every query.
 For joins via ``select_related()``, tenant filters are also propagated
 to joined RLS-protected tables, enabling PostgreSQL to use composite
 indexes on both sides of the join.
-
-.. note:: **``for_user()`` GUC limitation**
-
-    The ``for_user()`` mechanism only sets GUC variables during
-    ``_fetch_all()`` (iteration). Methods that bypass ``_fetch_all``
-    (``count()``, ``exists()``, ``aggregate()``, ``update()``,
-    ``delete()``, ``iterator()``) do **not** trigger GUC setting.
-    For non-middleware entry points (Celery tasks, management commands),
-    prefer ``tenant_context()`` or ``admin_context()`` which set GUCs
-    at the connection level for the entire block.
 """
 
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager, nullcontext
 from functools import lru_cache
+from itertools import islice
 from typing import TYPE_CHECKING, Any
 
+from asgiref.sync import sync_to_async
 from django.core.exceptions import FieldDoesNotExist
-from django.db import models
+from django.db import connections, models, router, transaction
 from django.db.models import Q
 
 from django_rls_tenants.exceptions import NoTenantContextError
-from django_rls_tenants.rls.guc import clear_guc, set_guc
+from django_rls_tenants.rls.context import restore_gucs
+from django_rls_tenants.rls.guc import set_guc
 from django_rls_tenants.tenants.conf import rls_tenants_config
-from django_rls_tenants.tenants.context import _resolve_user_guc_vars
+from django_rls_tenants.tenants.context import _resolve_user_guc_vars, _snapshot_gucs
 from django_rls_tenants.tenants.errors import HINT_NO_CONTEXT
 from django_rls_tenants.tenants.state import (
     get_current_tenant_id,
     get_rls_context_active,
     reset_current_tenant_id,
+    reset_rls_context_active,
     set_current_tenant_id,
+    set_rls_context_active,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Iterator, Mapping
+
     from django_rls_tenants.tenants.types import TenantUser
 
 try:
@@ -60,6 +60,16 @@ else:
     _SELECT_RELATED_NO_ARGS_DEPRECATED = True
 
 logger = logging.getLogger("django_rls_tenants")
+
+# QuerySet.iterator()'s default chunk size, hard-coded in QuerySet._iterator(),
+# and QuerySet.aiterator()'s default. TenantQuerySet._scoped_chunks() pulls the
+# same number of rows per scope, so each scope covers one cursor fetch.
+_ITERATOR_CHUNK_SIZE = 2000
+
+
+def _next_chunk(rows: Iterator[Any], size: int) -> list[Any]:
+    """Pull the next ``size`` items from ``rows``."""
+    return list(islice(rows, size))
 
 
 def _is_rls_protected(model: type[models.Model]) -> bool:
@@ -109,38 +119,37 @@ def _rls_model_cache() -> frozenset[type[models.Model]]:
 
 
 # Type ignore explanation: Django's QuerySet is generic at runtime but
-# unparameterised in django-stubs; suppressed to avoid false positives.
+# unparameterised in django-stubs; suppressed to avoid false positives. The
+# overrides below return Any for rows and instances for the same reason.
 class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
-    """QuerySet that sets RLS GUC variables at evaluation time.
+    """QuerySet that applies a ``for_user()`` user's RLS context when it runs SQL.
 
-    Stores the user reference from ``for_user()`` and defers GUC setup
-    to ``_fetch_all()``, ensuring lazy querysets work correctly with RLS.
+    ``for_user()`` stores the user and sets nothing. Every method that
+    executes SQL then runs its statements in a scope that sets the user's
+    GUC variables and tenant state on the connection the SQL uses and puts
+    the previous values back afterwards (see "Lazy QuerySet Evaluation" in
+    the architecture guide). That covers
+    iteration (``_fetch_all()``), ``count()``, ``exists()``,
+    ``aggregate()``, ``iterator()``, ``aiterator()``, ``update()``,
+    ``delete()``, ``create()``, ``bulk_create()``, ``bulk_update()``,
+    ``update_or_create()`` and ``explain()``; everything else (``get()``,
+    ``first()``, ``get_or_create()``, ``contains()``, ``in_bulk()``, the
+    ``a``-prefixed async methods, ...) runs its SQL through one of those.
 
     When auto-scope is active (via ``tenant_context()`` or middleware),
     ``select_related()`` automatically adds ``WHERE related.tenant_id = X``
     for joined RLS-protected tables, enabling index usage on both sides
     of the join.
-
-    .. warning:: **Limitation of ``for_user()`` GUC management**
-
-        GUC variables are only set during ``_fetch_all()`` (iteration).
-        QuerySet methods that bypass ``_fetch_all()`` — such as
-        ``count()``, ``exists()``, ``aggregate()``, ``update()``,
-        ``delete()``, and ``iterator()`` — will **not** have GUC
-        variables set by ``for_user()``.
-
-        For non-admin users this is safe because ``for_user()`` also
-        adds a Django ORM ``WHERE tenant_id = X`` filter. For **admin
-        users** (``is_tenant_admin=True``), no ORM filter is applied,
-        so these methods run against whatever GUC state the connection
-        already has.
-
-        For non-middleware contexts (Celery tasks, management commands),
-        use ``tenant_context()`` or ``admin_context()`` instead, which
-        set GUCs at the connection level for the entire block.
     """
 
     _rls_user: TenantUser | None
+
+    # Internal QuerySet attributes this class reads or pins; django-stubs
+    # does not declare them.
+    _db: str | None
+    _hints: dict[str, Any]
+    _prefetch_related_lookups: tuple[Any, ...]
+    _prefetch_done: bool
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -152,18 +161,12 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         For admin users: returns all rows (RLS admin bypass at eval time).
         For tenant users: returns rows matching the user's tenant.
 
-        The queryset remains lazy and chainable. GUC variables are set
-        when the queryset is evaluated, not when ``for_user()`` is called.
-
-        .. warning::
-
-            GUC variables are only set during iteration (``_fetch_all``).
-            Methods like ``count()``, ``exists()``, ``aggregate()``,
-            ``update()``, ``delete()``, and ``iterator()`` bypass
-            ``_fetch_all`` and will **not** have GUC variables set.
-            For admin users this means those methods run without GUC
-            protection. Use ``tenant_context()`` or ``admin_context()``
-            for full coverage in non-middleware contexts.
+        The queryset remains lazy and chainable. The user's GUC variables
+        are set when the queryset runs SQL, not when ``for_user()`` is
+        called, and only for the duration of that SQL: every method that
+        executes a query applies them, and the values found on the
+        connection before are restored afterwards (see "Lazy QuerySet
+        Evaluation" in the architecture guide).
 
         Args:
             as_user: User object satisfying the ``TenantUser`` protocol.
@@ -301,44 +304,260 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         hint = f"{HINT_NO_CONTEXT} To disable this guard, set STRICT_MODE=False in RLS_TENANTS."
         raise NoTenantContextError(msg, hint=hint)
 
+    # ---- for_user() RLS scope ----
+
+    @contextmanager
+    def _rls_scope(
+        self,
+        *,
+        for_write: bool = False,
+        using: str | None = None,
+        own_transaction: bool = False,
+    ) -> Iterator[None]:
+        """Apply the ``for_user()`` user's RLS context around SQL this queryset runs.
+
+        A no-op unless ``for_user()`` was called. Otherwise, on the
+        connection the SQL runs on, it:
+
+        1. reads the admin and tenant GUC variables;
+        2. sets those that differ from the user's values, so nothing is
+           written when an enclosing context (``RLSTenantMiddleware`` for
+           the same user, the scope of an outer call) already applied them;
+        3. sets the tenant state ``ContextVar`` values, so querysets created
+           meanwhile (prefetches, ``delete()`` cascades, signal handlers) are
+           auto-scoped to the user's tenant and pass ``STRICT_MODE``;
+        4. on exit, resets the ``ContextVar`` values and restores the GUCs it
+           changed to the values read in step 1.
+
+        Restoring instead of clearing leaves an enclosing ``tenant_context()``,
+        ``admin_context()`` or middleware context intact after a ``for_user()``
+        query, in both GUC modes, and lets scopes nest. While an exception
+        propagates out of an aborted transaction a failing restore is logged
+        and dropped, and the rollback undoes the change (see
+        :func:`django_rls_tenants.rls.context.restore_gucs`).
+
+        The alias is resolved once and pinned on the queryset for the
+        duration of the scope, so Django runs the SQL where the GUCs were
+        set even when a database router answers differently on each call.
+
+        Args:
+            for_write: Target the alias Django writes to instead of
+                ``self.db``. Write methods set ``_for_write`` only once they
+                run, so before that ``self.db`` names the read alias.
+            using: Alias to use instead of resolving it (``iterator()``
+                resolves it once for all its chunks).
+            own_transaction: With ``USE_LOCAL_SET=True`` and no transaction
+                open, run the scope in ``transaction.atomic()``. For methods
+                Django runs in a transaction of its own anyway: their
+                ``SET LOCAL`` must be issued before that transaction begins.
+
+        Raises:
+            NoTenantContextError: If the user is not an admin and has
+                ``rls_tenant_id=None``.
+            RuntimeError: If ``USE_LOCAL_SET=True``, a GUC has to change and
+                the connection is not inside ``transaction.atomic()`` (and
+                ``own_transaction`` is not set).
+        """
+        user = self._rls_user
+        if user is None:
+            yield
+            return
+        conf = rls_tenants_config
+        is_local = conf.USE_LOCAL_SET
+        if using is None:
+            using = self._db_for_write() if for_write else self.db
+        variables = _resolve_user_guc_vars(user, conf)
+        transaction_block = (
+            transaction.atomic(using=using, savepoint=False)
+            if own_transaction and is_local and not connections[using].in_atomic_block
+            else nullcontext()
+        )
+        with self._pinned_db(using), transaction_block:
+            previous = _snapshot_gucs(conf, using=using)
+            # Decided before writing, so every GUC that may have been set is
+            # restored, even when an exception lands right after a set_guc().
+            changed = {
+                name: previous[name]
+                for name, value in variables.items()
+                # get_guc() reads an empty variable as None; the admin tenant value is "".
+                if (previous[name] or "") != value
+            }
+            active_token = set_rls_context_active(True)
+            tenant_token = set_current_tenant_id(
+                None if user.is_tenant_admin else user.rls_tenant_id,
+            )
+            exc_pending = False
+            try:
+                for name in changed:
+                    set_guc(name, variables[name], is_local=is_local, using=using)
+                yield
+            except BaseException:
+                exc_pending = True
+                raise
+            finally:
+                reset_current_tenant_id(tenant_token)
+                reset_rls_context_active(active_token)
+                restore_gucs(changed, is_local=is_local, using=using, exc_pending=exc_pending)
+
+    @contextmanager
+    def _pinned_db(self, using: str) -> Iterator[None]:
+        """Make ``self.db`` return ``using`` inside the block, whatever a router answers."""
+        pinned_db = self._db
+        self._db = using
+        try:
+            yield
+        finally:
+            self._db = pinned_db
+
+    def _db_for_write(self) -> str:
+        """Return the alias a write on this queryset runs on.
+
+        This is ``QuerySet.db`` as Django computes it once a write method
+        has set ``_for_write``; with a read/write router it differs from
+        ``self.db``.
+        """
+        return self._db or router.db_for_write(self.model, **self._hints)
+
     # ---- Guarded evaluation methods ----
     #
-    # Methods like first()/last()/get() may also trigger _fetch_all()
-    # on a cloned queryset internally, resulting in a double check.
-    # This is intentional defense-in-depth: the direct check here
-    # catches the call at the public API boundary, while the
-    # _fetch_all() check catches any code path that reaches
-    # evaluation without going through these overrides.
+    # Each override below checks STRICT_MODE, runs its SQL inside
+    # _rls_scope(), or both; its docstring says which. get(), first() and
+    # last() only check: their SQL runs on a clone, in _fetch_all()'s scope.
+    # Methods that are not overridden (get_or_create(), contains(),
+    # in_bulk(), the async a*() wrappers, ...) run their SQL through these
+    # methods, on a clone that carries _rls_user.
+    #
+    # A queryset whose results are cached answers some calls without SQL;
+    # those skip both the scope and the check. Otherwise get(), first() and
+    # last() are checked twice, here and in _fetch_all() on the clone. This
+    # is intentional defense-in-depth: the direct check catches the call at
+    # the public API boundary, while the _fetch_all() check catches any code
+    # path that reaches evaluation without going through these overrides.
 
     def count(self) -> int:
-        """Guard ``count()`` with strict mode check."""
+        """Run ``count()`` in the ``for_user()`` scope; guarded by strict mode.
+
+        A queryset with cached results answers from the cache, so it runs
+        no SQL and needs neither the scope nor the strict mode check.
+        """
+        if self._result_cache is not None:
+            return super().count()
         self._check_strict_mode()
-        return super().count()
+        with self._rls_scope():
+            return super().count()
 
     def exists(self) -> bool:
-        """Guard ``exists()`` with strict mode check."""
+        """Run ``exists()`` in the ``for_user()`` scope; guarded by strict mode.
+
+        A queryset with cached results answers from the cache, so it runs
+        no SQL and needs neither the scope nor the strict mode check.
+        """
+        if self._result_cache is not None:
+            return super().exists()
         self._check_strict_mode()
-        return super().exists()
+        with self._rls_scope():
+            return super().exists()
 
     def aggregate(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """Guard ``aggregate()`` with strict mode check."""
+        """Run ``aggregate()`` in the ``for_user()`` scope; guarded by strict mode."""
         self._check_strict_mode()
-        return super().aggregate(*args, **kwargs)
+        with self._rls_scope():
+            return super().aggregate(*args, **kwargs)
 
     def update(self, **kwargs: Any) -> int:
-        """Guard ``update()`` with strict mode check."""
+        """Run ``update()`` in the ``for_user()`` scope; guarded by strict mode."""
         self._check_strict_mode()
-        return super().update(**kwargs)
+        with self._rls_scope(for_write=True):
+            return super().update(**kwargs)
 
     def delete(self) -> tuple[int, dict[str, int]]:
-        """Guard ``delete()`` with strict mode check."""
-        self._check_strict_mode()
-        return super().delete()
+        """Run ``delete()`` in the ``for_user()`` scope; guarded by strict mode.
 
-    def iterator(self, chunk_size: int | None = None) -> Any:
-        """Guard ``iterator()`` with strict mode check."""
+        One scope covers the whole deletion: collecting the rows, the
+        cascades and ``SET_NULL`` updates on related models, the delete
+        signals and the ``DELETE`` statements.
+        """
         self._check_strict_mode()
-        return super().iterator(chunk_size=chunk_size)
+        with self._rls_scope(for_write=True, own_transaction=True):
+            return super().delete()
+
+    # QuerySet.delete() is queryset_only, so a manager has no delete() that
+    # empties the whole table. Overriding the method drops the flag; restore it.
+    delete.queryset_only = True  # type: ignore[attr-defined]
+
+    def iterator(self, chunk_size: int | None = None) -> Iterator[Any]:
+        """Run ``iterator()`` in the ``for_user()`` scope; guarded by strict mode.
+
+        Each chunk of ``chunk_size`` rows (Django's default of 2000 when
+        ``None``) is fetched, together with its ``prefetch_related()``
+        lookups, inside its own scope. The scope is not held while the
+        caller's loop body runs, so the user's context neither leaks into
+        that code nor stays on the connection when the loop stops early.
+        """
+        self._check_strict_mode()
+        if self._rls_user is None:
+            return super().iterator(chunk_size=chunk_size)
+        # Resolved once: the cursor and every chunk's scope use the same alias.
+        using = self.db
+        with self._pinned_db(using):
+            rows = super().iterator(chunk_size=chunk_size)
+        return self._scoped_chunks(rows, chunk_size or _ITERATOR_CHUNK_SIZE, using)
+
+    def _scoped_chunks(self, rows: Iterator[Any], chunk_size: int, using: str) -> Iterator[Any]:
+        """Yield from ``rows``, pulling every chunk inside :meth:`_rls_scope`.
+
+        Every ``next()`` on ``rows`` that can execute SQL (opening the
+        cursor, fetching the next chunk, prefetching) happens inside a
+        scope. A server-side cursor inside a transaction produces its rows
+        at fetch time, and a part of the plan that a later fetch reaches
+        first (a ``UNION ALL`` branch, say) evaluates the RLS policy only
+        then, so each fetch needs the user's GUCs.
+        """
+        while True:
+            with self._rls_scope(using=using):
+                chunk = _next_chunk(rows, chunk_size)
+            yield from chunk
+            if len(chunk) < chunk_size:
+                return
+
+    async def aiterator(self, chunk_size: int = _ITERATOR_CHUNK_SIZE) -> AsyncIterator[Any]:
+        """Run ``aiterator()`` in the ``for_user()`` scope; guarded by strict mode.
+
+        Django's ``aiterator()`` does not go through ``iterator()``. With a
+        ``for_user()`` user, each chunk is pulled from :meth:`iterator` in
+        one thread-sensitive ``sync_to_async`` hop, so every scope is
+        entered and left inside a hop, on the thread that owns the
+        connection.
+        """
+        if self._rls_user is None:
+            self._check_strict_mode()
+            async for item in super().aiterator(chunk_size=chunk_size):
+                yield item
+            return
+        if chunk_size <= 0:  # QuerySet.aiterator()'s check and message
+            msg = "Chunk size must be strictly positive."
+            raise ValueError(msg)
+        # iterator() also runs the strict mode check, which for_user() satisfies.
+        rows = self.iterator(chunk_size=chunk_size)
+        while True:
+            chunk = await sync_to_async(_next_chunk, thread_sensitive=True)(rows, chunk_size)
+            for item in chunk:
+                yield item
+            if len(chunk) < chunk_size:
+                return
+
+    def create(self, **kwargs: Any) -> Any:
+        """Run ``create()`` in the ``for_user()`` scope.
+
+        The ``INSERT`` must pass the RLS policy's ``WITH CHECK`` clause,
+        which reads the GUCs. Unlike ``bulk_create()``, which has been
+        guarded since strict mode was added, ``create()`` is not: without a
+        context the database rejects the row loudly instead of returning a
+        wrong result, and guarding it now would break code that creates
+        rows outside a context on a superuser connection.
+        """
+        with self._rls_scope(for_write=True):
+            return super().create(**kwargs)
 
     def bulk_create(
         self,
@@ -349,16 +568,17 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         update_fields: Any = None,
         unique_fields: Any = None,
     ) -> list[Any]:
-        """Guard ``bulk_create()`` with strict mode check."""
+        """Run ``bulk_create()`` in the ``for_user()`` scope; guarded by strict mode."""
         self._check_strict_mode()
-        return super().bulk_create(
-            objs,
-            batch_size=batch_size,
-            ignore_conflicts=ignore_conflicts,
-            update_conflicts=update_conflicts,
-            update_fields=update_fields,
-            unique_fields=unique_fields,
-        )
+        with self._rls_scope(for_write=True, own_transaction=True):
+            return super().bulk_create(
+                objs,
+                batch_size=batch_size,
+                ignore_conflicts=ignore_conflicts,
+                update_conflicts=update_conflicts,
+                update_fields=update_fields,
+                unique_fields=unique_fields,
+            )
 
     def bulk_update(
         self,
@@ -366,9 +586,44 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         fields: Any,
         batch_size: int | None = None,
     ) -> int:
-        """Guard ``bulk_update()`` with strict mode check."""
+        """Run ``bulk_update()`` in one ``for_user()`` scope; guarded by strict mode."""
         self._check_strict_mode()
-        return super().bulk_update(objs, fields, batch_size=batch_size)
+        with self._rls_scope(for_write=True, own_transaction=True):
+            return super().bulk_update(objs, fields, batch_size=batch_size)
+
+    def update_or_create(
+        self,
+        defaults: Mapping[str, Any] | None = None,
+        create_defaults: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> tuple[Any, bool]:
+        """Run ``update_or_create()`` in the ``for_user()`` scope.
+
+        Updating an existing row calls ``Model.save()``, which writes
+        through the model's base manager rather than this queryset, so one
+        scope spans the whole call. The lookup runs through ``_fetch_all()``
+        and is guarded by strict mode there.
+        """
+        with self._rls_scope(for_write=True, own_transaction=True):
+            return super().update_or_create(
+                defaults=defaults,
+                create_defaults=create_defaults,
+                **kwargs,
+            )
+
+    def explain(
+        self,
+        *,
+        format: str | None = None,  # noqa: A002  -- QuerySet.explain()'s parameter name
+        **options: Any,
+    ) -> str:
+        """Run ``explain()`` in the ``for_user()`` scope.
+
+        With ``analyze=True`` the query runs, and the plan then reports the
+        user's rows. Not guarded by strict mode: it is a diagnostic.
+        """
+        with self._rls_scope():
+            return super().explain(format=format, **options)
 
     def get(self, *args: Any, **kwargs: Any) -> Any:
         """Guard ``get()`` with strict mode check."""
@@ -376,48 +631,44 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         return super().get(*args, **kwargs)
 
     def first(self) -> Any:
-        """Guard ``first()`` with strict mode check."""
-        self._check_strict_mode()
+        """Guard ``first()`` with strict mode check, unless the results are cached.
+
+        On a cached, ordered queryset Django answers from the cache. Any
+        other case queries a clone, which ``_fetch_all()`` checks.
+        """
+        if self._result_cache is None:
+            self._check_strict_mode()
         return super().first()
 
     def last(self) -> Any:
-        """Guard ``last()`` with strict mode check."""
+        """Guard ``last()`` with strict mode check.
+
+        It always queries: Django reverses the ordering on a fresh clone.
+        """
         self._check_strict_mode()
         return super().last()
 
     def _fetch_all(self) -> None:
-        """Set GUC variables just before query execution.
+        """Evaluate in the ``for_user()`` scope; guarded by strict mode.
 
-        Uses ``self.db`` so GUCs target the correct connection in
-        multi-database setups (e.g., ``.using("replica")``).
+        The scope uses ``self.db``, so the GUCs target the connection the
+        query runs on in multi-database setups (``.using("replica")``, a
+        read router).
 
-        Also sets the ``ContextVar`` tenant state during evaluation so
-        that any querysets created during fetch (e.g., prefetch queries,
-        deferred loads) benefit from auto-scope.
+        A queryset whose results and prefetches are already cached runs no
+        SQL, so it skips both the scope and the strict mode check. That
+        includes the querysets ``prefetch_related()`` caches on each
+        instance: they can be read after the context that fetched them has
+        ended, for example in a template rendering a ``for_user()``
+        queryset.
         """
+        if self._result_cache is not None and (
+            self._prefetch_done or not self._prefetch_related_lookups
+        ):
+            super()._fetch_all()
+            return
         self._check_strict_mode()
-        if self._rls_user is not None:
-            conf = rls_tenants_config
-            db_alias = self.db
-            guc_vars = _resolve_user_guc_vars(self._rls_user, conf)
-
-            # Set ContextVar so prefetch/deferred querysets get auto-scope
-            user = self._rls_user
-            ctx_tenant_id = None if user.is_tenant_admin else user.rls_tenant_id
-            token = set_current_tenant_id(ctx_tenant_id)
-            try:
-                for guc_name, guc_value in guc_vars.items():
-                    if guc_value:
-                        set_guc(guc_name, guc_value, is_local=conf.USE_LOCAL_SET, using=db_alias)
-                    else:
-                        clear_guc(guc_name, is_local=conf.USE_LOCAL_SET, using=db_alias)
-                super()._fetch_all()
-            finally:
-                reset_current_tenant_id(token)
-                if not conf.USE_LOCAL_SET:
-                    clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
-                    clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
-        else:
+        with self._rls_scope():
             super()._fetch_all()
 
 
