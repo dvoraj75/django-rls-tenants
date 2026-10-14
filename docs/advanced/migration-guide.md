@@ -153,6 +153,15 @@ migration that assigns the correct tenant to each existing record.
   Wrap such code in `transaction.atomic()`. With `STRICT_MODE=True`, `aiterator()`
   without a context now raises `NoTenantContextError`, like `iterator()`. See
   [Lazy QuerySet Evaluation](architecture.md#lazy-queryset-evaluation).
+- **Other threads get no request context** (#130, security fix). A database connection
+  opened during a request on a thread other than the one where `RLSTenantMiddleware` set
+  the GUCs no longer receives them. That covers the error pages Django builds under ASGI
+  outside `process_exception` (such as a 404 for a URL that does not resolve) and, under
+  ASGI or WSGI, work run with `sync_to_async(..., thread_sensitive=False)` or
+  `asyncio.to_thread()`. Such code now sees no RLS-protected rows; before, the thread's
+  connection kept the GUCs of the request that opened it, for later requests too. Open
+  `tenant_context()` / `admin_context()` inside that code if it needs tenant data. See
+  [Running under ASGI](../guides/middleware.md#running-under-asgi).
 
 ### From 1.3.3 to 1.3.4
 

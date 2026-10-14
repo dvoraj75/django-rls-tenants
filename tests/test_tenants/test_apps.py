@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import contextvars
+import logging
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
+from django.conf import settings as django_settings
 from django.core.signals import request_finished
-from django.db import close_old_connections, connection
+from django.db import close_old_connections, connection, connections
 from django.db.backends.signals import connection_created
 from django.test import override_settings
 
@@ -217,3 +222,137 @@ class TestConnectionCreatedSignalHandler:
         # None or empty string depending on PostgreSQL version.
         assert result is not None
         assert result[0] in (None, "")
+
+
+def _on_new_thread(func):
+    """Run ``func`` on a new thread in a copy of the current context; close its connections.
+
+    Like a ``sync_to_async(..., thread_sensitive=False)`` hop: the ``ContextVar``
+    values come along, the database connection is the new thread's own.
+    """
+
+    def call():
+        try:
+            return func()
+        finally:
+            connections.close_all()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(contextvars.copy_context().run, call).result()
+
+
+def _read_gucs():
+    return get_guc("rls.current_tenant"), get_guc("rls.is_admin")
+
+
+_STALE_GUCS_SQL = (
+    "SELECT set_config('rls.current_tenant', '999', false), "
+    "set_config('rls.is_admin', 'true', false)"
+)
+
+
+def _arrive_with(sql, alias="default"):
+    """Make this thread's next ``alias`` connection run ``sql`` before ``connection_created``.
+
+    A connection reused from a pool can carry a previous borrower's session state.
+    """
+    conn = connections[alias]
+    init_connection_state = conn.init_connection_state
+
+    def init_then_run():
+        init_connection_state()
+        with conn.connection.cursor() as cursor:
+            cursor.execute(sql)
+
+    conn.init_connection_state = init_then_run
+
+
+def _read_gucs_on_dirty_connection():
+    _arrive_with(_STALE_GUCS_SQL)
+    return _read_gucs()
+
+
+def _read_gucs_on_dirty_replica_connection():
+    """The same on a second alias, registered on this thread only."""
+    default = connections["default"]
+    replica = type(default)(default.settings_dict, alias="replica")
+    connections["replica"] = replica
+    try:
+        _arrive_with(_STALE_GUCS_SQL, alias="replica")
+        return get_guc("rls.current_tenant", using="replica"), get_guc(
+            "rls.is_admin", using="replica"
+        )
+    finally:
+        del connections["replica"]
+        replica.close()
+
+
+def _connect_on_broken_connection():
+    conn = connections["default"]
+    init_connection_state = conn.init_connection_state
+
+    def init_then_break():
+        init_connection_state()
+        conn.connection.close()
+
+    conn.init_connection_state = init_then_break
+    conn.ensure_connection()
+
+
+class TestConnectionCreatedOnAnotherThread:
+    """#130: GUCs go only on connections opened on the thread that set them.
+
+    The request's cleanup clears that thread's connections only. A connection
+    opened on another thread holding a copy of the request's context (Django's
+    ``thread_sensitive=False`` error-page hop under ASGI) is left without one.
+    """
+
+    @pytest.mark.parametrize("tenant_id", [42, None], ids=["tenant", "admin"])
+    def test_connection_gets_no_gucs(self, tenant_id, caplog):
+        set_current_tenant_id(tenant_id)
+        _mark_gucs_set()
+
+        with caplog.at_level(logging.DEBUG, logger="django_rls_tenants"):
+            assert _on_new_thread(_read_gucs) == (None, None)
+
+        assert any("outside the request's thread" in m for m in caplog.messages)
+
+    def test_stale_gucs_on_a_reused_connection_are_cleared(self):
+        # Control: outside a request the handler leaves a connection alone, so the
+        # simulated reused connection really does arrive with both GUCs set.
+        assert _on_new_thread(_read_gucs_on_dirty_connection) == ("999", "true")
+
+        set_current_tenant_id(42)
+        _mark_gucs_set()
+
+        assert _on_new_thread(_read_gucs_on_dirty_connection) == (None, None)
+
+    def test_clear_runs_on_the_new_connections_alias(self):
+        databases = {**django_settings.RLS_TENANTS, "DATABASES": ["default", "replica"]}
+        with override_settings(RLS_TENANTS=databases):
+            # Control, as above: the replica connection really arrives with the GUCs.
+            assert _on_new_thread(_read_gucs_on_dirty_replica_connection) == ("999", "true")
+
+            set_current_tenant_id(42)
+            _mark_gucs_set()
+
+            assert _on_new_thread(_read_gucs_on_dirty_replica_connection) == (None, None)
+
+    def test_failed_clear_is_logged_not_raised(self, caplog):
+        set_current_tenant_id(42)
+        _mark_gucs_set()
+
+        with caplog.at_level(logging.WARNING, logger="django_rls_tenants"):
+            _on_new_thread(_connect_on_broken_connection)
+
+        assert any("Failed to clear RLS GUCs" in m for m in caplog.messages)
+
+    def test_owner_thread_still_gets_gucs(self):
+        """The thread that set the flag keeps the lazily-opened-connection behaviour."""
+
+        def owner():
+            set_current_tenant_id(42)
+            _mark_gucs_set()
+            return _read_gucs()
+
+        assert _on_new_thread(owner) == ("42", "false")

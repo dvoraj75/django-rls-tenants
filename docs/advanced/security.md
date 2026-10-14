@@ -185,6 +185,11 @@ Mitigations:
 - **Default behavior**: middleware clears GUCs in `process_response` (WSGI) or at the end
   of its async path (ASGI).
 - **Safety net**: `request_finished` signal clears GUCs if `process_response` is skipped.
+- **Other threads**: the `connection_created` handler sets the request's GUCs only on
+  connections opened on the thread that set them, where the cleanup above runs. A
+  connection opened on another thread during the request (an ASGI error page,
+  `thread_sensitive=False` work) is cleared instead (#130; see
+  [Running under ASGI](../guides/middleware.md#running-under-asgi)).
 - **USE_LOCAL_SET**: `SET LOCAL` scopes GUCs to the transaction, preventing leaks.
 
 See [Connection Pooling](../guides/connection-pooling.md) for details.

@@ -54,8 +54,10 @@ RLS_TENANTS = {
 ```
 
 The middleware sets GUCs on all configured aliases during each request. A
-`connection_created` signal handler also sets GUCs on lazily-created connections
-that don't exist when the middleware runs.
+`connection_created` signal handler also sets GUCs on connections created lazily,
+after the middleware ran, but only on the thread that set the request's GUCs. A
+connection opened on another thread during the request gets none (see
+[Running under ASGI](../guides/middleware.md#running-under-asgi)).
 
 !!! warning
     Each alias must exist in Django's `DATABASES` setting. A typo (e.g., `"replca"`)

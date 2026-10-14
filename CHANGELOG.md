@@ -104,6 +104,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Security: under ASGI, an error page could leave a request's tenant context on a
+  worker thread's connection** (#130). Django builds some error responses in a
+  `sync_to_async(..., thread_sensitive=False)` hop while the request context is still
+  active: for a URL that does not resolve, a view that returns `None`, or an exception
+  from a `process_view` or `process_template_response` hook or from an async-capable
+  middleware listed after `RLSTenantMiddleware`. The hop runs on a worker thread with its
+  own database connection and a copy of the request's `ContextVar`s. When that connection
+  opened, the `connection_created` handler set the request's GUCs on it, and nothing ever
+  cleared them. Worker threads live as long as the server, so a later error page built on
+  the same thread, an anonymous visitor's included, ran with the earlier user's tenant,
+  or with the admin bypass, and could read that data if it queried RLS-protected tables.
+  The handler now applies the GUCs only on the thread that set them, where the
+  middleware's cleanup runs, and clears both GUCs on a connection opened on any other
+  thread during the request (which also drops stale values a reused connection may
+  carry). Such error pages now see no RLS-protected rows, like error pages for view
+  exceptions already did. Database work a request hands to another thread with a copy of
+  its context (`sync_to_async(..., thread_sensitive=False)`, `asyncio.to_thread()`, under
+  WSGI too) is fail-closed the same way: open `tenant_context()` / `admin_context()`
+  inside it. Requests whose work stays on the request's thread, such as synchronous WSGI
+  views, are unchanged. Affects ASGI deployments since 1.2.0, which added the handler,
+  whose error handlers, templates or context processors query RLS-protected data.
 - **`select_related()` with no arguments on Django 6.1** (#114). Django 6.1 deprecates
   that form, and the `RemovedInDjango2028Warning` blamed
   `TenantQuerySet.select_related` in `managers.py` instead of the code that made the

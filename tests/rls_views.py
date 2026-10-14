@@ -6,6 +6,7 @@ tenant context set by ``RLSTenantMiddleware`` is in force while the view runs.
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING
 
 from asgiref.sync import sync_to_async
@@ -21,7 +22,7 @@ from django.http import (
 from django_rls_tenants.rls.guc import aget_guc, get_guc
 from django_rls_tenants.tenants.context import async_admin_context, async_tenant_context
 from django_rls_tenants.tenants.middleware import RLSTenantMiddleware
-from django_rls_tenants.tenants.state import get_current_tenant_id
+from django_rls_tenants.tenants.state import get_current_tenant_id, get_rls_context_active
 from tests.test_app.models import Order, Tenant
 
 try:
@@ -134,6 +135,48 @@ def write_then_404_view(request: HttpRequest) -> HttpResponse:
 def database_404_handler(request: HttpRequest, exception: Exception) -> JsonResponse:
     """Error pages may query shared tables, like navigation or site settings."""
     return JsonResponse({"tenants": Tenant.objects.count()}, status=404)
+
+
+def guc_probe_404_handler(request: HttpRequest, exception: Exception) -> JsonResponse:
+    """Report the context an error page runs with: its thread, connection, GUCs and rows.
+
+    Under ASGI, Django builds this page in a ``thread_sensitive=False`` hop, on a
+    worker thread with a connection of its own and a copy of the request's
+    ``ContextVar``s (#130).
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT pg_backend_pid(), current_setting('rls.current_tenant', true), "
+            "current_setting('rls.is_admin', true)"
+        )
+        pid, tenant_guc, is_admin_guc = cursor.fetchone()
+    return JsonResponse(
+        {
+            "thread": threading.get_ident(),
+            "pid": pid,
+            "tenant_guc": tenant_guc or None,
+            "is_admin_guc": is_admin_guc or None,
+            "database_products": _database_products(),
+            "rls_context_active": get_rls_context_active(),
+        },
+        status=404,
+    )
+
+
+def reconnect_view(request: HttpRequest) -> JsonResponse:
+    """Reopen the request thread's connection, then report its GUCs and rows.
+
+    The ``connection_created`` handler gives the new connection the request's
+    GUCs, because this is the thread that set them.
+    """
+    connection.close()
+    return JsonResponse(
+        {
+            "tenant_guc": get_guc("rls.current_tenant"),
+            "is_admin_guc": get_guc("rls.is_admin"),
+            "database_products": _database_products(),
+        }
+    )
 
 
 class DatabaseExceptionMiddleware(MiddlewareMixin):

@@ -1,4 +1,4 @@
-"""End-to-end tests for ``RLSTenantMiddleware`` under ASGI (#58, #38).
+"""End-to-end tests for ``RLSTenantMiddleware`` under ASGI (#58, #38, #130).
 
 Drives real requests through the full middleware stack with ``django.test.AsyncClient``.
 Before the #58 fix every authenticated request failed with ``ValueError: <Token ...> was
@@ -10,22 +10,31 @@ these requests on its own async path; ``TestNativeAsyncPath`` covers it with asy
 
 ``AsyncClientHandler`` fires ``request_finished`` on a throwaway connection, so the
 "nothing left behind" assertions below check the middleware's own cleanup, not the
-``request_finished`` safety net.
+``request_finished`` safety net. ``TestErrorPageOnWorkerThread`` covers the error pages
+Django builds on a worker thread while the request context is active (#130).
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from unittest.mock import patch
 
 import pytest
 from asgiref.sync import async_to_sync
 from django.conf import settings as django_settings
-from django.test import AsyncClient, override_settings
+from django.core.handlers.asgi import ASGIHandler
+from django.db import connections
+from django.test import AsyncClient, Client, override_settings
 
 from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.guc import get_guc
 from django_rls_tenants.tenants.middleware import RLSTenantMiddleware
 from django_rls_tenants.tenants.state import get_current_tenant_id, get_rls_context_active
+from tests import admin_urls
 from tests.test_app.models import AdminUser
 
 pytestmark = pytest.mark.django_db
@@ -318,4 +327,178 @@ class TestNativeAsyncPath:
         assert response["X-RLS-Hooks"] == "sync"
         assert response.json()["database_products"] == ["Widget A1", "Widget A2"]
         assert response.json()["tenant_guc"] == str(tenant_a.pk)
+        _assert_request_left_nothing_behind()
+
+
+@pytest.fixture
+def guc_probe_404(monkeypatch):
+    """Serve 404 pages with ``guc_probe_404_handler``."""
+    monkeypatch.setattr(
+        admin_urls, "handler404", "tests.rls_views.guc_probe_404_handler", raising=False
+    )
+
+
+async def _on_one_worker(*fetches):
+    """Await each fetch in turn with a one-thread default executor; return the results.
+
+    Django builds error pages in ``thread_sensitive=False`` hops, i.e. on the default
+    executor. With one worker, the same thread and connection serve every page, as
+    the long-lived worker threads of an ASGI server do.
+    """
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+    try:
+        return [await fetch() for fetch in fetches]
+    finally:
+        # Django never closes a worker thread's connection; the test does.
+        await loop.run_in_executor(None, connections.close_all)
+
+
+async def _client_get_json(client, path):
+    return (await client.get(path)).json()
+
+
+async def _asgi_get_json(application, path, cookie=None):
+    """Send one GET through ``application`` as an ASGI server would; return the JSON body."""
+    headers = [(b"host", b"testserver")]
+    if cookie is not None:
+        headers.append((b"cookie", cookie.encode()))
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": headers,
+        "server": ("testserver", 80),
+        "client": ("127.0.0.1", 50000),
+    }
+    messages = [{"type": "http.request", "body": b"", "more_body": False}]
+
+    async def receive():
+        if not messages:
+            # Never disconnect: ASGIHandler cancels this wait once the response is sent.
+            await asyncio.Event().wait()
+        return messages.pop()
+
+    body = []
+
+    async def send(message):
+        if message["type"] == "http.response.body":
+            body.append(message.get("body", b""))
+
+    await application(scope, receive, send)
+    return json.loads(b"".join(body))
+
+
+def _serve_like_an_asgi_server(application, requests):
+    """Serve each ``(path, cookie)`` in turn on a fresh event-loop thread; return the bodies.
+
+    ``asyncio.run`` on a thread of its own, as an ASGI server runs its loop: no
+    synchronous caller serves the thread-sensitive hops, so ``ASGIHandler`` gives
+    each request a thread of its own. ``AsyncClient`` driven from the test runs
+    them on the test thread instead.
+    """
+    fetches = [partial(_asgi_get_json, application, path, cookie) for path, cookie in requests]
+    with ThreadPoolExecutor(max_workers=1) as loop_thread:
+        return loop_thread.submit(asyncio.run, _on_one_worker(*fetches)).result()
+
+
+_HOOK_SUBCLASS = "tests.rls_views.TaggingRLSTenantMiddleware"
+
+# Each way Django can run the RLS middleware under ASGI, and so each place that
+# records which thread set the GUCs.
+_ASGI_MIDDLEWARE_PATHS = {
+    "native": _MIDDLEWARE_WITH_RLS,
+    "sync-path": [*_MIDDLEWARE_WITH_RLS, "tests.rls_views.SyncOnlyMiddleware"],
+    "hook-path": [_HOOK_SUBCLASS if path == _RLS else path for path in _MIDDLEWARE_WITH_RLS],
+}
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+class TestErrorPageOnWorkerThread:
+    """#130: an error page built on a worker thread gets no context, and leaves none behind.
+
+    ``transaction=True``: the worker thread's connection is not the test's, so it
+    sees committed rows only.
+    """
+
+    @pytest.mark.parametrize("middleware_path", list(_ASGI_MIDDLEWARE_PATHS))
+    @pytest.mark.parametrize("first_user", ["scoped", "admin"])
+    def test_unresolved_url_leaves_no_context_on_the_worker_connection(
+        self,
+        first_user,
+        middleware_path,
+        scoped_web_user,
+        admin_web_user,
+        sample_orders,
+        enforce_rls_on_other_threads,
+        guc_probe_404,
+    ):
+        """The URL is resolved outside ``process_exception``'s reach: the context is live."""
+        authenticated = AsyncClient()
+        authenticated.force_login({"scoped": scoped_web_user, "admin": admin_web_user}[first_user])
+
+        with override_settings(MIDDLEWARE=_ASGI_MIDDLEWARE_PATHS[middleware_path]):
+            first, second = async_to_sync(_on_one_worker)(
+                partial(_client_get_json, authenticated, "/no-such-page/"),
+                partial(_client_get_json, AsyncClient(), "/no-such-page/"),
+            )
+
+        # One worker thread and connection built both pages, not the test thread, and
+        # the first one ran in a copy of the live request context.
+        assert first["thread"] == second["thread"] != threading.get_ident()
+        assert first["pid"] == second["pid"]
+        assert [page["rls_context_active"] for page in (first, second)] == [True, False]
+        for page in (first, second):
+            assert page["tenant_guc"] is None
+            assert page["is_admin_guc"] is None
+            assert page["database_products"] == []
+        _assert_request_left_nothing_behind()
+
+    @pytest.mark.parametrize("middleware_path", list(_ASGI_MIDDLEWARE_PATHS))
+    def test_through_asgi_handler(
+        self,
+        middleware_path,
+        scoped_web_user,
+        sample_orders,
+        tenant_a,
+        enforce_rls_on_other_threads,
+        guc_probe_404,
+    ):
+        """The same through ``ASGIHandler``, which serves each request on a thread of its own.
+
+        That thread sets the GUCs, so a connection it reopens mid-request gets them.
+        """
+        client = Client()
+        client.force_login(scoped_web_user)
+        session = client.cookies[django_settings.SESSION_COOKIE_NAME].value
+        cookie = f"{django_settings.SESSION_COOKIE_NAME}={session}"
+
+        with override_settings(MIDDLEWARE=_ASGI_MIDDLEWARE_PATHS[middleware_path]):
+            reopened, first, second = _serve_like_an_asgi_server(
+                ASGIHandler(),
+                [
+                    ("/rls/reconnect/", cookie),
+                    ("/no-such-page/", cookie),
+                    ("/no-such-page/", None),
+                ],
+            )
+
+        assert reopened == {
+            "tenant_guc": str(tenant_a.pk),
+            "is_admin_guc": "false",
+            "database_products": ["Widget A1", "Widget A2"],
+        }
+        assert first["pid"] == second["pid"]
+        assert [page["rls_context_active"] for page in (first, second)] == [True, False]
+        for page in (first, second):
+            assert page["tenant_guc"] is None
+            assert page["is_admin_guc"] is None
+            assert page["database_products"] == []
         _assert_request_left_nothing_behind()

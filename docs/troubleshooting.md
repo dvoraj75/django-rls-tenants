@@ -45,6 +45,29 @@ for both; the middleware's request transaction has already ended. In an async ge
 
 **See:** [Transaction Per Request](guides/middleware.md#transaction-per-request-use_local_settrue).
 
+### Work handed to another thread sees no rows
+
+**Symptom:** Under `RLSTenantMiddleware`, code run with
+`sync_to_async(..., thread_sensitive=False)`, `asyncio.to_thread()` or a thread pool
+returns zero rows. So does an ASGI error page that queries RLS-protected models when
+Django builds it outside `process_exception`, for example a 404 for a URL that does not
+resolve. The rest of the request sees its data.
+
+**Cause:** That code runs on another thread with its own database connection, while the
+request's GUCs are set on the request thread's connection, the only one the middleware
+can clear. A thread that receives a copy of the request's context (`sync_to_async`,
+`asyncio.to_thread()`, the error-page hop Django makes under ASGI) used to get the GUCs
+on its connection when it opened, and nothing cleared them for the life of the thread,
+so later requests on that thread ran with them (#130). Since 1.4.0 such a connection
+gets none. A plain thread pool never received the context, so it never had them.
+
+**Fix:** Open `tenant_context()` / `admin_context()` inside the code that runs on the
+other thread, or keep it on the request's thread with `thread_sensitive=True` (the
+default for `sync_to_async`). In a custom error handler, template or context processor,
+enter the context only for an authenticated `request.user`.
+
+**See:** [Running under ASGI](guides/middleware.md#running-under-asgi).
+
 ## Errors
 
 ### `NoTenantContextError` with one of three hints
