@@ -43,6 +43,7 @@ The upper layer builds Django multitenancy on top of `rls/`:
 | `tenants/conf.py` | `RLSTenantsConfig` -- reads `RLS_TENANTS` settings |
 | `tenants/models.py` | `RLSProtectedModel` -- abstract base with auto-FK and `RLSConstraint`. `register_m2m_rls()` -- auto-detection of M2M fields |
 | `operations.py` | `AddM2MRLSPolicy` -- reversible migration operation for M2M RLS policies |
+| `pool.py` | `reset_rls_gucs()` -- `reset` callback for Django's psycopg connection pool. Also the single statement that clears every GUC the policies read, which the `connection_created` handler runs on each checkout from a pool. Importable from `settings.py` (no `tenants/` import at module level) |
 | `tenants/managers.py` | `TenantQuerySet`, `RLSManager` -- lazy GUC setting at query eval time |
 | `tenants/context.py` | `tenant_context()`, `admin_context()`, `@with_rls_context` |
 | `tenants/middleware.py` | `RLSTenantMiddleware` -- per-request RLS context, with a native async path for ASGI |
@@ -50,7 +51,7 @@ The upper layer builds Django multitenancy on top of `rls/`:
 | `tenants/testing.py` | Test helpers: `rls_bypass`, `rls_as_tenant`, assertion functions, and their async counterparts (`async_rls_bypass`, `async_rls_as_tenant`, `aassert_*`) |
 | `tenants/types.py` | `TenantUser` protocol |
 | `tenants/state.py` | `get_current_tenant_id()`, `set_current_tenant_id()`, `reset_current_tenant_id()` -- `ContextVar`-based tenant state for auto-scoping. Also `get_rls_context_active()`, `set_rls_context_active()`, `reset_rls_context_active()` -- tracks whether any RLS context is active (used by strict mode) |
-| `tenants/checks.py` | Django system checks (W001--W009) |
+| `tenants/checks.py` | Django system checks (W001--W010) |
 
 ### Import Boundary
 

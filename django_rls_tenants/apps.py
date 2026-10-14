@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 from django.apps import AppConfig
 
 if TYPE_CHECKING:
+    from django.db.backends.base.base import BaseDatabaseWrapper
+
     from django_rls_tenants.tenants.conf import RLSTenantsConfig
 
 logger = logging.getLogger("django_rls_tenants")
@@ -61,36 +63,57 @@ def _apply_request_gucs(db_alias: str, conf: RLSTenantsConfig) -> None:
         )
 
 
-def _leave_connection_without_context(db_alias: str, conf: RLSTenantsConfig) -> None:
-    """Clear both GUCs on a connection opened off the thread that set the request's GUCs.
+def _clear_new_connection_gucs(connection: BaseDatabaseWrapper, reason: str) -> None:
+    """Clear every GUC the RLS policies read on a connection that must start without context.
 
-    The middleware clears GUCs only on its own thread, so values set on this
-    connection would stay for the life of the thread and reach later requests
-    (#130). Clearing, not just skipping, also drops stale values that a reused
-    (pooled) connection may carry. Failures are logged, not raised.
+    Two kinds of connection get this. One opened off the thread that set the
+    request's GUCs: the middleware clears GUCs only on its own thread, so values
+    set on this connection would stay for the life of the thread and reach later
+    requests (#130). And one checked out of a connection pool, which may still
+    carry a previous borrower's session GUCs if that borrower's cleanup did not
+    reach it (#96). One statement, so one round trip.
+
+    A failure on a pooled connection fails the checkout: its session is ended,
+    so the pool discards it instead of reusing it, and the error is raised to
+    the code that asked for the connection. Any other connection is
+    a new session, so a failure there is logged, not raised.
 
     Args:
-        db_alias: Alias of the new connection.
-        conf: ``RLSTenantsConfig`` instance.
+        connection: The new connection, as sent by ``connection_created``.
+        reason: Why the connection is cleared, completing the log messages.
     """
-    from django_rls_tenants.rls.guc import clear_guc  # noqa: PLC0415
+    from django_rls_tenants.pool import _clear_policy_gucs  # noqa: PLC0415
 
     try:
-        clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
-        clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
+        _clear_policy_gucs(connection)
     except Exception:
+        pooled = _is_pooled(connection)
         logger.warning(
-            "Failed to clear RLS GUCs on a connection for alias %r opened outside the "
-            "request's thread.",
-            db_alias,
+            "Failed to clear RLS GUCs on a connection for alias %r %s%s.",
+            connection.alias,
+            reason,
+            "; discarding it" if pooled else "",
             exc_info=True,
         )
-    else:
-        logger.debug(
-            "Connection for alias %r opened outside the request's thread; left without "
-            "RLS context",
-            db_alias,
-        )
+        if not pooled:
+            return
+        # End the session without Connection.close(), which hands the
+        # connection back to a pool with close_returns=True. Django's close()
+        # then returns it once, and the pool discards a closed connection and
+        # replaces it.
+        with contextlib.suppress(Exception):
+            connection.connection.pgconn.finish()
+        with contextlib.suppress(Exception):
+            connection.close()
+        raise
+    logger.debug("Connection for alias %r %s; RLS GUCs cleared", connection.alias, reason)
+
+
+def _is_pooled(connection: object) -> bool:
+    """Whether ``connection`` comes from Django's psycopg pool (``OPTIONS["pool"]``)."""
+    from django_rls_tenants.pool import _pool_options  # noqa: PLC0415
+
+    return _pool_options(getattr(connection, "settings_dict", {})) is not None
 
 
 class DjangoRlsTenantsConfig(AppConfig):
@@ -103,8 +126,10 @@ class DjangoRlsTenantsConfig(AppConfig):
     def ready(self) -> None:
         """Connect signal handlers and validate configuration on startup."""
         from django.core.signals import request_finished, setting_changed  # noqa: PLC0415
+        from django.db import connections  # noqa: PLC0415
         from django.db.backends.signals import connection_created  # noqa: PLC0415
 
+        from django_rls_tenants.pool import _declared_policy_guc_names_cached  # noqa: PLC0415
         from django_rls_tenants.rls.guc import clear_guc  # noqa: PLC0415
         from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
 
@@ -133,6 +158,13 @@ class DjangoRlsTenantsConfig(AppConfig):
                 conf = rls_tenants_config
                 if not conf.USE_LOCAL_SET:
                     for db_alias in conf.DATABASES:
+                        # Nothing to clear on a closed connection: its session
+                        # is gone, or it is back in a pool, which Django's own
+                        # request_finished receiver does first, and the next
+                        # checkout clears it. Reopening it here would check out
+                        # another pooled connection and keep it.
+                        if connections[db_alias].connection is None:
+                            continue
                         clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
                         clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
             except Exception:
@@ -146,16 +178,17 @@ class DjangoRlsTenantsConfig(AppConfig):
 
         request_finished.connect(_clear_rls_on_request_finished, weak=False)
 
-        # Signal handler for lazily created database connections.
-        # When a new connection is established mid-request on a configured
-        # database alias, reads the current tenant state from ContextVars
-        # and sets GUCs on the new connection. This covers the case where
-        # a replica connection is lazily created after the middleware has
-        # already run on eagerly-opened connections. Only on the thread
-        # where the middleware set the GUCs: its cleanup clears them there.
+        # Signal handler for new database connections on a configured alias.
+        # When a connection is established mid-request, reads the current
+        # tenant state from ContextVars and sets GUCs on the new connection.
+        # This covers the case where a replica connection is lazily created
+        # after the middleware has already run on eagerly-opened connections.
+        # Only on the thread where the middleware set the GUCs: its cleanup
+        # clears them there. Django sends the signal on every checkout from a
+        # connection pool too; such a connection is cleared first (#96).
         def _set_guc_on_new_connection(
             sender: type,  # noqa: ARG001  -- Django signal API
-            connection: object,
+            connection: BaseDatabaseWrapper,
             **kwargs: object,  # noqa: ARG001  -- Django signal API
         ) -> None:
             from django_rls_tenants.tenants.middleware import (  # noqa: PLC0415
@@ -163,22 +196,27 @@ class DjangoRlsTenantsConfig(AppConfig):
                 _were_gucs_set_on_this_thread,
             )
 
-            db_alias: str = getattr(connection, "alias", "")
+            db_alias = connection.alias
             conf = rls_tenants_config
 
             if db_alias not in conf.DATABASES:
                 return
 
-            if not _were_gucs_set():
-                return  # No active request context
-
-            if _were_gucs_set_on_this_thread():
-                _apply_request_gucs(db_alias, conf)
-            else:
+            on_request_thread = _were_gucs_set_on_this_thread()
+            if _were_gucs_set() and not on_request_thread:
                 # Another thread with a copy of the request's context, such as
                 # the thread_sensitive=False hop in which Django builds an
                 # error page under ASGI.
-                _leave_connection_without_context(db_alias, conf)
+                _clear_new_connection_gucs(connection, "opened outside the request's thread")
+                return
+
+            if _is_pooled(connection):
+                # A pooled connection keeps its session GUCs between borrowers;
+                # the previous one's cleanup may not have reached it. With or
+                # without a request context, the new borrower starts clean.
+                _clear_new_connection_gucs(connection, "checked out of a connection pool")
+            if on_request_thread:
+                _apply_request_gucs(db_alias, conf)
 
         connection_created.connect(_set_guc_on_new_connection, weak=False)
 
@@ -194,6 +232,9 @@ class DjangoRlsTenantsConfig(AppConfig):
         ) -> None:
             if setting == "RLS_TENANTS":
                 rls_tenants_config.reload()
+            elif setting == "INSTALLED_APPS":
+                # The registry changed, as when Django clears its own model caches.
+                _declared_policy_guc_names_cached.cache_clear()
 
         # Tests that override INSTALLED_APPS can call ready() more than once.
         setting_changed.connect(

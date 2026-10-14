@@ -50,6 +50,14 @@ fails the session if anything was skipped. Never add a runtime `pytest.skip()`. 
 need a superuser connection carry `@pytest.mark.superuser_only` (registered in
 `pyproject.toml`) and `pytest.fail()` on a plain role; deselect with `-m "not superuser_only"`.
 
+**psycopg 3 marker.** Tests that need Django's connection pool (psycopg 3 plus
+`psycopg_pool`) carry `@pytest.mark.psycopg3_only`. `pytest_collection_modifyitems` in
+`tests/conftest.py` deselects them when Django runs on psycopg2 (reported as "deselected",
+not skipped, so the zero-skipped rule holds); only the psycopg 3 CI leg runs them, and a
+missing `psycopg_pool` there fails them. They use the `pooled` fixture, a real pool of one
+connection. To run them locally, install `psycopg[binary,pool]` into a separate
+environment: installing psycopg 3 switches Django's driver for the whole process.
+
 **Plain-role rule.** CI's `test-plain-role` job runs the whole library suite as a
 non-superuser role (`-m "not superuser_only"`). A superuser bypasses RLS, so any test that
 asserts database-level filtering (including `for_user()` results) must request the
@@ -79,6 +87,10 @@ The library has two internal layers with a strict import boundary:
   managers, middleware, config, testing utilities).
 - **`django_rls_tenants/operations.py`** — Migration operations (`AddM2MRLSPolicy`)
   for M2M join table RLS policies. Imports from `rls/` for shared SQL builders and validation.
+- **`django_rls_tenants/pool.py`** — `reset_rls_gucs()`, the `reset` callback for Django's
+  psycopg connection pool, and the single statement that clears every GUC the policies
+  read (used by the `connection_created` handler too). `settings.py` imports it before
+  Django is set up, so it must not import `tenants/` at module level.
 
 This boundary is enforced by `tests/test_layering.py`. Never import from `tenants/` in `rls/`.
 
@@ -110,6 +122,23 @@ clears the GUCs instead (#130). Code that sets the flag from a different thread
 than the one that set the GUCs must pass that thread's marker (the async path
 takes it from the enter hop); `_mark_gucs_set()` alone marks the current thread.
 The safety-net `request_finished` handler clears GUCs on all configured aliases.
+
+On an alias with `OPTIONS["pool"]` (Django's psycopg pool, `_is_pooled()` in `apps.py`),
+Django sends `connection_created` on every checkout, and the handler first clears every
+GUC the policies read, with or without a request context: `_clear_new_connection_gucs()`
+runs `_clear_policy_gucs()` from `pool.py`, one statement on the connection the signal
+sent (not `connections[alias]`), committed under `AUTOCOMMIT=False`, because a pool keeps
+session GUCs between borrowers and the previous borrower's cleanup may not have reached
+the connection (#96). If it fails on a pooled connection, the handler closes the
+connection (the pool discards it) and re-raises: fail closed. The request thread's GUCs
+are applied after it. The #130 clear for other threads uses the same statement.
+`_policy_guc_names()` collects the names from the configured `GUC_PREFIX` GUCs and the
+installed models' constraints (`RLSConstraint` GUCs and `extra_bypass_flags`,
+`RLSM2MConstraint` GUCs), keeping only dotted custom-GUC names; hand-written policies and
+`AddM2MRLSPolicy` with non-default names are not covered. The registry part is cached once
+`apps.ready` and dropped on an `INSTALLED_APPS` change. The safety net skips a closed
+connection (with a pool, Django has already returned it). System check `W010` asks for
+`reset_rls_gucs` as the pool's `reset`.
 
 When modifying middleware or GUC-related code, ensure all database iteration
 uses `conf.DATABASES` rather than hardcoding `"default"`.
@@ -314,7 +343,8 @@ example/
 
 GitHub Actions runs lint + type-check, a strict mkdocs build (`mkdocs build --strict`),
 a test matrix across Python {3.12, 3.13, 3.14} × Django {5.2, 6.0, 6.1} on PostgreSQL 16
-(psycopg2, no `exclude` rows) plus one psycopg 3 leg on Python 3.12 / Django 6.1, and a
+(psycopg2, no `exclude` rows) plus one psycopg 3 leg on Python 3.12 / Django 6.1 (the only
+one that runs the `psycopg3_only` tests), and a
 `test-postgres` job on PostgreSQL 15 and 18 with the oldest and newest supported Django
 (5.2 on Python 3.12 / 6.1 on Python 3.14) on every push/PR. Those legs connect as the
 `postgres` superuser; a `test-plain-role` job runs the suite once more as a plain role

@@ -5,14 +5,17 @@ from __future__ import annotations
 import contextvars
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 from django.conf import settings as django_settings
 from django.core.signals import request_finished
-from django.db import close_old_connections, connection, connections
+from django.db import Error, close_old_connections, connection, connections
 from django.db.backends.signals import connection_created
 from django.test import override_settings
 
+from django_rls_tenants.apps import _is_pooled
+from django_rls_tenants.pool import reset_rls_gucs
 from django_rls_tenants.rls.guc import get_guc, set_guc
 from django_rls_tenants.tenants.middleware import (
     _clear_gucs_set_flag,
@@ -127,6 +130,22 @@ class TestRequestFinishedSafetyNet:
         assert _were_gucs_set() is False
         # Reconnect for subsequent tests / cleanup
         connection.close()
+
+    @pytest.mark.django_db(transaction=True)
+    def test_leaves_a_closed_connection_closed(self):
+        """A closed session holds no GUCs, and a pooled one is cleared on its next checkout.
+
+        With Django's pool, ``close_old_connections`` has returned the request's
+        connection before this handler runs; reopening it would check out
+        another pooled connection and keep it.
+        """
+        _mark_gucs_set()
+        connection.close()
+
+        request_finished.send(sender=self.__class__)
+
+        assert connection.connection is None
+        assert _were_gucs_set() is False
 
     def test_safety_net_clears_gucs_on_all_databases(self):
         """Safety-net handler clears GUCs on all configured DATABASES aliases.
@@ -287,6 +306,23 @@ def _read_gucs_on_dirty_replica_connection():
         replica.close()
 
 
+_STALE_POLICY_GUCS_SQL = (
+    "SELECT set_config('rls.current_tenant', '999', false), "
+    "set_config('rls.is_admin', 'true', false), "
+    "set_config('rls.is_login_request', 'true', false)"
+)
+
+
+def _read_policy_gucs():
+    """The tenant and admin GUCs plus one of ``ProtectedUser``'s ``extra_bypass_flags``."""
+    return (*_read_gucs(), get_guc("rls.is_login_request"))
+
+
+def _read_policy_gucs_on_dirty_connection():
+    _arrive_with(_STALE_POLICY_GUCS_SQL)
+    return _read_policy_gucs()
+
+
 def _connect_on_broken_connection():
     conn = connections["default"]
     init_connection_state = conn.init_connection_state
@@ -347,6 +383,13 @@ class TestConnectionCreatedOnAnotherThread:
 
         assert any("Failed to clear RLS GUCs" in m for m in caplog.messages)
 
+    def test_clear_covers_every_policy_guc(self):
+        """Bypass flags a reused connection carries go too, not just the tenant GUCs."""
+        set_current_tenant_id(42)
+        _mark_gucs_set()
+
+        assert _on_new_thread(_read_policy_gucs_on_dirty_connection) == (None, None, None)
+
     def test_owner_thread_still_gets_gucs(self):
         """The thread that set the flag keeps the lazily-opened-connection behaviour."""
 
@@ -356,3 +399,142 @@ class TestConnectionCreatedOnAnotherThread:
             return _read_gucs()
 
         assert _on_new_thread(owner) == ("42", "false")
+
+
+@pytest.fixture
+def pooled_connections(monkeypatch):
+    """Treat every new connection as a checkout from Django's connection pool.
+
+    The real pool needs psycopg 3 (``test_integration/test_connection_pool.py``);
+    this runs the handler's pooled branch on either driver.
+    """
+    monkeypatch.setattr("django_rls_tenants.apps._is_pooled", lambda connection: True)
+
+
+class TestConnectionCreatedOnPooledConnection:
+    """#96: a connection checked out of a pool starts without any policy GUC.
+
+    It may carry the session GUCs of its previous borrower, whose cleanup did
+    not reach it. ``_arrive_with`` simulates that borrower.
+    """
+
+    def test_control_unpooled_connection_outside_a_request_is_left_alone(self):
+        assert _on_new_thread(_read_policy_gucs_on_dirty_connection) == ("999", "true", "true")
+
+    def test_checkout_outside_a_request_clears_every_policy_guc(self, pooled_connections, caplog):
+        with caplog.at_level(logging.DEBUG, logger="django_rls_tenants"):
+            assert _on_new_thread(_read_policy_gucs_on_dirty_connection) == (None, None, None)
+
+        assert any("checked out of a connection pool" in m for m in caplog.messages)
+
+    @pytest.mark.parametrize(
+        ("tenant_id", "expected"),
+        [(42, ("42", "false", None)), (None, (None, "true", None))],
+        ids=["tenant", "admin"],
+    )
+    def test_checkout_on_the_request_thread_gets_the_request_gucs_only(
+        self,
+        pooled_connections,
+        tenant_id,
+        expected,
+    ):
+        def owner():
+            set_current_tenant_id(tenant_id)
+            _mark_gucs_set()
+            return _read_policy_gucs_on_dirty_connection()
+
+        assert _on_new_thread(owner) == expected
+
+    def test_checkout_on_another_thread_clears_every_policy_guc(self, pooled_connections):
+        set_current_tenant_id(42)
+        _mark_gucs_set()
+
+        assert _on_new_thread(_read_policy_gucs_on_dirty_connection) == (None, None, None)
+
+    def test_alias_outside_rls_databases_is_left_alone(self, pooled_connections):
+        assert _on_new_thread(_read_gucs_on_dirty_replica_connection) == ("999", "true")
+
+    def test_clear_runs_on_the_connection_that_connected(self, pooled_connections):
+        """Not on the thread's registered wrapper: ``create_connection()`` makes another one."""
+
+        def on_separate_wrapper():
+            other = connections.create_connection("default")
+            init_connection_state = other.init_connection_state
+
+            def init_then_dirty():
+                init_connection_state()
+                with other.connection.cursor() as cursor:
+                    cursor.execute(_STALE_POLICY_GUCS_SQL)
+
+            other.init_connection_state = init_then_dirty
+            try:
+                with other.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT current_setting('rls.current_tenant', true), "
+                        "current_setting('rls.is_login_request', true)"
+                    )
+                    values = tuple(value or None for value in cursor.fetchone())
+            finally:
+                other.close()
+            return values, connections["default"].connection is None
+
+        assert _on_new_thread(on_separate_wrapper) == ((None, None), True)
+
+    def test_clear_is_one_statement(self, pooled_connections):
+        def connect_and_log():
+            conn = connections["default"]
+            conn.force_debug_cursor = True
+            conn.ensure_connection()
+            return [query["sql"] for query in conn.queries_log]
+
+        statements = _on_new_thread(connect_and_log)
+
+        assert len(statements) == 1
+        assert statements[0].count("set_config(") == 4
+
+    def test_failed_clear_fails_the_checkout_and_drops_the_connection(
+        self,
+        pooled_connections,
+        caplog,
+    ):
+        """A connection that may still be dirty is never handed to the borrower."""
+
+        def connect():
+            try:
+                _connect_on_broken_connection()
+            except Error as exc:
+                return type(exc), connections["default"].connection
+            return None, connections["default"].connection
+
+        with caplog.at_level(logging.WARNING, logger="django_rls_tenants"):
+            error, raw_connection = _on_new_thread(connect)
+
+        assert error is not None
+        assert raw_connection is None
+        assert any(
+            "Failed to clear RLS GUCs" in m
+            and "checked out of a connection pool; discarding it" in m
+            for m in caplog.messages
+        )
+
+
+class TestIsPooled:
+    """``_is_pooled`` follows Django's own test for an enabled pool."""
+
+    @pytest.mark.parametrize(
+        ("pool", "expected"),
+        [
+            (True, True),
+            ({"max_size": 4}, True),
+            # The checkout clear runs even when the pool has a reset callback.
+            ({"reset": reset_rls_gucs}, True),
+            ({}, False),
+            (False, False),
+            (None, False),
+        ],
+    )
+    def test_follows_options_pool(self, pool, expected):
+        assert _is_pooled(SimpleNamespace(settings_dict={"OPTIONS": {"pool": pool}})) is expected
+
+    def test_unpooled_test_connection(self):
+        assert _is_pooled(connection) is False

@@ -266,7 +266,9 @@ also sets GUCs on lazily-created connections that don't exist when the middlewar
 runs (e.g., a replica connection opened by a database router mid-request). It does
 so only on the thread that set the request's GUCs, where the middleware's cleanup
 clears them; a connection opened on another thread during the request gets no
-context (see [Running under ASGI](#running-under-asgi)).
+context (see [Running under ASGI](#running-under-asgi)). A connection checked out of
+Django's connection pool is cleared of every RLS GUC first (see
+[Django's Connection Pool](connection-pooling.md#djangos-connection-pool)).
 
 See [Configuration](../getting-started/configuration.md#databases) for details.
 
@@ -281,6 +283,9 @@ This is a defense-in-depth measure -- the primary cleanup always happens in
 which also runs for failed and cancelled requests, so the safety net only matters if that
 GUC clear itself fails. It sees the middleware's flag only when Django sends
 `request_finished` from the request's own task: Django 6.1 does, Django 5.2 and 6.0 do not.
+It skips a closed connection: with Django's connection pool, Django has always returned the
+request's connection by then, and the clear on its next checkout (and the pool's `reset`
+callback, if one is set) cleans it.
 
 ## API-Agnostic Design
 

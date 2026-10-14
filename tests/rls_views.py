@@ -10,7 +10,7 @@ import threading
 from typing import TYPE_CHECKING
 
 from asgiref.sync import sync_to_async
-from django.db import connection
+from django.db import DEFAULT_DB_ALIAS, connection, connections
 from django.http import (
     Http404,
     HttpResponse,
@@ -19,7 +19,7 @@ from django.http import (
     StreamingHttpResponse,
 )
 
-from django_rls_tenants.rls.guc import aget_guc, get_guc
+from django_rls_tenants.rls.guc import aget_guc, get_guc, set_guc
 from django_rls_tenants.tenants.context import async_admin_context, async_tenant_context
 from django_rls_tenants.tenants.middleware import RLSTenantMiddleware
 from django_rls_tenants.tenants.state import get_current_tenant_id, get_rls_context_active
@@ -36,13 +36,14 @@ if TYPE_CHECKING:
     from django.http import HttpRequest
 
 
-def _database_products() -> list[str]:
+def _database_products(using: str = DEFAULT_DB_ALIAS) -> list[str]:
     """Read the products with raw SQL, bypassing the ORM auto-scope filter.
 
     Only PostgreSQL's RLS policy filters these rows.
     """
-    with connection.cursor() as cursor:
-        table = connection.ops.quote_name(Order._meta.db_table)
+    db = connections[using]
+    with db.cursor() as cursor:
+        table = db.ops.quote_name(Order._meta.db_table)
         cursor.execute(f"SELECT product FROM {table} ORDER BY product")
         return [row[0] for row in cursor.fetchall()]
 
@@ -177,6 +178,43 @@ def reconnect_view(request: HttpRequest) -> JsonResponse:
             "database_products": _database_products(),
         }
     )
+
+
+def pool_probe_view(request: HttpRequest) -> JsonResponse:
+    """Report the physical connection, RLS GUCs and visible rows on the ``pooled`` alias.
+
+    ``pooled`` is registered by the ``pooled`` test fixture.
+    """
+    with connections["pooled"].cursor() as cursor:
+        cursor.execute(
+            "SELECT pg_backend_pid(), current_setting('rls.current_tenant', true), "
+            "current_setting('rls.is_admin', true), "
+            "current_setting('rls.is_login_request', true)"
+        )
+        pid, tenant, is_admin, login_flag = cursor.fetchone()
+    return JsonResponse(
+        {
+            "pid": pid,
+            # current_setting() is NULL for a GUC never set in the session, ""
+            # once cleared; both mean "no context".
+            "tenant_guc": tenant or None,
+            "is_admin_guc": is_admin or None,
+            "login_flag_guc": login_flag or None,
+            "database_products": _database_products("pooled"),
+        }
+    )
+
+
+def pool_reconnect_view(request: HttpRequest) -> JsonResponse:
+    """Leave a bypass flag on the ``pooled`` connection, return it early, then probe.
+
+    Like a view that closes its connection mid-request: the probe checks the
+    same physical connection out again, and the ``connection_created`` handler
+    must clear the flag and give it the request's GUCs.
+    """
+    set_guc("rls.is_login_request", "true", using="pooled")
+    connections["pooled"].close()
+    return pool_probe_view(request)
 
 
 class DatabaseExceptionMiddleware(MiddlewareMixin):

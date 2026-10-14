@@ -239,6 +239,7 @@ addopts = [
 markers = [
     "integration: end-to-end tests requiring a live PostgreSQL database",
     'superuser_only: needs a PostgreSQL superuser connection; deselect with -m "not superuser_only" on a plain role',
+    "psycopg3_only: needs psycopg 3 and psycopg_pool (Django's connection pool); deselected automatically on psycopg2",
 ]
 
 # ---------------------------------------------------------------------------

@@ -219,6 +219,17 @@ coroutine; see [Async Tests](../guides/testing.md#async-tests).
 
 ---
 
+## Connection Pool
+
+Hook for Django's psycopg connection pool (`OPTIONS["pool"]`, Django 5.1+). It is **not**
+re-exported from the top-level package; import it from `django_rls_tenants.pool`, which is
+safe to import from `settings.py`. See
+[Django's Connection Pool](../guides/connection-pooling.md#djangos-connection-pool).
+
+::: django_rls_tenants.pool.reset_rls_gucs
+
+---
+
 ## Contrib
 
 Optional integrations with third-party libraries. These are **not** re-exported

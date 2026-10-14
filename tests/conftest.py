@@ -31,6 +31,7 @@ from tests.test_app.models import (
 )
 
 _RLS_ROLE = "rls_test_role"
+_POOLED_ALIAS = "pooled"
 
 # Zero-skipped-tests rule (#110). A skipped RLS test is indistinguishable from
 # a CI leg whose database role never materialised, so every PostgreSQL CI leg
@@ -59,6 +60,27 @@ def pytest_configure(config):
     for name, obj in vars(deprecation).items():
         if name.startswith("RemovedIn") and isinstance(obj, type) and issubclass(obj, Warning):
             config.addinivalue_line("filterwarnings", f"error::django.utils.deprecation.{name}")
+
+
+def pytest_collection_modifyitems(config, items):
+    """Deselect ``psycopg3_only`` tests unless Django runs on psycopg 3.
+
+    Django's connection pool needs psycopg 3 and ``psycopg_pool``, and Django
+    switches to psycopg 3 whenever it is importable, so only the psycopg 3 CI
+    leg can run these tests. Deselected tests are not skipped, so the
+    zero-skipped rule still holds; that leg's driver check proves it really
+    runs psycopg 3, and a missing ``psycopg_pool`` there fails the tests.
+    """
+    from django.db.backends.postgresql.psycopg_any import (  # noqa: PLC0415  -- keep conftest import-light
+        is_psycopg3,
+    )
+
+    if is_psycopg3:
+        return
+    deselected = [item for item in items if item.get_closest_marker("psycopg3_only")]
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = [item for item in items if not item.get_closest_marker("psycopg3_only")]
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -112,10 +134,13 @@ def _clear_gucs_after_test(db):
                 clear_guc(name)
 
 
-def _connection_bypasses_rls(cursor):
-    """Return whether the test connection's role bypasses RLS (superuser or ``BYPASSRLS``)."""
+def _connection_bypasses_rls(cursor, *, role="current_user"):
+    """Return whether the test connection's role bypasses RLS (superuser or ``BYPASSRLS``).
+
+    ``role="session_user"`` asks about the login role, which ``SET ROLE`` does not change.
+    """
     cursor.execute(
-        "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user",
+        f"SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = {role}",
     )
     row = cursor.fetchone()
     return bool(row and row[0])
@@ -192,6 +217,44 @@ def replica(_rls_role, transactional_db):
     finally:
         del connections["replica"]
         conn.close()
+
+
+@pytest.fixture
+def pooled(request, _rls_role, transactional_db):
+    """A ``pooled`` alias on the test database, served by Django's pool of one connection.
+
+    Every checkout gets the same physical connection, so a test sees what the
+    previous borrower left on it. Like ``replica`` it is a separate session
+    (committed rows only), registered on this thread only, and it runs as a
+    role RLS applies to, set at connection startup through libpq ``options``.
+    (Django 6.1's ``assume_role`` cannot connect through a pool: it composes
+    ``SET ROLE`` with a cursor of the same alias, which waits on the pool that
+    is still configuring the connection.) Django's test client never returns
+    connections at request boundaries (it disconnects ``close_old_connections``),
+    so tests close the alias where a server would. Indirect parametrization
+    adds pool options.
+
+    Needs psycopg 3 and ``psycopg_pool``: request it from ``psycopg3_only`` tests.
+    """
+    default = connections[DEFAULT_DB_ALIAS]
+    options = {
+        **default.settings_dict["OPTIONS"],
+        "pool": {"min_size": 1, "max_size": 1, "timeout": 10, **getattr(request, "param", {})},
+    }
+    # session_user: enforce_rls may already have switched current_user.
+    with default.cursor() as cur:
+        if _connection_bypasses_rls(cur, role="session_user"):
+            options["options"] = f"-c role={_RLS_ROLE}"
+    conn = type(default)({**default.settings_dict, "OPTIONS": options}, alias=_POOLED_ALIAS)
+    connections[_POOLED_ALIAS] = conn
+    try:
+        yield _POOLED_ALIAS
+    finally:
+        del connections[_POOLED_ALIAS]
+        try:
+            conn.close()
+        finally:
+            conn.close_pool()
 
 
 @pytest.fixture

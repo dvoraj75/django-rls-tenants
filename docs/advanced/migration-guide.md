@@ -162,6 +162,17 @@ migration that assigns the correct tenant to each existing record.
   connection kept the GUCs of the request that opened it, for later requests too. Open
   `tenant_context()` / `admin_context()` inside that code if it needs tenant data. See
   [Running under ASGI](../guides/middleware.md#running-under-asgi).
+- **Django's connection pool is cleared on every checkout** (#96, security fix). With
+  `OPTIONS["pool"]` (Django 5.1+, psycopg 3), a connection that the request's cleanup did
+  not reach used to hand its session GUCs to its next borrower: the tenant and admin GUCs
+  with `USE_LOCAL_SET=False`, and session-scoped bypass flags in either mode. The
+  `connection_created` handler now clears every GUC the policies read on each checkout
+  from the pool, in one statement: one extra round trip per checkout. If that clear fails,
+  the checkout now raises instead of handing over the connection. Otherwise nothing
+  changes, but set `django_rls_tenants.pool.reset_rls_gucs` as the pool's `reset` callback
+  to clear them when the connection goes back too. New system check `W010` warns until you
+  do (or set `USE_LOCAL_SET=True`, WSGI only). See [Django's Connection
+  Pool](../guides/connection-pooling.md#djangos-connection-pool).
 
 ### From 1.3.3 to 1.3.4
 
