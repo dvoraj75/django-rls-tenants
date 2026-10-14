@@ -160,11 +160,12 @@ migration that assigns the correct tenant to each existing record.
   WSGI, work run with `sync_to_async(..., thread_sensitive=False)` or
   `asyncio.to_thread()`. Before, that connection got the request's GUCs only if it opened
   during that request, and then kept them for later requests on its thread. Now the new
-  GUC affinity guard applies the context to each of that code's statements and takes it
-  off the connection before the first statement run without it. Work started without a
-  copy of the context (`ThreadPoolExecutor.submit()`, `loop.run_in_executor()`) still runs
-  without one. With `USE_LOCAL_SET=True` the guard does nothing: open `tenant_context()` /
-  `admin_context()` inside such code. See
+  GUC affinity guard applies the context to each of that code's statements while the
+  context is live, and takes it off the connection before the first statement run without
+  it. Work started without a copy of the context (`ThreadPoolExecutor.submit()`,
+  `loop.run_in_executor()`), or still running after the context's block has ended (a task
+  started and not awaited inside it), runs without one. With `USE_LOCAL_SET=True` the
+  guard does nothing: open `tenant_context()` / `admin_context()` inside such code. See
   [Running under ASGI](../guides/middleware.md#running-under-asgi) and
   [GUC Affinity Guard](architecture.md#guc-affinity-guard).
 - **Every configured alias follows the active context** (#41). With several aliases in
@@ -173,18 +174,18 @@ migration that assigns the correct tenant to each existing record.
   to that tenant (before, it usually found no rows), and `admin_context(using="replica")`
   gives the admin bypass on every configured alias, not only the replica. Nested
   `tenant_context(..., using=...)` blocks that only repeated an outer context for another
-  configured alias can go. Aliases outside `RLS_TENANTS["DATABASES"]` are unaffected. See
+  configured alias can go. `using` names the alias written to first, not a limit: a
+  context entered with `using=` on an alias outside `RLS_TENANTS["DATABASES"]` still
+  applies on every configured alias, so check `admin_context(using=...)` calls that were
+  meant to grant the admin bypass on one alias only. An alias outside the list does not
+  follow a context entered on another alias. See
   [Multi-Database Support](../guides/context-managers.md#multi-database-support).
-- **Sibling tasks can hold different contexts** (#41). `asyncio.gather` over
-  `async_tenant_context()` blocks for different tenants is now safe for raw SQL and M2M
-  through tables too: each task's statements run with its own context, although the
-  tasks share the request's connection. Bypass flags are still shared. See
-  [Concurrent tasks](../guides/context-managers.md#concurrent-tasks).
 - **An extra `set_config(...)` statement can appear in query counts** (#41). The guard
   runs one before a statement whose connection does not hold the active context's GUCs.
   Code that stays on one connection runs none, but a test that leaves a context open (by
-  calling `process_request()` without `process_response()`, say) can make the next
-  statement run one. See [A `set_config(...)` query you did not
+  calling `process_request()` without `process_response()`, say), or one that ends a
+  transaction through the driver connection, can make the next statement run one. See
+  [A `set_config(...)` query you did not
   run](../troubleshooting.md#a-set_config-query-you-did-not-run).
 - **Django's connection pool is cleared on every checkout** (#96, security fix). With
   `OPTIONS["pool"]` (Django 5.1+, psycopg 3), a connection that the request's cleanup did

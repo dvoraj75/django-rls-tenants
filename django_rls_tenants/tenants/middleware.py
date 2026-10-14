@@ -8,6 +8,7 @@ synchronous (WSGI) path and on its own native async (ASGI) path.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 from contextlib import ExitStack
@@ -26,6 +27,7 @@ from django_rls_tenants.tenants.affinity import writing
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import _context_gucs_of, _resolve_user_guc_vars
 from django_rls_tenants.tenants.state import (
+    _clear_context_gucs,
     _reset_context_gucs,
     _set_context_gucs,
     reset_current_tenant_id,
@@ -41,6 +43,7 @@ if TYPE_CHECKING:
     from django.utils.deprecation import MiddlewareMixin
 
     from django_rls_tenants.tenants.conf import RLSTenantsConfig
+    from django_rls_tenants.tenants.state import ContextGucs, _Live
 else:
     # Django 6.2 moves MiddlewareMixin to django.middleware and deprecates the
     # old import path (RemovedInDjango2029Warning). django-stubs still declares
@@ -152,7 +155,7 @@ def _reset_or_clear[T](
     clear()
 
 
-def _end_context_gucs(token: Token[tuple[str, str] | None] | None) -> None:
+def _end_context_gucs(token: Token[_Live | None] | None) -> None:
     """Reset the request's context GUC values through ``token``; clear them if that fails.
 
     Left set, they would make the GUC affinity guard apply the request's GUCs
@@ -165,9 +168,9 @@ def _end_context_gucs(token: Token[tuple[str, str] | None] | None) -> None:
             values were never set.
     """
     try:
-        _reset_or_clear(token, _reset_context_gucs, partial(_set_context_gucs, None))
+        _reset_or_clear(token, _reset_context_gucs, _clear_context_gucs)
     except BaseException:
-        _set_context_gucs(None)
+        _clear_context_gucs()
         raise
 
 
@@ -180,6 +183,13 @@ def _is_authenticated(request: HttpRequest) -> bool:
     return hasattr(request, "user") and bool(request.user.is_authenticated)
 
 
+def _clear_alias_gucs(conf: RLSTenantsConfig, db_alias: str) -> None:
+    """Clear both GUCs on the thread's connection of ``db_alias``, and record it for the guard."""
+    with writing(db_alias, None):
+        clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
+        clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
+
+
 def _clear_gucs_on_all_databases(conf: Any) -> None:
     """Best-effort clear of GUCs on all configured database aliases.
 
@@ -190,12 +200,9 @@ def _clear_gucs_on_all_databases(conf: Any) -> None:
         conf: ``RLSTenantsConfig`` instance.
     """
     for db_alias in conf.DATABASES:
-        try:
-            with writing(db_alias, None):
-                clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
-                clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
-        except Exception:  # noqa: S110  -- best-effort cleanup, connection may be dead
-            pass
+        # Best-effort cleanup: the connection may be dead.
+        with contextlib.suppress(Exception):
+            _clear_alias_gucs(conf, db_alias)
 
 
 def _clear_request_gucs(conf: RLSTenantsConfig) -> None:
@@ -210,9 +217,7 @@ def _clear_request_gucs(conf: RLSTenantsConfig) -> None:
     if conf.USE_LOCAL_SET:
         return
     for db_alias in conf.DATABASES:
-        with writing(db_alias, None):
-            clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
-            clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
+        _clear_alias_gucs(conf, db_alias)
     logger.debug("Middleware cleared GUCs on databases=%s", conf.DATABASES)
 
 
@@ -220,7 +225,7 @@ class _RequestScope(NamedTuple):
     """State of a request whose GUCs the async enter hop has set."""
 
     tenant_id: int | str | None
-    gucs: tuple[str, str]
+    gucs: ContextGucs
     thread_marker: _ThreadMarker
 
 
@@ -316,7 +321,17 @@ class RLSTenantMiddleware(MiddlewareMixin):
             return self.__acall__(request)
         conf = rls_tenants_config
         if not conf.USE_LOCAL_SET or not _is_authenticated(request):
-            return super().__call__(request)
+            try:
+                return super().__call__(request)
+            except BaseException:
+                # Django turns an Exception from the chain into a response, so
+                # this is a BaseException (KeyboardInterrupt, a server's
+                # timeout) that skipped process_response, or a failure in it.
+                # Under WSGI the thread's next request would start inside this
+                # request's context; the GUC affinity guard would apply it.
+                with contextlib.suppress(Exception):  # the original error wins
+                    self._cleanup_rls_state(request)
+                raise
         with ExitStack() as stack:
             for db_alias in conf.DATABASES:
                 stack.enter_context(transaction.atomic(using=db_alias))
@@ -504,7 +519,7 @@ class RLSTenantMiddleware(MiddlewareMixin):
         # the failure.
         tenant_token: Token[int | str | None] | None = None
         active_token: Token[bool] | None = None
-        gucs_token: Token[tuple[str, str] | None] | None = None
+        gucs_token: Token[_Live | None] | None = None
         try:
             guc_vars = _resolve_user_guc_vars(user, conf)
             self._set_gucs_on_all_databases(guc_vars, conf)
@@ -620,12 +635,8 @@ class RLSTenantMiddleware(MiddlewareMixin):
         except Exception:
             # Rollback GUCs on databases that were already set.
             for done_alias in completed_aliases:
-                try:
-                    with writing(done_alias, None):
-                        clear_guc(conf.GUC_IS_ADMIN, using=done_alias)
-                        clear_guc(conf.GUC_CURRENT_TENANT, using=done_alias)
-                except Exception:  # noqa: S110  -- best-effort cleanup
-                    pass
+                with contextlib.suppress(Exception):  # best-effort cleanup
+                    _clear_alias_gucs(conf, done_alias)
             raise
 
     @staticmethod

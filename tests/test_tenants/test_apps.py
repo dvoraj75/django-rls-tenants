@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextvars
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -23,10 +24,13 @@ from django_rls_tenants.tenants.middleware import (
     _were_gucs_set,
 )
 from django_rls_tenants.tenants.state import (
+    ADMIN_GUCS,
+    ContextGucs,
     _set_context_gucs,
     set_current_tenant_id,
     set_rls_context_active,
 )
+from tests.session_gucs import session_gucs
 
 pytestmark = pytest.mark.django_db
 
@@ -179,18 +183,8 @@ def _enter_request_context(tenant_id):
     """
     set_current_tenant_id(tenant_id)
     set_rls_context_active(True)
-    _set_context_gucs(("true", "") if tenant_id is None else ("false", str(tenant_id)))
+    _set_context_gucs(ADMIN_GUCS if tenant_id is None else ContextGucs.for_tenant(tenant_id))
     _mark_gucs_set()
-
-
-def _read_session_gucs(conn):
-    """Read the tenant and admin GUCs with a driver cursor, which the affinity guard never sees."""
-    with conn.connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT current_setting('rls.current_tenant', true), "
-            "current_setting('rls.is_admin', true)"
-        )
-        return tuple(value or None for value in cursor.fetchone())
 
 
 @pytest.mark.django_db(transaction=True)
@@ -230,7 +224,7 @@ class TestConnectionCreatedSignalHandler:
 
         connection.ensure_connection()  # connection_created
 
-        assert _read_session_gucs(connection) == expected
+        assert session_gucs(connection) == expected
 
     def test_no_context_skips_guc_setting(self):
         """Without active context, handler does nothing on new connections."""
@@ -249,6 +243,17 @@ class TestConnectionCreatedSignalHandler:
         # None or empty string depending on PostgreSQL version.
         assert result is not None
         assert result[0] in (None, "")
+
+    def test_flag_without_a_context_gets_nothing_on_a_new_connection(self):
+        """The thread's flag alone, with no context values, applies nothing (not admin)."""
+        _mark_gucs_set()
+        connection.ensure_connection()
+        connection.connection.close()
+        connection.connection = None
+
+        connection.ensure_connection()  # connection_created
+
+        assert session_gucs(connection) == (None, None)
 
 
 def _on_new_thread(func):
@@ -299,13 +304,19 @@ def _read_gucs_on_dirty_connection():
     return _read_gucs()
 
 
-def _read_gucs_on_dirty_replica_connection():
-    """The same on a second alias, registered on this thread only."""
+def _read_gucs_on_dirty_replica_connection(*, on_connect=False):
+    """The same on a second alias, registered on this thread only.
+
+    ``on_connect`` reads with a driver cursor right after the connection opens,
+    before the affinity guard applies anything.
+    """
     default = connections["default"]
     replica = type(default)(default.settings_dict, alias="replica")
     connections["replica"] = replica
     try:
         _arrive_with(_STALE_GUCS_SQL, alias="replica")
+        if on_connect:
+            return session_gucs(replica)
         return get_guc("rls.current_tenant", using="replica"), get_guc(
             "rls.is_admin", using="replica"
         )
@@ -347,7 +358,7 @@ def _read_session_gucs_on_connect():
     """Open this thread's connection and read its GUCs before any statement runs."""
     conn = connections["default"]
     conn.ensure_connection()
-    return _read_session_gucs(conn)
+    return session_gucs(conn)
 
 
 class TestConnectionCreatedOnAnotherThread:
@@ -402,6 +413,8 @@ class TestConnectionCreatedOnAnotherThread:
 
             _enter_request_context(42)
 
+            read_on_connect = partial(_read_gucs_on_dirty_replica_connection, on_connect=True)
+            assert _on_new_thread(read_on_connect) == (None, None)
             assert _on_new_thread(_read_gucs_on_dirty_replica_connection) == ("42", "false")
 
     def test_failed_clear_is_logged_not_raised(self, caplog):

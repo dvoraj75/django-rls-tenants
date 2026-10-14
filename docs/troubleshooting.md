@@ -60,11 +60,14 @@ happens there. It still happens when:
 
 - the thread never got the context: `ThreadPoolExecutor.submit()` and
   `loop.run_in_executor()` do not copy it;
+- the work runs after the context's block has ended (a task started and not awaited inside
+  it): the guard applies a context only while it is live;
 - `USE_LOCAL_SET=True`: the guard does nothing, and the other thread's connection is not in
   the request's transaction either;
 - the context was built by hand with `set_current_tenant_id()` / `set_rls_context_active()`
-  instead of a context manager or the middleware: the guard only applies contexts the
-  library set up.
+  instead of a context manager or the middleware, or the GUCs were set by hand with
+  `set_guc()` / `rls_context()`: the guard only applies the admin and tenant GUCs of
+  contexts the library set up.
 
 Before 1.4.0 such a connection got the request's GUCs only if it opened during that request,
 and kept them for later requests on its thread (#130).
@@ -577,10 +580,18 @@ before one of your statements.
 
 **Cause:** The [GUC affinity guard](advanced/architecture.md#guc-affinity-guard) ran it
 because the connection did not hold the active context's GUCs, or because it could not tell
-what they were: the code ran on another thread or in a sibling task, another context changed
-them meanwhile, or a transaction that changed them ended, a savepoint the guard did not see
-set was rolled back, or a `RESET ALL` / `DISCARD ALL` ran. Code that stays on one thread
-and connection inside a context runs none.
+what they were. Code that stays on one thread and connection inside a context runs none.
+Typical reasons:
+
+- the code ran on another thread, or in a sibling task with a different context;
+- a rollback undid GUCs the guard had applied inside the transaction or savepoint;
+- a transaction ended through the driver connection with GUCs different from before it
+  (the guard cannot tell a commit from a rollback there), a savepoint it did not see set
+  was rolled back, or a `RESET ALL` / `DISCARD ALL` ran;
+- an earlier test left a context open.
+
+At `DEBUG` level the `django_rls_tenants` logger names each one: `GUC affinity guard: alias
+'default' held ...; applied the active context's ...`.
 
 **Fix:** Nothing is wrong. In a test that counts queries, run a statement before the counted
 block (or count inside the context) so the connection already holds the context's GUCs, and

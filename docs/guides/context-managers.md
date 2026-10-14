@@ -188,8 +188,8 @@ generic `async_rls_context()` and `async_bypass_flag()` do not check this: with
 
 ### Concurrent tasks
 
-*Changed in 1.4.0.* Sibling tasks of one request share the request's database connection,
-but each has its own `ContextVar` state. Before each statement, the
+Sibling tasks of one request share the request's database connection, but each has its
+own `ContextVar` state. Before each statement, the
 [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) applies the context of
 the task that runs it, so blocks for different tenants can run concurrently:
 
@@ -207,13 +207,14 @@ alone. It does not cover:
   stay on the shared connection while the block runs, and sibling tasks see them. Do not
   run such a block concurrently with work that must not get the bypass;
 - `USE_LOCAL_SET=True` (see above), where the guard does nothing;
-- SQL that bypasses Django's cursor: a raw driver cursor, and the `FETCH`es of a
-  server-side cursor (`iterator()`) opened inside a transaction, whose rows PostgreSQL
-  computes as they are fetched. Outside a transaction, as under ASGI, it computes them when
-  the cursor opens.
+- SQL that bypasses Django's execute wrappers: a driver cursor, `callproc()`, the driver's
+  `copy` methods, and the `FETCH`es of a server-side cursor (`iterator()`) opened inside a
+  transaction, whose rows PostgreSQL computes as they are fetched. Outside a transaction
+  (autocommit, Django's default) it computes them when the cursor opens.
 
-Before 1.4.0 the tasks' GUC writes interleaved: model queries stayed scoped by the ORM
-auto-scope filter, but raw SQL could see another task's tenant.
+A task that a block starts and does not await gets the block's context only while the
+block is live: once the block has ended, that task's statements run without it
+(fail-closed). Enter the context inside the task if it outlives the block.
 
 ### Mixing sync and async code
 
@@ -475,3 +476,9 @@ to a configured replica, and `admin_context(using="analytics")` gives the admin 
 every configured alias. An alias outside `RLS_TENANTS["DATABASES"]` gets the GUCs only when
 you name it in `using`. With `USE_LOCAL_SET=True` the guard does nothing, and only the
 `using` alias gets them.
+
+!!! warning "`using` does not limit a context to one alias"
+    `using` names the alias the GUCs are written to first, not the aliases the context
+    reaches. `admin_context(using="analytics")` also gives the admin bypass on every alias in
+    `RLS_TENANTS["DATABASES"]`, `default` included, even when `analytics` is not listed.
+    Do not enter an admin context for an alias you do not need it on.

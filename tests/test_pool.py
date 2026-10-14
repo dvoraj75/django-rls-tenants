@@ -172,6 +172,10 @@ class TestClearPolicyGucs:
         assert [get_guc(name) for name in _POLICY_GUCS] == [None] * len(_POLICY_GUCS)
 
     def test_one_round_trip(self):
+        # Settle the connection first: after a transaction an earlier test ended
+        # with a driver commit, the GUC affinity guard would apply the (empty)
+        # context once before the first statement.
+        get_guc("rls.current_tenant")
         with CaptureQueriesContext(connection) as queries:
             _clear_policy_gucs(connection)
 

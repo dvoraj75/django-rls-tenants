@@ -31,7 +31,7 @@ def restore_gucs(
     is_local: bool = False,
     using: str = "default",
     exc_pending: bool = False,
-) -> None:
+) -> bool:
     """Restore several GUCs to the values saved before a context block.
 
     Shared exit path for every context manager in the library. Restoring
@@ -65,12 +65,17 @@ def restore_gucs(
         is_local: Scope the block used; ``True`` re-issues ``SET LOCAL``.
         using: Database alias. Default: ``"default"``.
         exc_pending: ``True`` when called while an exception is propagating.
+
+    Returns:
+        ``True`` if every GUC was restored, ``False`` if a failure was
+        skipped because ``exc_pending`` was set.
     """
     if not previous:
-        return
+        return True
     conn = connections[using]
     needs_rollback = conn.needs_rollback
     conn.needs_rollback = False
+    restored = True
     try:
         for name, prev in previous.items():
             try:
@@ -78,6 +83,7 @@ def restore_gucs(
             except DatabaseError:
                 if not exc_pending:
                     raise
+                restored = False
                 logger.debug(
                     "Skipping GUC restore for %s: the transaction is already aborted and "
                     "will be rolled back; the original exception is propagated instead.",
@@ -86,6 +92,7 @@ def restore_gucs(
                 )
     finally:
         conn.needs_rollback = needs_rollback
+    return restored
 
 
 @contextmanager

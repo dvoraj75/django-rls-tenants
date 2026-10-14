@@ -11,12 +11,11 @@ from django.apps import AppConfig
 if TYPE_CHECKING:
     from django.db.backends.base.base import BaseDatabaseWrapper
 
-    from django_rls_tenants.tenants.conf import RLSTenantsConfig
 
 logger = logging.getLogger("django_rls_tenants")
 
 
-def _apply_request_gucs(connection: BaseDatabaseWrapper, conf: RLSTenantsConfig) -> None:
+def _apply_request_gucs(connection: BaseDatabaseWrapper, *, is_local: bool) -> None:
     """Set the active context's GUCs on a new connection, in one statement.
 
     Used on the thread where the middleware set the GUCs, whose cleanup clears
@@ -27,16 +26,16 @@ def _apply_request_gucs(connection: BaseDatabaseWrapper, conf: RLSTenantsConfig)
 
     Args:
         connection: The new connection, as sent by ``connection_created``.
-        conf: ``RLSTenantsConfig`` instance.
+        is_local: Set them transaction-locally (``USE_LOCAL_SET=True``).
     """
-    from django_rls_tenants.tenants.affinity import set_gucs  # noqa: PLC0415
+    from django_rls_tenants.tenants.affinity import write_gucs  # noqa: PLC0415
     from django_rls_tenants.tenants.state import _get_context_gucs  # noqa: PLC0415
 
     context_gucs = _get_context_gucs()
     if context_gucs is None:
         return
     try:
-        set_gucs(connection, context_gucs, is_local=conf.USE_LOCAL_SET)
+        write_gucs(connection, context_gucs, is_local=is_local)
     except Exception:
         logger.warning(
             "Failed to set RLS GUCs on new connection for alias %r. "
@@ -152,7 +151,7 @@ def _prepare_new_connection(connection: BaseDatabaseWrapper) -> None:
         # request context, the new borrower starts clean.
         _clear_new_connection_gucs(connection, "checked out of a connection pool")
     if on_request_thread:
-        _apply_request_gucs(connection, conf)
+        _apply_request_gucs(connection, is_local=conf.USE_LOCAL_SET)
 
 
 class DjangoRlsTenantsConfig(AppConfig):
@@ -191,14 +190,14 @@ class DjangoRlsTenantsConfig(AppConfig):
             try:
                 from django_rls_tenants.tenants.affinity import writing  # noqa: PLC0415
                 from django_rls_tenants.tenants.state import (  # noqa: PLC0415
-                    _set_context_gucs,
+                    _clear_context_gucs,
                     set_current_tenant_id,
                 )
 
                 set_current_tenant_id(None)
                 # Otherwise the affinity guard would apply the request's GUCs
                 # again before the next statement in this context.
-                _set_context_gucs(None)
+                _clear_context_gucs()
                 conf = rls_tenants_config
                 if not conf.USE_LOCAL_SET:
                     for db_alias in conf.DATABASES:

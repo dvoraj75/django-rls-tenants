@@ -15,9 +15,10 @@ to distinguish "no context" from "admin context" -- both have
 ``_current_tenant_id=None``, but only the former should raise.
 
 A third, private ``ContextVar`` (``_context_gucs``) holds the admin and
-tenant GUC values the library applied for the active context. The GUC
-affinity guard (``tenants/affinity.py``) re-applies those values on whichever
-connection a statement runs on.
+tenant GUC values the library applied for the active context, ended for every
+copy of the context when its block exits. The GUC affinity guard
+(``tenants/affinity.py``) applies those values on whichever connection a
+statement runs on.
 
 The state is set/restored by ``tenant_context()``, ``admin_context()``,
 and ``RLSTenantMiddleware``. Users should not need to call these functions
@@ -27,6 +28,7 @@ directly -- use the context managers or middleware instead.
 from __future__ import annotations
 
 from contextvars import ContextVar, Token
+from typing import Final, NamedTuple
 
 # ---- Tenant ID state ----
 
@@ -111,36 +113,91 @@ def reset_rls_context_active(token: Token[bool]) -> None:
 
 # ---- GUC values of the active context (GUC affinity guard) ----
 
-# The admin and tenant GUC values the library applied for the innermost active
-# context, as ``(is_admin, current_tenant)``, or ``None`` outside one. Only the
-# library's own entry points set it (the context managers, the middleware and
-# ``TenantQuerySet._rls_scope()``), so the guard re-applies the contexts the
-# library set up and nothing else: code that drives the public functions above
-# by hand, and writes the GUCs itself, is left alone.
-_context_gucs: ContextVar[tuple[str, str] | None] = ContextVar("rls_context_gucs", default=None)
+
+class ContextGucs(NamedTuple):
+    """The admin and tenant GUC values an RLS context sets.
+
+    Internal: the library's entry points record them for the GUC affinity
+    guard (``tenants/affinity.py``).
+    """
+
+    is_admin: str
+    current_tenant: str
+
+    @classmethod
+    def for_tenant(cls, tenant_id: int | str) -> ContextGucs:
+        """Return the values of ``tenant_context(tenant_id)``."""
+        return cls("false", str(tenant_id))
 
 
-def _get_context_gucs() -> tuple[str, str] | None:
-    """Return the ``(is_admin, current_tenant)`` GUC values of the active context, or ``None``."""
-    return _context_gucs.get()
+# The values of ``admin_context()``: the tenant GUC is cleared, not a sentinel.
+ADMIN_GUCS: Final = ContextGucs("true", "")
 
 
-def _set_context_gucs(values: tuple[str, str] | None) -> Token[tuple[str, str] | None]:
-    """Record the GUC values of the context being entered; ``None`` for no context.
+class _Live:
+    """A context's GUC values, shared by every copy of the context's ``ContextVar`` values.
+
+    A task, a ``sync_to_async`` hop or a ``copy_context()`` made inside the
+    block holds this same object, so ending the block ends the context for
+    every copy: work that outlives the block runs without it (fail-closed)
+    instead of keeping its tenant or admin rights.
+    """
+
+    __slots__ = ("alive", "values")
+
+    def __init__(self, values: ContextGucs) -> None:
+        self.values = values
+        self.alive = True
+
+
+# The GUC values of the innermost active context the library set up, or
+# ``None`` outside one. Only the library's own entry points set it (the context
+# managers, the middleware and ``TenantQuerySet._rls_scope()``), so the guard
+# applies the contexts the library set up and nothing else: code that drives the
+# public functions above by hand, and writes the GUCs itself, is left alone.
+_context_gucs: ContextVar[_Live | None] = ContextVar("rls_context_gucs", default=None)
+
+
+def _get_context_gucs() -> ContextGucs | None:
+    """Return the GUC values of the active context, or ``None`` if none is live."""
+    live = _context_gucs.get()
+    return live.values if live is not None and live.alive else None
+
+
+def _end_live_context() -> None:
+    """End the context whose values are current, for every copy that holds them."""
+    live = _context_gucs.get()
+    if live is not None:
+        live.alive = False
+
+
+def _set_context_gucs(values: ContextGucs) -> Token[_Live | None]:
+    """Record the GUC values of the context being entered.
 
     Args:
-        values: ``(is_admin, current_tenant)`` as the context sets them, or ``None``.
+        values: The values the context sets.
 
     Returns:
-        A ``Token`` for restoring the previous values.
+        A ``Token`` for :func:`_reset_context_gucs`.
     """
-    return _context_gucs.set(values)
+    return _context_gucs.set(_Live(values))
 
 
-def _reset_context_gucs(token: Token[tuple[str, str] | None]) -> None:
-    """Restore the previous context GUC values using a token from ``_set_context_gucs()``.
+def _reset_context_gucs(token: Token[_Live | None]) -> None:
+    """End the context entered with ``token`` and restore the enclosing one.
 
     Args:
         token: The token returned by the corresponding ``_set_context_gucs()`` call.
     """
+    _end_live_context()
     _context_gucs.reset(token)
+
+
+def _clear_context_gucs() -> None:
+    """End the current context and record none, without a token.
+
+    For cleanup paths that cannot reset through a token (see
+    ``middleware._reset_or_clear``) and for the ``request_finished`` safety net.
+    """
+    _end_live_context()
+    _context_gucs.set(None)

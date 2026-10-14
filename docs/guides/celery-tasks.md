@@ -245,7 +245,7 @@ def replicate() -> None:
         Order.objects.using("replica").all()
 ```
 
-!!! warning "Aliases outside `RLS_TENANTS[\"DATABASES\"]` are not auto-scoped"
+!!! warning "Aliases outside `RLS_TENANTS['DATABASES']` are not auto-scoped"
     A task body that queries such an alias without an explicit
     `tenant_context(..., using="<alias>")` runs **unscoped** on it (RLS then
     returns zero rows, or every row in admin mode). Wrap every such alias the task

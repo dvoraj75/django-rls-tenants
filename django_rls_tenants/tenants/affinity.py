@@ -10,18 +10,18 @@ something else has changed the GUCs:
   own connections; so does the error page Django builds there under ASGI;
 - sibling ``asyncio`` tasks of one request share its connection, so one
   task's context can change the GUCs between another task's statements;
-- a connection keeps the GUCs a hop put on it, and a context entered on one
-  alias leaves the other aliases as they were.
+- a context entered on one alias leaves the other aliases as they were.
 
-:func:`install` puts :func:`_guard` first in the ``execute_wrappers`` of each
-connection of an alias in ``RLS_TENANTS["DATABASES"]``, so Django runs every
-statement on it through the guard. Before each statement the guard compares
-the GUC values of the active context (``state._get_context_gucs()``, set only
-by the library's own entry points) with the values the library last left on
-that database session. When they differ, it applies the context's values in
-one ``set_config()`` statement first: a hop inherits the context, a task gets
-its own values back, and a connection used outside any context loses the
-values a context left on it. If that statement fails, the error propagates
+:func:`install` puts :func:`_guard` first in the ``execute_wrappers`` of every
+PostgreSQL connection, so Django runs every statement on it through the guard.
+On a connection of an alias in ``RLS_TENANTS["DATABASES"]``, before each
+statement, the guard compares the GUC values of the active context
+(``state._get_context_gucs()``, set only by the library's own entry points and
+ended for every copy when the context ends) with the values the library last
+left on that database session. When they differ, it applies the context's
+values in one ``set_config()`` statement first: a hop inherits the context, a
+task gets its own values back, and a connection used outside any context loses
+the values a context left on it. If that statement fails, the error propagates
 and the original statement does not run.
 
 The library's own GUC writes run inside :func:`writing`, which keeps the guard
@@ -30,32 +30,37 @@ other code (``set_guc()``, ``rls_context()``) are not recorded, so they stay
 in force until the context changes, as before.
 
 PostgreSQL undoes a ``set_config()`` made in a transaction or savepoint that
-is rolled back. After a transaction ends, a value recorded during it is kept
-only if it equals the value from before the transaction, since commit and
-rollback then leave the same thing. After a ``ROLLBACK TO SAVEPOINT``, once
-any value changed in the transaction, nothing recorded is trusted. In both
-cases the next statement applies the context's values again. The guard reads
-the transaction status from the driver (libpq), without a round trip.
+is rolled back. The tracker follows the transaction status the driver reports
+(libpq, without a round trip), Django's commit and rollback of the connection
+(``install()`` wraps them), and the transaction-control statements that run
+through Django's cursor: a savepoint keeps the values it was set with, and a
+``ROLLBACK TO`` it puts them back. Whatever it cannot follow (a transaction a
+driver cursor ended, a savepoint it did not see set, a statement it cannot
+read) makes the values unknown, and the next statement applies the context's
+values again.
 
 Limits: the guard only works with session GUCs; with ``USE_LOCAL_SET=True`` it
 does nothing and never writes a session GUC. It covers the admin and tenant
 GUCs, not bypass flags or other GUCs set with ``rls_context()``. It cannot
-see SQL that bypasses Django's cursor wrapper: a raw driver cursor, or the
-``FETCH`` of a server-side cursor that is already open.
+see SQL that bypasses Django's execute wrappers (a driver cursor,
+``CursorWrapper.callproc()``, the driver's ``copy`` methods, the ``FETCH`` of a
+server-side cursor that is already open); on a connection the guard has used,
+such SQL sees whatever values it left there until the next statement it sees.
 """
 
 from __future__ import annotations
 
 import logging
+import string
 import threading
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
 from django.db import connections
 from django.utils.connection import ConnectionDoesNotExist
 
 from django_rls_tenants.tenants.conf import rls_tenants_config
-from django_rls_tenants.tenants.state import _get_context_gucs
+from django_rls_tenants.tenants.state import ContextGucs, _get_context_gucs
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -66,17 +71,46 @@ logger = logging.getLogger("django_rls_tenants")
 
 # libpq's transaction status (PQtransactionStatus), which both drivers report as is.
 _IDLE: Final = 0
-_IN_TRANSACTION: Final = 2
+_IN_ERROR: Final = 3
+_CONNECTION_BAD: Final = 4
 
 # One statement for both GUCs: names and values are bind parameters.
 _SET_GUCS_SQL: Final = "SELECT set_config(%s, %s, %s), set_config(%s, %s, %s)"
 
-# Attribute holding a guarded connection's _SessionGUCs.
+# Attributes of a guarded connection: its tracker, and the marker that its
+# commit and rollback are followed.
 _TRACKER_ATTR: Final = "_rls_session_gucs"
+_HOOKED_ATTR: Final = "_rls_transaction_ends_followed"
 
-# Depth of the library's own GUC writes on this thread (see writing()). One
-# thread runs one connection's statements at a time, sync_to_async hops included.
-_writes = threading.local()
+# How much of a statement is read to find its command and arguments.
+_SQL_HEAD: Final = 256
+
+# Statements that only control the transaction: they read no data, so the guard
+# does not apply the context before them. Failing there would break Django's
+# own transaction handling (a savepoint rollback, say).
+_TRANSACTION_CONTROL: Final = frozenset(
+    {"ABORT", "BEGIN", "COMMIT", "END", "PREPARE", "RELEASE", "ROLLBACK", "SAVEPOINT", "START"},
+)
+
+# Statements after which the tracker is updated: transaction control, and
+# session resets (RESET ALL, DISCARD ALL, RESET of the admin or tenant GUC).
+_FOLLOWED: Final = _TRANSACTION_CONTROL | {"DISCARD", "RESET"}
+
+# PostgreSQL folds unquoted identifiers to lower case for ASCII letters only.
+_ASCII_LOWER: Final = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+
+class _WriteDepth(threading.local):
+    """Depth of the library's own GUC writes on this thread (see :func:`writing`).
+
+    One thread runs one connection's statements at a time, ``sync_to_async``
+    hops included.
+    """
+
+    depth = 0
+
+
+_writes = _WriteDepth()
 
 
 class _Unknown:
@@ -90,9 +124,30 @@ class _Unknown:
 
 UNKNOWN: Final = _Unknown()
 
-# (is_admin, current_tenant) as the library left them; None when no context's
-# values are in force (the session's own, or cleared); or UNKNOWN.
-type _Tracked = tuple[str, str] | _Unknown | None
+# The values the library left on a session; None when no context's values are in
+# force (the session's own, or cleared); or UNKNOWN.
+type _Tracked = ContextGucs | _Unknown | None
+
+
+# ---- The tracker ----
+
+
+def _no_status() -> int:
+    """Stand-in status reader for a tracker that has no session yet."""
+    return _IDLE
+
+
+def _status_reader(raw: Any) -> Callable[[], int]:  # Any: a psycopg or psycopg2 connection
+    """Return a function reading libpq's transaction status of ``raw``, without a query.
+
+    Args:
+        raw: A psycopg 3 or psycopg2 connection.
+    """
+    pgconn = getattr(raw, "pgconn", None)
+    if pgconn is not None:  # psycopg 3
+        return lambda: int(pgconn.transaction_status)
+    get_status: Callable[[], int] = raw.get_transaction_status  # psycopg2
+    return get_status
 
 
 class _SessionGUCs:
@@ -100,6 +155,7 @@ class _SessionGUCs:
 
     Attributes:
         raw: The DB-API connection (the session) the other attributes describe.
+        read_status: Reads the session's transaction status from the driver.
         values: The admin and tenant GUC values the library left on it.
         in_transaction: A transaction was open when the session was last looked at.
         base: ``values`` when that transaction started.
@@ -127,7 +183,7 @@ class _SessionGUCs:
         self.changed = False
         self.savepoints: list[tuple[str, _Tracked]] = []
 
-    def start(self, raw: Any, values: _Tracked) -> None:
+    def attach(self, raw: Any, values: _Tracked) -> None:  # Any: a DB-API connection
         """Start tracking a new session, ``raw``, whose GUCs hold ``values``."""
         self.raw = raw
         self.read_status = _status_reader(raw)
@@ -137,82 +193,58 @@ class _SessionGUCs:
         self.changed = False
         self.savepoints.clear()
 
+    def sync_transaction(self) -> int:
+        """Bring the record up to date with the session's transaction status, and return it.
 
-def _no_status() -> int:
-    """Stand-in status reader for a tracker that has no session yet."""
-    return _IDLE
+        A transaction that has ended unseen since the last look either
+        committed the values recorded during it or rolled back to ``base``.
+        They are kept only when the two agree.
+        """
+        status = self.read_status()
+        if status == _IDLE:
+            if self.in_transaction:
+                self.in_transaction = False
+                self.savepoints.clear()
+                if self.values != self.base:
+                    self.values = UNKNOWN
+        elif not self.in_transaction:
+            self.in_transaction = True
+            self.base = self.values
+            self.changed = False
+            self.savepoints.clear()
+        return status
+
+    def set_values(self, values: _Tracked) -> None:
+        """Record ``values`` as what the session holds."""
+        if values != self.values:
+            self.values = values
+            if self.in_transaction:
+                self.changed = True
+
+    def forget(self) -> None:
+        """Record that the values are not known."""
+        self.set_values(UNKNOWN)
+
+    def end_transaction(self, *, committed: bool) -> None:
+        """Follow the end of the transaction: a commit keeps the values, a rollback undoes them."""
+        if self.in_transaction:
+            if not committed:
+                self.values = self.base
+            self.in_transaction = False
+        self.savepoints.clear()
+
+    def savepoint_index(self, name: str) -> int | None:
+        """Return the position of the newest savepoint called ``name``, or ``None``."""
+        for index in range(len(self.savepoints) - 1, -1, -1):
+            if self.savepoints[index][0] == name:
+                return index
+        return None
 
 
-def _status_reader(raw: Any) -> Callable[[], int]:
-    """Return a function reading libpq's transaction status of ``raw``, without a query.
-
-    Args:
-        raw: A psycopg 3 or psycopg2 connection.
-    """
-    pgconn = getattr(raw, "pgconn", None)
-    if pgconn is not None:  # psycopg 3
-        return lambda: int(pgconn.transaction_status)
-    get_status: Callable[[], int] = raw.get_transaction_status  # psycopg2
-    return get_status
-
-
-def install(connection: BaseDatabaseWrapper, *, values: _Tracked) -> None:
-    """Guard ``connection`` and start tracking the database session it has just opened.
-
-    The ``connection_created`` handler calls it for each alias in
-    ``RLS_TENANTS["DATABASES"]``, on every connect and every checkout from a
-    connection pool.
-
-    Args:
-        connection: The connection, as sent by ``connection_created``.
-        values: What the new session's admin and tenant GUCs hold: ``None`` for
-            a new session, ``UNKNOWN`` for one a pool has lent out before.
-    """
-    if connection.vendor != "postgresql":
-        return
-    if _guard not in connection.execute_wrappers:
-        # First, not last: connection.execute_wrapper() removes the last
-        # wrapper when its block exits, which would be the guard if the
-        # connection opened inside such a block.
-        connection.execute_wrappers.insert(0, _guard)
+def _tracker_of(connection: BaseDatabaseWrapper | None) -> _SessionGUCs | None:
+    """Return ``connection``'s tracker, or ``None`` if it has none (or is ``None``)."""
     tracker: _SessionGUCs | None = getattr(connection, _TRACKER_ATTR, None)
-    if tracker is None:
-        tracker = _SessionGUCs()
-        setattr(connection, _TRACKER_ATTR, tracker)
-    tracker.start(connection.connection, values)
-
-
-def _is_guarded(connection: BaseDatabaseWrapper) -> bool:
-    """Whether the guard applies the context's GUCs on ``connection`` (session GUC mode only)."""
-    conf = rls_tenants_config
-    return not conf.USE_LOCAL_SET and connection.alias in conf.DATABASES
-
-
-def _observe(connection: BaseDatabaseWrapper, tracker: _SessionGUCs) -> int:
-    """Bring ``tracker`` up to date with the session's transaction status, and return it.
-
-    A transaction that has ended since the last look either committed the
-    values recorded during it or rolled back to ``base``. The recorded values
-    are kept only when the two agree.
-    """
-    raw = connection.connection
-    if raw is not tracker.raw:
-        # A session install() did not see open, such as one an alias had
-        # before it joined RLS_TENANTS["DATABASES"].
-        tracker.start(raw, UNKNOWN)
-    status = tracker.read_status()
-    if status == _IDLE:
-        if tracker.in_transaction:
-            tracker.in_transaction = False
-            tracker.savepoints.clear()
-            if tracker.values != tracker.base:
-                tracker.values = UNKNOWN
-    elif not tracker.in_transaction:
-        tracker.in_transaction = True
-        tracker.base = tracker.values
-        tracker.changed = False
-        tracker.savepoints.clear()
-    return status
+    return tracker
 
 
 def _connection_of(target: BaseDatabaseWrapper | str) -> BaseDatabaseWrapper | None:
@@ -229,7 +261,101 @@ def _connection_of(target: BaseDatabaseWrapper | str) -> BaseDatabaseWrapper | N
         return None
 
 
-def record(target: BaseDatabaseWrapper | str, values: _Tracked) -> None:
+def _is_guarded(connection: BaseDatabaseWrapper) -> bool:
+    """Whether the guard applies the context's GUCs on ``connection`` (session GUC mode only)."""
+    return (
+        not rls_tenants_config.USE_LOCAL_SET and connection.alias in rls_tenants_config.DATABASES
+    )
+
+
+def _observe(connection: BaseDatabaseWrapper, tracker: _SessionGUCs) -> int:
+    """Bring ``tracker`` up to date with ``connection``'s session, and return its status."""
+    raw = connection.connection
+    if raw is not tracker.raw:
+        # A session install() did not see open, such as one an alias had
+        # before it joined RLS_TENANTS["DATABASES"].
+        tracker.attach(raw, UNKNOWN)
+    return tracker.sync_transaction()
+
+
+# ---- Installing the guard ----
+
+
+def install(connection: BaseDatabaseWrapper, *, values: _Tracked) -> None:
+    """Guard ``connection`` and track the database session it has just opened.
+
+    The ``connection_created`` handler calls it for every PostgreSQL
+    connection, on every connect and every checkout from a connection pool;
+    the guard itself ignores aliases outside ``RLS_TENANTS["DATABASES"]``.
+
+    Args:
+        connection: The connection, as sent by ``connection_created``.
+        values: What the new session's admin and tenant GUCs hold: ``None`` for
+            a new session, ``UNKNOWN`` for one a pool has lent out before. A new
+            session the guard already tracks (a statement of another
+            ``connection_created`` receiver ran through it) keeps its record.
+    """
+    if connection.vendor != "postgresql":
+        return
+    if _guard not in connection.execute_wrappers:
+        # First, not last: connection.execute_wrapper() removes the last
+        # wrapper when its block exits, which would be the guard if the
+        # connection opened inside such a block.
+        connection.execute_wrappers.insert(0, _guard)
+    _follow_transaction_ends(connection)
+    tracker = _tracker_of(connection)
+    if tracker is None:
+        tracker = _SessionGUCs()
+        setattr(connection, _TRACKER_ATTR, tracker)
+    if values is UNKNOWN or tracker.raw is not connection.connection:
+        tracker.attach(connection.connection, values)
+
+
+def _follow_transaction_ends(connection: BaseDatabaseWrapper) -> None:
+    """Make ``connection``'s commit and rollback update its tracker.
+
+    Django ends the outermost transaction (``atomic()``, ``transaction.commit()``
+    / ``rollback()``) through ``_commit()`` / ``_rollback()``, on the driver
+    connection, not through a cursor. Following them tells the tracker which of
+    the two happened, instead of leaving it to find out from the transaction
+    status that the transaction ended, possibly too late.
+    """
+    if getattr(connection, _HOOKED_ATTR, False):
+        return
+    for name, committed in (("_commit", True), ("_rollback", False)):
+        end: Callable[[], Any] = getattr(connection, name)
+        # An instance attribute shadows Django's method for this connection only.
+        setattr(connection, name, _transaction_end(connection, end, committed=committed))
+    setattr(connection, _HOOKED_ATTR, True)
+
+
+def _transaction_end(
+    connection: BaseDatabaseWrapper,
+    end: Callable[[], Any],
+    *,
+    committed: bool,
+) -> Callable[[], Any]:
+    """Wrap Django's ``_commit`` or ``_rollback`` of ``connection`` to update its tracker."""
+
+    def end_and_follow() -> Any:  # Any: what Django's _commit / _rollback return
+        raw = connection.connection
+        try:
+            result = end()
+        except BaseException:
+            _forget(connection)
+            raise
+        tracker = _tracker_of(connection)
+        if tracker is not None and raw is not None and raw is tracker.raw:
+            tracker.end_transaction(committed=committed)
+        return result
+
+    return end_and_follow
+
+
+# ---- The library's own writes ----
+
+
+def _record(target: BaseDatabaseWrapper | str, values: _Tracked) -> None:
     """Note that the library has left the admin and tenant GUCs of a connection at ``values``.
 
     A no-op on a connection that is closed: its next session is tracked from
@@ -242,37 +368,29 @@ def record(target: BaseDatabaseWrapper | str, values: _Tracked) -> None:
 
     Args:
         target: The connection written to, or its alias.
-        values: ``(is_admin, current_tenant)``, ``None`` for cleared GUCs, or
-            ``UNKNOWN``.
+        values: The values, ``None`` for cleared GUCs, or ``UNKNOWN``.
     """
     connection = _connection_of(target)
     if connection is None or connection.connection is None:
         return
-    tracker: _SessionGUCs | None = getattr(connection, _TRACKER_ATTR, None)
+    tracker = _tracker_of(connection)
     if tracker is None:
         install(connection, values=UNKNOWN)
         return
-    if not _is_guarded(connection):
-        values = UNKNOWN
     _observe(connection, tracker)
-    if values != tracker.values:
-        tracker.values = values
-        if tracker.in_transaction:
-            tracker.changed = True
+    tracker.set_values(values if _is_guarded(connection) else UNKNOWN)
 
 
 def _forget(target: BaseDatabaseWrapper | str) -> None:
     """Mark a connection's GUC values unknown, without touching the driver."""
-    connection = _connection_of(target)
-    tracker: _SessionGUCs | None = getattr(connection, _TRACKER_ATTR, None)
+    tracker = _tracker_of(_connection_of(target))
     if tracker is not None:
-        tracker.values = UNKNOWN
-        tracker.changed = True
+        tracker.forget()
 
 
 @contextmanager
 def writing(target: BaseDatabaseWrapper | str, values: _Tracked) -> Iterator[None]:
-    """Run the library's own writes of the admin and tenant GUCs on ``connection``.
+    """Mark a block as the library's own write of the admin and tenant GUCs on ``target``.
 
     The guard does not reconcile statements inside the block. When the block
     exits, ``values`` is recorded as what it left on the session, or
@@ -284,24 +402,24 @@ def writing(target: BaseDatabaseWrapper | str, values: _Tracked) -> Iterator[Non
     Args:
         target: The connection the block writes to, or its alias (the thread's
             connection of that alias, looked up when the block exits).
-        values: ``(is_admin, current_tenant)`` as the block leaves them, or
-            ``None`` for cleared GUCs.
+        values: The values the block leaves, or ``None`` for cleared GUCs.
     """
-    _writes.depth = getattr(_writes, "depth", 0) + 1
+    depth = _writes.depth
+    _writes.depth = depth + 1
     try:
         yield
     except BaseException:
         _forget(target)
         raise
     else:
-        record(target, values)
+        _record(target, values)
     finally:
-        _writes.depth -= 1
+        _writes.depth = depth
 
 
-def set_gucs(
+def write_gucs(
     connection: BaseDatabaseWrapper,
-    values: tuple[str, str] | None,
+    values: ContextGucs | None,
     *,
     is_local: bool = False,
 ) -> None:
@@ -312,8 +430,9 @@ def set_gucs(
 
     Args:
         connection: The connection to write to.
-        values: ``(is_admin, current_tenant)``, or ``None`` to clear both.
-        is_local: Set them transaction-locally (``SET LOCAL`` semantics).
+        values: The context's values, or ``None`` to clear both GUCs.
+        is_local: Set them transaction-locally (``SET LOCAL`` semantics); only
+            the ``connection_created`` handler does, with ``USE_LOCAL_SET=True``.
 
     Raises:
         RuntimeError: If ``is_local=True`` outside ``transaction.atomic()``.
@@ -334,60 +453,120 @@ def set_gucs(
         )
 
 
-def _reconcile(connection: BaseDatabaseWrapper, tracker: _SessionGUCs) -> None:
+# ---- Applying the active context ----
+
+
+def _apply_if_stale(connection: BaseDatabaseWrapper, tracker: _SessionGUCs) -> int:
     """Apply the active context's GUC values on ``connection`` if its session holds others.
 
-    Skipped where a statement cannot run anyway (a failed transaction, or one
-    Django has marked for rollback), so that statement's own error surfaces.
+    Skipped where a statement cannot run anyway (a failed transaction or
+    connection, or a transaction Django has marked for rollback), so that
+    statement's own error surfaces.
+
+    Returns:
+        The session's transaction status before any statement ran.
     """
     status = _observe(connection, tracker)
-    if status not in {_IDLE, _IN_TRANSACTION} or connection.needs_rollback:
-        return
-    if not _is_guarded(connection):
-        return
     context_gucs = _get_context_gucs()
     held = tracker.values
     if context_gucs == held:
-        return
-    set_gucs(connection, context_gucs)
+        return status
+    if status in {_IN_ERROR, _CONNECTION_BAD} or connection.needs_rollback:
+        return status
+    if not _is_guarded(connection):
+        return status
+    write_gucs(connection, context_gucs)
     logger.debug(
         "GUC affinity guard: alias %r held %r; applied the active context's %r",
         connection.alias,
         held,
         context_gucs,
     )
+    return status
 
 
-def reconcile(connection: BaseDatabaseWrapper) -> None:
+def apply_active_context(connection: BaseDatabaseWrapper) -> None:
     """Apply the active context's GUC values on ``connection`` now, as the guard would.
 
     For code that reads a snapshot of the GUCs inside :func:`writing`, where
     the guard stays out of the way. Opens the connection if needed.
     """
     connection.ensure_connection()
-    tracker: _SessionGUCs | None = getattr(connection, _TRACKER_ATTR, None)
+    tracker = _tracker_of(connection)
     if tracker is not None:
-        _reconcile(connection, tracker)
+        _apply_if_stale(connection, tracker)
 
 
-# Statements that only control the transaction: they read no data, so the guard
-# does not apply the context before them. Failing there would break Django's
-# own transaction handling (a savepoint rollback, say).
-_TRANSACTION_CONTROL: Final = frozenset(
-    {"ABORT", "BEGIN", "COMMIT", "END", "RELEASE", "ROLLBACK", "SAVEPOINT", "START"},
-)
+def settle_other_aliases(using: str) -> None:
+    """Take a context's values off this thread's other connections once the context has ended.
 
-# Statements after which the tracker is updated: transaction control, and
-# session resets (RESET ALL, DISCARD ALL, RESET of the admin or tenant GUC).
-_FOLLOWED: Final = _TRANSACTION_CONTROL | {"DISCARD", "RESET"}
+    Called when a context block exits: the guard may have applied the block's
+    context on the other aliases in ``RLS_TENANTS["DATABASES"]``, and SQL the
+    guard does not see (``callproc()``, a driver cursor) would find it there
+    until their next statement. A connection that holds a context's values
+    other than the active context's gets the active one's (or none) now;
+    one that holds none is left alone.
+
+    Args:
+        using: The alias the block restored itself.
+    """
+    for alias in rls_tenants_config.DATABASES:
+        if alias == using:
+            continue
+        connection = _connection_of(alias)
+        tracker = _tracker_of(connection)
+        if (
+            connection is not None
+            and connection.connection is not None
+            and tracker is not None
+            and isinstance(tracker.values, tuple)
+        ):
+            _apply_if_stale(connection, tracker)
 
 
-def _command_of(sql: object) -> str:
-    """Return the first word of ``sql``, upper-cased, or ``""`` if there is none."""
+# ---- Following the SQL that runs ----
+
+
+class _Statement(NamedTuple):
+    """The start of a statement, as far as the tracker needs it."""
+
+    command: str  # first word, upper-cased
+    words: list[str]  # the first words, as written
+    compound: bool  # more than one statement
+
+
+def _skip_leading_comments(sql: str) -> str:
+    """Return ``sql`` without leading whitespace and ``--`` / ``/* */`` comments (nested)."""
+    text = sql.lstrip()
+    while text.startswith(("--", "/*")):
+        if text.startswith("--"):
+            end = text.find("\n")
+            text = "" if end < 0 else text[end + 1 :].lstrip()
+            continue
+        depth, index = 1, 2
+        while depth and index < len(text):
+            if text.startswith("/*", index):
+                depth, index = depth + 1, index + 2
+            elif text.startswith("*/", index):
+                depth, index = depth - 1, index + 2
+            else:
+                index += 1
+        text = text[index:].lstrip() if not depth else ""
+    return text
+
+
+def _parse(sql: object) -> _Statement | None:
+    """Read the command of ``sql``; ``None`` if it cannot be read (not text, or only comments)."""
+    if isinstance(sql, bytes):
+        sql = sql.decode("latin-1")  # only ASCII keywords are looked at
     if not isinstance(sql, str):
-        return ""
-    words = sql[:128].split(None, 1)
-    return words[0].upper() if words else ""
+        return None
+    words = _skip_leading_comments(sql[:_SQL_HEAD]).split(None, 4)
+    if not words:
+        return None if sql.strip() else _Statement("", [], compound=False)
+    semicolon = sql.find(";")
+    compound = semicolon >= 0 and bool(sql[semicolon:].strip("; \t\r\n"))
+    return _Statement(words[0].rstrip(";").upper(), words, compound)
 
 
 def _identifier(word: str) -> str:
@@ -395,98 +574,102 @@ def _identifier(word: str) -> str:
     word = word.rstrip(";")
     if len(word) > 1 and word[0] == word[-1] == '"':
         return word[1:-1].replace('""', '"')
-    return word.lower()
-
-
-def _savepoint_index(tracker: _SessionGUCs, name: str) -> int | None:
-    """Return the position of the newest savepoint called ``name``, or ``None``."""
-    for index in range(len(tracker.savepoints) - 1, -1, -1):
-        if tracker.savepoints[index][0] == name:
-            return index
-    return None
+    return word.translate(_ASCII_LOWER)
 
 
 def _follow(
-    command: str,
-    sql: str,
+    statement: _Statement,
+    status_before: int,
     connection: BaseDatabaseWrapper,
     tracker: _SessionGUCs,
 ) -> None:
     """Update ``tracker`` after a statement in ``_FOLLOWED`` has run.
 
-    A savepoint records the values at that point, and ``ROLLBACK TO`` it puts
-    them back, as PostgreSQL does with the GUCs. A ``ROLLBACK`` of the whole
-    transaction brings back the values from before it, and a ``COMMIT`` keeps
-    the current ones. ``RESET ALL``, ``DISCARD ALL`` and ``RESET`` of the admin
-    or tenant GUC reset them. Anything the tracker cannot follow (a savepoint
-    it did not see set, say) makes the values unknown once they changed during
-    the transaction.
-
     Args:
-        command: The statement's first word, upper-cased (``_command_of()``).
-        sql: The statement.
+        statement: The statement, as ``_parse()`` read it.
+        status_before: The session's transaction status before it ran.
         connection: The connection it ran on.
         tracker: The connection's tracker.
     """
-    words = sql[:256].split()
-    argument = words[1].rstrip(";").upper() if len(words) > 1 else ""
-    if command in {"RESET", "DISCARD"}:
+    words = statement.words
+    argument = _identifier(words[1]).upper() if len(words) > 1 else ""
+    if statement.command in {"RESET", "DISCARD"}:
         conf = rls_tenants_config
         names = {conf.GUC_IS_ADMIN.upper(), conf.GUC_CURRENT_TENANT.upper()}
-        if argument == "ALL" or (command == "RESET" and argument in names):
-            tracker.values = UNKNOWN
+        if argument == "ALL" or (statement.command == "RESET" and argument in names):
+            tracker.forget()
         return
     if argument == "PREPARED":  # two-phase commit: another transaction
         return
-    rolls_back_to = command == "ROLLBACK" and "TO" in (word.upper() for word in words)
-    if command in {"ROLLBACK", "ABORT"} and not rolls_back_to:
-        if tracker.in_transaction:
-            tracker.values = tracker.base
-        tracker.savepoints.clear()
-    elif command in {"COMMIT", "END"}:
-        tracker.base = tracker.values
-        tracker.savepoints.clear()
+    rolls_back_to = statement.command == "ROLLBACK" and "TO" in (w.upper() for w in words)
+    if statement.command in {"ROLLBACK", "ABORT"} and not rolls_back_to:
+        tracker.end_transaction(committed=False)
+    elif statement.command in {"COMMIT", "END"}:
+        # PostgreSQL answers COMMIT in a failed transaction with ROLLBACK.
+        tracker.end_transaction(committed=status_before != _IN_ERROR)
+    elif statement.command == "PREPARE" and argument == "TRANSACTION":
+        # The transaction is no longer this session's; what it leaves is unclear.
+        tracker.end_transaction(committed=False)
+        tracker.forget()
     # Picks up a transaction this statement opened or closed.
     _observe(connection, tracker)
-    if command == "SAVEPOINT" and len(words) > 1:
+    if statement.command == "SAVEPOINT" and len(words) > 1:
         tracker.savepoints.append((_identifier(words[1]), tracker.values))
-    elif command == "RELEASE" or rolls_back_to:
-        index = _savepoint_index(tracker, _identifier(words[-1]))
-        if index is None:
-            if tracker.changed:
-                tracker.values = UNKNOWN
-        elif rolls_back_to:
-            # The savepoint stays after a rollback to it.
-            tracker.values = tracker.savepoints[index][1]
-            del tracker.savepoints[index + 1 :]
-        else:
-            del tracker.savepoints[index:]
+    elif statement.command == "RELEASE" or rolls_back_to:
+        _follow_savepoint_end(_identifier(words[-1]), tracker, rolled_back=rolls_back_to)
+
+
+def _follow_savepoint_end(name: str, tracker: _SessionGUCs, *, rolled_back: bool) -> None:
+    """Follow ``RELEASE`` or ``ROLLBACK TO`` of the savepoint ``name``."""
+    index = tracker.savepoint_index(name)
+    if index is None:
+        # A savepoint set where the guard could not see it: nothing to go back to.
+        if tracker.changed:
+            tracker.forget()
+    elif rolled_back:
+        # The savepoint stays after a rollback to it.
+        tracker.values = tracker.savepoints[index][1]
+        del tracker.savepoints[index + 1 :]
+    else:
+        del tracker.savepoints[index:]
+
+
+# ---- The execute wrapper ----
 
 
 def _guard(
     execute: Callable[[str, Any, bool, dict[str, Any]], Any],
     sql: str,
-    params: Any,
+    params: Any,  # Any: Django's execute-wrapper signature
     many: bool,
     context: dict[str, Any],
 ) -> Any:
     """Execute wrapper: apply the active context's GUCs before the statement if needed."""
     connection: BaseDatabaseWrapper = context["connection"]
-    tracker: _SessionGUCs | None = getattr(connection, _TRACKER_ATTR, None)
+    tracker = _tracker_of(connection)
     if tracker is None:
         return execute(sql, params, many, context)
-    command = _command_of(sql)
-    if getattr(_writes, "depth", 0) or command in _TRANSACTION_CONTROL:
+    statement = _parse(sql)
+    control = (
+        statement is not None
+        and statement.command in _TRANSACTION_CONTROL
+        and not statement.compound
+    )
+    if _writes.depth or control:
         # The library's own write, or no data read: only follow the transaction.
-        _observe(connection, tracker)
+        status = _observe(connection, tracker)
     else:
-        _reconcile(connection, tracker)
+        status = _apply_if_stale(connection, tracker)
     try:
         result = execute(sql, params, many, context)
     except BaseException:
-        if command in _TRANSACTION_CONTROL:
-            tracker.values = UNKNOWN
+        if statement is None or statement.command in _FOLLOWED:
+            # A failed transaction-control statement leaves the GUCs undetermined.
+            tracker.forget()
         raise
-    if command in _FOLLOWED:
-        _follow(command, sql, connection, tracker)
+    if statement is None or statement.compound:
+        # It may have changed the transaction or the GUCs in ways not followed.
+        tracker.forget()
+    elif statement.command in _FOLLOWED:
+        _follow(statement, status, connection, tracker)
     return result

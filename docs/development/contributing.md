@@ -117,6 +117,12 @@ tests/
 - **Async code** is tested from plain sync tests through `asgiref.sync.async_to_sync`
   (there is no asyncio pytest plugin). Thread-sensitive hops then run on the test
   thread, so they see the test's connection and transaction.
+- **GUC affinity guard**: a statement run through Django's cursor gets the active
+  context's GUCs first, so to see what a session itself holds, read it with a driver
+  cursor (`tests/session_gucs.py`). A test that leaves a context open (calling
+  `process_request()` alone, say) relies on the autouse `_clear_gucs_after_test`
+  fixture, which also ends the guard's context. A test that counts statements runs one
+  statement first, so the guard has settled the connection.
 
 ### Skipped tests and the `superuser_only` marker
 

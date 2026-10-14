@@ -15,7 +15,7 @@ from django_rls_tenants.rls.guc import clear_guc
 from django_rls_tenants.tenants.context import admin_context
 from django_rls_tenants.tenants.middleware import _clear_gucs_set_flag
 from django_rls_tenants.tenants.state import (
-    _set_context_gucs,
+    _clear_context_gucs,
     set_current_tenant_id,
     set_rls_context_active,
 )
@@ -130,7 +130,7 @@ def _clear_gucs_after_test(db):
         set_rls_context_active(False)
         # A test that calls process_request() alone leaves the request's GUC
         # values here; the affinity guard would apply them in later tests.
-        _set_context_gucs(None)
+        _clear_context_gucs()
         # A middleware test can leave this set; the connection_created handler
         # would then put GUCs on the next new connection, outside any test
         # transaction.

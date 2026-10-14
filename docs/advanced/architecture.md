@@ -105,8 +105,8 @@ something else has changed the GUCs:
 
 The `connection_created` handler puts an execute wrapper, the guard, first in the
 `execute_wrappers` of every PostgreSQL connection, and Django runs every statement through
-it. On a connection of an alias in `RLS_TENANTS["DATABASES"]`, before each statement, the
-guard compares:
+it. The guard acts only on connections of an alias in `RLS_TENANTS["DATABASES"]`, with
+`USE_LOCAL_SET=False`. Before each statement there, it compares:
 
 1. the GUC values of the active context, held in a private `ContextVar` that only the
    library's own entry points set (the context managers, the middleware, `for_user()`), to
@@ -115,9 +115,11 @@ guard compares:
 
 When they differ, it first runs `SELECT set_config('rls.is_admin', ..., false),
 set_config('rls.current_tenant', ..., false)` on the same connection, with cleared values
-outside any context. The statement goes through Django's cursor, so query logs show it. If
-it fails, the error propagates and the original statement does not run. A context therefore
-applies to every alias in `RLS_TENANTS["DATABASES"]`, whichever alias it was entered on.
+outside any context. The statement goes through Django's cursor, so query logs show it, and
+the `django_rls_tenants` logger names each one at `DEBUG` level. If it fails, the error
+propagates and the original statement does not run. A context therefore applies to every
+alias in `RLS_TENANTS["DATABASES"]`, whichever alias it was entered on, including one
+outside the list.
 
 ```
 Request thread                       Worker thread (hop with a copy of the context)
@@ -135,6 +137,13 @@ tenant_context(42)
                                        SELECT ...           ──▶ conn B
 ```
 
+**Live contexts only.** A copy of the context (a hop, a task, `copy_context()`) shares the
+context's entry in that `ContextVar` with the block that made it, and the block's exit ends
+it for every copy. A hop or task awaited inside the block inherits the context; one that
+runs after the block has ended gets nothing, as on a connection without a context. When a
+block exits, the guard also takes its context off this thread's other configured aliases
+right away, if it applied it there.
+
 **What it records.** The library's own GUC writes (context entry and exit, the middleware,
 `for_user()`, the `connection_created` handler) run with the guard out of the way and record
 the values they leave. A context's exit restores its entry snapshot, and the guard brought
@@ -145,18 +154,22 @@ changes, as before: `assert_rls_blocks_without_context()` relies on that. A conn
 opened before the handler was connected (during another app's `ready()`, say) gets the guard
 at the library's first GUC write on it.
 
-**Rollbacks.** PostgreSQL undoes a `set_config()` made in a transaction or savepoint that
-is rolled back. The guard reads the transaction status from the driver (libpq, without a
-round trip) and follows the transaction-control statements that run through Django's cursor:
+**Rollbacks.** PostgreSQL undoes a `set_config()` made in a transaction or savepoint that is
+rolled back. The guard follows:
 
-- a savepoint records the values at that point, and `ROLLBACK TO` it puts them back;
-- `ROLLBACK` sent as SQL brings back the values from before the transaction, and `COMMIT`
-  keeps the current ones;
-- Django commits and rolls back the outermost transaction through the driver, which the
-  guard does not see. Once such a transaction has ended, the values recorded during it are
-  kept only if they equal those from before it, since commit and rollback then leave the
-  same thing; otherwise they become unknown;
-- `RESET ALL`, `DISCARD ALL` and `RESET` of the admin or tenant GUC make them unknown.
+- Django's commit and rollback of the connection (`atomic()`, `transaction.commit()` /
+  `rollback()`): `install()` wraps the connection's `_commit()` and `_rollback()`. A commit
+  keeps the values; a rollback brings back those from before the transaction.
+- the transaction-control statements that run through Django's cursor: a savepoint records
+  the values at that point and `ROLLBACK TO` it puts them back; `ROLLBACK` and `COMMIT` sent
+  as SQL are followed like Django's, and a `COMMIT` of a failed transaction, which
+  PostgreSQL turns into a rollback, as one. `RESET ALL`, `DISCARD ALL` and `RESET` of the
+  admin or tenant GUC make the values unknown. Leading comments are skipped; a string with
+  several statements makes them unknown.
+- the transaction status the driver reports (libpq, without a round trip), for a transaction
+  that ended where the guard could not see it (a commit on the driver connection): the
+  values recorded during it are kept only if they equal those from before it, since commit
+  and rollback then leave the same thing.
 
 Unknown values are applied again before the next statement. The guard never runs its
 statement before a transaction-control statement, in a failed transaction, or while Django
@@ -165,19 +178,27 @@ has marked the transaction for rollback: those statements succeed or fail on the
 **Limits.**
 
 - Session GUCs only. With `USE_LOCAL_SET=True` the guard does nothing and never writes a
-  session GUC, which a PgBouncer in transaction mode would hand to another client.
+  session GUC.
+- One Django connection is taken to be one database session. Behind an external pooler in
+  transaction mode (PgBouncer) it is not, and the guard cannot know which server connection
+  a statement reaches: use `USE_LOCAL_SET=True` there, as before.
 - The admin and tenant GUCs only. Bypass flags and other GUCs set with `bypass_flag()` or
   `rls_context()` stay on the connection they were set on, and sibling tasks see them.
 - Only contexts the library set up. Code that builds a context by hand with
   `set_current_tenant_id()` / `set_rls_context_active()` and writes the GUCs itself is left
   alone: the guard never infers a context from those functions (an active flag without a
   tenant would otherwise mean admin).
-- SQL that bypasses Django's cursor wrapper is not seen: a raw driver cursor, and the
-  `FETCH`es of a server-side cursor that is already open. Inside a transaction PostgreSQL
-  computes such a cursor's rows as they are fetched (outside one, when it opens), so a
-  sibling task's statement between two fetches changes the GUCs the later rows are checked
-  against.
-- The cost is about 1.5 µs of Python per statement and no extra round trip while the
+- SQL that bypasses Django's execute wrappers is not seen: a driver cursor,
+  `CursorWrapper.callproc()`, the driver's `copy` methods, and the `FETCH`es of a server-side
+  cursor that is already open. On a connection the guard has used, such SQL sees what it last
+  left there until the next statement it sees: a worker thread's connection can hold the
+  context of the last hop it ran. Inside a transaction PostgreSQL computes a server-side
+  cursor's rows as they are fetched (outside one, when it opens), so a sibling task's
+  statement between two fetches changes the GUCs the later rows are checked against.
+- A transaction that ends where the guard cannot see it and is followed by one it cannot see
+  start (both on the driver connection) can leave it trusting values the rollback undid; the
+  next statement through Django's cursor after a visible boundary corrects it.
+- The cost is about 1.5 µs of Python per statement, and no extra round trip while the
   connection already holds the context's values.
 
 ## Policy Generation

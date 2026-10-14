@@ -35,18 +35,13 @@ from django_rls_tenants.tenants.context import (
     _context_gucs_of,
     _resolve_user_guc_vars,
     _restore_tenant_gucs,
+    _rls_state,
     _snapshot_gucs,
 )
 from django_rls_tenants.tenants.errors import HINT_NO_CONTEXT
 from django_rls_tenants.tenants.state import (
-    _reset_context_gucs,
-    _set_context_gucs,
     get_current_tenant_id,
     get_rls_context_active,
-    reset_current_tenant_id,
-    reset_rls_context_active,
-    set_current_tenant_id,
-    set_rls_context_active,
 )
 
 if TYPE_CHECKING:
@@ -390,24 +385,18 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
                 if (previous[name] or "") != value
             }
             gucs = _context_gucs_of(variables, conf)
-            active_token = set_rls_context_active(True)
-            tenant_token = set_current_tenant_id(
-                None if user.is_tenant_admin else user.rls_tenant_id,
-            )
-            gucs_token = _set_context_gucs(gucs)
+            tenant_id = None if user.is_tenant_admin else user.rls_tenant_id
             exc_pending = False
             try:
-                with writing(using, gucs):
-                    for name in changed:
-                        set_guc(name, variables[name], is_local=is_local, using=using)
-                yield
+                with _rls_state(tenant_id, gucs):
+                    with writing(using, gucs):
+                        for name in changed:
+                            set_guc(name, variables[name], is_local=is_local, using=using)
+                    yield
             except BaseException:
                 exc_pending = True
                 raise
             finally:
-                _reset_context_gucs(gucs_token)
-                reset_current_tenant_id(tenant_token)
-                reset_rls_context_active(active_token)
                 _restore_tenant_gucs(
                     changed,
                     is_local=is_local,

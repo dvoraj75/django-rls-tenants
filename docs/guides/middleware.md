@@ -52,7 +52,10 @@ work in its own async path; see [Running under ASGI](#running-under-asgi).
    auto-scoped queries; admin users and unauthenticated requests do not).
 6. Sets `_rls_context_active=True` to mark that an RLS context is active. This is used
    by strict mode to distinguish "middleware set context" from "no context at all".
-7. Records in a `ContextVar` that GUCs were set, and on which thread (read by the
+7. Records the GUC values it set for the
+   [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard), which applies them
+   on any other connection the request's code uses (*added in 1.4.0*).
+8. Records in a `ContextVar` that GUCs were set, and on which thread (read by the
    safety-net and `connection_created` signal handlers).
 
 ### Transaction Per Request (`USE_LOCAL_SET=True`)
@@ -170,15 +173,21 @@ a synchronous one.
 
 ### Response Phase (`process_response`)
 
-1. Resets the `_rls_context_active` flag (via saved token or, when the token belongs to
+1. Ends the GUC values recorded for the GUC affinity guard, first, so that it does not
+   apply the request's context again after the cleanup (*added in 1.4.0*).
+2. Resets the `_rls_context_active` flag (via saved token or, when the token belongs to
    another `contextvars.Context`, by clearing the variable, #58) to prevent cross-request
    leaks.
-2. Clears the `ContextVar` auto-scope state to prevent cross-request leaks.
-3. If `USE_LOCAL_SET` is `False` (default): clears both GUC variables on **all
+3. Clears the `ContextVar` auto-scope state to prevent cross-request leaks.
+4. If `USE_LOCAL_SET` is `False` (default): clears both GUC variables on **all
    configured database aliases** to prevent cross-request leaks on persistent connections.
-4. If `USE_LOCAL_SET` is `True`: GUCs are automatically cleared at transaction end
+5. If `USE_LOCAL_SET` is `True`: GUCs are automatically cleared at transaction end
    (by PostgreSQL), so explicit cleanup is skipped.
-5. Clears the `ContextVar` GUC flag.
+6. Clears the `ContextVar` GUC flag.
+
+The same cleanup runs when a `BaseException` (`KeyboardInterrupt`, a server's timeout)
+escapes the view and skips `process_response` (*changed in 1.4.0*): under WSGI the
+thread's next request would otherwise start inside this request's context.
 
 ### Exception Phase (`process_exception`)
 

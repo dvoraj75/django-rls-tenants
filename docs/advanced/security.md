@@ -194,11 +194,13 @@ Mitigations:
   [Running under ASGI](../guides/middleware.md#running-under-asgi)).
 - **GUC affinity guard**: before each statement on a configured alias, the guard applies
   the active context's GUCs if the connection holds other values, and clears them if no
-  context is active. Work on another thread therefore runs with the context it was handed
-  and leaves nothing on that thread's connection for later work, and a connection whose
-  cleanup failed is corrected before its next statement (#41). It only applies contexts
-  the library itself set up (a private `ContextVar`), never one inferred from the public
-  state functions, and session GUCs only. See
+  context is active. Work on another thread therefore runs with the context it was handed,
+  only while that context is live, and the guard takes the context off that thread's
+  connection before the next statement run without one (until then the session still
+  holds it, which SQL that bypasses Django's cursor, such as `callproc()`, would see). A
+  connection whose cleanup failed is corrected before its next statement (#41). The guard
+  only applies contexts the library itself set up (a private `ContextVar`), never one
+  inferred from the public state functions, and session GUCs only. See
   [GUC Affinity Guard](architecture.md#guc-affinity-guard).
 - **Django's connection pool**: on each checkout from a pool (`OPTIONS["pool"]`) on a
   configured alias, the `connection_created` handler clears every GUC the policies read,
@@ -208,8 +210,8 @@ Mitigations:
   and system check `W010` asks for it. GUCs read only by hand-written policies, or by
   `AddM2MRLSPolicy` with non-default names, are not cleared.
 - **USE_LOCAL_SET**: `SET LOCAL` scopes GUCs to the transaction, preventing leaks. An
-  external pooler such as PgBouncer in transaction mode still needs it: the handler does
-  not see that pooler hand the server connection to another client.
+  external pooler such as PgBouncer in transaction mode still needs it: the handler and the
+  guard do not see that pooler hand the server connection to another client.
 
 See [Connection Pooling](../guides/connection-pooling.md) for details.
 
