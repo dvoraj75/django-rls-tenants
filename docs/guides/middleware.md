@@ -147,7 +147,8 @@ it is iterated after the context ends, so its queries see no context (fail-close
 
 *Changed in 1.4.0.* When every middleware listed after it can run asynchronously (Django's
 own middleware can), Django serves the request through the middleware's own async path,
-`__acall__`, instead of the generic one inherited from `MiddlewareMixin`:
+`__acall__`, instead of the generic one inherited from `MiddlewareMixin`. For choosing a
+server, connection pooling and settings under ASGI, see [Async Deployment](async.md).
 
 1. **One** `sync_to_async(..., thread_sensitive=True)` hop reads `request.user` and sets the
    GUCs on every alias in `RLS_TENANTS["DATABASES"]`. Django has no asynchronous database

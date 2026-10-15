@@ -93,6 +93,7 @@ nav:
       - Testing: guides/testing.md
       - Management Commands: guides/management-commands.md
       - Connection Pooling: guides/connection-pooling.md
+      - Async Deployment: guides/async.md
       - Performance & Indexing: guides/performance.md
   - Advanced:
       - Architecture: advanced/architecture.md

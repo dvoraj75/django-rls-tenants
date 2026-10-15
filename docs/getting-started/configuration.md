@@ -279,7 +279,9 @@ RLS_TENANTS = {
 }
 ```
 
-See [Connection Pooling](../guides/connection-pooling.md) for detailed setup instructions.
+See [Connection Pooling](../guides/connection-pooling.md) for detailed setup instructions, and
+[Async Deployment](../guides/async.md#set-local-without-async-transactions) for this mode
+under ASGI.
 
 ## System Checks
 
