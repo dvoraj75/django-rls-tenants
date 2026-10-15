@@ -82,7 +82,12 @@ class RLSTenantsConfig:
 
     @property
     def USE_LOCAL_SET(self) -> bool:
-        """Use ``SET LOCAL`` instead of ``set_config``. Default: ``False``."""
+        """Set the GUCs transaction-locally (``SET LOCAL``). Default: ``False``.
+
+        The GUC affinity guard then sets the active context's values in each
+        transaction, giving a statement run in autocommit inside a context a
+        transaction of its own.
+        """
         return self._get("USE_LOCAL_SET", default=False)  # type: ignore[no-any-return]
 
     @property
@@ -100,9 +105,13 @@ class RLSTenantsConfig:
     def DATABASES(self) -> list[str]:
         """Database aliases that follow the active RLS context. Default: ``["default"]``.
 
-        The middleware sets the GUCs on each of them, and with session GUCs
-        the GUC affinity guard applies the active context on each of them
-        before every statement, whichever alias the context was entered on.
+        The middleware sets the GUCs on each of them (with
+        ``USE_LOCAL_SET=True`` on its synchronous path only), and the GUC
+        affinity guard applies the active context on each of them before
+        every statement, whichever alias the context was entered on
+        (transaction-locally with ``USE_LOCAL_SET=True``). With
+        ``USE_LOCAL_SET=True`` an alias outside this list still needs
+        ``transaction.atomic()`` around a context entered on it.
         In multi-database setups (e.g., read replicas), add all aliases
         that serve RLS-protected queries::
 

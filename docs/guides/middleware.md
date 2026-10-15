@@ -32,11 +32,16 @@ view and roll back its writes. An unsafe ordering raises `RLSConfigurationError`
 when the middleware is loaded. Middleware classes without exception hooks can still
 follow it. Function-based middleware factories must precede it too: their returned
 instances can expose exception hooks that cannot be inspected before construction.
+The check applies where the middleware owns a request transaction, the synchronous path
+(WSGI, or ASGI when a synchronous-only middleware is listed after it); it is skipped for
+an instance on the async path (*changed in 1.4.0*), which has no request transaction to
+roll back.
 
 ## How It Works
 
 The phases below are the synchronous (WSGI) path. Under ASGI the middleware does the same
-work in its own async path; see [Running under ASGI](#running-under-asgi).
+work in its own async path (with `USE_LOCAL_SET=True` it writes no GUC there); see
+[Running under ASGI](#running-under-asgi).
 
 ### Request Phase (`process_request`)
 
@@ -67,13 +72,18 @@ itself: for every authenticated request it enters `transaction.atomic(using=alia
 each alias in `RLS_TENANTS["DATABASES"]` *before* `process_request` and leaves it
 *after* `process_response`. The GUCs live exactly as long as the request and vanish at
 the commit (or rollback) that ends it. Unauthenticated requests get no transaction.
+This is the synchronous path (WSGI, or ASGI with a synchronous-only middleware listed
+after this one); on the async path there is no request transaction (see
+[`USE_LOCAL_SET` and ASGI](#use_local_set-and-asgi)).
 
 Transaction behavior and limitations:
 
 - A view that **raises** rolls the whole request transaction back. The middleware
   records the failure in `process_exception`, then marks each transaction for rollback
   just before leaving it. This lets error handlers query after non-database exceptions
-  such as `Http404`; the tenant context stays active until response cleanup. Writes by
+  such as `Http404`; the request's tenant context stays active until response cleanup,
+  unless the view left a context block open: ending that block leaves the error response
+  with no context (see [Exception Phase](#exception-phase-process_exception)). Writes by
   those handlers are rolled back too. A view that **returns** an error response without
   raising commits. These view outcomes match `ATOMIC_REQUESTS`, but error handling and
   downstream middleware also run inside this transaction.
@@ -88,20 +98,50 @@ Transaction behavior and limitations:
 - A `StreamingHttpResponse` iterates its body after the transaction has ended, so
   queries made while streaming see no tenant context (fail-closed). Open a context
   inside the synchronous generator and evaluate the queries there. With
-  `USE_LOCAL_SET=True`, first enter `transaction.atomic(using=alias)`, then
+  `USE_LOCAL_SET=True` you can first enter `transaction.atomic(using=alias)`, then
   `tenant_context(tenant_id, using=alias)` (or `admin_context(using=alias)`), using
-  the database alias queried by the generator.
+  the database alias queried by the generator. Since 1.4.0 the `atomic()` is optional on
+  an alias in `RLS_TENANTS["DATABASES"]`: without it, the GUC affinity guard gives each
+  statement the context in a transaction of its own; with it, the block writes its GUCs
+  once for the transaction.
 
 With the default `USE_LOCAL_SET=False` nothing changes: the view runs in autocommit (or
 under `ATOMIC_REQUESTS`, if you enable it) exactly as before.
 
 ### `USE_LOCAL_SET` and ASGI
 
-The async middleware path cannot hold a synchronous `transaction.atomic()` open across
-the awaited downstream chain, so `USE_LOCAL_SET=True` is not available under ASGI. The
-middleware raises `RLSConfigurationError` for authenticated requests in that setup
-instead of failing deep inside `SET LOCAL`. Serve the application through WSGI, or use
-the default session-scoped mode. The native async path added in 1.4.0 has the same limit.
+*Changed in 1.4.0.* What matters is which path serves the request. The async path (ASGI,
+when every middleware listed after `RLSTenantMiddleware` can run asynchronously) cannot
+hold a synchronous `transaction.atomic()` open across the awaited downstream chain, so it
+has no request transaction. Before 1.4.0 the middleware raised `RLSConfigurationError` for
+authenticated requests in that setup (`RLSTenantMiddleware cannot use
+RLS_TENANTS['USE_LOCAL_SET'] = True under ASGI`); that error no longer exists. Instead the
+middleware writes no GUC and only records the request's context, on the native async path
+and on the hook path used by subclasses that override `process_request` or
+`process_response`. The
+[GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) applies the context
+transaction-locally:
+
+- In autocommit, each statement the request runs gets a transaction of its own: `BEGIN`,
+  the `set_config()` statement, the statement, `COMMIT`. That is three extra round trips
+  per statement (see [Code Outside a Request
+  Transaction](connection-pooling.md#code-outside-a-request-transaction)).
+- Inside a transaction, such as a sync view under `ATOMIC_REQUESTS` (Django does not
+  support `ATOMIC_REQUESTS` for async views) or an `atomic()` block in the view, the guard
+  sets the request's GUCs once per transaction, since the request's context was entered
+  before it. A context the view itself enters inside an `atomic()` block writes its own
+  values instead.
+
+**A WSGI request is atomic in this mode and a request on the async path is not.** On the
+synchronous path the middleware's transaction commits or rolls back everything the request
+wrote. On the async path a view that writes twice can commit the first write and fail on
+the second; wrap the writes in `transaction.atomic()` where that matters. For the same
+reason the startup check of exception-middleware ordering (see [Setup](#setup)) is skipped
+for an instance on the async path: there is no request transaction to roll back. If a
+synchronous-only middleware is listed after `RLSTenantMiddleware`, Django runs it
+synchronously even under ASGI, and then the request transaction, its rollback and the
+ordering check apply as under WSGI. A `StreamingHttpResponse` body behaves as under WSGI:
+it is iterated after the context ends, so its queries see no context (fail-closed).
 
 ### Running under ASGI
 
@@ -117,6 +157,12 @@ own middleware can), Django serves the request through the middleware's own asyn
    async views, the async ORM and every later hop see them.
 3. When the chain returns, raises, or the request task is cancelled, the `ContextVar`s are
    reset with their own tokens and **one** more hop clears the GUCs.
+
+With `USE_LOCAL_SET=True` the first hop writes no GUC and the last has none to clear: the
+guard applies the context to each statement (see
+[`USE_LOCAL_SET` and ASGI](#use_local_set-and-asgi)). Like the cleanup on the synchronous
+path, the last hop only marks what the sessions hold for themselves as unknown (see
+[Response Phase](#response-phase-process_response)).
 
 Because the tenant state is set and reset in one `contextvars.Context`, the
 `Token was created in a different Context` failure (#58) cannot occur, and a context that was
@@ -184,8 +230,15 @@ a synchronous one.
    1.4.0*).
 4. If `USE_LOCAL_SET` is `False` (default): clears both GUC variables on **all
    configured database aliases** to prevent cross-request leaks on persistent connections.
-5. If `USE_LOCAL_SET` is `True`: GUCs are automatically cleared at transaction end
-   (by PostgreSQL), so explicit cleanup is skipped.
+5. If `USE_LOCAL_SET` is `True`: the GUCs are transaction-local and end with their
+   transaction (by PostgreSQL), so no clearing statement runs. What the sessions of the
+   configured aliases hold for themselves counts as unknown from now on (*added in
+   1.4.0*), because the view may have written the GUCs for the session (`set_guc()`, a
+   function, a `DO` block): the next statement run outside any context, in autocommit or
+   in a transaction, first clears them for the session, one extra statement, for example
+   the next request's session lookup on a persistent connection. The `request_finished`
+   safety net marks them too. Inside a transaction the mark takes effect at the commit; a
+   rollback undoes such a write anyway.
 6. Clears the `ContextVar` GUC flag.
 
 The same cleanup runs when a `BaseException` (`KeyboardInterrupt`, a server's timeout)
@@ -215,11 +268,15 @@ request's tokens stay with `__acall__`, so it clears the variables:
    a later middleware, say) sends no signal, and an exception middleware listed after
    `RLSTenantMiddleware` that returns a response stops this hook from running (Django
    calls `process_exception` innermost first): list such middleware before
-   `RLSTenantMiddleware`. With `USE_LOCAL_SET=True` the block's `SET LOCAL` values stay
-   until the transaction ends. Keep context blocks inside the code that needs them rather
-   than in a generator the view leaves suspended. A block that a middleware listed after
-   `RLSTenantMiddleware` holds around the rest of the chain is ended as well when a 500
-   response is built inside it, so the rest of that block runs without a context.
+   `RLSTenantMiddleware`. The block was the current context, so ending it leaves the
+   error response with no context (fail-closed), under WSGI with `USE_LOCAL_SET=True`
+   too, where the request transaction is still open: the guard takes the block's values
+   off the connection before the response's first statement, and only SQL that bypasses
+   Django's cursor could see them until then. Keep context blocks inside the code that
+   needs them rather than in a generator the view leaves suspended. A block that a
+   middleware listed after `RLSTenantMiddleware` holds around the rest of the chain is
+   ended as well when a 500 response is built inside it, so the rest of that block runs
+   without a context.
 
 This prevents `ContextVar` leaks that could affect subsequent requests on the same
 thread (WSGI) or async task (ASGI).
@@ -235,8 +292,10 @@ If setting a GUC fails during `process_request` (e.g., broken database connectio
 
 ## Request Lifecycle Diagram
 
-The synchronous (WSGI) path. Under ASGI, `__acall__` does the request phase in one hop and
-the cleanup in one hop (see [Running under ASGI](#running-under-asgi)).
+The synchronous path (WSGI). On the async path, `__acall__` does the request phase in one
+hop and the cleanup in one hop (see [Running under ASGI](#running-under-asgi)); with
+`USE_LOCAL_SET=True` it opens no transaction and writes no GUC (see
+[`USE_LOCAL_SET` and ASGI](#use_local_set-and-asgi)).
 
 ```
 Request arrives
@@ -274,7 +333,8 @@ RLSTenantMiddleware.process_response()  (or process_exception on error)
     ├── RESET _rls_context_active (via saved token)
     ├── RESET auto-scope ContextVar (via saved token)
     ├── USE_LOCAL_SET == False → CLEAR both GUCs
-    └── USE_LOCAL_SET == True  → no-op, then COMMIT/ROLLBACK drops the SET LOCAL values
+    └── USE_LOCAL_SET == True  → no statement: mark the sessions' own values unknown,
+                                 then COMMIT/ROLLBACK drops the SET LOCAL values
 ```
 
 ## Multi-Database Support
@@ -294,7 +354,8 @@ The middleware sets GUCs on all configured aliases during `process_request` and
 clears them during `process_response`. A `connection_created` signal handler
 also sets GUCs on lazily-created connections that don't exist when the middleware
 runs (e.g., a replica connection opened by a database router mid-request), on the
-thread that set the request's GUCs. *Changed in 1.4.0:* the
+thread that set the request's GUCs (with `USE_LOCAL_SET=False`; with `True` the guard
+applies them to each statement instead, *changed in 1.4.0*). *Changed in 1.4.0:* the
 [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) also applies the
 active context on every configured alias before each statement, on any thread (see
 [Running under ASGI](#running-under-asgi)), whichever alias the context was entered on:
@@ -327,7 +388,9 @@ The middleware is API-agnostic. It works identically for:
 - Django REST Framework
 - GraphQL (Graphene, Strawberry, Ariadne)
 - Async views and ASGI servers (a native async path, see
-  [Running under ASGI](#running-under-asgi); `USE_LOCAL_SET=True` is WSGI-only)
+  [Running under ASGI](#running-under-asgi); with `USE_LOCAL_SET=True` a request on the
+  async path has no request transaction, see
+  [`USE_LOCAL_SET` and ASGI](#use_local_set-and-asgi))
 - Any other Django-compatible request handler
 
 The only requirement is that `request.user` satisfies the `TenantUser` protocol.

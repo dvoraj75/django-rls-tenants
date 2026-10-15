@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import threading
+from contextlib import nullcontext
 from decimal import Decimal
 
 import pytest
@@ -16,7 +17,7 @@ from django.utils.connection import ConnectionDoesNotExist
 
 from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.context import bypass_flag
-from django_rls_tenants.rls.guc import aget_guc, get_guc
+from django_rls_tenants.rls.guc import aget_guc, get_guc, set_guc
 from django_rls_tenants.tenants import testing as testing_mod
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import admin_context
@@ -33,6 +34,7 @@ from django_rls_tenants.tenants.testing import (
     rls_as_tenant,
     rls_bypass,
 )
+from tests.session_gucs import session_gucs
 from tests.test_app.models import Order, ProtectedUser, Tenant
 
 pytestmark = pytest.mark.django_db
@@ -320,12 +322,61 @@ class TestAssertRlsBlocksWithoutContext:
         assert _read_gucs() == (None, None)
 
     @pytest.mark.django_db(transaction=True)
-    def test_use_local_set_outside_a_transaction_raises(self, sample_orders, settings):
-        """With USE_LOCAL_SET=True and no transaction.atomic(), SET LOCAL fails loudly."""
+    @pytest.mark.parametrize("caller", ["none", "bypass", "tenant"])
+    def test_use_local_set_outside_a_transaction(
+        self,
+        enforce_rls,
+        sample_orders,
+        settings,
+        tenant_a,
+        caller,
+    ):
+        """No transaction: the caller's context is in the ContextVars only, and survives (#96)."""
+        settings.RLS_TENANTS = {**settings.RLS_TENANTS, "USE_LOCAL_SET": True}
+        expected = {
+            "none": ((None, None), (None, False), 0),
+            "bypass": (("true", None), (None, True), 3),
+            "tenant": (("false", str(tenant_a.pk)), (tenant_a.pk, True), 2),
+        }[caller]
+        block = {"none": nullcontext, "bypass": rls_bypass, "tenant": None}[caller]
+        with rls_as_tenant(tenant_a.pk) if block is None else block():
+            assert_rls_blocks_without_context(Order)
+            seen = _read_gucs(), _context_state(), _raw_order_count()
+        assert seen == expected
+        assert session_gucs() == (None, None)
+        assert _context_state() == (None, False)
+
+    @pytest.mark.django_db(transaction=True)
+    def test_use_local_set_session_values_are_cleared_for_the_count(
+        self,
+        enforce_rls,
+        sample_orders,
+        settings,
+    ):
+        """Values set for the session by hand do not reach the count.
+
+        The helper's admin pre-check is a context: once it ends, the session's
+        own values count as unknown, and the guard clears them before the
+        next statement run outside a context (#96).
+        """
+        settings.RLS_TENANTS = {**settings.RLS_TENANTS, "USE_LOCAL_SET": True}
+        set_guc("rls.is_admin", "true")
+        assert _raw_order_count() == 3
+        assert_rls_blocks_without_context(Order)
+        assert session_gucs() == (None, None)
+        assert _raw_order_count() == 0
+
+    @pytest.mark.django_db(transaction=True)
+    def test_use_local_set_alias_outside_rls_databases_raises(
+        self,
+        replica,
+        sample_orders,
+        settings,
+    ):
+        """The guard leaves that alias alone, so ``SET LOCAL`` still needs a transaction."""
         settings.RLS_TENANTS = {**settings.RLS_TENANTS, "USE_LOCAL_SET": True}
         with pytest.raises(RuntimeError, match="SET LOCAL"):
-            assert_rls_blocks_without_context(Order)
-        assert _read_gucs() == (None, None)
+            assert_rls_blocks_without_context(Order, using=replica)
         assert _context_state() == (None, False)
 
     @pytest.mark.django_db(transaction=True)
@@ -617,16 +668,26 @@ class TestAsyncAssertions:
         assert async_to_sync(run)() == expected
 
     @pytest.mark.django_db(transaction=True)
-    def test_blocks_without_context_use_local_set_outside_a_transaction_raises(
+    def test_blocks_without_context_use_local_set_outside_a_transaction(
         self,
+        enforce_rls,
         sample_orders,
         settings,
+        tenant_a,
     ):
-        """With USE_LOCAL_SET=True and no transaction.atomic() on the hop thread, it raises."""
+        """With USE_LOCAL_SET=True and no transaction on the hop thread it works too (#96)."""
         settings.RLS_TENANTS = {**settings.RLS_TENANTS, "USE_LOCAL_SET": True}
-        with pytest.raises(RuntimeError, match="SET LOCAL"):
-            async_to_sync(aassert_rls_blocks_without_context)(Order)
-        assert _read_gucs() == (None, None)
+
+        async def run():
+            async with async_rls_as_tenant(tenant_a.pk):
+                await aassert_rls_blocks_without_context(Order)
+                return (
+                    await _aread_gucs(),
+                    await sync_to_async(_raw_order_count, thread_sensitive=True)(),
+                )
+
+        assert async_to_sync(run)() == (("false", str(tenant_a.pk)), 2)
+        assert session_gucs() == (None, None)
 
 
 @pytest.mark.usefixtures("enforce_rls")

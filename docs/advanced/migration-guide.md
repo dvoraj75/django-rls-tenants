@@ -146,11 +146,15 @@ migration that assigns the correct tenant to each existing record.
   [assert_rls_blocks_without_context](../guides/testing.md#assert_rls_blocks_without_context).
 - **`for_user()` sets the user's GUCs for every method that runs SQL.** `count()`,
   `exists()`, `aggregate()`, `update()`, `delete()`, `create()` and the other methods now
-  run as the user, not only iteration. With `USE_LOCAL_SET=True` that means `SET LOCAL`,
-  which needs a transaction: `update_or_create()`, `bulk_create()`, `bulk_update()` and
-  `delete()` open one of their own, and the other methods raise `RuntimeError` outside
-  `transaction.atomic()`, as iteration always did (before, they ran without the GUCs).
-  Wrap such code in `transaction.atomic()`. With `STRICT_MODE=True`, `aiterator()`
+  run as the user, not only iteration. With `USE_LOCAL_SET=True` the GUCs are
+  transaction-local: inside `transaction.atomic()` the scope writes `SET LOCAL`;
+  `update_or_create()`, `bulk_create()`, `bulk_update()` and `delete()` open a transaction
+  of their own when none is open (on a configured alias the guard sets the user's values in
+  it); and outside `atomic()`, on an alias in `RLS_TENANTS["DATABASES"]`, every other
+  method works too, because the GUC affinity guard applies the user's GUCs to each
+  statement (see the `USE_LOCAL_SET=True` item below). On an alias outside that list they
+  raise `RuntimeError` outside `atomic()`, as iteration always did (before, they ran
+  without the GUCs). With `STRICT_MODE=True`, `aiterator()`
   without a context now raises `NoTenantContextError`, like `iterator()`. See
   [Lazy QuerySet Evaluation](architecture.md#lazy-queryset-evaluation).
 - **Other threads run with the context they were handed, and keep nothing** (#130
@@ -164,8 +168,8 @@ migration that assigns the correct tenant to each existing record.
   context is live, and takes it off the connection before the first statement run without
   it. Work started without a copy of the context (`ThreadPoolExecutor.submit()`,
   `loop.run_in_executor()`), or still running after the context's block has ended (a task
-  started and not awaited inside it), runs without one. With `USE_LOCAL_SET=True` the
-  guard does nothing: open `tenant_context()` / `admin_context()` inside such code. See
+  started and not awaited inside it), runs without one. This holds with
+  `USE_LOCAL_SET=True` too, where the guard applies the context transaction-locally. See
   [Running under ASGI](../guides/middleware.md#running-under-asgi) and
   [GUC Affinity Guard](architecture.md#guc-affinity-guard).
 - **Every configured alias follows the active context** (#41). With several aliases in
@@ -178,13 +182,17 @@ migration that assigns the correct tenant to each existing record.
   context entered with `using=` on an alias outside `RLS_TENANTS["DATABASES"]` still
   applies on every configured alias, so check `admin_context(using=...)` calls that were
   meant to grant the admin bypass on one alias only. An alias outside the list does not
-  follow a context entered on another alias. See
+  follow a context entered on another alias. This holds with `USE_LOCAL_SET=True` too
+  (before, only the `using` alias got the context in that mode). See
   [Multi-Database Support](../guides/context-managers.md#multi-database-support).
 - **An extra `set_config(...)` statement can appear in query counts** (#41). The guard
   runs one before a statement whose connection does not hold the active context's GUCs.
   Code that stays on one connection runs none, but a test that leaves a context open (by
   calling `process_request()` without `process_response()`, say), or one that ends a
-  transaction through the driver connection, can make the next statement run one. See
+  transaction through the driver connection, can make the next statement run one. With
+  `USE_LOCAL_SET=True`, every statement run under a context outside a transaction is
+  wrapped in `BEGIN`, a `set_config()` and `COMMIT`, which the query log counts (see the
+  `USE_LOCAL_SET=True` item below). See
   [A `set_config(...)` query you did not
   run](../troubleshooting.md#a-set_config-query-you-did-not-run).
 - **Django's connection pool is cleared on every checkout** (#96, security fix). With
@@ -196,8 +204,99 @@ migration that assigns the correct tenant to each existing record.
   the checkout now raises instead of handing over the connection. Otherwise nothing
   changes, but set `django_rls_tenants.pool.reset_rls_gucs` as the pool's `reset` callback
   to clear them when the connection goes back too. New system check `W010` warns until you
-  do (or set `USE_LOCAL_SET=True`, WSGI only). See [Django's Connection
+  do (or set `USE_LOCAL_SET=True`). See [Django's Connection
   Pool](../guides/connection-pooling.md#djangos-connection-pool).
+- **`USE_LOCAL_SET=True` works under ASGI and outside `transaction.atomic()`** (#96). The
+  GUC affinity guard now acts in this mode too, writing the context's GUCs
+  transaction-locally (`set_config(..., true)`), so they end with their transaction and
+  never stay on the session or on a pooled connection. What used to raise now works;
+  WSGI requests are unchanged. If you use this mode, check:
+    - *Context managers, `for_user()` and the testing helpers outside `atomic()`.* On an
+      alias in `RLS_TENANTS["DATABASES"]` they no longer raise `RuntimeError`
+      (`RLSConfigurationError` for the async managers). The context managers and the
+      `for_user()` scope write nothing on entry or exit (a transaction still open at exit,
+      from `AUTOCOMMIT=False` or an SQL `BEGIN`, may get one transaction-local clear), and
+      the guard applies the context to each statement. Celery tasks, management commands and scripts need no
+      `transaction.atomic()` any more; code that keeps it still works, and is cheaper for a
+      batch (see the round trips below). On an alias outside the list they still raise, and
+      the async managers' message now names the alias. Inside `atomic()` nothing changes.
+      `assert_rls_blocks_without_context()` also works outside `atomic()` in this mode: it
+      still clears and restores the GUCs for the session around its count.
+    - *The middleware's async path (ASGI).* The middleware no longer raises
+      `RLSConfigurationError: RLSTenantMiddleware cannot use RLS_TENANTS['USE_LOCAL_SET']
+      = True under ASGI`. On its async path (ASGI, when every middleware listed after it can
+      run asynchronously) it opens no request transaction and writes no GUC; the guard
+      applies the request's context to each statement, or once per transaction for a sync
+      view under `ATOMIC_REQUESTS`. So a WSGI request is atomic in this mode and a request
+      on the async path is not: if a view relied on the request transaction to roll back
+      several writes together, wrap them in `transaction.atomic()`. The startup check of
+      exception-middleware ordering is skipped for an instance on the async path. Under
+      ASGI with a synchronous-only middleware listed after `RLSTenantMiddleware`, Django
+      runs it synchronously and the request transaction, its rollback and the ordering check
+      apply as under WSGI. See
+      [`USE_LOCAL_SET` and ASGI](../guides/middleware.md#use_local_set-and-asgi).
+    - *WSGI.* Unchanged: the middleware still opens `transaction.atomic()` on every
+      configured alias around each authenticated request, and streaming responses still
+      iterate their body without a context. A context block the view leaves open is ended
+      before the error response, which then runs with no context.
+    - *Extra round trips and query counts.* In autocommit, a statement run under a context
+      gets a transaction of its own: `BEGIN`, a `set_config(..., true)` statement, your
+      statement, `COMMIT`. That is three extra round trips per statement. The guard sends
+      `BEGIN`, `COMMIT` and `ROLLBACK` past Django's cursor (no execute wrapper sees them)
+      and logs them as Django logs its own transaction control, so they appear in
+      `connection.queries` and count in `assertNumQueries`: a wrapped statement counts as
+      four queries, listed `BEGIN`, `set_config()`, `COMMIT`, then the statement itself,
+      which Django logs when it finishes. Where the context is entered decides the rest: a
+      transaction opened inside it costs one `set_config()`; a context entered inside
+      `transaction.atomic()` writes its own GUCs (two `current_setting()` reads and two
+      `SET LOCAL` statements on entry, two on exit), and the guard sends none for it while
+      its tracker is clean (a test transaction, the WSGI request transaction), but one clear
+      first after an earlier context has ended on that connection, on every iteration of a
+      loop that enters `atomic()` and a context. Raise the expected counts of tests that run
+      outside a transaction, or run the counted code in one `transaction.atomic()` inside
+      the context.
+    - *Commands that run unwrapped.* Statements PostgreSQL may refuse inside a transaction
+      block (`VACUUM`, `CLUSTER`, `REINDEX`, `DISCARD`; `CREATE` / `ALTER` / `DROP` of a
+      `DATABASE`, `TABLESPACE` or `SUBSCRIPTION`, and `ALTER SYSTEM`; `CREATE [UNIQUE]
+      INDEX CONCURRENTLY` and `DROP INDEX CONCURRENTLY`; `ALTER TABLE ... DETACH PARTITION
+      ... CONCURRENTLY`) run as they are, without the context; none evaluates an RLS
+      policy. `SET TRANSACTION` is transaction control in both GUC modes: the guard writes
+      nothing before it, so it can start an `atomic()` entered inside a context, and writes
+      the context's values after it. A procedure or a `DO` block that commits or rolls back
+      fails inside the wrap with "invalid transaction termination": run it outside any RLS
+      context in this mode. An `executemany()` under a context runs in one transaction, so
+      it commits or fails as a whole.
+    - *After a context ends.* When a context ends, and on any connection after a statement
+      run under a context's values (a `thread_sensitive=False` hop's, say), what a session
+      holds for itself counts as unknown. The next statement run outside any context, in
+      autocommit or in a transaction, clears it first for the session: one extra
+      `set_config()` statement, for example the next request's session lookup on a
+      persistent connection. It covers an admin or tenant GUC that code inside the context
+      wrote for the session (`set_guc()`, `rls_context()` without `is_local=True`, a
+      function, a `DO` block), which used to outlive the context in this mode. No statement
+      runs when the context ends.
+    - *Session writes inside a context.* In autocommit, a statement run inside a context
+      gets the context's values in its own transaction, which override such session writes:
+      narrowing an `admin_context()` with `rls_context({"rls.is_admin": "false", ...})` has
+      no effect there, though it does inside `atomic()` and in session mode. Change the
+      context with `tenant_context()` / `admin_context()` instead.
+    - *Failed rollbacks.* If the guard's `ROLLBACK` after a failed statement cannot be
+      confirmed (a broken connection, say), it closes the connection; the next statement
+      reconnects and the statement's own error is the one raised.
+    - *Connections opened mid-request.* A connection opened on the request thread is no
+      longer written eagerly in this mode (that attempted `SET LOCAL` outside a transaction
+      and logged a warning); the guard applies the values to its statements. A connection
+      that was already open when the app's `ready()` ran gets the guard there.
+    - *System checks.* The text of `W004` now ends "...which scopes the GUCs to
+      transactions, so they never stay on a connection.", and the `W010` hint no longer says
+      "(WSGI only)". Update any filter that matches the old text.
+    - *Limits that stay.* The guard covers only aliases in `RLS_TENANTS["DATABASES"]` and
+      only the admin and tenant GUCs; bypass flags keep their explicit `is_local` parameter
+      (default `False`). SQL that bypasses Django's cursor is not seen.
+
+    See [Code Outside a Request
+    Transaction](../guides/connection-pooling.md#code-outside-a-request-transaction) and
+    [GUC Affinity Guard](architecture.md#guc-affinity-guard).
 
 ### From 1.3.3 to 1.3.4
 
@@ -207,7 +306,8 @@ A **drop-in upgrade** -- no code, data or settings change is required. Under ASG
 async view is cancelled. If you took the middleware out of `MIDDLEWARE` or moved views
 to explicit `tenant_context()` calls to work around that error, you can put it back; see
 [Running under ASGI](../guides/middleware.md#running-under-asgi).
-`USE_LOCAL_SET=True` is still WSGI-only.
+`USE_LOCAL_SET=True` is still WSGI-only in 1.3.4; 1.4.0 supports it under ASGI (see
+[From 1.3.4 to 1.4.0](#from-134-to-140)).
 
 ### From 1.3.2 to 1.3.3
 
@@ -252,8 +352,9 @@ A **drop-in upgrade** -- no code or data migration is required.
   `@non_atomic_requests` has no effect). Middleware implementing `process_exception`
   and function-based middleware factories must precede `RLSTenantMiddleware`;
   unsafe ordering raises `RLSConfigurationError`
-  when the middleware is loaded. ASGI deployments cannot use this mode yet; the
-  middleware raises `RLSConfigurationError`. See
+  when the middleware is loaded. ASGI deployments cannot use this mode in 1.3.x; the
+  middleware raises `RLSConfigurationError` (1.4.0 supports it, see
+  [From 1.3.4 to 1.4.0](#from-134-to-140)). See
   [Middleware](../guides/middleware.md#transaction-per-request-use_local_settrue).
 - **System check `W007` is retired.** It flagged `USE_LOCAL_SET=True` without
   `ATOMIC_REQUESTS`, which is now a supported configuration. `W004` no longer mentions

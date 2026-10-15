@@ -38,6 +38,7 @@ from django_rls_tenants.tenants.context import (
     _rls_state,
     _session_of,
     _snapshot_gucs,
+    _writes_gucs,
 )
 from django_rls_tenants.tenants.errors import HINT_NO_CONTEXT
 from django_rls_tenants.tenants.state import (
@@ -340,6 +341,12 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         and dropped, and the rollback undoes the change (see
         :func:`django_rls_tenants.rls.context.restore_gucs`).
 
+        With ``USE_LOCAL_SET=True`` outside ``transaction.atomic()``, steps 1,
+        2 and 4's restore are skipped on an alias in
+        ``RLS_TENANTS["DATABASES"]``: the GUC affinity guard sets the user's
+        values transaction-locally for each statement (see
+        ``context._writes_gucs()``).
+
         The alias is resolved once and pinned on the queryset for the
         duration of the scope, so Django runs the SQL where the GUCs were
         set even when a database router answers differently on each call.
@@ -352,14 +359,17 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
                 resolves it once for all its chunks).
             own_transaction: With ``USE_LOCAL_SET=True`` and no transaction
                 open, run the scope in ``transaction.atomic()``. For methods
-                Django runs in a transaction of its own anyway: their
-                ``SET LOCAL`` must be issued before that transaction begins.
+                Django runs in a transaction of its own anyway, so the whole
+                call shares one: on an alias in ``RLS_TENANTS["DATABASES"]``
+                the GUC affinity guard sets the values once in it, and on any
+                other alias the scope's own ``SET LOCAL`` needs it.
 
         Raises:
             NoTenantContextError: If the user is not an admin and has
                 ``rls_tenant_id=None``.
-            RuntimeError: If ``USE_LOCAL_SET=True``, a GUC has to change and
-                the connection is not inside ``transaction.atomic()`` (and
+            RuntimeError: If ``USE_LOCAL_SET=True``, a GUC has to change, the
+                alias is not in ``RLS_TENANTS["DATABASES"]`` and its
+                connection is not inside ``transaction.atomic()`` (and
                 ``own_transaction`` is not set).
         """
         user = self._rls_user
@@ -371,21 +381,27 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         if using is None:
             using = self._db_for_write() if for_write else self.db
         variables = _resolve_user_guc_vars(user, conf)
+        # Decided before the transaction below opens: on an alias the guard
+        # covers, it writes the values once, inside that transaction.
+        writes = _writes_gucs(using, is_local=is_local)
         transaction_block = (
             transaction.atomic(using=using, savepoint=False)
             if own_transaction and is_local and not connections[using].in_atomic_block
             else nullcontext()
         )
         with self._pinned_db(using), transaction_block:
-            previous = _snapshot_gucs(conf, using=using)
-            # Decided before writing, so every GUC that may have been set is
-            # restored, even when an exception lands right after a set_guc().
-            changed = {
-                name: previous[name]
-                for name, value in variables.items()
-                # get_guc() reads an empty variable as None; the admin tenant value is "".
-                if (previous[name] or "") != value
-            }
+            # None: nothing is written, so nothing is restored.
+            changed: dict[str, str | None] | None = None
+            if writes:
+                previous = _snapshot_gucs(conf, using=using)
+                # Decided before writing, so every GUC that may have been set is
+                # restored, even when an exception lands right after a set_guc().
+                changed = {
+                    name: previous[name]
+                    for name, value in variables.items()
+                    # get_guc() reads an empty variable as None; the admin tenant value is "".
+                    if (previous[name] or "") != value
+                }
             gucs = _context_gucs_of(variables, conf)
             tenant_id = None if user.is_tenant_admin else user.rls_tenant_id
             session = _session_of(using)
@@ -393,9 +409,10 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
             exc_pending = False
             try:
                 with _rls_state(tenant_id, gucs):
-                    with writing(using, gucs):
-                        for name in changed:
-                            set_guc(name, variables[name], is_local=is_local, using=using)
+                    if changed is not None:
+                        with writing(using, gucs, local=is_local):
+                            for name in changed:
+                                set_guc(name, variables[name], is_local=is_local, using=using)
                     yield
             except BaseException:
                 exc_pending = True

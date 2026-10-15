@@ -230,8 +230,9 @@ up through middleware and context managers.
   of the request context, which broke the token resets (#58; 1.3.4 added a fallback).
   Setting the state in the request coroutine fixes that by construction and restores an
   outer context instead of clearing it. The gain is correctness, not throughput.
-  *Constraint:* Sync WSGI deployments work exactly as before; `USE_LOCAL_SET=True` stays
-  WSGI-only.
+  *Constraint:* Sync WSGI deployments work exactly as before. `USE_LOCAL_SET=True` stayed
+  WSGI-only here until #96, which made it work on this async path without a request
+  transaction (the GUC affinity guard applies the context to each statement).
 
 ### Tier 4: Async-safe decorator and testing helpers
 

@@ -198,14 +198,14 @@ def _enter_gucs(
     return previous
 
 
-async def _run_enter_hop(
-    enter: Callable[..., dict[str, str | None]],
+async def _run_enter_hop[S](
+    enter: Callable[..., S],
     variables: Mapping[str, str],
     *,
     is_local: bool,
     using: str,
     undo: Callable[..., object] = restore_gucs,
-) -> dict[str, str | None]:
+) -> S:
     """Run an enter helper in one thread-sensitive hop, undoing it if cancelled meanwhile.
 
     asgiref cannot stop a sync function that is already running in its
@@ -217,7 +217,8 @@ async def _run_enter_hop(
     hop and only then propagates.
 
     Args:
-        enter: ``_enter_gucs`` or a wrapper with the same signature.
+        enter: ``_enter_gucs`` or a wrapper with the same signature (whose
+            snapshot ``undo`` takes).
         variables: Mapping of GUC name to the value to set.
         is_local: If ``True``, use ``SET LOCAL`` (transaction-scoped).
         using: Database alias.
@@ -225,7 +226,7 @@ async def _run_enter_hop(
             :func:`restore_gucs` (the default).
 
     Returns:
-        The snapshot returned by ``enter``, for :func:`restore_gucs`.
+        The snapshot returned by ``enter``, for :func:`restore_gucs` (or ``undo``).
     """
     hop = asyncio.ensure_future(
         sync_to_async(enter, thread_sensitive=True)(variables, is_local=is_local, using=using)

@@ -81,6 +81,15 @@ task base class reads those headers and runs the body inside the matching
 returns or raises. An explicitly-passed header always wins over the captured
 value, so you can override it per call if you ever need to.
 
+With `USE_LOCAL_SET=True`, a task body needs no `transaction.atomic()` (*changed in
+1.4.0*; before, the context manager raised outside a transaction): the context manager
+writes nothing there and the GUC affinity guard gives each statement the context in a
+transaction of its own (three extra round trips per statement). The task's context is
+entered before the body, so a task that runs many statements is faster with its work in
+one `transaction.atomic()` inside the body: the guard then sets the GUCs once for that
+transaction. See
+[Code Outside a Request Transaction](connection-pooling.md#code-outside-a-request-transaction).
+
 If no context is active when the task is enqueued, nothing is captured and the
 task runs unscoped (fail-closed) — unless you opt into
 [`rls_require_context`](#requiring-a-context).
@@ -227,9 +236,8 @@ handlers, so there is no double-entry.
 The propagated context is restored on the **`default`** database alias.
 *Changed in 1.4.0:* every other alias in `RLS_TENANTS["DATABASES"]` follows it too,
 through the [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard), so a
-task's queries on a configured replica are scoped as well (with the default
-`USE_LOCAL_SET=False`). Queries on an alias *outside* `RLS_TENANTS["DATABASES"]`, or on
-any alias but `default` with `USE_LOCAL_SET=True`, are **not** scoped unless you
+task's queries on a configured replica are scoped as well (in both GUC modes). Queries on
+an alias *outside* `RLS_TENANTS["DATABASES"]` are **not** scoped unless you
 re-enter the context for that alias yourself. Pass `using="..."` to the context
 manager inside the task body to scope queries on a specific alias:
 
@@ -249,8 +257,9 @@ def replicate() -> None:
     A task body that queries such an alias without an explicit
     `tenant_context(..., using="<alias>")` runs **unscoped** on it (RLS then
     returns zero rows, or every row in admin mode). Wrap every such alias the task
-    touches, as shown above. Before 1.4.0 this applied to every alias but `default`,
-    and it still does with `USE_LOCAL_SET=True`.
+    touches, as shown above. Before 1.4.0 this applied to every alias but `default`.
+    With `USE_LOCAL_SET=True`, such an alias also needs `transaction.atomic(using="<alias>")`
+    around the block.
 
 See [Context Managers](context-managers.md#multi-database-support) for details.
 

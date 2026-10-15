@@ -123,8 +123,11 @@ This function:
    vacuous passes on empty tables).
 2. Clears the admin and tenant GUCs on the `using` connection, counts the rows again and
    restores the GUCs to their previous values (with `SET LOCAL` when
-   `USE_LOCAL_SET=True`). The restore happens before the assertion, so the caller's
-   context is intact even when the assertion fails.
+   `USE_LOCAL_SET=True` inside `transaction.atomic()`). The restore happens before the
+   assertion, so the caller's context is intact even when the assertion fails. With
+   `USE_LOCAL_SET=True` outside `atomic()` (*1.4.0+*), the count runs with the
+   [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) seeing no context,
+   and the GUCs are cleared and restored on the session.
 3. Asserts that the second count is zero.
 
 Both counts are raw SQL on the model's table (`SELECT COUNT(*)`), not ORM queries. The
@@ -149,7 +152,9 @@ Raises `AssertionError` if:
 
 Raises `RuntimeError` if:
 
-- `USE_LOCAL_SET=True` and the `using` connection is not inside `transaction.atomic()`.
+- `USE_LOCAL_SET=True`, `using` is not in `RLS_TENANTS["DATABASES"]` and its connection is
+  not inside `transaction.atomic()`. Before 1.4.0 it raised for every alias outside
+  `atomic()`.
 
 ## pytest Integration
 
@@ -242,7 +247,8 @@ the transaction it sees. That thread depends on how the test runs the coroutine:
 - **`async def` methods on a `TransactionTestCase`.** The hops also run on the test thread
   and use its connection, but no test transaction is open. Writes are committed, and the
   tables are flushed after each test. With `USE_LOCAL_SET=True`, the async context managers
-  raise `RLSConfigurationError`.
+  write nothing there and the guard gives each statement a transaction of its own (before
+  1.4.0 they raised `RLSConfigurationError`).
 - **A sync pytest test that drives a coroutine with `async_to_sync`.** The hops run on the
   test thread too. With plain `@pytest.mark.django_db` this behaves like a `TestCase` and
   works with your usual fixtures. With `transaction=True` it behaves like a
@@ -323,9 +329,6 @@ def test_async_report_is_scoped(tenant_a, sample_orders):
       connect as a superuser), it is bypassed on the executor connection. ORM-level
       isolation checks still pass there, because of the auto-scope filter, so they pass for
       the wrong reason.
-    - With `USE_LOCAL_SET=True`, `async_rls_bypass()` and `async_rls_as_tenant()` raise
-      `RLSConfigurationError` and `aassert_rls_blocks_without_context()` raises
-      `RuntimeError`, because no transaction is open on that thread.
     - The extra connection stays open, so pytest-django cannot drop the test database at
       the end of the session. It reports this only as a `PytestWarning` ("database ... is
       being accessed by other users") and leaves the database behind.
@@ -333,7 +336,7 @@ def test_async_report_is_scoped(tenant_a, sample_orders):
     Prefer the patterns above. If you must use the plugin, mark the tests
     `@pytest.mark.django_db(transaction=True)`. Committed fixture rows are then visible,
     nothing waits on an open test transaction, and the tables are flushed after each test.
-    The `SET ROLE` and `USE_LOCAL_SET` points still apply. Also close the executor thread's
+    The `SET ROLE` point still applies. Also close the executor thread's
     connection when the test ends:
 
     ```python
@@ -405,6 +408,11 @@ def test_local_set_mode(settings, tenant_a):
         ...
 ```
 
+Since 1.4.0 the `transaction.atomic()` is optional on an alias in
+`RLS_TENANTS["DATABASES"]`: outside a transaction, the guard gives each statement the
+context in a transaction of its own (see
+[Code Outside a Request Transaction](connection-pooling.md#code-outside-a-request-transaction)).
+
 Reloading the config does not rebuild model fields or database RLS policies.
 Overrides of schema-related options such as `TENANT_MODEL`, `TENANT_FK_FIELD`,
 `TENANT_PK_TYPE` or `GUC_PREFIX` require matching models and policies. In particular,
@@ -429,10 +437,13 @@ with rls_bypass(using="replica"):
 assert_rls_enabled("myapp_order", using="replica")
 ```
 
-*Changed in 1.4.0:* with the default session GUCs, `rls_bypass()` and `rls_as_tenant()`
-apply to every alias in `RLS_TENANTS["DATABASES"]`, whichever one `using` names, even one
-outside that list (see [Multi-Database Support](context-managers.md#multi-database-support)).
-An alias outside the list gets the context only when `using` names it.
+*Changed in 1.4.0:* `rls_bypass()` and `rls_as_tenant()` apply to every alias in
+`RLS_TENANTS["DATABASES"]`, whichever one `using` names, in both GUC modes (see
+[Multi-Database Support](context-managers.md#multi-database-support)). An alias outside the
+list gets the context only when `using` names it, and the configured aliases follow it too.
+With `USE_LOCAL_SET=True`, naming such an alias raises `RuntimeError`
+(`RLSConfigurationError` for the async helpers) unless the helper runs inside
+`transaction.atomic(using=...)`.
 
 ## Example: Full Test Suite
 

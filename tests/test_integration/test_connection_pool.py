@@ -8,18 +8,25 @@ connection that the previous request's cleanup did not reach arrives dirty.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+import asyncio
+from contextlib import contextmanager, suppress
 
 import pytest
+from asgiref.sync import async_to_sync, sync_to_async
 from django.conf import settings as django_settings
 from django.core.signals import request_finished
 from django.db import DatabaseError, connections
+from django.http import HttpRequest
 from django.test import Client, override_settings
 
+from django_rls_tenants.contrib.celery import rls_task
 from django_rls_tenants.pool import reset_rls_gucs
 from django_rls_tenants.rls.guc import set_guc
-from django_rls_tenants.tenants.middleware import _mark_gucs_set
+from django_rls_tenants.tenants.context import tenant_context
+from django_rls_tenants.tenants.middleware import RLSTenantMiddleware, _mark_gucs_set
+from django_rls_tenants.tenants.state import _current_live
 from tests import admin_urls
+from tests.rls_views import _database_products
 from tests.test_app.models import AdminUser
 
 pytestmark = [
@@ -47,8 +54,31 @@ _READ_STATE_SQL = (
 )
 
 
+_POOLED = "pooled"
+
+
 def _keep_everything(conn):
     """A pool ``reset`` callback that clears nothing, standing in for one of the user's own."""
+
+
+def _pooled_state():
+    """Read the physical connection, the GUCs and the visible rows on the ``pooled`` alias.
+
+    Through Django's cursor, so after the GUC affinity guard.
+
+    Returns:
+        ``(pid, (tenant, is_admin, login_flag), products)``, cleared GUCs as ``None``.
+    """
+    with connections[_POOLED].cursor() as cursor:
+        cursor.execute(_READ_STATE_SQL)
+        pid, *values = cursor.fetchone()
+    return pid, tuple(value or None for value in values), _database_products(_POOLED)
+
+
+@rls_task
+def pooled_state_task():
+    """``_pooled_state()`` as a Celery task: its body runs in the propagated context."""
+    return _pooled_state()
 
 
 @pytest.fixture
@@ -360,3 +390,121 @@ class TestResetRlsGucsInThePool:
                 assert raw.execute("SHOW TimeZone").fetchone()[0] == "Asia/Tokyo"
             finally:
                 raw.execute("SELECT set_config('TimeZone', %s, false)", [original])
+
+
+class TestTransactionLocalMode:
+    """``USE_LOCAL_SET=True``: the GUCs end with their transaction; the pool never gets them (#96).
+
+    Outside a transaction (an ASGI request, a Celery task) the GUC affinity
+    guard runs each statement in a transaction of its own with the context's
+    values.
+    """
+
+    @staticmethod
+    def _serve_async(user, view):
+        """Serve one request through the native async path; return the connection to the pool."""
+        request = HttpRequest()
+        request.user = user
+        try:
+            return async_to_sync(RLSTenantMiddleware(get_response=view))(request)
+        finally:
+            connections[_POOLED].close()
+
+    def test_context_leaves_nothing_on_the_returned_connection(
+        self,
+        pooled,
+        sample_orders,
+        tenant_a,
+    ):
+        """Set tenant, return the connection early, borrow it anonymously: no GUCs."""
+        with _rls_on(pooled, use_local_set=True):
+            with tenant_context(tenant_a.pk):
+                pid, gucs, products = _pooled_state()
+                connections[pooled].close()
+            returned = _raw_state(pooled)
+            body = _probe(Client(), pooled)
+
+        assert (gucs, products) == ((str(tenant_a.pk), "false", None), ["Widget A1", "Widget A2"])
+        assert returned == (pid, (None, None, None))
+        assert body == {
+            "pid": pid,
+            "tenant_guc": None,
+            "is_admin_guc": None,
+            "login_flag_guc": None,
+            "database_products": [],
+        }
+
+    def test_asgi_requests_for_two_tenants_on_one_physical_connection(
+        self,
+        pooled,
+        sample_orders,
+        web_user_a,
+        web_user_b,
+        tenant_a,
+        tenant_b,
+    ):
+        async def view(request):
+            return await sync_to_async(_pooled_state)()
+
+        with _rls_on(pooled, use_local_set=True):
+            first = self._serve_async(web_user_a, view)
+            second = self._serve_async(web_user_b, view)
+            after = _raw_state(pooled)
+
+        assert first[0] == second[0] == after[0]
+        assert first[1:] == ((str(tenant_a.pk), "false", None), ["Widget A1", "Widget A2"])
+        assert second[1:] == ((str(tenant_b.pk), "false", None), ["Gadget B1"])
+        assert after[1] == (None, None, None)
+
+    def test_cancelled_asgi_request_leaves_nothing(
+        self,
+        pooled,
+        sample_orders,
+        web_user_a,
+        tenant_a,
+    ):
+        seen = []
+        holders = []
+        cancelled = []
+
+        async def run():
+            started = asyncio.Event()
+
+            async def view(request):
+                seen.append(await sync_to_async(_pooled_state)())
+                holders.append(_current_live())
+                started.set()
+                await asyncio.sleep(30)
+
+            request = HttpRequest()
+            request.user = web_user_a
+            task = asyncio.ensure_future(RLSTenantMiddleware(get_response=view)(request))
+            await asyncio.wait_for(started.wait(), timeout=10)
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            cancelled.append(task.cancelled())
+
+        with _rls_on(pooled, use_local_set=True):
+            async_to_sync(run)()
+            connections[pooled].close()
+            pid, after = _raw_state(pooled)
+            body = _probe(Client(), pooled)
+
+        assert cancelled == [True]
+        assert holders[0].alive is False  # the request's context ended with it
+        assert seen[0][1:] == ((str(tenant_a.pk), "false", None), ["Widget A1", "Widget A2"])
+        assert (pid, after) == (seen[0][0], (None, None, None))
+        assert (body["pid"], body["tenant_guc"], body["database_products"]) == (pid, None, [])
+
+    def test_celery_task_on_a_pooled_connection(self, pooled, sample_orders, tenant_b):
+        """The worker runs the task outside any transaction, in the propagated context."""
+        with _rls_on(pooled, use_local_set=True):
+            result = pooled_state_task.apply(
+                headers={"rls_tenant_id": tenant_b.pk, "rls_admin": False},
+            ).get()
+            connections[pooled].close()
+            after = _raw_state(pooled)
+
+        assert result[1:] == ((str(tenant_b.pk), "false", None), ["Gadget B1"])
+        assert after == (result[0], (None, None, None))

@@ -495,9 +495,10 @@ the [Raw SQL guide](raw-sql.md) for the helpers' full contract.
 
 *Added in 1.4.0.* Every statement on a PostgreSQL connection passes through the
 [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard)'s execute wrapper; it
-acts only on aliases in `RLS_TENANTS["DATABASES"]` with `USE_LOCAL_SET=False`, where it
-compares the active context with what the connection holds. That costs a few
-microseconds of Python per statement, depending on the machine. Measured on one idle
+acts only on aliases in `RLS_TENANTS["DATABASES"]`, where it compares the active context
+with what the connection holds. That costs about a
+microsecond of Python per statement (0.8 to 1.4 µs measured with a stub execute and the real
+wrapper, depending on SQL length and load). Measured on one idle
 machine on `SELECT 1` over a local socket, the median per statement went from 29.6 to
 31.1 µs with psycopg2 and from 31.6 to 33.3 µs with psycopg 3, so the share is smaller for
 any real query. It adds no round trip while the
@@ -506,6 +507,41 @@ thread and connection. It sends one `set_config()` statement when they differ: o
 thread's connection, in a sibling task, after a rollback undid them, or when it cannot tell
 (a transaction ended through the driver connection, a `RESET ALL`). The guard does not
 change the SQL, so the plans in this guide are unaffected.
+
+**With `USE_LOCAL_SET=True`** (*changed in 1.4.0*, when the guard became active in this
+mode), the guard's Python cost per statement rises by about 0.1 to 0.15 µs outside a
+transaction and by almost nothing inside one, which is negligible. The round trips differ,
+because transaction-local values end with their transaction, and they depend on where the
+context is entered:
+
+- A context entered before a transaction opens (a task's context around an
+  `atomic()` block, or the request's context on the middleware's async path with
+  `ATOMIC_REQUESTS`): the guard sends one `set_config()` per transaction, plus one per
+  context change inside it.
+- A context entered inside `transaction.atomic()` (a `TestCase`, the WSGI request
+  transaction): the block writes the GUCs itself, two `current_setting()` reads and two
+  `SET LOCAL` statements on entry and two `SET LOCAL` statements on exit. The guard sends
+  none for it while its tracker is clean (a test transaction, the WSGI request
+  transaction); after an earlier context has ended on that connection it first clears the
+  session's values, one more statement, and a loop that enters `atomic()` and a context on
+  every iteration pays it every time.
+- In autocommit, a statement run under a context gets a transaction of its own: `BEGIN`,
+  the `set_config()` statement, the statement, `COMMIT`. That is **three extra round trips
+  per statement**, each as long as your latency to the database. This is the cost of
+  requests on the middleware's async path, Celery tasks and scripts that run without
+  `transaction.atomic()`.
+- Outside any context, a statement runs as it is, with no extra round trip. The next one
+  after a context has ended, in autocommit or in a transaction, sends one `set_config()` to
+  clear what the session may hold for itself (see
+  [After a context ends](connection-pooling.md#after-a-context-ends)), for example the next
+  request's session lookup on a persistent connection. The clear is for the session, so
+  once its transaction commits it sticks.
+
+Put batches in one `transaction.atomic()`: a task that runs a hundred statements under one
+context then pays for one `set_config()` (the context outside, the `atomic()` inside) or six
+small statements, plus one clear after an earlier context (the `atomic()` outside), instead
+of three hundred extra round trips, and its writes commit together. See
+[Code Outside a Request Transaction](connection-pooling.md#code-outside-a-request-transaction).
 
 ## How to measure
 

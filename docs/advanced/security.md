@@ -187,8 +187,9 @@ Mitigations:
 - **Safety net**: `request_finished` signal clears GUCs if `process_response` is skipped,
   on a connection that is still open (with Django's pool the next checkout clears it
   instead).
-- **Other threads**: the `connection_created` handler sets the request's GUCs on connect
-  only on connections opened on the thread that set them, where the cleanup above runs. A
+- **Other threads**: with session GUCs, the `connection_created` handler sets the request's
+  GUCs on connect only on connections opened on the thread that set them, where the cleanup
+  above runs. A
   connection opened on another thread during the request (an ASGI error page,
   `thread_sensitive=False` work) is cleared instead (#130; see
   [Running under ASGI](../guides/middleware.md#running-under-asgi)).
@@ -200,8 +201,9 @@ Mitigations:
   holds it, which SQL that bypasses Django's cursor, such as `callproc()`, would see). A
   connection whose cleanup failed is corrected before its next statement (#41). The guard
   only applies contexts the library itself set up (a private `ContextVar`), never one
-  inferred from the public state functions, and session GUCs only. See
-  [GUC Affinity Guard](architecture.md#guc-affinity-guard).
+  inferred from the public state functions, and only the admin and tenant GUCs. With
+  `USE_LOCAL_SET=True` it applies them transaction-locally (*1.4.0+*, #96), so the session
+  never holds them. See [GUC Affinity Guard](architecture.md#guc-affinity-guard).
 - **Django's connection pool**: on each checkout from a pool (`OPTIONS["pool"]`) on a
   configured alias, the `connection_created` handler clears every GUC the policies read,
   with or without a request context, so a connection that the previous borrower's cleanup
@@ -209,9 +211,22 @@ Mitigations:
   `django_rls_tenants.pool.reset_rls_gucs` clears them again as the connection goes back,
   and system check `W010` asks for it. GUCs read only by hand-written policies, or by
   `AddM2MRLSPolicy` with non-default names, are not cleared.
-- **USE_LOCAL_SET**: `SET LOCAL` scopes GUCs to the transaction, preventing leaks. An
-  external pooler such as PgBouncer in transaction mode still needs it: the handler and the
-  guard do not see that pooler hand the server connection to another client.
+- **USE_LOCAL_SET**: transaction-local GUCs end with their transaction, so they never stay
+  on a connection. The transaction is the WSGI middleware's request transaction, one you
+  open with `transaction.atomic()`, or, on the middleware's async path (ASGI) and for code
+  outside a transaction, one the guard opens around each statement run under a context
+  (*1.4.0+*; before, those cases raised). A few commands PostgreSQL refuses inside a
+  transaction block (`VACUUM`, `REINDEX`, `CREATE INDEX CONCURRENTLY` and similar) run
+  without the context; none of them evaluates an RLS policy. Code inside a context can
+  still write the admin or tenant GUC for the session (`set_guc()`, `rls_context()` without
+  `is_local=True`, a function, a `DO` block): when a context ends, and on any connection
+  after a statement run under a context's values, the sessions' own values count as
+  unknown, and the next statement run outside any context, in autocommit or in a
+  transaction, clears them first, so such a value does not outlive the context on a
+  persistent or pooled connection. Inside a context in autocommit, the guard's values
+  override such a write, so it cannot narrow the context. An external pooler such as
+  PgBouncer in transaction mode still needs this mode: with session GUCs the handler and
+  the guard do not see that pooler hand the server connection to another client.
 
 See [Connection Pooling](../guides/connection-pooling.md) for details.
 

@@ -91,10 +91,12 @@ with admin_context():
     assert Order.objects.count() == all_count
 ```
 
-Save and restore happen in **both** GUC modes. With `USE_LOCAL_SET=True` the previous
-values are re-issued with `SET LOCAL` when the inner block exits, so the enclosing block
-keeps its own scope for the rest of the transaction; PostgreSQL then drops everything at
-`COMMIT` / `ROLLBACK` as usual.
+Save and restore happen in **both** GUC modes. With `USE_LOCAL_SET=True` inside
+`transaction.atomic()`, the previous values are re-issued with `SET LOCAL` when the inner
+block exits, so the enclosing block keeps its own scope for the rest of the transaction;
+PostgreSQL then drops everything at `COMMIT` / `ROLLBACK` as usual. Outside `atomic()` the
+blocks write nothing and restore nothing (see
+[below](#use_local_settrue-outside-a-transaction)).
 
 !!! warning "Before 1.3.2"
     With `USE_LOCAL_SET=True`, versions up to 1.3.1 did not restore on block exit at all.
@@ -128,6 +130,47 @@ with transaction.atomic(), tenant_context(tenant_id=1):
     # Back to tenant 1: the savepoint rollback restored the GUCs.
     Order.objects.count()
 ```
+
+## `USE_LOCAL_SET=True` Outside a Transaction
+
+*Changed in 1.4.0.* `SET LOCAL` needs a transaction. Inside `transaction.atomic()` the
+managers behave as described above: they snapshot, `SET LOCAL` on entry and restore on
+exit. Outside `atomic()`, on an alias in `RLS_TENANTS["DATABASES"]`, they no longer raise
+`RuntimeError`. They write nothing on entry or exit and only set the Python-side context
+(if a transaction is still open at exit, from `AUTOCOMMIT=False` or an SQL `BEGIN`, the
+exit may send one transaction-local clear). The
+[GUC affinity guard](../advanced/architecture.md#guc-affinity-guard)
+applies the values to each statement, transaction-locally: in a transaction of its own for
+a statement run in autocommit (`BEGIN`, the `set_config()` statement, your statement,
+`COMMIT`: three extra round trips), and once per transaction for a transaction opened
+inside the block. Celery tasks, management commands and scripts therefore need no
+`transaction.atomic()`:
+
+```python
+with tenant_context(tenant_id=42):  # no atomic() needed
+    orders = list(Order.objects.all())
+```
+
+Put a batch of statements in one `transaction.atomic()` when the round trips matter.
+Opened inside the block, it costs one `set_config()` per transaction. Opened around the
+block, the block writes its own GUCs: two `current_setting()` reads and two `SET LOCAL`
+statements on entry, two `SET LOCAL` statements on exit. The guard sends none for it while
+its tracker is clean (a test transaction, the first such block after a statement run
+outside any context); after an earlier context has ended on that connection it first
+clears the session's values, one more statement, and a loop that enters `atomic()` and a
+context on every iteration pays it every time. The same holds for `admin_context()`,
+`@with_rls_context`, the `for_user()` scope and the testing helpers. When a block ends,
+what the session holds for itself counts as unknown, and the next statement run outside any
+context, in autocommit or in a transaction, clears it first (one statement), in case code
+inside the block wrote the GUCs for the session. Such a write does not narrow the block's
+context in autocommit: the guard's values override it, so change the context with
+`tenant_context()` / `admin_context()`. See [Code Outside a Request
+Transaction](connection-pooling.md#code-outside-a-request-transaction) for the cost by
+placement, the query counts, and where the guard stops.
+
+On an alias outside `RLS_TENANTS["DATABASES"]`, which the guard leaves alone, nothing
+changes: a block entered outside `atomic()` still raises `RuntimeError` ("Cannot use SET
+LOCAL for ... outside a transaction"), and the async managers raise `RLSConfigurationError`.
 
 ## Async Code
 
@@ -168,21 +211,34 @@ also explains which database connection an `async def` test uses.
 
 ### `USE_LOCAL_SET=True` in async code
 
-`SET LOCAL` needs `transaction.atomic()` open on the thread that runs the database calls,
-and a coroutine cannot open one (`atomic()` on the event-loop thread raises
-`SynchronousOnlyOperation`). With `USE_LOCAL_SET=True` the async managers therefore raise
-`RLSConfigurationError` unless the coroutine is driven by `async_to_sync` from synchronous
-code that is already inside `transaction.atomic()`:
+*Changed in 1.4.0.* A coroutine cannot open `transaction.atomic()` (`atomic()` on the
+event-loop thread raises `SynchronousOnlyOperation`), so the thread that runs the database
+calls is normally in autocommit. With `USE_LOCAL_SET=True` the async managers write
+nothing there: they set the Python-side context, and the GUC affinity guard gives each
+statement the context in a transaction of its own (see
+[`USE_LOCAL_SET=True` Outside a Transaction](#use_local_settrue-outside-a-transaction)).
+That works in an ASGI request, a bare event loop and a script run with `asyncio.run()`:
+
+```python
+async with async_tenant_context(tenant_id):  # no atomic() needed
+    count = await Order.objects.acount()
+```
+
+When the coroutine is driven by `async_to_sync` from synchronous code that is already
+inside `transaction.atomic()`, the managers write `SET LOCAL` values into that
+transaction, as the sync managers do:
 
 ```python
 from asgiref.sync import async_to_sync
 from django.db import transaction
 
 with transaction.atomic():
-    async_to_sync(do_tenant_work)()   # async_tenant_context() inside works
+    async_to_sync(do_tenant_work)()   # async_tenant_context() inside sets SET LOCAL
 ```
 
-Under an ASGI request or a bare event loop, use the default `USE_LOCAL_SET=False`. The
+On an alias outside `RLS_TENANTS["DATABASES"]`, which the guard leaves alone, the async
+managers still need that transaction and raise `RLSConfigurationError` without one; add
+the alias to the list, or run the block through `async_to_sync` inside `atomic()`. The
 generic `async_rls_context()` and `async_bypass_flag()` do not check this: with
 `is_local=True` outside a transaction the `RuntimeError` from `set_guc()` propagates.
 
@@ -206,10 +262,10 @@ alone. It does not cover:
 - bypass flags and other GUCs set with `async_bypass_flag()` / `async_rls_context()`: they
   stay on the shared connection while the block runs, and sibling tasks see them. Do not
   run such a block concurrently with work that must not get the bypass;
-- `USE_LOCAL_SET=True` (see above), where the guard does nothing. A block that exits in
-  another `contextvars.Context` than it entered in (a generator suspended inside it and
-  closed elsewhere) restores, on the session it entered on, the values of the context it
-  was entered in while that context is live, even if another context is current there;
+- a block that exits in another `contextvars.Context` than it entered in (a generator
+  suspended inside it and closed elsewhere): it restores, on the session it entered on,
+  the values of the context it was entered in while that context is live, even if another
+  context is current there;
 - SQL that bypasses Django's execute wrappers: a driver cursor, `callproc()`, the driver's
   `copy` methods, and the `FETCH`es of a server-side cursor (`iterator()`) opened inside a
   transaction, whose rows PostgreSQL computes as they are fetched. Outside a transaction
@@ -233,8 +289,8 @@ the outer async block when it exits; an async block run with `async_to_sync` ins
 `tenant_context()` restores the sync scope. Prefer `thread_sensitive=True` (the default): a
 different thread means a different connection. The
 [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) applies your context
-there too (session GUCs only), but that connection is outside any transaction your code
-has open.
+there too, but that connection is outside any transaction your code has open (with
+`USE_LOCAL_SET=True`, each of its statements gets a transaction of its own).
 
 ## @with_rls_context Decorator
 
@@ -298,7 +354,7 @@ async def dashboard(request):
   `request.user`, a lazy object that queries on first access and raises
   `SynchronousOnlyOperation` in async code.
 - Everything in [Async Code](#async-code) applies: one thread hop on entry and one on exit,
-  the [`USE_LOCAL_SET=True` limitation](#use_local_settrue-in-async-code), and
+  the [`USE_LOCAL_SET=True` behaviour](#use_local_settrue-in-async-code), and
   [concurrent tasks](#concurrent-tasks). Decorated calls for different users can run
   concurrently, as in `asyncio.gather(order_count(as_user=a), order_count(as_user=b))`,
   within the limits listed there.
@@ -483,8 +539,11 @@ the [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) applies
 each statement there. `tenant_context(42)` therefore also scopes a read that a router sends
 to a configured replica, and `admin_context(using="analytics")` gives the admin bypass on
 every configured alias. An alias outside `RLS_TENANTS["DATABASES"]` gets the GUCs only when
-you name it in `using`. With `USE_LOCAL_SET=True` the guard does nothing, and only the
-`using` alias gets them.
+you name it in `using`. With `USE_LOCAL_SET=True` the configured aliases follow the context
+too, with transaction-local values: the guard sets them per statement in autocommit, or
+once per transaction opened inside the context. An alias outside the list gets them only
+when you name it in `using` and have a transaction open on it
+(`transaction.atomic(using=...)`).
 
 !!! warning "`using` does not limit a context to one alias"
     `using` names the alias the GUCs are written to first, not the aliases the context
