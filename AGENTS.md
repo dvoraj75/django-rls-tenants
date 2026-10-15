@@ -112,8 +112,9 @@ avoid duplication. All SQL-interpolated inputs are validated via
 ### Multi-Database Support
 
 The middleware sets GUC variables on all database aliases listed in
-`RLS_TENANTS["DATABASES"]` (default: `["default"]`). A `connection_created`
-signal handler in `apps.py` also sets GUCs on lazily-created connections,
+`RLS_TENANTS["DATABASES"]` (default: `["default"]`). With `USE_LOCAL_SET=False`, a
+`connection_created` signal handler in `apps.py` also sets GUCs on lazily-created
+connections (with `True` the GUC affinity guard applies them per statement instead),
 but only on the thread that set the request's GUCs: the "GUCs set" `ContextVar`
 holds that thread's marker (`_mark_gucs_set()`, `_were_gucs_set_on_this_thread()`
 in `middleware.py`). `ContextVar`s are copied into `thread_sensitive=False` hops,
@@ -133,8 +134,9 @@ runs `_clear_policy_gucs()` from `pool.py`, one statement on the connection the 
 sent (not `connections[alias]`), committed under `AUTOCOMMIT=False`, because a pool keeps
 session GUCs between borrowers and the previous borrower's cleanup may not have reached
 the connection (#96). If it fails on a pooled connection, the handler closes the
-connection (the pool discards it) and re-raises: fail closed. The request thread's GUCs
-are applied after it. The #130 clear for other threads uses the same statement.
+connection (the pool discards it) and re-raises: fail closed. With `USE_LOCAL_SET=False`
+the request thread's GUCs are applied after it. The #130 clear for other threads uses the
+same statement.
 `_policy_guc_names()` collects the names from the configured `GUC_PREFIX` GUCs and the
 installed models' constraints (`RLSConstraint` GUCs and `extra_bypass_flags`,
 `RLSM2MConstraint` GUCs), keeping only dotted custom-GUC names; hand-written policies and
@@ -152,11 +154,50 @@ uses `conf.DATABASES` rather than hardcoding `"default"`.
 in `apps.py`) calls `install()` on every PostgreSQL connection: `_guard` goes first in
 `execute_wrappers` (Django's `execute_wrapper()` pops the last one on exit), the
 connection's `_commit` / `_rollback` are wrapped, and a `_SessionGUCs` tracker is attached.
-Before each statement on an alias in `conf.DATABASES` with `USE_LOCAL_SET=False`, the guard
+Before each statement on an alias in `conf.DATABASES`, the guard
 compares the active context's values (`state._get_context_gucs()`: a `ContextGucs` named
 tuple, or `None`) with what the tracker says the session holds and, if they differ, runs
 `write_gucs()` (one `set_config()` pair) first; a failure propagates. So every configured
-alias follows the context, whichever alias it was entered on. The `ContextVar` holds a
+alias follows the context, whichever alias it was entered on. With `USE_LOCAL_SET=True`
+(#96) the pair is transaction-local (`set_config(..., true)`), written only when the
+statement runs in a transaction (`_will_run_in_transaction()`: libpq status not idle, or
+Django's `autocommit` off). A statement in autocommit inside a context goes through
+`_run_in_own_transaction()` instead: `BEGIN` and `COMMIT`/`ROLLBACK` sent past Django's
+cursor (`_send_transaction_control()`: no execute wrapper sees them, but Django's
+`debug_transaction` logs them, so they are in `connection.queries`, listed `BEGIN`,
+`set_config()`, `COMMIT`, then the statement, which Django logs when it finishes: a
+wrapped statement counts as four queries), the `set_config()` pair through Django's
+cursor, the statement in between; an `executemany()` runs in one such transaction. If the
+guard's `ROLLBACK` after a failure cannot be confirmed, `_abandon_own_transaction()`
+closes the connection (Django thought it was in autocommit). `_refused_in_a_transaction()`
+/ `_refused_ddl()` match, on their real grammar from the first words (also `VACUUM(...)`
+option lists), the commands PostgreSQL may refuse in a transaction block (`VACUUM`,
+`CLUSTER`, `REINDEX`, `DISCARD`, `CREATE`/`ALTER`/`DROP` of a database, tablespace or
+subscription, `ALTER SYSTEM`, `CREATE [UNIQUE] INDEX CONCURRENTLY`, `DROP INDEX
+CONCURRENTLY`, `DETACH PARTITION ... CONCURRENTLY`); they run unwrapped. `SET TRANSACTION`
+(also `SNAPSHOT`) is not one of them: `_controls_the_transaction()` treats it as
+transaction control in both modes, so `_guard` writes nothing before it (it must be a
+transaction's first statement). A procedure or `DO` block that commits cannot run in a
+context in autocommit, and the context's values, set in the statement's own transaction,
+override writes of the GUCs that other code made for the session (`set_guc()`,
+`rls_context()` without `is_local=True`). Outside a context, `_apply_if_stale()` clears
+the session's own values (a tuple or `UNKNOWN`) for the session, in autocommit or in a
+transaction, where the clear sticks once the transaction commits. In that mode
+`suspect_sessions()` marks the sessions' own values `UNKNOWN`
+(`_SessionGUCs.suspect_session()`; no statement runs), because code in the context may
+have written the GUCs for the session and nothing restores them. It runs from
+`_restore_tenant_gucs()` (block exits and `for_user()` scope ends),
+`middleware._clear_request_gucs()` (request end) and
+`apps._clear_finished_request_gucs()` (the `request_finished` safety net), and `_guard`
+marks a connection's session the same way after a statement that ran under local values
+(in its own transaction, or in a transaction with `wrote_local`), which reaches
+connections of other threads that no block exit reaches. In a transaction the mark takes
+effect at the commit. The context managers, `_rls_scope()` and the
+middleware write nothing outside `transaction.atomic()` on a configured alias
+(`context._writes_gucs()`, which `_rls_scope()` decides before its own transaction opens;
+the restore then gets `previous=None` and only settles), and the middleware's async path
+opens no request transaction. `ready()` calls `_guard_open_connections()` so connections
+opened earlier get the guard (`guard_open_connection()`). The `ContextVar` holds a
 `_Live` holder that `_reset_context_gucs()` / `_clear_context_gucs()` end for every copy,
 so a hop or task inherits a context only while its block is live. `_reset_context_gucs()`
 also ends a newer holder left current in its place, and the current one for a token used
@@ -192,7 +233,8 @@ Rules for code that sets a context or writes the admin/tenant GUCs:
 - The middleware records the holder a request found (`_FoundContext` on
   `request._rls_found_context`). `_end_blocks_left_open()` ends a newer current holder
   that is not the request's own (a block the view left open) before Django builds the
-  error response: from `process_exception` (in a `finally` after the cleanup) and from the
+  error response: from `process_exception` (in a `finally`, after the cleanup, or after
+  marking the middleware-owned transaction for rollback) and from the
   `got_request_exception` receiver in `apps.py` (500s `process_exception` does not see).
   `_release_context_gucs()` ends one at the end of the request, and `_cleanup_rls_state()`
   scrubs the tenant values of a request that set none only when it was not served inside
@@ -200,16 +242,22 @@ Rules for code that sets a context or writes the admin/tenant GUCs:
 - `_Live.serial` orders holders: `_end_if_newer()` ends a holder left current only if it is
   newer than the one being reset or released, so an exit out of order (an inner block whose
   enclosing request context was reset below it) does not end an older enclosing context.
-- The library's own GUC writes run inside `writing(alias_or_connection, values)`, which
-  keeps the guard out of the way and records `values` (`UNKNOWN` if the block raises). A
+- The library's own GUC writes run inside `writing(alias_or_connection, values, local=...)`,
+  which keeps the guard out of the way and records `values` (`UNKNOWN` if the block raises);
+  `local=True` for a transaction-local write, which ends with its transaction. A
   restore records `_get_context_gucs()` read after the `ContextVar` reset
   (`_restore_tenant_gucs()` in `context.py`, which also settles the thread's other
   configured aliases): the guard reconciled the snapshot reads, so the snapshot holds the
   enclosing context's values. A snapshot taken inside `writing()` needs
   `apply_active_context()` first (`_enter_tenant_gucs()`).
-- Writes by other code (`set_guc()`, `rls_context()`) are deliberately not recorded.
+- Writes by other code (`set_guc()`, `rls_context()`) are deliberately not recorded. With
+  `USE_LOCAL_SET=True` they do not narrow a context in autocommit: the guard's own
+  transaction sets the context's values over them.
 
-PostgreSQL undoes `set_config()` calls made in a rolled-back transaction or savepoint, so
+PostgreSQL undoes `set_config()` calls made in a rolled-back transaction or savepoint, and
+transaction-local ones at any end of their transaction (`_SessionGUCs.end_transaction()`
+reads `wrote_local` / `wrote_session`; both kinds in one committed transaction leave the
+values `UNKNOWN`, since which one survives depends on their order), so
 the tracker follows Django's commit and rollback (the wrapped `_commit` / `_rollback`), the
 libpq transaction status, and the statements in `_FOLLOWED` that run through Django's cursor
 (savepoint stack, `ROLLBACK`/`COMMIT` as SQL, `RESET ALL`/`DISCARD ALL`/`RESET` of the two
@@ -242,7 +290,11 @@ user's values and the tenant `ContextVar`s, then restores the previous values. A
 override that runs SQL must use it. `iterator()` / `aiterator()` enter it once per chunk
 and never across a `yield`. A queryset with cached results must skip both the scope and
 `_check_strict_mode()`. Methods Django runs in a transaction of their own pass
-`own_transaction=True`, so `SET LOCAL` mode works outside `transaction.atomic()`.
+`own_transaction=True`, so their `SET LOCAL` lands in that transaction (on a configured
+alias with `USE_LOCAL_SET=True` the scope writes nothing in it and the guard sets the
+values there, one `set_config()`, and takes them off at the scope's exit). With
+`USE_LOCAL_SET=True` outside `transaction.atomic()` on a configured alias the scope only
+sets the `ContextVar`s, and the GUC affinity guard applies the user's values per statement.
 
 ### Async Middleware Path
 
@@ -259,7 +311,12 @@ and the GUC affinity guard applies the copied context to their statements and ta
 the connection before the next statement run without it (#130, #41).
 A subclass that overrides `process_request` or `process_response` is detected in `__init__`
 and served by `_acall_through_sync_hooks` (`MiddlewareMixin.__acall__`), so changes to the
-sync hooks must keep that path working too.
+sync hooks must keep that path working too. With `USE_LOCAL_SET=True` neither async path
+opens a transaction or writes a GUC (the guard applies the request's values per statement,
+#96); only the sync `__call__` (`_call_sync`) owns a request transaction, so `__init__`
+checks the exception-middleware order only when `async_mode` is off. `async_mode` is off
+under ASGI too when a synchronous-only middleware follows `RLSTenantMiddleware`: Django
+then runs it synchronously, with the request transaction, its rollback and the check.
 
 ## Code Style
 

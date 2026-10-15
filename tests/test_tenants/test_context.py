@@ -866,28 +866,71 @@ class TestAsyncNestedContextRestore:
 
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("use_admin", [False, True], ids=["tenant", "admin"])
-def test_use_local_set_without_transaction_raises_configuration_error(use_admin):
-    """USE_LOCAL_SET=True with no transaction on the hop thread is a configuration error."""
+def test_use_local_set_without_transaction_applies_the_context_per_statement(use_admin):
+    """USE_LOCAL_SET=True with no transaction on the hop thread (#96).
+
+    The block writes nothing; the GUC affinity guard runs each statement in a
+    transaction of its own with the block's values, so none stay on the session.
+    """
     from django.db import connections  # noqa: PLC0415
     from django.test import override_settings  # noqa: PLC0415
+
+    from tests.session_gucs import session_gucs  # noqa: PLC0415
+
+    def read():
+        return (get_guc("rls.is_admin"), get_guc("rls.current_tenant")), session_gucs()
 
     async def run():
         try:
             ctx = async_admin_context() if use_admin else async_tenant_context(1)
-            with pytest.raises(RLSConfigurationError, match="USE_LOCAL_SET"):
-                async with ctx:
-                    pytest.fail("The block must not run")
-            return get_current_tenant_id(), get_rls_context_active()
+            async with ctx:
+                inside = await sync_to_async(read, thread_sensitive=True)()
+                state = get_current_tenant_id(), get_rls_context_active()
+            after = await sync_to_async(read, thread_sensitive=True)()
+            return inside, state, after
         finally:
             await sync_to_async(connections.close_all, thread_sensitive=True)()
 
     with override_settings(
         RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant", "USE_LOCAL_SET": True},
     ):
-        # asyncio.run: the hop runs on an executor thread outside any transaction.
-        assert asyncio.run(run()) == (None, False)
+        # asyncio.run: the hops run on an executor thread outside any transaction.
+        inside, state, after = asyncio.run(run())
+    values = ("true", None) if use_admin else ("false", "1")
+    assert inside == (values, (None, None))
+    assert state == (None if use_admin else 1, True)
+    assert after == ((None, None), (None, None))
     assert get_current_tenant_id() is None
     assert get_rls_context_active() is False
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("use_admin", [False, True], ids=["tenant", "admin"])
+def test_use_local_set_alias_outside_rls_databases_needs_a_transaction(replica, use_admin):
+    """The guard leaves that alias alone, so ``SET LOCAL`` still needs ``atomic()``."""
+    from django.test import override_settings  # noqa: PLC0415
+
+    async def run():
+        ctx = (
+            async_admin_context(using=replica)
+            if use_admin
+            else async_tenant_context(1, using=replica)
+        )
+        with pytest.raises(RLSConfigurationError, match="RLS_TENANTS\\['DATABASES'\\]"):
+            async with ctx:
+                pytest.fail("The block must not run")
+        return get_current_tenant_id(), get_rls_context_active()
+
+    with override_settings(
+        RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant", "USE_LOCAL_SET": True},
+    ):
+        # async_to_sync: the hop runs on this thread, which knows the replica alias.
+        assert async_to_sync(run)() == (None, False)
+        with (
+            pytest.raises(RuntimeError, match="outside a transaction"),
+            tenant_context(1, using=replica),
+        ):
+            pytest.fail("The block must not run")
 
 
 @pytest.mark.django_db(transaction=True)

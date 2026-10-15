@@ -22,9 +22,13 @@ from django.utils.module_loading import import_string
 
 from django_rls_tenants.exceptions import RLSConfigurationError
 from django_rls_tenants.rls.guc import clear_guc, set_guc
-from django_rls_tenants.tenants.affinity import writing
+from django_rls_tenants.tenants.affinity import suspect_sessions, writing
 from django_rls_tenants.tenants.conf import rls_tenants_config
-from django_rls_tenants.tenants.context import _context_gucs_of, _resolve_user_guc_vars
+from django_rls_tenants.tenants.context import (
+    _context_gucs_of,
+    _resolve_user_guc_vars,
+    _writes_gucs,
+)
 from django_rls_tenants.tenants.state import (
     _ContextGucsToken,
     _current_live,
@@ -275,13 +279,17 @@ def _clear_gucs_on_all_databases(conf: Any) -> None:
 def _clear_request_gucs(conf: RLSTenantsConfig) -> None:
     """Clear both GUCs on every configured alias at the end of a request.
 
-    A no-op with ``USE_LOCAL_SET=True``: the ``SET LOCAL`` values vanish with
-    the transaction that ends the request.
+    With ``USE_LOCAL_SET=True`` no statement runs: transaction-local values
+    end with their transactions (the request's own, on the synchronous path),
+    and what the sessions hold for themselves only counts as unknown from now
+    on (``affinity.suspect_sessions()``), since the view may have written the
+    GUCs for the session.
 
     Args:
         conf: ``RLSTenantsConfig`` instance.
     """
     if conf.USE_LOCAL_SET:
+        suspect_sessions()
         return
     for db_alias in conf.DATABASES:
         _clear_alias_gucs(conf, db_alias)
@@ -294,14 +302,6 @@ class _RequestScope(NamedTuple):
     tenant_id: int | str | None
     gucs: ContextGucs
     thread_marker: _ThreadMarker
-
-
-_ASGI_LOCAL_SET_MESSAGE = (
-    "RLSTenantMiddleware cannot use RLS_TENANTS['USE_LOCAL_SET'] = True "
-    "under ASGI: SET LOCAL needs a transaction held open across the whole "
-    "request, which the async middleware path cannot provide. Serve the "
-    "application through WSGI, or set USE_LOCAL_SET=False."
-)
 
 
 class RLSTenantMiddleware(MiddlewareMixin):
@@ -324,13 +324,12 @@ class RLSTenantMiddleware(MiddlewareMixin):
         ]
 
     With ``USE_LOCAL_SET=True`` the middleware owns a database transaction
-    for every authenticated request: ``transaction.atomic()`` is opened on
-    each alias in ``RLS_TENANTS["DATABASES"]`` around the rest of the
-    middleware chain and the view, so the ``SET LOCAL`` GUCs are in force
-    for the whole request and vanish at commit/rollback. ``ATOMIC_REQUESTS``
-    is not required (and is harmless -- it nests as a savepoint). This
-    transaction-per-request mode is only available on the synchronous
-    (WSGI) code path.
+    for every authenticated request on the synchronous (WSGI) path:
+    ``transaction.atomic()`` is opened on each alias in
+    ``RLS_TENANTS["DATABASES"]`` around the rest of the middleware chain and
+    the view, so the ``SET LOCAL`` GUCs are in force for the whole request and
+    vanish at commit/rollback. ``ATOMIC_REQUESTS`` is not required (and is
+    harmless -- it nests as a savepoint).
 
     Under ASGI, ``__acall__`` serves the request natively instead of
     ``MiddlewareMixin.__acall__``: one thread-sensitive hop resolves the user
@@ -338,7 +337,13 @@ class RLSTenantMiddleware(MiddlewareMixin):
     with their own tokens in the request coroutine, and one hop clears the
     GUCs at the end. A subclass that overrides ``process_request`` or
     ``process_response`` keeps the hook-based path, so its hooks still run.
-    ``USE_LOCAL_SET=True`` stays WSGI-only.
+    With ``USE_LOCAL_SET=True`` a request on the async path gets no
+    transaction (none can be held open across the awaited chain; under ASGI
+    with a synchronous-only middleware after this one, Django runs it on the
+    synchronous path, with the transaction) and the middleware writes no GUC:
+    the GUC affinity guard sets the request's values transaction-locally for
+    each statement, giving a statement run in autocommit a transaction of its
+    own (#96).
     """
 
     def __init__(self, get_response: Callable[..., Any]) -> None:
@@ -349,7 +354,8 @@ class RLSTenantMiddleware(MiddlewareMixin):
             getattr(type(self), hook) is not getattr(RLSTenantMiddleware, hook)
             for hook in ("process_request", "process_response")
         )
-        if rls_tenants_config.USE_LOCAL_SET:
+        # Only the synchronous path opens the request transaction this protects.
+        if rls_tenants_config.USE_LOCAL_SET and not self.async_mode:
             self._validate_exception_middleware_order()
 
     def _validate_exception_middleware_order(self) -> None:
@@ -387,7 +393,7 @@ class RLSTenantMiddleware(MiddlewareMixin):
             return self._call_sync(request)
 
     def _call_sync(self, request: HttpRequest) -> Any:
-        """Run a WSGI request, inside a transaction per alias when ``USE_LOCAL_SET``.
+        """Run a request on the sync path; with ``USE_LOCAL_SET``, in a transaction per alias.
 
         Django's ``ATOMIC_REQUESTS`` wraps only the view callable, never
         ``process_request``, so ``SET LOCAL`` issued there would run in
@@ -448,9 +454,10 @@ class RLSTenantMiddleware(MiddlewareMixin):
         is served by ``_acall_through_sync_hooks`` instead, so its hooks run as
         they did before this path existed.
 
-        ``USE_LOCAL_SET=True`` is not supported here: the async path cannot hold
-        a synchronous ``transaction.atomic()`` open across the awaited chain, so
-        authenticated requests raise ``RLSConfigurationError``.
+        With ``USE_LOCAL_SET=True`` the async path opens no transaction (it
+        cannot hold a synchronous ``transaction.atomic()`` open across the
+        awaited chain) and writes no GUC; the GUC affinity guard applies the
+        request's context to each statement, transaction-locally.
         """
         if self._sync_hooks_overridden:
             return await self._acall_through_sync_hooks(request)
@@ -501,16 +508,11 @@ class RLSTenantMiddleware(MiddlewareMixin):
         Returns:
             ``None`` for an unauthenticated request (nothing was set), otherwise
             the auto-scope tenant ID (``None`` for an admin user), the GUC values
-            set, and the marker of the thread that set them.
-
-        Raises:
-            RLSConfigurationError: If ``USE_LOCAL_SET=True`` and the request is
-                authenticated.
+            set (with ``USE_LOCAL_SET=True``, the values the GUC affinity guard
+            applies), and the marker of the thread that set them.
         """
         if not _is_authenticated(request):
             return None
-        if conf.USE_LOCAL_SET:
-            raise RLSConfigurationError(_ASGI_LOCAL_SET_MESSAGE)
         user: Any = request.user
         try:
             guc_vars = _resolve_user_guc_vars(user, conf)
@@ -562,16 +564,9 @@ class RLSTenantMiddleware(MiddlewareMixin):
         so cleanup clears the ``ContextVar`` values instead of resetting them
         (see ``_reset_or_clear``). A cancelled request skips Django's response
         and exception hooks, so the ``finally`` block cleans it up instead.
-
-        Raises:
-            RLSConfigurationError: If ``USE_LOCAL_SET=True`` and the request is
-                authenticated.
+        With ``USE_LOCAL_SET=True`` no transaction is opened here either, and
+        ``process_request`` writes no GUC (see ``__acall__``).
         """
-        if rls_tenants_config.USE_LOCAL_SET and await sync_to_async(
-            _is_authenticated,
-            thread_sensitive=True,
-        )(request):
-            raise RLSConfigurationError(_ASGI_LOCAL_SET_MESSAGE)
         # process_request's values replace the holder; a cancelled call's block
         # cannot. Held until the cleanup below has run.
         with _holder_for_the_request(request):
@@ -686,21 +681,29 @@ class RLSTenantMiddleware(MiddlewareMixin):
         thread and database connection; ending the context first keeps that
         error handling fail-closed, as on WSGI. ``__acall__`` then only resets
         its tokens.
+
+        Either way, a context block the view left open (a generator suspended
+        inside one) is ended, so the error response does not run in it. With
+        a middleware-owned transaction that response then runs with no
+        context (fail-closed), as it does without one.
         """
-        if getattr(request, "_rls_owns_transaction", False) is True:
-            setattr(request, "_rls_rollback_transaction", True)  # noqa: B010 -- dynamic request marker
-        else:
-            try:
+        try:
+            if getattr(request, "_rls_owns_transaction", False) is True:
+                setattr(request, "_rls_rollback_transaction", True)  # noqa: B010 -- dynamic request marker
+            else:
                 self._cleanup_rls_state(request)
-            finally:
-                _end_blocks_left_open(request)
+        finally:
+            _end_blocks_left_open(request)
 
     @staticmethod
     def _set_gucs_on_all_databases(guc_vars: dict[str, str], conf: Any) -> None:
         """Set GUC variables on all configured database aliases.
 
         If setting GUCs on one database fails, clears all GUCs on
-        databases that were already set, then re-raises.
+        databases that were already set, then re-raises. With
+        ``USE_LOCAL_SET=True`` an alias whose connection is not inside
+        ``transaction.atomic()`` (any alias on the async path) is skipped: the GUC
+        affinity guard applies the request's values there, transaction-locally.
 
         Args:
             guc_vars: Mapping of GUC names to values.
@@ -708,19 +711,17 @@ class RLSTenantMiddleware(MiddlewareMixin):
         """
         completed_aliases: list[str] = []
         gucs = _context_gucs_of(guc_vars, conf)
+        is_local = conf.USE_LOCAL_SET
         try:
             for db_alias in conf.DATABASES:
-                with writing(db_alias, gucs):
+                if not _writes_gucs(db_alias, is_local=is_local):
+                    continue
+                with writing(db_alias, gucs, local=is_local):
                     for guc_name, guc_value in guc_vars.items():
                         if guc_value:
-                            set_guc(
-                                guc_name,
-                                guc_value,
-                                is_local=conf.USE_LOCAL_SET,
-                                using=db_alias,
-                            )
+                            set_guc(guc_name, guc_value, is_local=is_local, using=db_alias)
                         else:
-                            clear_guc(guc_name, is_local=conf.USE_LOCAL_SET, using=db_alias)
+                            clear_guc(guc_name, is_local=is_local, using=db_alias)
                 completed_aliases.append(db_alias)
         except Exception:
             # Rollback GUCs on databases that were already set.

@@ -53,13 +53,13 @@ RLS_TENANTS = {
 }
 ```
 
-The middleware sets GUCs on all configured aliases during each request. A
+The middleware sets GUCs on all configured aliases during each request (with
+`USE_LOCAL_SET=True`, on its synchronous path only). With session GUCs, a
 `connection_created` signal handler also sets GUCs on connections created lazily,
 after the middleware ran, on the thread that set the request's GUCs. *Changed in 1.4.0:*
-with the default session GUCs, the
-[GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) applies the active
+the [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) applies the active
 context on every configured alias before each statement, on any thread, whichever alias
-the context was entered on (see
+the context was entered on, in both GUC modes (see
 [Running under ASGI](../guides/middleware.md#running-under-asgi)). A connection checked
 out of Django's connection pool (`OPTIONS["pool"]`) is cleared of every RLS GUC first,
 whether or not a request is active (see
@@ -239,18 +239,38 @@ When `True`, uses `SET LOCAL` (transaction-scoped) instead of `set_config()`
 
 **What changes when enabled:**
 
-- `RLSTenantMiddleware` opens `transaction.atomic()` on every configured alias around
-  each authenticated request, so the `SET LOCAL` GUCs cover the whole request and are
-  cleared at commit/rollback. `ATOMIC_REQUESTS` is not required (it nests as a
+- On the synchronous path (WSGI, or ASGI with a synchronous-only middleware listed after
+  it), `RLSTenantMiddleware` opens `transaction.atomic()` on every configured alias
+  around each authenticated request, so the `SET LOCAL` GUCs cover the whole request and
+  are cleared at commit/rollback. `ATOMIC_REQUESTS` is not required (it nests as a
   savepoint if you keep it).
-- Outside a request (Celery tasks, management commands, scripts) you must wrap the
-  context manager in `transaction.atomic()` yourself, and the queries of a `for_user()`
-  queryset too (`update_or_create()`, `bulk_create()`, `bulk_update()` and `delete()`
-  open a transaction of their own when none is open).
-- Middleware implementing `process_exception`, and function-based middleware factories,
-  must precede `RLSTenantMiddleware`; unsafe ordering raises `RLSConfigurationError`
-  when the middleware is loaded. See [middleware ordering](../guides/middleware.md#setup).
-- Not supported under ASGI; the middleware raises `RLSConfigurationError` there.
+- On the middleware's async path (*1.4.0+*; ASGI, when every middleware listed after it can
+  run asynchronously), it opens no transaction and writes no GUC. The
+  [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) sets the request's
+  GUCs for each statement, in a transaction of its own when none is open, or once per
+  transaction for a sync view under `ATOMIC_REQUESTS`. So a WSGI request is atomic in this
+  mode and a request on the async path is not. Before 1.4.0 the middleware raised
+  `RLSConfigurationError` under ASGI.
+- Outside a request (Celery tasks, management commands, scripts), the context managers and
+  `for_user()` no longer need `transaction.atomic()` (*1.4.0+*): the guard gives each
+  statement the context in a transaction of its own, which costs three extra round trips
+  per statement in autocommit. Wrapping a batch of statements in `transaction.atomic()` is
+  still worth it for performance (see
+  [Code Outside a Request Transaction](../guides/connection-pooling.md#code-outside-a-request-transaction)
+  for the cost by placement). This holds for aliases in `RLS_TENANTS["DATABASES"]`; on any
+  other alias a context manager outside `atomic()` raises `RuntimeError`
+  (`RLSConfigurationError` for the async managers), as before. `for_user()`'s
+  `update_or_create()`, `bulk_create()`, `bulk_update()` and `delete()` still open a
+  transaction of their own when none is open.
+- When a context ends, and on any connection after a statement run under a context's
+  values, the values a session holds for itself count as unknown. The next statement run
+  outside any context, in autocommit or in a transaction, clears them first for the
+  session (one extra statement), in case code inside the context wrote the GUCs for the
+  session.
+- On the synchronous path, middleware implementing `process_exception`, and function-based
+  middleware factories, must precede `RLSTenantMiddleware`; unsafe ordering raises
+  `RLSConfigurationError` when the middleware is loaded. See
+  [middleware ordering](../guides/middleware.md#setup).
 
 ```python
 RLS_TENANTS = {

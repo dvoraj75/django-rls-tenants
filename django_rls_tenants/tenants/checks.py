@@ -13,8 +13,10 @@ silent failures at runtime:
 
 Check IDs are never renumbered. ``W003`` (retired in 1.3.1) and ``W007``
 (retired in 1.3.2) are no longer emitted: ``RLSTenantMiddleware`` opens its
-own transaction when ``USE_LOCAL_SET=True``, so ``ATOMIC_REQUESTS`` is no
-longer a requirement of that mode.
+own transaction when ``USE_LOCAL_SET=True`` (and since 1.4.0 the GUC affinity
+guard gives each statement run in autocommit inside a context a transaction of
+its own in that mode), so ``ATOMIC_REQUESTS`` is no longer a requirement of
+that mode.
 """
 
 from __future__ import annotations
@@ -190,8 +192,8 @@ def _check_conn_max_age_with_session_gucs() -> list[CheckWarning]:
                     f"DATABASES[{alias!r}] has CONN_MAX_AGE={conn_max_age} "
                     f"with USE_LOCAL_SET=False. This risks GUC state leaking "
                     f"between requests on persistent connections. Consider "
-                    f"USE_LOCAL_SET=True, which scopes the GUCs to a "
-                    f"transaction the middleware opens per request.",
+                    f"USE_LOCAL_SET=True, which scopes the GUCs to "
+                    f"transactions, so they never stay on a connection.",
                     hint=f"Set RLS_TENANTS['USE_LOCAL_SET'] = True, "
                     f"or set DATABASES[{alias!r}]['CONN_MAX_AGE'] = 0.",
                     id="django_rls_tenants.W004",
@@ -233,7 +235,7 @@ def _check_pool_without_reset() -> list[CheckWarning]:
                     hint=(
                         f"Set DATABASES[{alias!r}]['OPTIONS']['pool']['reset'] to "
                         f"django_rls_tenants.pool.reset_rls_gucs, or set "
-                        f"RLS_TENANTS['USE_LOCAL_SET'] = True (WSGI only)."
+                        f"RLS_TENANTS['USE_LOCAL_SET'] = True."
                     ),
                     id="django_rls_tenants.W010",
                 )

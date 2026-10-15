@@ -102,7 +102,9 @@ class TestRequestFinishedSafetyNet:
             },
         ):
             request_finished.send(sender=self.__class__)
-            # Assert inside override context — GUCs should still be set
+            # No statement inside the test transaction: the GUCs are still set,
+            # and what the session holds for itself counts as unknown after it.
+            assert connection._rls_session_gucs.wrote_session is True
             assert get_guc("rls.is_admin") == "true"
             assert get_guc("rls.current_tenant") == "42"
 

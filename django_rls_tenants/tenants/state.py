@@ -227,11 +227,13 @@ def _end_live_context() -> None:
         live.alive = False
 
 
-def _set_context_gucs(values: ContextGucs, *, block: bool = True) -> _ContextGucsToken:
+def _set_context_gucs(values: ContextGucs | None, *, block: bool = True) -> _ContextGucsToken:
     """Record the GUC values of the context being entered.
 
     Args:
-        values: The values the context sets.
+        values: The values the context sets, or ``None`` for a block that runs
+            with no context, whatever encloses it (the GUC affinity guard
+            then applies none).
         block: ``False`` only for a holder that a ``sync_to_async`` call must
             hand back to its caller (see :class:`_Live`).
 

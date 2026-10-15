@@ -709,12 +709,6 @@ class TestWhatTheGuardLeavesAlone:
             assert _gucs() == ("999", "false")
         assert _gucs() == _NO_GUCS
 
-    def test_local_mode_leaves_a_hop_without_context(self, tenant_a, worker):
-        local = {**django_settings.RLS_TENANTS, "USE_LOCAL_SET": True}
-        with override_settings(RLS_TENANTS=local), tenant_context(tenant_a.pk):
-            assert _gucs() == _read_as(tenant_a)
-            assert _hop(worker, _gucs) == _NO_GUCS
-
     def test_alias_outside_rls_databases_does_not_follow(self, replica, tenant_a):
         with tenant_context(tenant_a.pk):
             assert _gucs(replica) == _NO_GUCS
@@ -901,10 +895,14 @@ class TestTracking:
 
         assert _gucs() == _NO_GUCS
 
-    def test_local_mode_records_unknown(self, tenant_a):
+    def test_local_mode_records_what_a_block_writes(self, tenant_a):
+        """Inside the test transaction the block writes ``SET LOCAL`` values, and restores them."""
         local = {**django_settings.RLS_TENANTS, "USE_LOCAL_SET": True}
-        with override_settings(RLS_TENANTS=local), tenant_context(tenant_a.pk):
-            assert _tracker().values is affinity.UNKNOWN
+        with override_settings(RLS_TENANTS=local):
+            with tenant_context(tenant_a.pk):
+                assert _tracker().values == ContextGucs.for_tenant(tenant_a.pk)
+                assert _tracker().wrote_local is True
+            assert _tracker().values is None
 
     def test_alias_without_a_connection_is_ignored(self):
         affinity._record("no_such_alias", None)
@@ -1358,6 +1356,34 @@ class TestBlockLeftOpenByTheView:
         user = tenant_a_user if authenticated else AnonymousUser()
 
         assert middleware(_request_for(user)) == (None, [])
+
+    def test_wsgi_local_mode_error_response_runs_without_it(
+        self,
+        sample_orders,
+        tenant_a_user,
+        enforce_rls,
+    ):
+        """With ``USE_LOCAL_SET=True`` the middleware owns the request transaction.
+
+        ``process_exception`` keeps the request's context for the error
+        response there, but not the block's admin bypass: once the block is
+        ended, the guard takes its ``SET LOCAL`` values off (fail-closed).
+        """
+
+        def view(request):
+            rows = _admin_rows_sync()
+            next(rows)
+            middleware.process_exception(request, RuntimeError("boom"))
+            seen = _get_context_gucs(), _products()
+            rows.close()
+            return seen
+
+        local = {**django_settings.RLS_TENANTS, "USE_LOCAL_SET": True}
+        with override_settings(RLS_TENANTS=local):
+            middleware = RLSTenantMiddleware(view)
+            seen = middleware(_request_for(tenant_a_user))
+
+        assert seen == (None, [])
 
     @pytest.mark.parametrize("left_open", [True, False])
     @pytest.mark.parametrize(("middleware_class", "authenticated"), _PATHS)
@@ -1947,7 +1973,7 @@ class TestBlockExitedInAnotherContext:
         tenant_a,
         enforce_rls,
     ):
-        """The guard does nothing with ``USE_LOCAL_SET=True``: the restore must still run."""
+        """With ``USE_LOCAL_SET=True`` the restore puts the ``SET LOCAL`` values back too."""
 
         async def stream():
             async with async_admin_context():
@@ -2000,7 +2026,8 @@ class TestBlockExitedInAnotherContext:
             generator = contextvars.Context().run(start_inside_b)
             seen = contextvars.Context().run(close_inside_a, generator)
 
-        assert seen == (_NO_GUCS, [])  # fail-closed: the guard is off in local mode
+        # The restore cleared the session; the guard applied A again for the query.
+        assert seen == (_NO_GUCS, _TENANT_A_PRODUCTS)
 
     def test_async_generator_closed_in_another_task(
         self,

@@ -330,6 +330,65 @@ class TestNativeAsyncPath:
         _assert_request_left_nothing_behind()
 
 
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
+class TestTransactionLocalMode:
+    """``USE_LOCAL_SET=True`` under ASGI (#96): no request transaction, one per statement.
+
+    ``transaction=True``: the request runs in autocommit, as it does in production.
+    """
+
+    @pytest.fixture
+    def local_mode(self):
+        local = {**django_settings.RLS_TENANTS, "USE_LOCAL_SET": True}
+        with override_settings(RLS_TENANTS=local):
+            yield
+
+    @pytest.mark.parametrize("path", ["/rls/async-orders/", "/rls/orders/"])
+    def test_view_sees_its_tenant(
+        self,
+        scoped_web_user,
+        sample_orders,
+        tenant_a,
+        enforce_rls_on_other_threads,
+        local_mode,
+        rls_middleware,
+        path,
+    ):
+        client = AsyncClient()
+        client.force_login(scoped_web_user)
+
+        body = async_to_sync(client.get)(path).json()
+
+        assert body["products"] == ["Widget A1", "Widget A2"]
+        assert body["database_products"] == ["Widget A1", "Widget A2"]
+        assert (body["tenant_guc"], body["is_admin_guc"]) == (str(tenant_a.pk), "false")
+        # A sync view under ASGI: the middleware opens no transaction there.
+        assert body.get("in_atomic_block", False) is False
+        _assert_request_left_nothing_behind()
+
+    def test_view_can_widen_to_admin_and_return(
+        self,
+        scoped_web_user,
+        sample_orders,
+        tenant_a,
+        enforce_rls_on_other_threads,
+        local_mode,
+        rls_middleware,
+    ):
+        client = AsyncClient()
+        client.force_login(scoped_web_user)
+
+        body = async_to_sync(client.get)("/rls/async-widen/").json()
+
+        assert body == {
+            "admin": ["Gadget B1", "Widget A1", "Widget A2"],
+            "after": ["Widget A1", "Widget A2"],
+            "tenant_guc": str(tenant_a.pk),
+        }
+        _assert_request_left_nothing_behind()
+
+
 @pytest.fixture
 def guc_probe_404(monkeypatch):
     """Serve 404 pages with ``guc_probe_404_handler``."""
@@ -554,3 +613,38 @@ class TestErrorPageOnWorkerThread:
             [],
         )
         _assert_request_left_nothing_behind()
+
+
+class TestErrorPageOnWorkerThreadInLocalMode(TestErrorPageOnWorkerThread):
+    """The same with ``USE_LOCAL_SET=True`` (#96): the guard applies them transaction-locally.
+
+    The worker thread's statements each run in a transaction of their own with
+    the request's values, and nothing stays on its connection.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _local_mode(self):
+        local = {**django_settings.RLS_TENANTS, "USE_LOCAL_SET": True}
+        with override_settings(RLS_TENANTS=local):
+            yield
+
+    # "sync-path" is left out: there the middleware owns the request's transaction,
+    # and /rls/reconnect/ closes its connection inside it.
+    @pytest.mark.parametrize("middleware_path", ["native", "hook-path"])
+    def test_through_asgi_handler(
+        self,
+        middleware_path,
+        scoped_web_user,
+        sample_orders,
+        tenant_a,
+        enforce_rls_on_other_threads,
+        guc_probe_404,
+    ):
+        super().test_through_asgi_handler(
+            middleware_path,
+            scoped_web_user,
+            sample_orders,
+            tenant_a,
+            enforce_rls_on_other_threads,
+            guc_probe_404,
+        )

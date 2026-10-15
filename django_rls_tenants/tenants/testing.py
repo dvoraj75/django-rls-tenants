@@ -18,11 +18,13 @@ from django.db import connections
 from django_rls_tenants.rls.context import rls_context
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import (
+    _writes_gucs,
     admin_context,
     async_admin_context,
     async_tenant_context,
     tenant_context,
 )
+from django_rls_tenants.tenants.state import _reset_context_gucs, _set_context_gucs
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -113,6 +115,16 @@ def assert_rls_policy_exists(
         )
 
 
+@contextmanager
+def _no_context_for_the_guard() -> Iterator[None]:
+    """Make the GUC affinity guard apply no context in the block, whatever encloses it."""
+    entered = _set_context_gucs(None)
+    try:
+        yield
+    finally:
+        _reset_context_gucs(entered)
+
+
 def _count_rows(model_class: type[models.Model], *, using: str) -> int:
     """Count the rows of ``model_class``'s table that the ``using`` connection can see.
 
@@ -156,6 +168,10 @@ def assert_rls_blocks_without_context(
        result does not depend on the caller's admin or tenant context, and
        such a context (for example :func:`rls_bypass` or
        :func:`rls_as_tenant`) is intact when the helper returns or fails.
+       With ``USE_LOCAL_SET=True`` outside ``transaction.atomic()``, where
+       such a context lives in the ``ContextVar`` values only and the GUC
+       affinity guard applies it to each statement, the count runs without
+       it, and the GUCs are cleared and restored for the session.
        Other GUCs, such as a flag set with ``bypass_flag()``, are left as they
        are.
 
@@ -171,8 +187,9 @@ def assert_rls_blocks_without_context(
     Raises:
         AssertionError: If any rows are returned, or if the table is empty
             (which would make the assertion pass vacuously).
-        RuntimeError: If ``USE_LOCAL_SET=True`` and the ``using`` connection is
-            not inside ``transaction.atomic()``.
+        RuntimeError: If ``USE_LOCAL_SET=True``, ``using`` is not in
+            ``RLS_TENANTS["DATABASES"]`` and its connection is not inside
+            ``transaction.atomic()``.
     """
     conf = rls_tenants_config
 
@@ -189,8 +206,14 @@ def assert_rls_blocks_without_context(
     # Clear the admin and tenant GUCs for the count only, so a context the
     # caller holds cannot make rows visible, then restore them.
     no_context = {conf.GUC_IS_ADMIN: "", conf.GUC_CURRENT_TENANT: ""}
-    with rls_context(no_context, is_local=conf.USE_LOCAL_SET, using=using):
-        count = _count_rows(model_class, using=using)
+    if _writes_gucs(using, is_local=conf.USE_LOCAL_SET):
+        with rls_context(no_context, is_local=conf.USE_LOCAL_SET, using=using):
+            count = _count_rows(model_class, using=using)
+    else:
+        # USE_LOCAL_SET=True outside a transaction: the guard would run the count in
+        # a transaction of its own with the caller's context.
+        with _no_context_for_the_guard(), rls_context(no_context, using=using):
+            count = _count_rows(model_class, using=using)
     table = model_class._meta.db_table  # noqa: SLF001  -- standard Django _meta access
     assert count == 0, (
         f"Expected 0 rows from {model_class.__name__} (table '{table}') without RLS "
@@ -217,8 +240,9 @@ async def async_rls_bypass(*, using: str = "default") -> AsyncIterator[None]:
         using: Database alias. Default: ``"default"``.
 
     Raises:
-        RLSConfigurationError: If ``USE_LOCAL_SET=True`` and no transaction is
-            open on the hop thread.
+        RLSConfigurationError: If ``USE_LOCAL_SET=True``, ``using`` is not in
+            ``RLS_TENANTS["DATABASES"]`` and no transaction is open on the hop
+            thread.
 
     Usage::
 
@@ -246,8 +270,9 @@ async def async_rls_as_tenant(
 
     Raises:
         NoTenantContextError: If ``tenant_id`` is ``None``.
-        RLSConfigurationError: If ``USE_LOCAL_SET=True`` and no transaction is
-            open on the hop thread.
+        RLSConfigurationError: If ``USE_LOCAL_SET=True``, ``using`` is not in
+            ``RLS_TENANTS["DATABASES"]`` and no transaction is open on the hop
+            thread.
 
     Usage::
 
@@ -322,8 +347,9 @@ async def aassert_rls_blocks_without_context(
     Raises:
         AssertionError: If any rows are returned, or if the table is empty
             (which would make the assertion pass vacuously).
-        RuntimeError: If ``USE_LOCAL_SET=True`` and the hop thread's
-            connection is not inside ``transaction.atomic()``.
+        RuntimeError: If ``USE_LOCAL_SET=True``, ``using`` is not in
+            ``RLS_TENANTS["DATABASES"]`` and the hop thread's connection is
+            not inside ``transaction.atomic()``.
     """
     await sync_to_async(assert_rls_blocks_without_context, thread_sensitive=True)(
         model_class,

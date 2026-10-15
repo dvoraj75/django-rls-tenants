@@ -25,6 +25,7 @@ from django_rls_tenants.tenants.affinity import (
     _forget,
     apply_active_context,
     settle_other_aliases,
+    suspect_sessions,
     writing,
 )
 from django_rls_tenants.tenants.conf import rls_tenants_config
@@ -124,6 +125,28 @@ def _rls_state(tenant_id: int | str | None, gucs: ContextGucs) -> Iterator[None]
                 reset_rls_context_active(active_token)
 
 
+def _writes_gucs(using: str, *, is_local: bool) -> bool:
+    """Whether a context block entered on ``using`` writes the admin and tenant GUCs itself.
+
+    With session GUCs it always does. With ``USE_LOCAL_SET=True`` it does
+    inside ``transaction.atomic()``, where its ``SET LOCAL`` lasts as long as
+    the block needs it. Outside one there is no transaction to scope it to:
+    on an alias in ``RLS_TENANTS["DATABASES"]`` the block only sets the
+    ``ContextVar`` values, and the GUC affinity guard applies the context
+    transaction-locally to each statement (#96). On any other alias the write
+    is still attempted, and fails as before.
+
+    Args:
+        using: Database alias the block is entered on.
+        is_local: Scope the block uses (``USE_LOCAL_SET``, read once).
+    """
+    return (
+        not is_local
+        or connections[using].in_atomic_block
+        or using not in rls_tenants_config.DATABASES
+    )
+
+
 @contextmanager
 def tenant_context(
     tenant_id: int | str,
@@ -137,16 +160,24 @@ def tenant_context(
     ``SET LOCAL`` so an enclosing block keeps its database scope for the
     rest of the transaction (see :func:`django_rls_tenants.rls.context.restore_gucs`
     for the behaviour when the block exits with an aborted transaction).
+    Outside ``transaction.atomic()`` that mode writes nothing on entry or
+    exit: the GUC affinity guard sets the context's values
+    transaction-locally for each statement, giving a statement run in
+    autocommit a transaction of its own (see "GUC affinity guard" in the
+    architecture guide).
 
     Args:
         tenant_id: The tenant PK to scope queries to.
         using: Database alias the GUCs are written to on entry and restored on
-            exit. Default: ``"default"``. With session GUCs, every alias in
+            exit. Default: ``"default"``. Every alias in
             ``RLS_TENANTS["DATABASES"]`` follows the context too (the GUC
             affinity guard applies it before each statement there).
 
     Raises:
         NoTenantContextError: If ``tenant_id`` is ``None``.
+        RuntimeError: If ``USE_LOCAL_SET=True``, ``using`` is not in
+            ``RLS_TENANTS["DATABASES"]`` and its connection is not inside
+            ``transaction.atomic()``.
     """
     if tenant_id is None:
         msg = "tenant_id cannot be None."
@@ -154,10 +185,11 @@ def tenant_context(
 
     conf = rls_tenants_config
     is_local = conf.USE_LOCAL_SET
+    writes = _writes_gucs(using, is_local=is_local)
 
     # Save previous state for nesting support (both modes: a SET LOCAL made
     # by an enclosing block is visible here and must be re-issued on exit).
-    previous = _snapshot_gucs(conf, using=using)
+    previous = _snapshot_gucs(conf, using=using) if writes else None
     session = _session_of(using)
     enclosing = _current_live()
 
@@ -165,14 +197,15 @@ def tenant_context(
     exc_pending = False
     try:
         with _rls_state(tenant_id, gucs):
-            with writing(using, gucs):
-                set_guc(conf.GUC_IS_ADMIN, gucs.is_admin, is_local=is_local, using=using)
-                set_guc(
-                    conf.GUC_CURRENT_TENANT,
-                    gucs.current_tenant,
-                    is_local=is_local,
-                    using=using,
-                )
+            if writes:
+                with writing(using, gucs, local=is_local):
+                    set_guc(conf.GUC_IS_ADMIN, gucs.is_admin, is_local=is_local, using=using)
+                    set_guc(
+                        conf.GUC_CURRENT_TENANT,
+                        gucs.current_tenant,
+                        is_local=is_local,
+                        using=using,
+                    )
             logger.debug("tenant_context entered: tenant_id=%s, using=%s", tenant_id, using)
             yield
     except BaseException:
@@ -199,31 +232,44 @@ def admin_context(
 
     The previous GUC values are saved on entry and restored on exit in both
     GUC modes, so an inner ``admin_context()`` never leaks the admin bypass
-    into the enclosing block (see :func:`tenant_context`).
+    into the enclosing block (see :func:`tenant_context`, also for
+    ``USE_LOCAL_SET=True`` outside ``transaction.atomic()``).
 
     Args:
         using: Database alias the GUCs are written to on entry and restored on
-            exit. Default: ``"default"``. With session GUCs, every alias in
+            exit. Default: ``"default"``. Every alias in
             ``RLS_TENANTS["DATABASES"]`` gets the admin bypass too, even when
             ``using`` names an alias outside that list.
+
+    Raises:
+        RuntimeError: If ``USE_LOCAL_SET=True``, ``using`` is not in
+            ``RLS_TENANTS["DATABASES"]`` and its connection is not inside
+            ``transaction.atomic()``.
     """
     conf = rls_tenants_config
     is_local = conf.USE_LOCAL_SET
+    writes = _writes_gucs(using, is_local=is_local)
 
     # Save previous state for nesting support (both modes).
-    previous = _snapshot_gucs(conf, using=using)
+    previous = _snapshot_gucs(conf, using=using) if writes else None
     session = _session_of(using)
     enclosing = _current_live()
 
     exc_pending = False
     try:
         with _rls_state(None, ADMIN_GUCS):
-            with writing(using, ADMIN_GUCS):
-                set_guc(conf.GUC_IS_ADMIN, ADMIN_GUCS.is_admin, is_local=is_local, using=using)
-                # Clear tenant GUC for admin mode; the admin_bypass clause in the
-                # RLS policy handles access independently. Avoids the old "-1"
-                # sentinel which could collide with integer PKs or fail UUID casts.
-                clear_guc(conf.GUC_CURRENT_TENANT, is_local=is_local, using=using)
+            if writes:
+                with writing(using, ADMIN_GUCS, local=is_local):
+                    set_guc(
+                        conf.GUC_IS_ADMIN,
+                        ADMIN_GUCS.is_admin,
+                        is_local=is_local,
+                        using=using,
+                    )
+                    # Clear tenant GUC for admin mode; the admin_bypass clause in the
+                    # RLS policy handles access independently. Avoids the old "-1"
+                    # sentinel which could collide with integer PKs or fail UUID casts.
+                    clear_guc(conf.GUC_CURRENT_TENANT, is_local=is_local, using=using)
             logger.debug("admin_context entered: using=%s", using)
             yield
     except BaseException:
@@ -260,7 +306,7 @@ def _snapshot_gucs(conf: RLSTenantsConfig, *, using: str) -> dict[str, str | Non
 
 
 def _restore_tenant_gucs(
-    previous: Mapping[str, str | None],
+    previous: Mapping[str, str | None] | None,
     *,
     is_local: bool,
     using: str,
@@ -287,14 +333,55 @@ def _restore_tenant_gucs(
     outlive the block there), and the values are left unknown, so the guard
     applies the current context before the next statement.
 
+    A block that wrote nothing on entry (``USE_LOCAL_SET=True`` outside
+    ``transaction.atomic()``, see :func:`_writes_gucs`) has nothing to restore:
+    the guard set its values transaction-locally, so they ended with their
+    transactions. Only a transaction still open (``AUTOCOMMIT=False``) may
+    hold them, and every configured alias is settled. With
+    ``USE_LOCAL_SET=True`` the values the sessions hold for themselves then
+    count as unknown (``affinity.suspect_sessions()``): code in the block may
+    have written them for the session.
+
     Args:
-        previous: The snapshot taken on entry.
+        previous: The snapshot taken on entry, or ``None`` for a block that
+            wrote nothing.
         is_local: Scope the block used.
         using: Database alias.
         exc_pending: ``True`` when called while an exception is propagating.
         enclosing: The enclosing context's holder when the block was entered,
             from ``state._current_live()``.
         session: The DB-API connection of ``using`` the block entered on.
+    """
+    try:
+        if previous is None:
+            settle_other_aliases(None)
+        else:
+            _restore_snapshot(
+                previous,
+                is_local=is_local,
+                using=using,
+                exc_pending=exc_pending,
+                enclosing=enclosing,
+                session=session,
+            )
+    finally:
+        if is_local:
+            suspect_sessions()
+
+
+def _restore_snapshot(
+    previous: Mapping[str, str | None],
+    *,
+    is_local: bool,
+    using: str,
+    exc_pending: bool,
+    enclosing: _Live | None,
+    session: object,
+) -> None:
+    """Restore a block's snapshot on ``using`` and settle the other aliases.
+
+    The part of :func:`_restore_tenant_gucs` for a block that wrote the GUCs
+    on entry; it takes the same arguments.
     """
     if enclosing is not None and not enclosing.alive:
         conf = rls_tenants_config
@@ -304,13 +391,13 @@ def _restore_tenant_gucs(
         # generator closed there): its snapshot is not this context's.
         logger.debug("RLS context block exited in another context; GUC values left unknown")
         if session is not None and _session_of(using) is session:
-            with writing(using, UNKNOWN):
+            with writing(using, UNKNOWN, local=is_local):
                 restore_gucs(previous, is_local=is_local, using=using, exc_pending=exc_pending)
         else:
             _forget(using)
         settle_other_aliases(using)
         return
-    with writing(using, _get_context_gucs()):
+    with writing(using, _get_context_gucs(), local=is_local):
         restored = restore_gucs(previous, is_local=is_local, using=using, exc_pending=exc_pending)
     if not restored:
         _forget(using)
@@ -323,14 +410,16 @@ def _enter_tenant_gucs(
     is_local: bool,
     using: str,
     entered_on: list[object],
-) -> dict[str, str | None]:
+) -> dict[str, str | None] | None:
     """Snapshot + set the admin/tenant GUCs for an async block; one thread hop.
 
     Runs inside the hop, so ``in_atomic_block`` is read from the connection
     the block's queries will use. The GUC affinity guard first brings the
     connection to the enclosing context's values (the hop holds a copy of the
     coroutine's ``ContextVar`` values, which the block has not changed yet),
-    so the snapshot holds those values, as in :func:`_snapshot_gucs`.
+    so the snapshot holds those values, as in :func:`_snapshot_gucs`. With
+    ``USE_LOCAL_SET=True`` outside ``transaction.atomic()`` it writes nothing
+    (see :func:`_writes_gucs`).
 
     Args:
         variables: Mapping of GUC name to the value to set.
@@ -340,24 +429,30 @@ def _enter_tenant_gucs(
             :func:`_restore_tenant_gucs`.
 
     Returns:
-        The snapshot, for :func:`_restore_tenant_gucs`.
+        The snapshot, for :func:`_restore_tenant_gucs`, or ``None`` if
+        nothing was written.
 
     Raises:
-        RLSConfigurationError: If ``is_local`` is set and the hop thread is
-            not inside ``transaction.atomic()``.
+        RLSConfigurationError: If ``is_local`` is set, ``using`` is not in
+            ``RLS_TENANTS["DATABASES"]`` and the hop thread is not inside
+            ``transaction.atomic()``.
     """
     connection = connections[using]
+    if not _writes_gucs(using, is_local=is_local):
+        return None
     if is_local and not connection.in_atomic_block:
         msg = (
-            "async_tenant_context() and async_admin_context() cannot use "
-            "RLS_TENANTS['USE_LOCAL_SET'] = True here: SET LOCAL needs a transaction held "
-            "open on the thread that runs the database calls, and a coroutine cannot open "
-            "one. Run the block from synchronous code inside transaction.atomic() via "
-            "async_to_sync, or set USE_LOCAL_SET=False."
+            f"async_tenant_context() and async_admin_context() cannot use "
+            f"RLS_TENANTS['USE_LOCAL_SET'] = True on alias {using!r} here: it is not in "
+            f"RLS_TENANTS['DATABASES'], so the GUC affinity guard does not apply the "
+            f"context there, and SET LOCAL needs a transaction held open on the thread "
+            f"that runs the database calls, which a coroutine cannot open. Add {using!r} "
+            f"to RLS_TENANTS['DATABASES'], or run the block from synchronous code inside "
+            f"transaction.atomic() via async_to_sync."
         )
         raise RLSConfigurationError(msg)
     apply_active_context(connection)
-    with writing(connection, _context_gucs_of(variables, rls_tenants_config)):
+    with writing(connection, _context_gucs_of(variables, rls_tenants_config), local=is_local):
         previous = _enter_gucs(variables, is_local=is_local, using=using)
     entered_on.append(connection.connection)
     return previous
@@ -386,11 +481,16 @@ async def async_tenant_context(
     (with sync or async blocks) and the restore in both GUC modes behave as
     in :func:`tenant_context`.
 
-    **USE_LOCAL_SET.** ``SET LOCAL`` needs ``transaction.atomic()`` open on
-    the hop thread, which a coroutine cannot open. With ``USE_LOCAL_SET=True``
-    the block only works when the coroutine is driven by ``async_to_sync``
-    from synchronous code that is inside ``atomic()``; anywhere else (a bare
-    event loop, an ASGI request) it raises :class:`RLSConfigurationError`.
+    **USE_LOCAL_SET.** A coroutine cannot open ``transaction.atomic()``, so
+    with ``USE_LOCAL_SET=True`` the hop thread is usually in autocommit: the
+    block then writes nothing, and the GUC affinity guard sets its values
+    transaction-locally for each statement, in a transaction of its own (see
+    :func:`tenant_context`). When the coroutine is driven by
+    ``async_to_sync`` from synchronous code inside ``atomic()``, the block
+    writes ``SET LOCAL`` values into that transaction, as the sync manager
+    does. On an alias outside ``RLS_TENANTS["DATABASES"]``, which the guard
+    leaves alone, it needs that transaction and raises
+    :class:`RLSConfigurationError` without one.
 
     **Concurrent tasks.** Sibling tasks of one request (for example under
     ``asyncio.gather``) share the request's database connection, but each
@@ -399,9 +499,9 @@ async def async_tenant_context(
     blocks for different tenants can run concurrently, raw SQL,
     ``safe_tenant_sql()`` and M2M through tables included. It does not cover
     bypass flags and other GUCs set with ``async_bypass_flag()`` /
-    ``async_rls_context()`` (sibling tasks see them), ``USE_LOCAL_SET=True``,
-    or SQL that bypasses Django's cursor. Work that outlives the block (a task
-    it started without awaiting it) runs without its context.
+    ``async_rls_context()`` (sibling tasks see them), or SQL that bypasses
+    Django's cursor. Work that outlives the block (a task it started without
+    awaiting it) runs without its context.
 
     The restore runs even when the task is cancelled while entering or
     inside the block; only a second cancellation delivered during the
@@ -415,8 +515,9 @@ async def async_tenant_context(
 
     Raises:
         NoTenantContextError: If ``tenant_id`` is ``None``.
-        RLSConfigurationError: If ``USE_LOCAL_SET=True`` and no transaction is
-            open on the hop thread.
+        RLSConfigurationError: If ``USE_LOCAL_SET=True``, ``using`` is not in
+            ``RLS_TENANTS["DATABASES"]`` and no transaction is open on the hop
+            thread.
     """
     if tenant_id is None:
         msg = "tenant_id cannot be None."
@@ -472,7 +573,7 @@ async def async_admin_context(
 ) -> AsyncIterator[None]:
     """Async counterpart of :func:`admin_context`, for ``async with``. Supports nesting.
 
-    Same hop model, ``USE_LOCAL_SET`` constraint and concurrent-task
+    Same hop model, ``USE_LOCAL_SET`` behaviour and concurrent-task
     behaviour as :func:`async_tenant_context`. An inner
     ``async_admin_context()`` never leaks the admin bypass into the
     enclosing block.
@@ -482,8 +583,9 @@ async def async_admin_context(
             :func:`admin_context`. Default: ``"default"``.
 
     Raises:
-        RLSConfigurationError: If ``USE_LOCAL_SET=True`` and no transaction is
-            open on the hop thread.
+        RLSConfigurationError: If ``USE_LOCAL_SET=True``, ``using`` is not in
+            ``RLS_TENANTS["DATABASES"]`` and no transaction is open on the hop
+            thread.
     """
     conf = rls_tenants_config
     is_local = conf.USE_LOCAL_SET

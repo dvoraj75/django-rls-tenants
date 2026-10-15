@@ -16,18 +16,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger("django_rls_tenants")
 
 
-def _apply_request_gucs(connection: BaseDatabaseWrapper, *, is_local: bool) -> None:
+def _apply_request_gucs(connection: BaseDatabaseWrapper) -> None:
     """Set the active context's GUCs on a new connection, in one statement.
 
-    Used on the thread where the middleware set the GUCs, whose cleanup clears
-    them again. Writes to the connection the signal sent, which is not always
-    the thread's connection for its alias. Failures are logged, not raised;
-    with session GUCs the affinity guard applies the context again before the
-    connection's first statement, and raises if that fails too.
+    Session GUCs only: with ``USE_LOCAL_SET=True`` the affinity guard sets them
+    transaction-locally for each statement. Used on the thread where the
+    middleware set the GUCs, whose cleanup clears them again. Writes to the
+    connection the signal sent, which is not always the thread's connection
+    for its alias. Failures are logged, not raised; the affinity guard applies
+    the context again before the connection's first statement, and raises if
+    that fails too.
 
     Args:
         connection: The new connection, as sent by ``connection_created``.
-        is_local: Set them transaction-locally (``USE_LOCAL_SET=True``).
     """
     from django_rls_tenants.tenants.affinity import write_gucs  # noqa: PLC0415
     from django_rls_tenants.tenants.state import _get_context_gucs  # noqa: PLC0415
@@ -36,7 +37,7 @@ def _apply_request_gucs(connection: BaseDatabaseWrapper, *, is_local: bool) -> N
     if context_gucs is None:
         return
     try:
-        write_gucs(connection, context_gucs, is_local=is_local)
+        write_gucs(connection, context_gucs)
     except Exception:
         logger.warning(
             "Failed to set RLS GUCs on new connection for alias %r. "
@@ -102,6 +103,52 @@ def _is_pooled(connection: object) -> bool:
     return _pool_options(getattr(connection, "settings_dict", {})) is not None
 
 
+def _clear_finished_request_gucs() -> None:
+    """The ``request_finished`` safety net's database part, for a request that set GUCs.
+
+    With session GUCs, both GUCs are cleared on every configured alias whose
+    connection is open. Nothing is cleared on a closed connection: its session
+    is gone, or it is back in a pool, which Django's own ``request_finished``
+    receiver does first, and the next checkout clears it. Reopening it here
+    would check out another pooled connection and keep it. With
+    ``USE_LOCAL_SET=True`` the transaction-local values are gone with their
+    transactions, and what the sessions hold for themselves only counts as
+    unknown (``affinity.suspect_sessions()``, #96).
+    """
+    from django.db import connections  # noqa: PLC0415
+
+    from django_rls_tenants.rls.guc import clear_guc  # noqa: PLC0415
+    from django_rls_tenants.tenants.affinity import suspect_sessions, writing  # noqa: PLC0415
+    from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
+
+    conf = rls_tenants_config
+    if conf.USE_LOCAL_SET:
+        suspect_sessions()
+        return
+    for db_alias in conf.DATABASES:
+        if connections[db_alias].connection is None:
+            continue
+        with writing(db_alias, None):
+            clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
+            clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
+
+
+def _guard_open_connections() -> None:
+    """Install the GUC affinity guard on this thread's connections that are open without it.
+
+    Called from ``ready()``: a connection opened before (in an earlier app's
+    ``ready()``, say) got no ``connection_created`` call from the handler. With
+    ``USE_LOCAL_SET=True`` a context entered outside ``transaction.atomic()``
+    relies on the guard alone.
+    """
+    from django.db import connections  # noqa: PLC0415
+
+    from django_rls_tenants.tenants.affinity import guard_open_connection  # noqa: PLC0415
+
+    for connection in connections.all(initialized_only=True):
+        guard_open_connection(connection)
+
+
 def _prepare_new_connection(connection: BaseDatabaseWrapper) -> None:
     """Set up a new database connection for RLS.
 
@@ -110,10 +157,11 @@ def _prepare_new_connection(connection: BaseDatabaseWrapper) -> None:
     an alias in ``RLS_TENANTS["DATABASES"]`` (#41); nothing else happens on
     other aliases. When the connection opens mid-request on the thread where the
     middleware set the GUCs (a replica opened lazily by a router, say), the
-    GUCs are also set right away. On any other thread holding a copy of the
-    request's context, the connection is cleared first (#130). Django sends
-    the signal on every checkout from a connection pool, and such a connection
-    is cleared first as well (#96).
+    GUCs are also set right away, unless ``USE_LOCAL_SET=True``: the guard then
+    sets them transaction-locally for each statement. On any other thread
+    holding a copy of the request's context, the connection is cleared first
+    (#130). Django sends the signal on every checkout from a connection pool,
+    and such a connection is cleared first as well (#96).
 
     Args:
         connection: The new connection, as sent by ``connection_created``.
@@ -151,8 +199,8 @@ def _prepare_new_connection(connection: BaseDatabaseWrapper) -> None:
         # previous one's cleanup may not have reached it. With or without a
         # request context, the new borrower starts clean.
         _clear_new_connection_gucs(connection, "checked out of a connection pool")
-    if on_request_thread:
-        _apply_request_gucs(connection, is_local=conf.USE_LOCAL_SET)
+    if on_request_thread and not conf.USE_LOCAL_SET:
+        _apply_request_gucs(connection)
 
 
 class DjangoRlsTenantsConfig(AppConfig):
@@ -169,11 +217,9 @@ class DjangoRlsTenantsConfig(AppConfig):
             request_finished,
             setting_changed,
         )
-        from django.db import connections  # noqa: PLC0415
         from django.db.backends.signals import connection_created  # noqa: PLC0415
 
         from django_rls_tenants.pool import _declared_policy_guc_names_cached  # noqa: PLC0415
-        from django_rls_tenants.rls.guc import clear_guc  # noqa: PLC0415
         from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
 
         # Safety net: clear GUC variables when a request finishes, in case
@@ -193,7 +239,6 @@ class DjangoRlsTenantsConfig(AppConfig):
             if not _were_gucs_set():
                 return
             try:
-                from django_rls_tenants.tenants.affinity import writing  # noqa: PLC0415
                 from django_rls_tenants.tenants.state import (  # noqa: PLC0415
                     _clear_context_gucs,
                     set_current_tenant_id,
@@ -203,19 +248,7 @@ class DjangoRlsTenantsConfig(AppConfig):
                 # Otherwise the affinity guard would apply the request's GUCs
                 # again before the next statement in this context.
                 _clear_context_gucs()
-                conf = rls_tenants_config
-                if not conf.USE_LOCAL_SET:
-                    for db_alias in conf.DATABASES:
-                        # Nothing to clear on a closed connection: its session
-                        # is gone, or it is back in a pool, which Django's own
-                        # request_finished receiver does first, and the next
-                        # checkout clears it. Reopening it here would check out
-                        # another pooled connection and keep it.
-                        if connections[db_alias].connection is None:
-                            continue
-                        with writing(db_alias, None):
-                            clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
-                            clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
+                _clear_finished_request_gucs()
             except Exception:
                 logger.warning(
                     "Safety net: failed to clear RLS GUC variables on request_finished. "
@@ -281,6 +314,8 @@ class DjangoRlsTenantsConfig(AppConfig):
             weak=False,
             dispatch_uid="django_rls_tenants.reload_config_on_setting_changed",
         )
+
+        _guard_open_connections()
 
         # Import checks module so @register decorators are activated.
         import django_rls_tenants.tenants.checks  # noqa: PLC0415, F401

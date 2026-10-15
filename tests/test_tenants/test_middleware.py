@@ -584,22 +584,47 @@ class TestLocalSetTransaction:
         assert atomic.return_value.__exit__.call_count == 2
 
 
+@pytest.mark.django_db(transaction=True)
 class TestLocalSetUnderAsgi:
-    """The async path refuses ``USE_LOCAL_SET=True`` with a clear configuration error."""
+    """The async path serves ``USE_LOCAL_SET=True`` with no transaction of its own (#96).
+
+    ``transaction=True``: an ASGI request runs in autocommit, outside any test transaction.
+    """
 
     @staticmethod
-    def _async_middleware():
-        async def aget_response(request):
+    def _async_middleware(aget_response=None):
+        async def respond(request):
             return MagicMock(name="response")
 
-        return RLSTenantMiddleware(get_response=aget_response)
+        return RLSTenantMiddleware(get_response=aget_response or respond)
 
     @override_settings(RLS_TENANTS=_LOCAL_SET)
-    def test_authenticated_request_raises_configuration_error(self, tenant_a_user):
-        mw = self._async_middleware()
+    def test_authenticated_request_runs_each_statement_in_its_own_transaction(
+        self,
+        tenant_a_user,
+    ):
+        seen = {}
+
+        def probe():
+            return (
+                connection.in_atomic_block,
+                get_guc("rls.current_tenant"),
+                session_gucs(),
+            )
+
+        async def aget_response(request):
+            seen["probe"] = await sync_to_async(probe)()
+            seen["tenant"] = get_current_tenant_id()
+            return MagicMock(name="response")
+
+        mw = self._async_middleware(aget_response)
         assert iscoroutinefunction(mw) is True
-        with pytest.raises(RLSConfigurationError, match="under ASGI"):
-            async_to_sync(mw)(_make_request(user=tenant_a_user))
+        response = async_to_sync(mw)(_make_request(user=tenant_a_user))
+
+        assert response._mock_name == "response"
+        tenant_id = tenant_a_user.rls_tenant_id
+        assert seen == {"probe": (False, str(tenant_id), (None, None)), "tenant": tenant_id}
+        assert session_gucs() == (None, None)
 
     @override_settings(RLS_TENANTS=_LOCAL_SET)
     def test_unauthenticated_request_passes_through(self):
@@ -957,6 +982,23 @@ class TestProcessExceptionRollback:
     def test_session_mode_allows_downstream_exception_handlers(self):
         RLSTenantMiddleware(get_response=lambda r: MagicMock())
 
+    @override_settings(
+        RLS_TENANTS=_LOCAL_SET,
+        MIDDLEWARE=[
+            "django_rls_tenants.RLSTenantMiddleware",
+            "tests.rls_views.DatabaseExceptionMiddleware",
+        ],
+    )
+    def test_local_set_native_async_path_allows_downstream_exception_handlers(self):
+        """The async path opens no request transaction, so there is no rollback to skip (#96)."""
+
+        async def aget_response(request):
+            return MagicMock()
+
+        _async_mw(aget_response)
+        with pytest.raises(RLSConfigurationError, match="before RLSTenantMiddleware"):
+            RLSTenantMiddleware(get_response=lambda r: MagicMock())
+
 
 # ---- Native async path (#38) ----
 
@@ -1163,13 +1205,27 @@ class TestNativeAsyncPath:
             async_to_sync(_async_mw(aget_response))(_make_request(user=tenant_a_user))
         _assert_async_request_left_nothing_behind()
 
+    @pytest.mark.django_db(transaction=True)
     @override_settings(RLS_TENANTS=_LOCAL_SET)
-    def test_use_local_set_is_refused_before_anything_is_set(self, tenant_a_user):
-        async def aget_response(request):
-            pytest.fail("The chain must not run when USE_LOCAL_SET is refused")
+    def test_use_local_set_writes_no_gucs(self, tenant_a_user, monkeypatch):
+        """No transaction can span the awaited chain; the guard applies the values (#96)."""
+        hops = _record_hops(monkeypatch)
+        seen = {}
 
-        with pytest.raises(RLSConfigurationError, match="under ASGI"):
+        async def aget_response(request):
+            seen["state"] = _state()
+            seen["values"] = _get_context_gucs()
+            return MagicMock(name="response")
+
+        with patch.object(middleware_module, "set_guc", side_effect=AssertionError):
             async_to_sync(_async_mw(aget_response))(_make_request(user=tenant_a_user))
+
+        tenant_id = tenant_a_user.rls_tenant_id
+        assert seen == {
+            "state": (tenant_id, True, True),
+            "values": ContextGucs.for_tenant(tenant_id),
+        }
+        assert hops == ["_enter_request_gucs", "_clear_request_gucs"]
         _assert_async_request_left_nothing_behind()
 
     def test_enter_failure_skips_chain_and_leaves_nothing(self):
@@ -1404,13 +1460,26 @@ class TestSubclassWithSyncHooks:
 
         assert seen == {"calls": ["process_request"], "state": (None, False, False), "guc": None}
 
+    @pytest.mark.django_db(transaction=True)
     @override_settings(RLS_TENANTS=_LOCAL_SET)
-    def test_use_local_set_is_refused(self, tenant_a_user):
+    def test_use_local_set_serves_the_request_without_a_transaction(self, tenant_a_user):
+        """``process_request`` writes no GUC; the guard applies the values (#96)."""
+        seen = {}
+
+        def probe():
+            return (
+                connection.in_atomic_block,
+                get_guc("rls.current_tenant"),
+                session_gucs(),
+            )
+
         async def aget_response(request):
-            pytest.fail("The chain must not run when USE_LOCAL_SET is refused")
+            seen["probe"] = await sync_to_async(probe)()
+            return MagicMock(name="response")
 
         mw = _HookOverridingMiddleware(get_response=aget_response)
-        with pytest.raises(RLSConfigurationError, match="under ASGI"):
-            async_to_sync(mw)(_make_request(user=tenant_a_user))
-        assert mw.calls == []
+        async_to_sync(mw)(_make_request(user=tenant_a_user))
+
+        assert mw.calls == ["process_request", "process_response"]
+        assert seen["probe"] == (False, str(tenant_a_user.rls_tenant_id), (None, None))
         _assert_async_request_left_nothing_behind()

@@ -44,6 +44,7 @@ from django_rls_tenants.tenants.state import (
     reset_current_tenant_id,
     set_current_tenant_id,
 )
+from tests.session_gucs import session_gucs
 from tests.test_app.models import (
     Document,
     NoteRevision,
@@ -1399,12 +1400,53 @@ class TestForUserOutsideATransaction:
         assert len(async_to_sync(_collect)(qs.aiterator(chunk_size=1))) == expected
         _assert_no_rls_context()
 
-    def test_local_set_mode_query_raises(self, sample_orders, admin_user, settings, enforce_rls):
-        """``SET LOCAL`` needs a transaction, as it always did for iteration."""
+    def test_local_set_mode_queries_run_in_transactions_of_their_own(
+        self, sample_orders, scoped_user, settings, enforce_rls
+    ):
+        """No transaction to ``SET LOCAL`` in: the guard gives each statement one (#96)."""
         settings.RLS_TENANTS = {**settings.RLS_TENANTS, "USE_LOCAL_SET": True}
-        with pytest.raises(RuntimeError, match="outside a transaction"):
-            Order.objects.for_user(admin_user).count()
+        user, expected = scoped_user
+        qs = Order.objects.for_user(user)
+        assert qs.count() == expected
+        assert len(list(qs)) == expected
+        assert len(list(qs.iterator(chunk_size=1))) == expected
+        assert len(async_to_sync(_collect)(qs.aiterator(chunk_size=1))) == expected
+        assert session_gucs() == (None, None)
         _assert_no_rls_context()
+
+    def test_local_set_mode_transactional_method_writes_through_the_guard(
+        self, sample_orders, tenant_a_user, settings, enforce_rls
+    ):
+        """``delete()`` gets the scope's transaction; the scope itself writes nothing in it.
+
+        The guard sets the user's values before the first statement and takes
+        them off when the scope exits, each in one ``set_config()`` statement.
+        """
+        settings.RLS_TENANTS = {**settings.RLS_TENANTS, "USE_LOCAL_SET": True}
+        connection.ensure_connection()
+        with CaptureQueriesContext(connection) as queries:
+            deleted, _ = Order.objects.for_user(tenant_a_user).filter(product="Widget A1").delete()
+        logged = [query["sql"] for query in queries]
+        writes = [sql for sql in logged if sql.count("set_config(") == 2]
+        assert deleted == 1
+        assert (logged[0], logged[-1]) == ("BEGIN", "COMMIT")
+        assert len(writes) == 2
+        assert not [sql for sql in logged if "SET LOCAL" in sql]
+        assert session_gucs() == (None, None)
+
+    def test_local_set_mode_scope_writes_nothing_itself(
+        self, sample_orders, tenant_a_user, settings, enforce_rls
+    ):
+        """No snapshot, no write, no restore: the guard's own transaction around the query."""
+        settings.RLS_TENANTS = {**settings.RLS_TENANTS, "USE_LOCAL_SET": True}
+        connection.ensure_connection()
+        with CaptureQueriesContext(connection) as queries:
+            assert Order.objects.for_user(tenant_a_user).count() == 2
+        logged = [query["sql"] for query in queries]
+        assert len(logged) == 4
+        assert logged[0] == "BEGIN"
+        assert logged[1].count("set_config(") == 2
+        assert "COMMIT" in logged
 
     @pytest.mark.parametrize(
         "run",
@@ -1703,7 +1745,7 @@ class TestForUserAliases:
             used.append(("query", self_inner.db))
 
         @contextmanager
-        def writing(using, values):
+        def writing(using, values, *, local=False):
             used.append(("writing", using))
             yield
 
