@@ -214,11 +214,21 @@ def test_a_leading_comment_longer_than_the_head_is_skipped():
     assert affinity._parse(f"{comment}  ") is None
 
 
+class _UnrenderableComposable:
+    """A ``psycopg.sql``-like object whose ``as_string()`` fails, whatever the driver."""
+
+    def as_string(self, context):
+        raise TypeError("argument 2 must be a connection or a cursor")
+
+
 def test_a_composable_that_cannot_be_rendered_is_unreadable():
-    """``psycopg.sql`` objects are rendered with the driver cursor; without one they cannot be."""
-    assert (
-        affinity._parse(psycopg_sql.SQL("VACUUM {}").format(psycopg_sql.Identifier("t"))) is None
-    )
+    """A composable whose ``as_string()`` raises is unreadable, not an error.
+
+    Driver-neutral on purpose: psycopg2 cannot render ``psycopg2.sql`` objects
+    without a connection or cursor, while psycopg 3 renders them with none.
+    """
+    assert affinity._parse(_UnrenderableComposable()) is None
+    assert affinity._parse(_UnrenderableComposable(), cursor=object()) is None
 
 
 @pytest.mark.parametrize(
