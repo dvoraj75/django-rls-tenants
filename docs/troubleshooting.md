@@ -77,7 +77,8 @@ open `tenant_context()` / `admin_context()` inside the code that runs on the oth
 keep it on the request's thread with `thread_sensitive=True` (the default for
 `sync_to_async`).
 
-**See:** [Running under ASGI](guides/middleware.md#running-under-asgi).
+**See:** [Running under ASGI](guides/middleware.md#running-under-asgi),
+[Context propagation](guides/async.md#context-propagation-across-sync_to_async-and-async_to_sync).
 
 ## Errors
 
@@ -203,6 +204,36 @@ unwrapped, but it cannot tell which procedures commit.
 `USE_LOCAL_SET=False`.
 
 **See:** [Code Outside a Request Transaction](guides/connection-pooling.md#code-outside-a-request-transaction).
+
+### `RuntimeError: You cannot use ATOMIC_REQUESTS with async views.`
+
+**Symptom:** Every request to an async view fails with this error.
+
+**Cause:** Django does not support `ATOMIC_REQUESTS` for `async def` views. It is often
+turned on for `USE_LOCAL_SET=True`, which has not needed it since 1.3.2.
+
+**Fix:** Turn `ATOMIC_REQUESTS` off, or exempt the async views with
+`@transaction.non_atomic_requests` (add `@transaction.non_atomic_requests(using=alias)` for
+each other alias that has `ATOMIC_REQUESTS`). Put the writes of an async view in
+`transaction.atomic()` inside a synchronous function called with `sync_to_async()`.
+
+**See:** [`SET LOCAL` without async transactions](guides/async.md#set-local-without-async-transactions).
+
+### `SynchronousOnlyOperation: You cannot call this from an async context` in async code
+
+**Symptom:** An `async def` view or task fails with this error when it enters
+`transaction.atomic()`, `tenant_context()` / `admin_context()` or `rls_bypass()` (with the
+default `USE_LOCAL_SET=False`), or a sync assertion helper such as `assert_rls_enabled()`.
+
+**Cause:** These run database calls on the event-loop thread, which Django forbids. Django
+has no async transaction API, and the sync context managers write the GUCs directly.
+
+**Fix:** Use `async_tenant_context()` / `async_admin_context()` and the async testing
+helpers in coroutines. Put `transaction.atomic()` and the sync managers inside a synchronous
+function called with `sync_to_async()`.
+
+**See:** [Async Code](guides/context-managers.md#async-code),
+[Async Deployment](guides/async.md#set-local-without-async-transactions).
 
 ### `TypeError: @with_rls_context cannot decorate the generator function ...`
 
@@ -421,9 +452,12 @@ that clears them is skipped, the next request on that connection inherits the te
 **Fix:** Set `USE_LOCAL_SET=True` (the GUCs are scoped to transactions, so they never stay
 on a connection), or set `CONN_MAX_AGE=0`. On the middleware's async path (ASGI),
 `USE_LOCAL_SET=True` opens no request transaction: a WSGI request is atomic in that mode and
-a request on the async path is not.
+a request on the async path is not. Under ASGI, set `CONN_MAX_AGE=0`: each request runs on a
+thread of its own, so persistent connections are not reused there. Use Django's pool or
+PgBouncer instead.
 
-**See:** [W004 in Connection Pooling](guides/connection-pooling.md#w004-conn_max_age-with-session-gucs).
+**See:** [W004 in Connection Pooling](guides/connection-pooling.md#w004-conn_max_age-with-session-gucs),
+[Async Deployment: Connections and pooling](guides/async.md#connections-and-pooling).
 
 ### W010: Django's connection pool without a `reset` callback
 
@@ -597,7 +631,43 @@ before that, this mode did not work under ASGI, and scripts had to open their ow
 transaction before setting context).
 
 **See:** [PgBouncer: Transaction Mode](guides/connection-pooling.md#transaction-mode-recommended),
-[Connection-Level State](advanced/security.md#connection-level-state).
+[Connection-Level State](advanced/security.md#connection-level-state),
+[Async Deployment: Connections and pooling](guides/async.md#connections-and-pooling).
+
+### An async view committed some of its writes
+
+**Symptom:** With `USE_LOCAL_SET=True` under ASGI, a view that failed, or whose client
+disconnected, left its first writes in the database and not the rest.
+
+**Cause:** On the middleware's async path there is no request transaction. Each statement
+in autocommit runs in a transaction of its own, which the GUC affinity guard opens to hold
+the context's GUCs, and commits on its own. Django also cancels an async view when the
+client disconnects. Under WSGI the middleware's request transaction would have rolled the
+writes back together.
+
+**Fix:** Put writes that belong together in `transaction.atomic()` inside a synchronous
+function and call it with `sync_to_async()`. It also saves three round trips per statement.
+
+**See:** [`SET LOCAL` without async transactions](guides/async.md#set-local-without-async-transactions).
+
+### `too many clients already` or pool timeouts under ASGI
+
+**Symptom:** Under load on an ASGI server, PostgreSQL refuses connections with
+`FATAL: sorry, too many clients already`, or requests fail waiting for a connection from
+Django's pool.
+
+**Cause:** Under ASGI each request in flight runs on a thread of its own and holds its own
+connection, and nothing caps the number of requests. Threads of the event loop's default
+executor, which run ASGI error pages and `thread_sensitive=False` work, keep a connection
+each. With `CONN_MAX_AGE > 0` the connections are never reused, because the request's
+thread ends with the request.
+
+**Fix:** Keep `CONN_MAX_AGE = 0`. Cap the requests in flight at the server, or use
+Django's pool and size its `max_size` for one process's concurrent requests plus its
+executor threads. Size `max_connections` for every worker process, or put PgBouncer in
+front (with `USE_LOCAL_SET=True` in transaction mode).
+
+**See:** [Async Deployment: ASGI servers](guides/async.md#asgi-servers).
 
 ### Raw SQL returns rows from every tenant for a plain manager, or none at all
 

@@ -3,7 +3,8 @@
 When using a connection pooler like **PgBouncer** or **pgpool-II**, or Django's own
 connection pool, special care is needed to prevent GUC variables from leaking between
 requests through pooled connections. Django's pool has its own section,
-[Django's Connection Pool](#djangos-connection-pool).
+[Django's Connection Pool](#djangos-connection-pool). For which combinations are safe under
+ASGI, see [Async Deployment](async.md#connections-and-pooling).
 
 ## The Problem
 
@@ -246,6 +247,9 @@ With `pool_mode = transaction` and `USE_LOCAL_SET = True`:
 - Pass `is_local=True` to `bypass_flag()`, `set_bypass_flag()` and `rls_context()` (inside
   `transaction.atomic()`): they are session-scoped by default in either mode, and nothing
   clears a flag that PgBouncer hands to another client.
+- Set `DISABLE_SERVER_SIDE_CURSORS = True` on the alias. Django requires it for transaction
+  pooling: a server-side cursor (`iterator()`) can outlive its transaction, and the next
+  transaction may run on another server connection.
 
 ### Session Mode
 
@@ -454,3 +458,7 @@ RLS_TENANTS = {
     "USE_LOCAL_SET": True,
 }
 ```
+
+Under ASGI, keep `CONN_MAX_AGE = 0`: each request runs on a thread of its own, so a
+persistent connection is never reused. Use Django's pool or PgBouncer instead (see
+[Async Deployment](async.md#connections-and-pooling)).

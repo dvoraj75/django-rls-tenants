@@ -208,7 +208,8 @@ the primitives `aset_guc()`, `aget_guc()`, `aclear_guc()` and `arestore_guc()` (
 [API reference](../reference/api.md#async-guc-helpers)).
 
 For tests, the testing helpers have async counterparts. [Async Tests](testing.md#async-tests)
-also explains which database connection an `async def` test uses.
+also explains which database connection an `async def` test uses. For running the project on
+an ASGI server, see [Async Deployment](async.md).
 
 ### `USE_LOCAL_SET=True` in async code
 

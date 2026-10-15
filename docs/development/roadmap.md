@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: 2026-10-15
+> Last updated: 2026-10-16
 >
 > Priorities may shift based on community feedback.
 > Have a suggestion? [Open an issue](https://github.com/dvoraj75/django-rls-tenants/issues).
@@ -159,16 +159,19 @@ item are in the [changelog](changelog.md).
 
 First-class support for async Django (ASGI, async views, async ORM).
 
-The current codebase uses `contextvars.ContextVar` for tenant state, which is
-the correct primitive for async. However, every public API that touches the
-database (GUC operations, context managers, middleware, decorator) is
-synchronous. Under ASGI, Django wraps sync middleware in `sync_to_async`,
-adding a thread-hop per request and creating connection-affinity issues where
-GUCs are set on a connection in one thread but queries execute on a different
-connection in another thread.
+Tenant state already lived in `contextvars.ContextVar`s, the right primitive for async,
+but every public API that touches the database (GUC operations, context managers,
+middleware, decorator) was synchronous. Django has no asynchronous database cursor: every
+async ORM call is a `sync_to_async(..., thread_sensitive=True)` hop, and under ASGI all
+such hops of one request run on one thread, and so on one connection. The async APIs below
+therefore make thread hops too; what they add is `async with` ergonomics, and tenant state
+set and reset in the calling coroutine, in one `contextvars.Context` (#58). The real
+connection-affinity problems are code on *other* threads (`thread_sensitive=False` hops,
+the error pages Django builds on a worker thread; #130, #41), sibling tasks sharing one
+connection (#41), and pooled connections that keep a previous borrower's GUCs (#96).
 
 This release addresses the full async stack, from low-level GUC operations
-up through middleware and context managers.
+up through middleware and context managers, and the connection lifecycle under it.
 
 ### Tier 0: Platform
 
@@ -253,7 +256,30 @@ up through middleware and context managers.
   in `sync_to_async` breaks the generator protocol. First-class async
   helpers remove that boilerplate and ensure correct usage.
 
+- [x] **`assert_rls_blocks_without_context()` under `STRICT_MODE`** (#126) — The
+  helper (and its async counterpart) counts the rows with raw SQL and the GUCs
+  cleared, so it no longer raises `NoTenantContextError` under strict mode and
+  works inside `rls_bypass()` / `rls_as_tenant()`.
+  *Why:* The isolation check every test suite should have failed in exactly
+  the configuration that asks for the strictest checking.
+
 ### Tier 5: Connection-affinity safety net
+
+- [x] **ASGI error pages no longer leave GUCs on a worker thread's connection** (#130) —
+  Django builds some ASGI error responses on a worker thread. A connection opened there
+  during an authenticated request got the request's GUCs and kept them for later
+  requests on that thread, anonymous ones included. The `connection_created` handler now
+  applies the request's GUCs only on the thread that set them and clears them elsewhere.
+  *Why:* A 404 page whose template or context processors query tenant data could
+  show another tenant's rows, to anonymous visitors too.
+
+- [x] **Clear RLS GUCs on every checkout from Django's connection pool** (#96) — The
+  `connection_created` handler clears every GUC the policies read when a pooled
+  connection is checked out, with or without a request context, and fails closed if it
+  cannot. `django_rls_tenants.pool.reset_rls_gucs` clears them again as the connection
+  goes back, and system check `W010` asks for it.
+  *Why:* Django's pool keeps session GUCs between borrowers, and `W004` never fires for
+  a pool (Django rejects a non-zero `CONN_MAX_AGE` with one).
 
 - [x] **GUC-to-connection affinity guard** (#41) — The `connection_created`
   handler installs an execute wrapper on every connection that applies the
@@ -262,18 +288,30 @@ up through middleware and context managers.
   their own, and a connection loses a context before the next statement that
   runs without it. See
   [GUC Affinity Guard](../advanced/architecture.md#guc-affinity-guard).
-  *Why:* In async Django, `django.db.connections` is thread-local. A
-  `sync_to_async` hop lands on a new thread with a fresh connection that
-  does not have the GUC set. The existing `connection_created` signal
-  handler partially covers this for lazily-created connections, but does
-  not cover reused connections from a different request's thread.
+  *Why:* `django.db.connections` is per thread. Work on another thread
+  (`thread_sensitive=False` hops, `asyncio.to_thread()`, the error pages Django
+  builds on a worker thread) ran on a connection without the context's GUCs, or
+  with an earlier request's. Sibling tasks of one request share a connection, so
+  one task's context could change the GUCs between another task's statements.
 
-- [ ] **Documentation: async deployment guide** — Covers ASGI server
+- [x] **Transaction-local mode without a transaction** (#96) — With
+  `USE_LOCAL_SET=True` the guard writes the context's GUCs transaction-locally: once per
+  transaction, or around each autocommit statement in a transaction of its own. The
+  middleware's async path, the context managers and `for_user()` no longer need
+  `transaction.atomic()` on a configured alias, and a request on the async path works in
+  this mode instead of raising `RLSConfigurationError`.
+  *Why:* PgBouncer in transaction mode needs transaction-local GUCs, and Django has no
+  async transactions, so requests on the middleware's async path could not use the mode
+  at all.
+
+- [x] **Documentation: async deployment guide** (#42) — The
+  [Async Deployment](../guides/async.md) guide covers ASGI server
   configuration (Uvicorn, Daphne, Hypercorn), connection pooling
-  considerations with async (`CONN_MAX_AGE`, pgBouncer), `ContextVar`
-  propagation semantics across `sync_to_async` / `async_to_sync` boundaries,
-  and the interaction between `SET LOCAL` (transaction-scoped) and Django's
-  async transaction handling.
+  considerations with async (`CONN_MAX_AGE`, Django's pool, PgBouncer) with a
+  table of safe settings combinations, `ContextVar` propagation semantics
+  across `sync_to_async` / `async_to_sync` boundaries, and the interaction
+  between `SET LOCAL` (transaction-scoped) and Django's lack of async
+  transactions.
   *Why:* Async deployment has different failure modes than WSGI. Users need
   guidance on connection lifecycle, GUC scoping, and which settings
   combinations are safe.

@@ -217,9 +217,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pg_db_role_setting` for every GUC the installed policies read (the configured pair,
   the constraints' GUCs and `extra_bypass_flags`) and names the `ALTER ... RESET` that
   removes the default.
+- **Async Deployment guide** (`docs/guides/async.md`, #42). One page for running on an
+  ASGI server: the one-thread-one-connection-per-request model the library relies on;
+  Uvicorn / Daphne / Hypercorn commands and what matters for RLS on each (which middleware
+  path serves the request and how to tell, connections per worker process and how to cap
+  them, WebSockets); a table of which connection setups are safe with each `USE_LOCAL_SET`
+  value (`CONN_MAX_AGE`, Django's pool with `reset_rls_gucs`, PgBouncer in transaction and
+  session mode); how `ContextVar`s travel across tasks, `sync_to_async`, `async_to_sync`
+  and executor threads; what `USE_LOCAL_SET=True` means without async transactions (no
+  request transaction on the async path, three extra round trips per autocommit statement,
+  grouping writes in `transaction.atomic()` inside a synchronous function); testing the
+  async path; and a deployment checklist. It is in the site nav and the home page's
+  "I want to..." table, and is linked from the README, Middleware, Context Managers,
+  Connection Pooling, Configuration, Security Model and Troubleshooting.
+  Troubleshooting gains four entries: `You cannot use ATOMIC_REQUESTS with async views`,
+  `SynchronousOnlyOperation` in async code, an async view that committed some of its
+  writes, and `too many clients already` or pool timeouts under ASGI.
 
 ### Changed
 
+- **Docs: the roadmap's v1.4.0 section** (#42) describes the real connection-affinity
+  problems (code on other threads, sibling tasks sharing a connection, pooled connections)
+  instead of claiming that the sync middleware runs queries on a different connection from
+  its GUCs, and lists #126, #130 and both parts of #96. The Connection Pooling guide asks
+  for `DISABLE_SERVER_SIDE_CURSORS = True` behind PgBouncer in transaction mode, and it and
+  the `W004` troubleshooting entry say to keep `CONN_MAX_AGE = 0` under ASGI.
 - `requires-python` is now `>=3.12` and the dependency `django>=5.2` (#114). The lockfile
   moves to Django 6.1.2 (django-stubs 6.1.2, mypy 2.4.0) and psycopg2-binary 2.9.13 (the
   first release with Python 3.15 wheels); the example Docker image installs Django 6.1.

@@ -228,7 +228,9 @@ Mitigations:
   PgBouncer in transaction mode still needs this mode: with session GUCs the handler and
   the guard do not see that pooler hand the server connection to another client.
 
-See [Connection Pooling](../guides/connection-pooling.md) for details.
+See [Connection Pooling](../guides/connection-pooling.md) for details, and
+[Async Deployment](../guides/async.md#connections-and-pooling) for the safe combinations
+under ASGI.
 
 ## Threat Model
 
