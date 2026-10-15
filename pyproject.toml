@@ -7,7 +7,7 @@ build-backend = "hatchling.build"
 # ---------------------------------------------------------------------------
 [project]
 name = "django-rls-tenants"
-version = "1.3.4"
+version = "1.4.0"
 description = "Database-enforced multitenancy for Django using PostgreSQL Row-Level Security."
 readme = "README.md"
 license = "MIT"
@@ -156,6 +156,7 @@ ignore = [
     "S608",     # SQL injection (developer-controlled RLS policy strings)
     "TRY003",   # long exception messages
     "PLR0913",  # too many arguments
+    "PLR0917",  # too many positional arguments (public API, Django signatures)
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -189,6 +190,10 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-first-party = ["django_rls_tenants"]
+
+[tool.ruff.format]
+# Keep the docs' hand-aligned code examples as written.
+exclude = ["*.md"]
 
 # ---------------------------------------------------------------------------
 # mypy

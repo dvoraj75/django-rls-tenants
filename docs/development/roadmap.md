@@ -172,6 +172,7 @@ connection (#41), and pooled connections that keep a previous borrower's GUCs (#
 
 This release addresses the full async stack, from low-level GUC operations
 up through middleware and context managers, and the connection lifecycle under it.
+See [1.4.0](changelog.md#140-2026-10-16).
 
 ### Tier 0: Platform
 
