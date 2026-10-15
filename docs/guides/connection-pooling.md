@@ -164,7 +164,10 @@ every GUC the library's RLS policies read, before the new borrower's first query
   a `reset` callback (see below).
 - Then, on the thread that set the request's GUCs, the handler applies the request's GUCs
   as before (a connection checked out mid-request). A pooled connection always starts
-  clean, and only the request's own thread gets the request's GUCs.
+  clean. With `USE_LOCAL_SET=False`, the
+  [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) then applies the
+  active context before each statement, on whichever thread runs with one, and tracks
+  each checkout as a new session.
 - If the clear fails (a statement timeout, a broken connection), the checkout fails
   closed: the handler logs a warning (`Failed to clear RLS GUCs on a connection for alias
   ... checked out of a connection pool; discarding it.`), closes the connection so the pool

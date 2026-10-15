@@ -106,3 +106,8 @@ nav:
       - Code of Conduct: development/code-of-conduct.md
       - Changelog: development/changelog.md
       - Roadmap: development/roadmap.md
+
+# Strict builds also fail on links to a heading that does not exist.
+validation:
+  links:
+    anchors: warn

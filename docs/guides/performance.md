@@ -491,6 +491,22 @@ the default `include_admin=True` for statements that must behave identically in 
 contexts and are not on a hot path. See
 the [Raw SQL guide](raw-sql.md) for the helpers' full contract.
 
+## The GUC affinity guard
+
+*Added in 1.4.0.* Every statement on a PostgreSQL connection passes through the
+[GUC affinity guard](../advanced/architecture.md#guc-affinity-guard)'s execute wrapper; it
+acts only on aliases in `RLS_TENANTS["DATABASES"]` with `USE_LOCAL_SET=False`, where it
+compares the active context with what the connection holds. That costs a few
+microseconds of Python per statement, depending on the machine. Measured on one idle
+machine on `SELECT 1` over a local socket, the median per statement went from 29.6 to
+31.1 µs with psycopg2 and from 31.6 to 33.3 µs with psycopg 3, so the share is smaller for
+any real query. It adds no round trip while the
+connection already holds the context's GUCs, as in the normal nested use of contexts on one
+thread and connection. It sends one `set_config()` statement when they differ: on another
+thread's connection, in a sibling task, after a rollback undid them, or when it cannot tell
+(a transaction ended through the driver connection, a `RESET ALL`). The guard does not
+change the SQL, so the plans in this guide are unaffected.
+
 ## How to measure
 
 1. **Connect as the application role.** `EXPLAIN` from a superuser session shows no

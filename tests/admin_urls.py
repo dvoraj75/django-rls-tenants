@@ -11,6 +11,7 @@ from django.contrib import admin
 from django.urls import path
 
 from tests.rls_views import (
+    async_left_open_view,
     async_orders_view,
     async_stream_view,
     async_widen_to_admin_view,
@@ -31,6 +32,7 @@ urlpatterns = [
     path("rls/async-orders/", async_orders_view, name="rls-async-orders"),
     path("rls/async-widen/", async_widen_to_admin_view, name="rls-async-widen"),
     path("rls/async-stream/", async_stream_view, name="rls-async-stream"),
+    path("rls/async-left-open/", async_left_open_view, name="rls-async-left-open"),
     path("rls/boom/", boom_view, name="rls-boom"),
     path("rls/reconnect/", reconnect_view, name="rls-reconnect"),
     path("rls/pool-probe/", pool_probe_view, name="rls-pool-probe"),

@@ -93,6 +93,12 @@ async with async_bypass_flag("rls.auth_bypass"):
     user = await User.objects.aget(email="admin@example.com")
 ```
 
+!!! note
+    The [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) follows the
+    admin and tenant GUCs only. A bypass flag stays on the connection it was set on:
+    sibling tasks of the same request share that connection and see the flag while the
+    block runs, and work on another thread does not get it (fail-closed).
+
 ### Use Case: Authentication
 
 During authentication, the user record must be read before the tenant context is known.

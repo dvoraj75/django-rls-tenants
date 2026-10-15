@@ -20,9 +20,22 @@ from django.db import connections
 from django_rls_tenants.exceptions import NoTenantContextError, RLSConfigurationError
 from django_rls_tenants.rls.context import _enter_gucs, _run_enter_hop, restore_gucs
 from django_rls_tenants.rls.guc import clear_guc, get_guc, set_guc
+from django_rls_tenants.tenants.affinity import (
+    UNKNOWN,
+    _forget,
+    apply_active_context,
+    settle_other_aliases,
+    writing,
+)
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.errors import HINT_TENANT_ID_NONE, HINT_USER_NO_TENANT
 from django_rls_tenants.tenants.state import (
+    ADMIN_GUCS,
+    ContextGucs,
+    _current_live,
+    _get_context_gucs,
+    _reset_context_gucs,
+    _set_context_gucs,
     reset_current_tenant_id,
     reset_rls_context_active,
     set_current_tenant_id,
@@ -30,9 +43,10 @@ from django_rls_tenants.tenants.state import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Iterator
+    from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 
     from django_rls_tenants.tenants.conf import RLSTenantsConfig
+    from django_rls_tenants.tenants.state import _Live
     from django_rls_tenants.tenants.types import TenantUser
 
 logger = logging.getLogger("django_rls_tenants")
@@ -75,6 +89,41 @@ def _resolve_user_guc_vars(
     }
 
 
+def _context_gucs_of(variables: Mapping[str, str], conf: RLSTenantsConfig) -> ContextGucs:
+    """Return the ``ContextGucs`` of a ``_resolve_user_guc_vars()`` mapping.
+
+    The form the affinity guard compares and applies (see ``state._get_context_gucs()``).
+    """
+    return ContextGucs(variables[conf.GUC_IS_ADMIN], variables[conf.GUC_CURRENT_TENANT])
+
+
+@contextmanager
+def _rls_state(tenant_id: int | str | None, gucs: ContextGucs) -> Iterator[None]:
+    """Set the tenant ``ContextVar`` values of an RLS context; reset them on exit.
+
+    The auto-scope tenant, the strict-mode flag and the GUC values the
+    affinity guard applies. They are reset newest first, and a failing reset
+    does not skip the others.
+
+    Args:
+        tenant_id: The auto-scope tenant, ``None`` for an admin context.
+        gucs: The GUC values the context sets.
+    """
+    active_token = set_rls_context_active(True)
+    tenant_token = set_current_tenant_id(tenant_id)
+    entered = _set_context_gucs(gucs)
+    try:
+        yield
+    finally:
+        try:
+            _reset_context_gucs(entered)
+        finally:
+            try:
+                reset_current_tenant_id(tenant_token)
+            finally:
+                reset_rls_context_active(active_token)
+
+
 @contextmanager
 def tenant_context(
     tenant_id: int | str,
@@ -91,7 +140,10 @@ def tenant_context(
 
     Args:
         tenant_id: The tenant PK to scope queries to.
-        using: Database alias. Default: ``"default"``.
+        using: Database alias the GUCs are written to on entry and restored on
+            exit. Default: ``"default"``. With session GUCs, every alias in
+            ``RLS_TENANTS["DATABASES"]`` follows the context too (the GUC
+            affinity guard applies it before each statement there).
 
     Raises:
         NoTenantContextError: If ``tenant_id`` is ``None``.
@@ -106,27 +158,35 @@ def tenant_context(
     # Save previous state for nesting support (both modes: a SET LOCAL made
     # by an enclosing block is visible here and must be re-issued on exit).
     previous = _snapshot_gucs(conf, using=using)
+    session = _session_of(using)
+    enclosing = _current_live()
 
-    active_token = set_rls_context_active(True)
-    token = set_current_tenant_id(tenant_id)
+    gucs = ContextGucs.for_tenant(tenant_id)
     exc_pending = False
     try:
-        set_guc(conf.GUC_IS_ADMIN, "false", is_local=is_local, using=using)
-        set_guc(
-            conf.GUC_CURRENT_TENANT,
-            str(tenant_id),
-            is_local=is_local,
-            using=using,
-        )
-        logger.debug("tenant_context entered: tenant_id=%s, using=%s", tenant_id, using)
-        yield
+        with _rls_state(tenant_id, gucs):
+            with writing(using, gucs):
+                set_guc(conf.GUC_IS_ADMIN, gucs.is_admin, is_local=is_local, using=using)
+                set_guc(
+                    conf.GUC_CURRENT_TENANT,
+                    gucs.current_tenant,
+                    is_local=is_local,
+                    using=using,
+                )
+            logger.debug("tenant_context entered: tenant_id=%s, using=%s", tenant_id, using)
+            yield
     except BaseException:
         exc_pending = True
         raise
     finally:
-        reset_current_tenant_id(token)
-        reset_rls_context_active(active_token)
-        restore_gucs(previous, is_local=is_local, using=using, exc_pending=exc_pending)
+        _restore_tenant_gucs(
+            previous,
+            is_local=is_local,
+            using=using,
+            exc_pending=exc_pending,
+            enclosing=enclosing,
+            session=session,
+        )
         logger.debug("tenant_context exited: tenant_id=%s, using=%s", tenant_id, using)
 
 
@@ -142,41 +202,119 @@ def admin_context(
     into the enclosing block (see :func:`tenant_context`).
 
     Args:
-        using: Database alias. Default: ``"default"``.
+        using: Database alias the GUCs are written to on entry and restored on
+            exit. Default: ``"default"``. With session GUCs, every alias in
+            ``RLS_TENANTS["DATABASES"]`` gets the admin bypass too, even when
+            ``using`` names an alias outside that list.
     """
     conf = rls_tenants_config
     is_local = conf.USE_LOCAL_SET
 
     # Save previous state for nesting support (both modes).
     previous = _snapshot_gucs(conf, using=using)
+    session = _session_of(using)
+    enclosing = _current_live()
 
-    active_token = set_rls_context_active(True)
-    token = set_current_tenant_id(None)
     exc_pending = False
     try:
-        set_guc(conf.GUC_IS_ADMIN, "true", is_local=is_local, using=using)
-        # Clear tenant GUC for admin mode; the admin_bypass clause in the
-        # RLS policy handles access independently. Avoids the old "-1"
-        # sentinel which could collide with integer PKs or fail UUID casts.
-        clear_guc(conf.GUC_CURRENT_TENANT, is_local=is_local, using=using)
-        logger.debug("admin_context entered: using=%s", using)
-        yield
+        with _rls_state(None, ADMIN_GUCS):
+            with writing(using, ADMIN_GUCS):
+                set_guc(conf.GUC_IS_ADMIN, ADMIN_GUCS.is_admin, is_local=is_local, using=using)
+                # Clear tenant GUC for admin mode; the admin_bypass clause in the
+                # RLS policy handles access independently. Avoids the old "-1"
+                # sentinel which could collide with integer PKs or fail UUID casts.
+                clear_guc(conf.GUC_CURRENT_TENANT, is_local=is_local, using=using)
+            logger.debug("admin_context entered: using=%s", using)
+            yield
     except BaseException:
         exc_pending = True
         raise
     finally:
-        reset_current_tenant_id(token)
-        reset_rls_context_active(active_token)
-        restore_gucs(previous, is_local=is_local, using=using, exc_pending=exc_pending)
+        _restore_tenant_gucs(
+            previous,
+            is_local=is_local,
+            using=using,
+            exc_pending=exc_pending,
+            enclosing=enclosing,
+            session=session,
+        )
         logger.debug("admin_context exited: using=%s", using)
 
 
+def _session_of(using: str) -> object:
+    """Return the DB-API connection (the database session) of ``using`` on this thread."""
+    return connections[using].connection
+
+
 def _snapshot_gucs(conf: RLSTenantsConfig, *, using: str) -> dict[str, str | None]:
-    """Read the admin and tenant GUCs so a context block can restore them on exit."""
+    """Read the admin and tenant GUCs so a context block can restore them on exit.
+
+    Called before the block's ``ContextVar`` values are set: the GUC affinity
+    guard brings the connection to the enclosing context's values before the
+    first read, so the snapshot holds those values (see :func:`_restore_tenant_gucs`).
+    """
     return {
         conf.GUC_IS_ADMIN: get_guc(conf.GUC_IS_ADMIN, using=using),
         conf.GUC_CURRENT_TENANT: get_guc(conf.GUC_CURRENT_TENANT, using=using),
     }
+
+
+def _restore_tenant_gucs(
+    previous: Mapping[str, str | None],
+    *,
+    is_local: bool,
+    using: str,
+    exc_pending: bool,
+    enclosing: _Live | None,
+    session: object,
+) -> None:
+    """Restore a context block's snapshot of the admin and tenant GUCs, on exit.
+
+    Called after the block's ``ContextVar`` values have been reset. The
+    snapshot holds the enclosing context's values (see :func:`_snapshot_gucs`),
+    so they are what the GUC affinity guard records for the connection, unless
+    a failed restore was skipped (see
+    :func:`django_rls_tenants.rls.context.restore_gucs`): the values are then
+    unknown, and the guard applies the enclosing context before the next
+    statement. If the enclosing context has ended meanwhile (the block ran in
+    a task or thread that outlived it), its values do not come back: both GUCs
+    are cleared. The other configured aliases, on which the guard may have
+    applied the block's context, are brought back to the enclosing one too.
+    A block that exits in another ``Context`` than the one it entered in (a
+    generator closed or collected there) finds another context current: its
+    snapshot is the state of the session it entered on, not that context's.
+    It is restored only on that session (a ``SET LOCAL`` would otherwise
+    outlive the block there), and the values are left unknown, so the guard
+    applies the current context before the next statement.
+
+    Args:
+        previous: The snapshot taken on entry.
+        is_local: Scope the block used.
+        using: Database alias.
+        exc_pending: ``True`` when called while an exception is propagating.
+        enclosing: The enclosing context's holder when the block was entered,
+            from ``state._current_live()``.
+        session: The DB-API connection of ``using`` the block entered on.
+    """
+    if enclosing is not None and not enclosing.alive:
+        conf = rls_tenants_config
+        previous = dict.fromkeys((conf.GUC_IS_ADMIN, conf.GUC_CURRENT_TENANT))
+    if _current_live() is not enclosing:
+        # The block exits in a Context other than the one it entered in (a
+        # generator closed there): its snapshot is not this context's.
+        logger.debug("RLS context block exited in another context; GUC values left unknown")
+        if session is not None and _session_of(using) is session:
+            with writing(using, UNKNOWN):
+                restore_gucs(previous, is_local=is_local, using=using, exc_pending=exc_pending)
+        else:
+            _forget(using)
+        settle_other_aliases(using)
+        return
+    with writing(using, _get_context_gucs()):
+        restored = restore_gucs(previous, is_local=is_local, using=using, exc_pending=exc_pending)
+    if not restored:
+        _forget(using)
+    settle_other_aliases(using)
 
 
 def _enter_tenant_gucs(
@@ -184,17 +322,32 @@ def _enter_tenant_gucs(
     *,
     is_local: bool,
     using: str,
+    entered_on: list[object],
 ) -> dict[str, str | None]:
     """Snapshot + set the admin/tenant GUCs for an async block; one thread hop.
 
     Runs inside the hop, so ``in_atomic_block`` is read from the connection
-    the block's queries will use.
+    the block's queries will use. The GUC affinity guard first brings the
+    connection to the enclosing context's values (the hop holds a copy of the
+    coroutine's ``ContextVar`` values, which the block has not changed yet),
+    so the snapshot holds those values, as in :func:`_snapshot_gucs`.
+
+    Args:
+        variables: Mapping of GUC name to the value to set.
+        is_local: If ``True``, use ``SET LOCAL`` (transaction-scoped).
+        using: Database alias.
+        entered_on: Receives the DB-API connection the block enters on, for
+            :func:`_restore_tenant_gucs`.
+
+    Returns:
+        The snapshot, for :func:`_restore_tenant_gucs`.
 
     Raises:
         RLSConfigurationError: If ``is_local`` is set and the hop thread is
             not inside ``transaction.atomic()``.
     """
-    if is_local and not connections[using].in_atomic_block:
+    connection = connections[using]
+    if is_local and not connection.in_atomic_block:
         msg = (
             "async_tenant_context() and async_admin_context() cannot use "
             "RLS_TENANTS['USE_LOCAL_SET'] = True here: SET LOCAL needs a transaction held "
@@ -203,7 +356,11 @@ def _enter_tenant_gucs(
             "async_to_sync, or set USE_LOCAL_SET=False."
         )
         raise RLSConfigurationError(msg)
-    return _enter_gucs(variables, is_local=is_local, using=using)
+    apply_active_context(connection)
+    with writing(connection, _context_gucs_of(variables, rls_tenants_config)):
+        previous = _enter_gucs(variables, is_local=is_local, using=using)
+    entered_on.append(connection.connection)
+    return previous
 
 
 @asynccontextmanager
@@ -235,13 +392,16 @@ async def async_tenant_context(
     from synchronous code that is inside ``atomic()``; anywhere else (a bare
     event loop, an ASGI request) it raises :class:`RLSConfigurationError`.
 
-    **One context per task.** Sibling tasks of one request (for example
-    under ``asyncio.gather``) share the request's database connection, so
-    their GUC writes interleave. The ORM auto-scope filter still keeps model
-    queries scoped (``ContextVar`` state is per task), but raw SQL,
-    ``safe_tenant_sql()`` and M2M through tables rely on the GUCs alone and
-    are not protected. Do not run context blocks concurrently in sibling
-    tasks that share a connection.
+    **Concurrent tasks.** Sibling tasks of one request (for example under
+    ``asyncio.gather``) share the request's database connection, but each
+    has its own ``ContextVar`` state. The GUC affinity guard applies the
+    context of the task that runs a statement before that statement, so
+    blocks for different tenants can run concurrently, raw SQL,
+    ``safe_tenant_sql()`` and M2M through tables included. It does not cover
+    bypass flags and other GUCs set with ``async_bypass_flag()`` /
+    ``async_rls_context()`` (sibling tasks see them), ``USE_LOCAL_SET=True``,
+    or SQL that bypasses Django's cursor. Work that outlives the block (a task
+    it started without awaiting it) runs without its context.
 
     The restore runs even when the task is cancelled while entering or
     inside the block; only a second cancellation delivered during the
@@ -250,7 +410,8 @@ async def async_tenant_context(
 
     Args:
         tenant_id: The tenant PK to scope queries to.
-        using: Database alias. Default: ``"default"``.
+        using: Database alias the GUCs are written to first, as in
+            :func:`tenant_context`. Default: ``"default"``.
 
     Raises:
         NoTenantContextError: If ``tenant_id`` is ``None``.
@@ -269,29 +430,37 @@ async def async_tenant_context(
     # a failed hop then leaves no ContextVar to unwind. The ContextVars are
     # set here in the coroutine, never inside the hop, because a token
     # created in the hop's context copy cannot be reset from here (#58).
+    gucs = ContextGucs.for_tenant(tenant_id)
+    enclosing = _current_live()
+    entered_on: list[object] = []
     previous = await _run_enter_hop(
-        _enter_tenant_gucs,
-        {conf.GUC_IS_ADMIN: "false", conf.GUC_CURRENT_TENANT: str(tenant_id)},
+        functools.partial(_enter_tenant_gucs, entered_on=entered_on),
+        {conf.GUC_IS_ADMIN: gucs.is_admin, conf.GUC_CURRENT_TENANT: gucs.current_tenant},
         is_local=is_local,
         using=using,
+        # Runs in the Context the block enters in, so the session is not needed.
+        undo=functools.partial(_restore_tenant_gucs, enclosing=enclosing, session=None),
     )
-    active_token = set_rls_context_active(True)
-    token = set_current_tenant_id(tenant_id)
-    logger.debug("async_tenant_context entered: tenant_id=%s, using=%s", tenant_id, using)
     exc_pending = False
     try:
-        yield
+        with _rls_state(tenant_id, gucs):
+            logger.debug(
+                "async_tenant_context entered: tenant_id=%s, using=%s",
+                tenant_id,
+                using,
+            )
+            yield
     except BaseException:
         exc_pending = True
         raise
     finally:
-        reset_current_tenant_id(token)
-        reset_rls_context_active(active_token)
-        await sync_to_async(restore_gucs, thread_sensitive=True)(
+        await sync_to_async(_restore_tenant_gucs, thread_sensitive=True)(
             previous,
             is_local=is_local,
             using=using,
             exc_pending=exc_pending,
+            enclosing=enclosing,
+            session=next(iter(entered_on), None),
         )
         logger.debug("async_tenant_context exited: tenant_id=%s, using=%s", tenant_id, using)
 
@@ -303,12 +472,14 @@ async def async_admin_context(
 ) -> AsyncIterator[None]:
     """Async counterpart of :func:`admin_context`, for ``async with``. Supports nesting.
 
-    Same hop model, ``USE_LOCAL_SET`` constraint and one-context-per-task
-    rule as :func:`async_tenant_context`. An inner ``async_admin_context()``
-    never leaks the admin bypass into the enclosing block.
+    Same hop model, ``USE_LOCAL_SET`` constraint and concurrent-task
+    behaviour as :func:`async_tenant_context`. An inner
+    ``async_admin_context()`` never leaks the admin bypass into the
+    enclosing block.
 
     Args:
-        using: Database alias. Default: ``"default"``.
+        using: Database alias the GUCs are written to first, as in
+            :func:`admin_context`. Default: ``"default"``.
 
     Raises:
         RLSConfigurationError: If ``USE_LOCAL_SET=True`` and no transaction is
@@ -318,29 +489,32 @@ async def async_admin_context(
     is_local = conf.USE_LOCAL_SET
 
     # Same mapping as admin_context(): clear_guc() is set_guc(name, "").
+    enclosing = _current_live()
+    entered_on: list[object] = []
     previous = await _run_enter_hop(
-        _enter_tenant_gucs,
-        {conf.GUC_IS_ADMIN: "true", conf.GUC_CURRENT_TENANT: ""},
+        functools.partial(_enter_tenant_gucs, entered_on=entered_on),
+        {conf.GUC_IS_ADMIN: ADMIN_GUCS.is_admin, conf.GUC_CURRENT_TENANT: ""},
         is_local=is_local,
         using=using,
+        # Runs in the Context the block enters in, so the session is not needed.
+        undo=functools.partial(_restore_tenant_gucs, enclosing=enclosing, session=None),
     )
-    active_token = set_rls_context_active(True)
-    token = set_current_tenant_id(None)
-    logger.debug("async_admin_context entered: using=%s", using)
     exc_pending = False
     try:
-        yield
+        with _rls_state(None, ADMIN_GUCS):
+            logger.debug("async_admin_context entered: using=%s", using)
+            yield
     except BaseException:
         exc_pending = True
         raise
     finally:
-        reset_current_tenant_id(token)
-        reset_rls_context_active(active_token)
-        await sync_to_async(restore_gucs, thread_sensitive=True)(
+        await sync_to_async(_restore_tenant_gucs, thread_sensitive=True)(
             previous,
             is_local=is_local,
             using=using,
             exc_pending=exc_pending,
+            enclosing=enclosing,
+            session=next(iter(entered_on), None),
         )
         logger.debug("async_admin_context exited: using=%s", using)
 

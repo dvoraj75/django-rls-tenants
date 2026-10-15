@@ -254,11 +254,13 @@ up through middleware and context managers.
 
 ### Tier 5: Connection-affinity safety net
 
-- [ ] **GUC-to-connection affinity guard** — Ensure that when GUCs are set in
-  one thread/context, queries that execute on a different connection (due to
-  `sync_to_async` thread-hops) either inherit the GUC state or raise a clear
-  error. Extend the existing `connection_created` signal handler to cover
-  async connection acquisition patterns.
+- [x] **GUC-to-connection affinity guard** (#41) — The `connection_created`
+  handler installs an execute wrapper on every connection that applies the
+  active context's GUCs before a statement whenever the connection holds other
+  values: a `sync_to_async` hop inherits a live context, sibling tasks keep
+  their own, and a connection loses a context before the next statement that
+  runs without it. See
+  [GUC Affinity Guard](../advanced/architecture.md#guc-affinity-guard).
   *Why:* In async Django, `django.db.connections` is thread-local. A
   `sync_to_async` hop lands on a new thread with a fresh connection that
   does not have the GUC set. The existing `connection_created` signal

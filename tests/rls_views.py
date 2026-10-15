@@ -91,6 +91,23 @@ async def async_widen_to_admin_view(request: HttpRequest) -> JsonResponse:
     )
 
 
+async def _admin_rows() -> AsyncIterator[int]:
+    async with async_admin_context():
+        yield 1
+
+
+async def async_left_open_view(request: HttpRequest) -> HttpResponse:
+    """Leave an admin block open in a suspended generator, and return no response (a bug).
+
+    Django turns the missing response into a 500 page without calling
+    ``process_exception``. The request keeps the generator alive meanwhile.
+    """
+    rows = _admin_rows()
+    await anext(rows)
+    request.left_open = rows  # type: ignore[attr-defined]
+    return None  # type: ignore[return-value]
+
+
 async def async_stream_view(request: HttpRequest) -> StreamingHttpResponse:
     """Stream an async body; it runs after the middleware has ended the request context."""
     tenant_id = get_current_tenant_id()
@@ -145,6 +162,15 @@ def guc_probe_404_handler(request: HttpRequest, exception: Exception) -> JsonRes
     worker thread with a connection of its own and a copy of the request's
     ``ContextVar``s (#130).
     """
+    return _guc_probe(status=404)
+
+
+def guc_probe_500_handler(request: HttpRequest) -> JsonResponse:
+    """``guc_probe_404_handler`` for 500 pages."""
+    return _guc_probe(status=500)
+
+
+def _guc_probe(*, status: int) -> JsonResponse:
     with connection.cursor() as cursor:
         cursor.execute(
             "SELECT pg_backend_pid(), current_setting('rls.current_tenant', true), "
@@ -160,7 +186,7 @@ def guc_probe_404_handler(request: HttpRequest, exception: Exception) -> JsonRes
             "database_products": _database_products(),
             "rls_context_active": get_rls_context_active(),
         },
-        status=404,
+        status=status,
     )
 
 

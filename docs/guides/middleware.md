@@ -52,7 +52,10 @@ work in its own async path; see [Running under ASGI](#running-under-asgi).
    auto-scoped queries; admin users and unauthenticated requests do not).
 6. Sets `_rls_context_active=True` to mark that an RLS context is active. This is used
    by strict mode to distinguish "middleware set context" from "no context at all".
-7. Records in a `ContextVar` that GUCs were set, and on which thread (read by the
+7. Records the GUC values it set for the
+   [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard), which applies them
+   on any other connection the request's code uses (*added in 1.4.0*).
+8. Records in a `ContextVar` that GUCs were set, and on which thread (read by the
    safety-net and `connection_created` signal handlers).
 
 ### Transaction Per Request (`USE_LOCAL_SET=True`)
@@ -131,22 +134,26 @@ Some failures never reach `process_exception`: a URL that does not resolve (Djan
 it outside the code that calls the hook), a view that returns `None`, or an exception from a
 `process_view` or `process_template_response` hook or from an async-capable middleware listed
 after `RLSTenantMiddleware`. Django builds those error responses on a worker thread as well,
-while the request context is still active. *Changed in 1.4.0:* the request's GUCs go only on
-connections opened on the thread that set them, where the middleware clears them again. A
-connection opened on any other thread during the request is left without a context, so these
-error pages see no RLS-protected rows either (#130). Before 1.4.0 the worker thread's
-connection kept the request's GUCs for the life of the thread, and a later error page built on
-that thread, for an anonymous visitor too, ran with them. Under WSGI, and for an exception
-from a synchronous-only middleware listed after `RLSTenantMiddleware`, Django builds the
-error response on the request's own thread, inside its context. A custom error handler,
-template or context processor that needs the visitor's tenant data under ASGI must open
-`tenant_context()` / `admin_context()` itself, for an authenticated `request.user`.
+while the request context is still active. *Changed in 1.4.0:* the worker thread's connection
+is cleared when it opens, and the
+[GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) applies the request's
+context to each statement the error page runs on it, so the page sees what the request may
+see (#41). Before the first statement run without that context, the guard takes it off the
+connection again, so a later error page built on the same thread, an anonymous visitor's
+included, sees nothing (#130). Before 1.4.0 the worker thread's connection got the request's
+GUCs only if it opened during that request, and then kept them for the life of the thread.
+Under WSGI, and for an exception from a synchronous-only middleware listed after
+`RLSTenantMiddleware`, Django builds the error response on the request's own thread, inside
+its context.
 
-The same rule applies to database work handed to another thread, under ASGI or WSGI:
-`sync_to_async(..., thread_sensitive=False)`, `asyncio.to_thread()` or a thread pool runs on
-that thread's own connection, without the request's GUCs. With `DJANGO_ALLOW_ASYNC_UNSAFE`,
-so do queries an async view runs on the event-loop thread itself. Open `tenant_context()` /
-`admin_context()` inside that work if it needs tenant data.
+The same applies to database work handed to another thread with a copy of the request's
+context, under ASGI or WSGI: `sync_to_async(..., thread_sensitive=False)`,
+`asyncio.to_thread()`, or a function run with `contextvars.copy_context().run`. It runs on
+that thread's own connection, and the guard applies the request's context there before each
+statement. With `DJANGO_ALLOW_ASYNC_UNSAFE`, so do queries an async view runs on the
+event-loop thread itself. Work started without a copy of the context
+(`ThreadPoolExecutor.submit()`, `loop.run_in_executor()`) runs without one, fail-closed; open
+`tenant_context()` / `admin_context()` inside it if it needs tenant data.
 
 The async path does not call `process_request` or `process_response`. A subclass that
 overrides either hook therefore keeps the hook-based path that 1.3.4 used, so its hooks
@@ -155,9 +162,9 @@ rather than restoring an outer context.
 
 Async views that need a different context use `async_tenant_context()` /
 `async_admin_context()` (see [Async Code](context-managers.md#async-code)); on exit they
-restore the middleware's context. Keep one RLS context per request task: do not
-`asyncio.gather` work for different tenants inside one request, since it shares the request's
-connection.
+restore the middleware's context. Sibling tasks of one request can hold different contexts:
+they share the request's connection, and the guard applies each task's context before each of
+its statements (see [Concurrent tasks](context-managers.md#concurrent-tasks) for the limits).
 
 A `StreamingHttpResponse` body is iterated after the middleware has finished, as under WSGI,
 so queries made while streaming see no tenant context (fail-closed). Open
@@ -166,15 +173,24 @@ a synchronous one.
 
 ### Response Phase (`process_response`)
 
-1. Resets the `_rls_context_active` flag (via saved token or, when the token belongs to
+1. Ends the GUC values recorded for the GUC affinity guard, first, so that it does not
+   apply the request's context again after the cleanup (*added in 1.4.0*).
+2. Resets the `_rls_context_active` flag (via saved token or, when the token belongs to
    another `contextvars.Context`, by clearing the variable, #58) to prevent cross-request
    leaks.
-2. Clears the `ContextVar` auto-scope state to prevent cross-request leaks.
-3. If `USE_LOCAL_SET` is `False` (default): clears both GUC variables on **all
+3. Clears the `ContextVar` auto-scope state to prevent cross-request leaks. An
+   unauthenticated request served inside a context block (a test that wraps the test
+   client in `tenant_context()`, say) leaves that block's values alone (*changed in
+   1.4.0*).
+4. If `USE_LOCAL_SET` is `False` (default): clears both GUC variables on **all
    configured database aliases** to prevent cross-request leaks on persistent connections.
-4. If `USE_LOCAL_SET` is `True`: GUCs are automatically cleared at transaction end
+5. If `USE_LOCAL_SET` is `True`: GUCs are automatically cleared at transaction end
    (by PostgreSQL), so explicit cleanup is skipped.
-5. Clears the `ContextVar` GUC flag.
+6. Clears the `ContextVar` GUC flag.
+
+The same cleanup runs when a `BaseException` (`KeyboardInterrupt`, a server's timeout)
+escapes the view and skips `process_response` (*changed in 1.4.0*): under WSGI the
+thread's next request would otherwise start inside this request's context.
 
 ### Exception Phase (`process_exception`)
 
@@ -190,6 +206,20 @@ request's tokens stay with `__acall__`, so it clears the variables:
    cleared the same way).
 3. Clears GUC variables (same logic as `process_response`). The GUCs are cleared even if
    resetting a `ContextVar` fails.
+4. Ends a context block the view left open, such as a generator suspended inside
+   `async_admin_context()`, so the error response is not built in that block's context
+   (*added in 1.4.0*). A `got_request_exception` receiver does the same for a 500
+   response that `process_exception` does not see (a view that returns `None`, an
+   exception from a later middleware), and the end of the request ends such a block too.
+   A 4xx response Django builds for an exception raised outside the view (`Http404` from
+   a later middleware, say) sends no signal, and an exception middleware listed after
+   `RLSTenantMiddleware` that returns a response stops this hook from running (Django
+   calls `process_exception` innermost first): list such middleware before
+   `RLSTenantMiddleware`. With `USE_LOCAL_SET=True` the block's `SET LOCAL` values stay
+   until the transaction ends. Keep context blocks inside the code that needs them rather
+   than in a generator the view leaves suspended. A block that a middleware listed after
+   `RLSTenantMiddleware` holds around the rest of the chain is ended as well when a 500
+   response is built inside it, so the rest of that block runs without a context.
 
 This prevents `ContextVar` leaks that could affect subsequent requests on the same
 thread (WSGI) or async task (ASGI).
@@ -263,12 +293,14 @@ RLS_TENANTS = {
 The middleware sets GUCs on all configured aliases during `process_request` and
 clears them during `process_response`. A `connection_created` signal handler
 also sets GUCs on lazily-created connections that don't exist when the middleware
-runs (e.g., a replica connection opened by a database router mid-request). It does
-so only on the thread that set the request's GUCs, where the middleware's cleanup
-clears them; a connection opened on another thread during the request gets no
-context (see [Running under ASGI](#running-under-asgi)). A connection checked out of
-Django's connection pool is cleared of every RLS GUC first (see
-[Django's Connection Pool](connection-pooling.md#djangos-connection-pool)).
+runs (e.g., a replica connection opened by a database router mid-request), on the
+thread that set the request's GUCs. *Changed in 1.4.0:* the
+[GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) also applies the
+active context on every configured alias before each statement, on any thread (see
+[Running under ASGI](#running-under-asgi)), whichever alias the context was entered on:
+a `tenant_context(...)` entered on `default` inside a request scopes a configured replica
+too. A connection checked out of Django's connection pool is cleared of every RLS GUC
+first (see [Django's Connection Pool](connection-pooling.md#djangos-connection-pool)).
 
 See [Configuration](../getting-started/configuration.md#databases) for details.
 

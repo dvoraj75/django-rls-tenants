@@ -47,24 +47,35 @@ for both; the middleware's request transaction has already ended. In an async ge
 
 ### Work handed to another thread sees no rows
 
-**Symptom:** Under `RLSTenantMiddleware`, code run with
-`sync_to_async(..., thread_sensitive=False)`, `asyncio.to_thread()` or a thread pool
-returns zero rows. So does an ASGI error page that queries RLS-protected models when
-Django builds it outside `process_exception`, for example a 404 for a URL that does not
-resolve. The rest of the request sees its data.
+**Symptom:** Under `RLSTenantMiddleware` or a context manager, code run on another thread
+returns zero rows, while the rest of the request sees its data.
 
-**Cause:** That code runs on another thread with its own database connection, while the
-request's GUCs are set on the request thread's connection, the only one the middleware
-can clear. A thread that receives a copy of the request's context (`sync_to_async`,
-`asyncio.to_thread()`, the error-page hop Django makes under ASGI) used to get the GUCs
-on its connection when it opened, and nothing cleared them for the life of the thread,
-so later requests on that thread ran with them (#130). Since 1.4.0 such a connection
-gets none. A plain thread pool never received the context, so it never had them.
+**Cause:** That code runs on another thread with its own database connection, and the
+context's GUCs are set on the connection of the thread that entered it. *Changed in 1.4.0:*
+when the other thread got a copy of the context (`sync_to_async(..., thread_sensitive=False)`,
+`asyncio.to_thread()`, the error-page hop Django makes under ASGI), the
+[GUC affinity guard](advanced/architecture.md#guc-affinity-guard) applies the context to that
+thread's connection before each statement, so with the default session GUCs this no longer
+happens there. It still happens when:
 
-**Fix:** Open `tenant_context()` / `admin_context()` inside the code that runs on the
-other thread, or keep it on the request's thread with `thread_sensitive=True` (the
-default for `sync_to_async`). In a custom error handler, template or context processor,
-enter the context only for an authenticated `request.user`.
+- the thread never got the context: `ThreadPoolExecutor.submit()` and
+  `loop.run_in_executor()` do not copy it;
+- the work runs after the context's block has ended (a task started and not awaited inside
+  it): the guard applies a context only while it is live;
+- `USE_LOCAL_SET=True`: the guard does nothing, and the other thread's connection is not in
+  the request's transaction either;
+- the context was built by hand with `set_current_tenant_id()` / `set_rls_context_active()`
+  instead of a context manager or the middleware, or the GUCs were set by hand with
+  `set_guc()` / `rls_context()`: the guard only applies the admin and tenant GUCs of
+  contexts the library set up.
+
+Before 1.4.0 such a connection got the request's GUCs only if it opened during that request,
+and kept them for later requests on its thread (#130).
+
+**Fix:** Pass the context along (`contextvars.copy_context().run`, `asyncio.to_thread()`),
+open `tenant_context()` / `admin_context()` inside the code that runs on the other thread, or
+keep it on the request's thread with `thread_sensitive=True` (the default for
+`sync_to_async`).
 
 **See:** [Running under ASGI](guides/middleware.md#running-under-asgi).
 
@@ -560,3 +571,31 @@ a composite index with the tenant column first. For raw SQL, use
 
 **See:** [Performance & Indexing](guides/performance.md#composite-indexes-tenant-first),
 [Performance checklist](guides/performance.md#checklist).
+
+### A `set_config(...)` query you did not run
+
+**Symptom:** A query log (`assertNumQueries`, `CaptureQueriesContext`, the Django Debug
+Toolbar) shows `SELECT set_config('rls.is_admin', ...), set_config('rls.current_tenant', ...)`
+before one of your statements.
+
+**Cause:** The [GUC affinity guard](advanced/architecture.md#guc-affinity-guard) ran it
+because the connection did not hold the active context's GUCs, or because it could not tell
+what they were. Code that stays on one thread and connection inside a context runs none.
+Typical reasons:
+
+- the code ran on another thread, or in a sibling task with a different context;
+- a rollback undid GUCs the guard had applied inside the transaction or savepoint;
+- a transaction ended through the driver connection with GUCs different from before it
+  (the guard cannot tell a commit from a rollback there), a savepoint it did not see set
+  was rolled back, or a `RESET ALL` / `DISCARD ALL` ran;
+- an earlier test left a context open.
+
+At `DEBUG` level the `django_rls_tenants` logger names each one: `GUC affinity guard: alias
+'default' held ...; applied the active context's ...`.
+
+**Fix:** Nothing is wrong. In a test that counts queries, run a statement before the counted
+block (or count inside the context) so the connection already holds the context's GUCs, and
+end every context that a test opens by hand, for example `process_request()` without
+`process_response()`.
+
+**See:** [GUC Affinity Guard](advanced/architecture.md#guc-affinity-guard).

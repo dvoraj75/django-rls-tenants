@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import logging
 import time
@@ -22,15 +23,21 @@ from django_rls_tenants.exceptions import NoTenantContextError, RLSConfiguration
 from django_rls_tenants.rls.guc import get_guc, set_guc
 from django_rls_tenants.tenants import middleware as middleware_module
 from django_rls_tenants.tenants.conf import RLSTenantsConfig
+from django_rls_tenants.tenants.context import tenant_context
 from django_rls_tenants.tenants.middleware import (
     RLSTenantMiddleware,
     _clear_gucs_set_flag,
+    _end_context_gucs,
     _mark_gucs_set,
     _reset_or_clear,
     _were_gucs_set,
     _were_gucs_set_on_this_thread,
 )
 from django_rls_tenants.tenants.state import (
+    ContextGucs,
+    _get_context_gucs,
+    _reset_context_gucs,
+    _set_context_gucs,
     get_current_tenant_id,
     get_rls_context_active,
     reset_current_tenant_id,
@@ -38,6 +45,7 @@ from django_rls_tenants.tenants.state import (
     set_current_tenant_id,
     set_rls_context_active,
 )
+from tests.session_gucs import session_gucs
 
 pytestmark = pytest.mark.django_db
 
@@ -154,8 +162,10 @@ class TestProcessResponse:
             response = MagicMock()
             mw.process_response(request, response)
 
-        # GUCs should still be set (SET LOCAL auto-clears at transaction end)
-        assert get_guc("rls.current_tenant") is not None
+        # GUCs should still be set (SET LOCAL auto-clears at transaction end). Read
+        # with a driver cursor: the patch reaches the middleware only, so the
+        # affinity guard, still in session mode, would clear them first.
+        assert session_gucs()[0] is not None
 
 
 class TestThreadLocalFlags:
@@ -781,6 +791,126 @@ class TestTokenResetAcrossContexts:
         assert _were_gucs_set() is False
 
 
+class TestContextGucsCleanup:
+    """The guard's context values end with the request, however the request ends."""
+
+    def test_end_context_gucs_clears_even_when_the_reset_raises(self):
+        token = _set_context_gucs(ContextGucs.for_tenant(1))
+        _reset_context_gucs(token)  # the token is now used up: resetting raises
+        _set_context_gucs(ContextGucs.for_tenant(2))
+
+        with pytest.raises(RuntimeError):
+            _end_context_gucs(token)
+
+        assert _get_context_gucs() is None
+
+    def test_base_exception_from_the_view_still_ends_the_context(self, tenant_a_user):
+        """Not an Exception, so Django does not turn it into a response (WSGI)."""
+
+        class _Abort(BaseException):
+            pass
+
+        def abort(request):
+            raise _Abort
+
+        with pytest.raises(_Abort):
+            RLSTenantMiddleware(get_response=abort)(_make_request(user=tenant_a_user))
+
+        assert _get_context_gucs() is None
+        assert get_current_tenant_id() is None
+        assert get_guc("rls.current_tenant") is None
+        assert _were_gucs_set() is False
+
+
+class TestCleanupOfTheTenantValues:
+    """What the cleanup does to the tenant ``ContextVar`` and the strict-mode flag."""
+
+    @pytest.mark.parametrize("inside_a_block", [False, True])
+    def test_base_exception_in_process_request_resets_what_it_set(
+        self,
+        inside_a_block,
+        tenant_a,
+        tenant_b_user,
+        monkeypatch,
+    ):
+        """A signal-raised exception after the tenant was set and before the rest."""
+
+        class _Abort(BaseException):
+            pass
+
+        def abort(active):
+            raise _Abort
+
+        middleware = RLSTenantMiddleware(get_response=lambda request: None)
+        block = tenant_context(tenant_a.pk) if inside_a_block else contextlib.nullcontext()
+
+        with block:
+            monkeypatch.setattr(middleware_module, "set_rls_context_active", abort)
+            with pytest.raises(_Abort):
+                middleware(_make_request(user=tenant_b_user))
+            monkeypatch.undo()
+            tenant_id = get_current_tenant_id()
+
+        assert tenant_id == (tenant_a.pk if inside_a_block else None)
+
+    def test_anonymous_request_clears_what_its_view_left(self):
+        def view(request):
+            set_current_tenant_id(7)
+            set_rls_context_active(True)
+
+        RLSTenantMiddleware(get_response=view)(_make_request())
+
+        assert (get_current_tenant_id(), get_rls_context_active()) == (None, False)
+
+
+class TestMiddlewareContextValues:
+    """The context values the GUC affinity guard applies, as the middleware sets and ends them."""
+
+    def test_request_inside_a_context_gives_the_outer_context_back(self, tenant_a, tenant_b_user):
+        middleware = RLSTenantMiddleware(get_response=lambda request: None)
+        request = _make_request(user=tenant_b_user)
+
+        with tenant_context(tenant_a.pk):
+            middleware.process_request(request)
+            middleware.process_response(request, MagicMock())
+
+            assert _get_context_gucs() == ContextGucs.for_tenant(tenant_a.pk)
+            assert get_guc("rls.current_tenant") == str(tenant_a.pk)
+
+    def test_failed_request_setup_leaves_no_context_values(self, tenant_a_user, monkeypatch):
+        def fail():
+            msg = "setup failed"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(middleware_module, "_mark_gucs_set", fail)
+        middleware = RLSTenantMiddleware(get_response=lambda request: None)
+
+        with pytest.raises(RuntimeError, match="setup failed"):
+            middleware.process_request(_make_request(user=tenant_a_user))
+
+        assert _get_context_gucs() is None
+
+    def test_cleanup_error_does_not_replace_a_base_exception(self, tenant_a_user, monkeypatch):
+        class _Abort(BaseException):
+            pass
+
+        def abort(request):
+            raise _Abort
+
+        def failing_cleanup(request):
+            msg = "cleanup failed"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(
+            RLSTenantMiddleware,
+            "_cleanup_rls_state",
+            staticmethod(failing_cleanup),
+        )
+
+        with pytest.raises(_Abort):
+            RLSTenantMiddleware(get_response=abort)(_make_request(user=tenant_a_user))
+
+
 class TestProcessExceptionRollback:
     """Rollback is deferred until the middleware-owned transactions exit."""
 
@@ -1159,7 +1289,9 @@ class TestNativeAsyncPath:
             async_to_sync(_async_mw(aget_response))(_make_request(user=tenant_a_user))
 
         assert _state() == (None, False, True)
-        assert get_guc("rls.current_tenant") == str(tenant_a_user.rls_tenant_id)
+        # Still on the session. A driver cursor reads it: the affinity guard would
+        # clear it before any statement outside the context.
+        assert session_gucs()[0] == str(tenant_a_user.rls_tenant_id)
 
         # close_old_connections would close the test's connection.
         request_finished.disconnect(close_old_connections)

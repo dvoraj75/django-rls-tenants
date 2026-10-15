@@ -429,6 +429,11 @@ with rls_bypass(using="replica"):
 assert_rls_enabled("myapp_order", using="replica")
 ```
 
+*Changed in 1.4.0:* with the default session GUCs, `rls_bypass()` and `rls_as_tenant()`
+apply to every alias in `RLS_TENANTS["DATABASES"]`, whichever one `using` names, even one
+outside that list (see [Multi-Database Support](context-managers.md#multi-database-support)).
+An alias outside the list gets the context only when `using` names it.
+
 ## Example: Full Test Suite
 
 ```python title="tests/test_orders.py"

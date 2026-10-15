@@ -98,8 +98,11 @@ class RLSTenantsConfig:
 
     @property
     def DATABASES(self) -> list[str]:
-        """Database aliases to set GUCs on. Default: ``["default"]``.
+        """Database aliases that follow the active RLS context. Default: ``["default"]``.
 
+        The middleware sets the GUCs on each of them, and with session GUCs
+        the GUC affinity guard applies the active context on each of them
+        before every statement, whichever alias the context was entered on.
         In multi-database setups (e.g., read replicas), add all aliases
         that serve RLS-protected queries::
 

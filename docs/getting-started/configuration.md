@@ -55,8 +55,11 @@ RLS_TENANTS = {
 
 The middleware sets GUCs on all configured aliases during each request. A
 `connection_created` signal handler also sets GUCs on connections created lazily,
-after the middleware ran, but only on the thread that set the request's GUCs. A
-connection opened on another thread during the request gets none (see
+after the middleware ran, on the thread that set the request's GUCs. *Changed in 1.4.0:*
+with the default session GUCs, the
+[GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) applies the active
+context on every configured alias before each statement, on any thread, whichever alias
+the context was entered on (see
 [Running under ASGI](../guides/middleware.md#running-under-asgi)). A connection checked
 out of Django's connection pool (`OPTIONS["pool"]`) is cleared of every RLS GUC first,
 whether or not a request is active (see

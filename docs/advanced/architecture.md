@@ -47,10 +47,11 @@ The upper layer builds Django multitenancy on top of `rls/`:
 | `tenants/managers.py` | `TenantQuerySet`, `RLSManager` -- lazy GUC setting at query eval time |
 | `tenants/context.py` | `tenant_context()`, `admin_context()`, `@with_rls_context` |
 | `tenants/middleware.py` | `RLSTenantMiddleware` -- per-request RLS context, with a native async path for ASGI |
+| `tenants/affinity.py` | The GUC affinity guard -- an execute wrapper that applies the active context's GUCs on whichever connection a statement runs on (see [GUC Affinity Guard](#guc-affinity-guard)) |
 | `tenants/bypass.py` | `set_bypass_flag()`, `clear_bypass_flag()`, `bypass_flag()` |
 | `tenants/testing.py` | Test helpers: `rls_bypass`, `rls_as_tenant`, assertion functions, and their async counterparts (`async_rls_bypass`, `async_rls_as_tenant`, `aassert_*`) |
 | `tenants/types.py` | `TenantUser` protocol |
-| `tenants/state.py` | `get_current_tenant_id()`, `set_current_tenant_id()`, `reset_current_tenant_id()` -- `ContextVar`-based tenant state for auto-scoping. Also `get_rls_context_active()`, `set_rls_context_active()`, `reset_rls_context_active()` -- tracks whether any RLS context is active (used by strict mode) |
+| `tenants/state.py` | `get_current_tenant_id()`, `set_current_tenant_id()`, `reset_current_tenant_id()` -- `ContextVar`-based tenant state for auto-scoping. Also `get_rls_context_active()`, `set_rls_context_active()`, `reset_rls_context_active()` -- tracks whether any RLS context is active (used by strict mode). A private third `ContextVar` holds the GUC values the library applied for the active context, for the GUC affinity guard |
 | `tenants/checks.py` | Django system checks (W001--W010) |
 
 ### Import Boundary
@@ -87,6 +88,155 @@ ORM query executes  ──────▶  SELECT * FROM orders
 Middleware cleanup  ──────▶  set_config('rls.current_tenant', '')
                              set_config('rls.is_admin', '')
 ```
+
+## GUC Affinity Guard
+
+*Added in 1.4.0 (#41).* A context sets the admin and tenant GUCs when it starts, on the
+connection that is current at that moment. Django's connections are per thread, so SQL can
+still run on another connection while the context is live, or on the same connection after
+something else has changed the GUCs:
+
+- a `sync_to_async(..., thread_sensitive=False)` hop or `asyncio.to_thread()` runs on another
+  thread, with a copy of the context's `ContextVar`s but with that thread's own connection,
+  and so does an error page Django builds there under ASGI;
+- sibling `asyncio` tasks of one request share its connection, so one task's context can
+  change the GUCs between another task's statements;
+- a context entered on one alias leaves the other aliases as they were.
+
+The `connection_created` handler puts an execute wrapper, the guard, first in the
+`execute_wrappers` of every PostgreSQL connection, and Django runs every statement through
+it. The guard acts only on connections of an alias in `RLS_TENANTS["DATABASES"]`, with
+`USE_LOCAL_SET=False`. Before each statement there, it compares:
+
+1. the GUC values of the active context, held in a private `ContextVar` that only the
+   library's own entry points set (the context managers, the middleware, `for_user()`), to
+   exactly the values they write;
+2. the values the library last left on that database session.
+
+When they differ, it first runs `SELECT set_config('rls.is_admin', ..., false),
+set_config('rls.current_tenant', ..., false)` on the same connection, with cleared values
+outside any context. The statement goes through Django's cursor, so query logs show it, and
+the `django_rls_tenants` logger names each one at `DEBUG` level. If it fails, the error
+propagates and the original statement does not run. A context therefore applies to every
+alias in `RLS_TENANTS["DATABASES"]`, whichever alias it was entered on, including one
+outside the list.
+
+```
+Request thread                       Worker thread (hop with a copy of the context)
+──────────────                       ──────────────────────────────────────────────
+tenant_context(42)
+  set_config(... '42') ──▶ conn A
+  sync_to_async(f, thread_sensitive=False)
+                                     f(): cursor.execute("SELECT ...")
+                                       guard: context (false, 42), conn B holds nothing
+                                       set_config(... '42') ──▶ conn B
+                                       SELECT ...           ──▶ conn B
+                                     later job without a context:
+                                       guard: no context, conn B holds (false, 42)
+                                       set_config(... '')   ──▶ conn B
+                                       SELECT ...           ──▶ conn B
+```
+
+**Live contexts only.** A copy of the context (a hop, a task, `copy_context()`) shares the
+context's entry in that `ContextVar` with the block that made it, and the block's exit ends
+it for every copy. A hop or task awaited inside the block inherits the context; one that
+runs after the block has ended gets nothing, as on a connection without a context. A block
+such a copy entered itself, and that exits after the enclosing block has ended, clears the
+GUCs instead of restoring the ended context's values. A block that exits in another
+`contextvars.Context` than the one it entered in (a generator suspended inside it and closed
+or garbage-collected elsewhere) finds another context current: it restores its snapshot
+only on the database session it entered on (a `SET LOCAL` there would otherwise outlive
+the block; an ended enclosing context's values are cleared instead, as above), and leaves
+the values unknown, so the guard applies the current context before the next statement.
+A block the view leaves open in a request (a generator suspended inside it) is ended
+before Django builds the error response for an exception, by `process_exception` or, for a
+500 response it did not see (a view that returns `None`), by a `got_request_exception`
+receiver, and when the request ends. The request's own context is not ended there: the
+error page inherits it. A block that a middleware listed after `RLSTenantMiddleware` holds
+around the rest of the chain cannot be told apart from one left open, so it ends too when
+a 500 response is built inside it (fail-closed for the rest of that block). Not covered: a
+4xx response Django builds for an exception raised outside the view (`Http404` from a
+later middleware), which sends no signal; a response an exception middleware listed after
+`RLSTenantMiddleware` returns, which stops its `process_exception` (list exception
+middleware before it); and, with `USE_LOCAL_SET=True`, the left-open block's `SET LOCAL`
+values, which stay until the transaction ends.
+
+`asgiref` copies `ContextVar` values from one context into another where they differ: into
+the coroutine `async_to_sync` runs, which therefore inherits the block it is called in,
+and back from a `sync_to_async` call into its caller, also when the call is cancelled
+while its function is still inside a block. A block's entry never replaces an entry the
+caller already has, so a cancelled call cannot hand its still-running block to a caller
+inside a context, nor to a request the middleware serves: a request always holds an entry,
+its own context's, the one it is served in, or one of no context, and a coroutine its view
+runs with `async_to_sync` inherits it. Only the middleware's `process_request`, which runs
+in a hop of its own under `MiddlewareMixin`, hands its context back. A coroutine outside
+both (one started with `asyncio.run()`, say) does get the block of a call it cancels,
+until that block ends.
+
+When a block exits, the guard also takes its context off this thread's
+other configured aliases right away, if it applied it there; a connection that fails then
+is left for its next statement.
+
+**What it records.** The library's own GUC writes (context entry and exit, the middleware,
+`for_user()`, the `connection_created` handler) run with the guard out of the way and record
+the values they leave. A context's exit restores its entry snapshot, and the guard brought
+the session to the enclosing context's values before that snapshot was read, so code that
+stays on one connection and thread runs no extra statement. Writes of the same GUCs by other
+code (`set_guc()`, `rls_context()`) are not recorded and stay in force until the context
+changes, as before: `assert_rls_blocks_without_context()` relies on that. A connection that
+opened before the handler was connected (during another app's `ready()`, say) gets the guard
+at the library's first GUC write on it.
+
+**Rollbacks.** PostgreSQL undoes a `set_config()` made in a transaction or savepoint that is
+rolled back. The guard follows:
+
+- Django's commit and rollback of the connection (`atomic()`, `transaction.commit()` /
+  `rollback()`): `install()` wraps the connection's `_commit()` and `_rollback()` and reads
+  the transaction status before and after. A commit keeps the values; a rollback, or a
+  commit of a failed transaction (which PostgreSQL turns into a rollback without an
+  error), brings back those from before the transaction; a call that ended nothing
+  (psycopg2 sends nothing in autocommit mode) changes nothing.
+- the transaction-control statements that run through Django's cursor: a savepoint records
+  the values at that point and `ROLLBACK TO` it puts them back; `ROLLBACK` and `COMMIT` sent
+  as SQL are followed like Django's, and a `COMMIT` of a failed transaction, which
+  PostgreSQL turns into a rollback, as one. `RESET ALL`, `DISCARD ALL` and `RESET` of the
+  admin or tenant GUC make the values unknown. Leading comments are skipped; a string with
+  several statements, a statement that is not text, or a savepoint name the guard cannot
+  read makes them unknown.
+- the transaction status the driver reports (libpq, without a round trip), for a transaction
+  that ended where the guard could not see it (a commit on the driver connection): the
+  values recorded during it are kept only if they equal those from before it, since commit
+  and rollback then leave the same thing.
+
+Unknown values are applied again before the next statement. The guard never runs its
+statement before a transaction-control statement, in a failed transaction, or while Django
+has marked the transaction for rollback: those statements succeed or fail on their own.
+
+**Limits.**
+
+- Session GUCs only. With `USE_LOCAL_SET=True` the guard does nothing and never writes a
+  session GUC.
+- One Django connection is taken to be one database session. Behind an external pooler in
+  transaction mode (PgBouncer) it is not, and the guard cannot know which server connection
+  a statement reaches: use `USE_LOCAL_SET=True` there, as before.
+- The admin and tenant GUCs only. Bypass flags and other GUCs set with `bypass_flag()` or
+  `rls_context()` stay on the connection they were set on, and sibling tasks see them.
+- Only contexts the library set up. Code that builds a context by hand with
+  `set_current_tenant_id()` / `set_rls_context_active()` and writes the GUCs itself is left
+  alone: the guard never infers a context from those functions (an active flag without a
+  tenant would otherwise mean admin).
+- SQL that bypasses Django's execute wrappers is not seen: a driver cursor,
+  `CursorWrapper.callproc()`, the driver's `copy` methods, and the `FETCH`es of a server-side
+  cursor that is already open. On a connection the guard has used, such SQL sees what it last
+  left there until the next statement it sees: a worker thread's connection can hold the
+  context of the last hop it ran. Inside a transaction PostgreSQL computes a server-side
+  cursor's rows as they are fetched (outside one, when it opens), so a sibling task's
+  statement between two fetches changes the GUCs the later rows are checked against.
+- A transaction that ends where the guard cannot see it and is followed by one it cannot see
+  start (both on the driver connection) can leave it trusting values the rollback undid; the
+  next statement through Django's cursor after a visible boundary corrects it.
+- The cost is a few microseconds of Python per statement, and no extra round trip while the
+  connection already holds the context's values.
 
 ## Policy Generation
 

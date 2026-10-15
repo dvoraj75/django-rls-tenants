@@ -31,7 +31,7 @@ def restore_gucs(
     is_local: bool = False,
     using: str = "default",
     exc_pending: bool = False,
-) -> None:
+) -> bool:
     """Restore several GUCs to the values saved before a context block.
 
     Shared exit path for every context manager in the library. Restoring
@@ -65,12 +65,17 @@ def restore_gucs(
         is_local: Scope the block used; ``True`` re-issues ``SET LOCAL``.
         using: Database alias. Default: ``"default"``.
         exc_pending: ``True`` when called while an exception is propagating.
+
+    Returns:
+        ``True`` if every GUC was restored, ``False`` if a failure was
+        skipped because ``exc_pending`` was set.
     """
     if not previous:
-        return
+        return True
     conn = connections[using]
     needs_rollback = conn.needs_rollback
     conn.needs_rollback = False
+    restored = True
     try:
         for name, prev in previous.items():
             try:
@@ -78,6 +83,7 @@ def restore_gucs(
             except DatabaseError:
                 if not exc_pending:
                     raise
+                restored = False
                 logger.debug(
                     "Skipping GUC restore for %s: the transaction is already aborted and "
                     "will be rolled back; the original exception is propagated instead.",
@@ -86,6 +92,7 @@ def restore_gucs(
                 )
     finally:
         conn.needs_rollback = needs_rollback
+    return restored
 
 
 @contextmanager
@@ -197,6 +204,7 @@ async def _run_enter_hop(
     *,
     is_local: bool,
     using: str,
+    undo: Callable[..., object] = restore_gucs,
 ) -> dict[str, str | None]:
     """Run an enter helper in one thread-sensitive hop, undoing it if cancelled meanwhile.
 
@@ -213,6 +221,8 @@ async def _run_enter_hop(
         variables: Mapping of GUC name to the value to set.
         is_local: If ``True``, use ``SET LOCAL`` (transaction-scoped).
         using: Database alias.
+        undo: Restores the snapshot after a cancellation, called like
+            :func:`restore_gucs` (the default).
 
     Returns:
         The snapshot returned by ``enter``, for :func:`restore_gucs`.
@@ -226,7 +236,7 @@ async def _run_enter_hop(
         # The hop keeps running in its thread; wait for it so the change can
         # be undone. A second cancellation here is the documented gap.
         previous = await hop
-        await sync_to_async(restore_gucs, thread_sensitive=True)(
+        await sync_to_async(undo, thread_sensitive=True)(
             previous,
             is_local=is_local,
             using=using,

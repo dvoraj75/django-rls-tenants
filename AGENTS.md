@@ -118,10 +118,13 @@ but only on the thread that set the request's GUCs: the "GUCs set" `ContextVar`
 holds that thread's marker (`_mark_gucs_set()`, `_were_gucs_set_on_this_thread()`
 in `middleware.py`). `ContextVar`s are copied into `thread_sensitive=False` hops,
 whose connections the cleanup never reaches, so on any other thread the handler
-clears the GUCs instead (#130). Code that sets the flag from a different thread
-than the one that set the GUCs must pass that thread's marker (the async path
-takes it from the enter hop); `_mark_gucs_set()` alone marks the current thread.
-The safety-net `request_finished` handler clears GUCs on all configured aliases.
+clears the GUCs instead (#130), and the GUC affinity guard (below) then applies the
+copied context to that thread's statements (#41). Code that sets the flag from a
+different thread than the one that set the GUCs must pass that thread's marker (the
+async path takes it from the enter hop); `_mark_gucs_set()` alone marks the current
+thread. The safety-net `request_finished` handler clears GUCs on all configured aliases,
+and ends the guard's context. The sync `__call__` also cleans up when a `BaseException`
+skips `process_response`.
 
 On an alias with `OPTIONS["pool"]` (Django's psycopg pool, `_is_pooled()` in `apps.py`),
 Django sends `connection_created` on every checkout, and the handler first clears every
@@ -143,6 +146,81 @@ connection (with a pool, Django has already returned it). System check `W010` as
 When modifying middleware or GUC-related code, ensure all database iteration
 uses `conf.DATABASES` rather than hardcoding `"default"`.
 
+### GUC Affinity Guard
+
+`tenants/affinity.py` (#41). The `connection_created` handler (`_prepare_new_connection()`
+in `apps.py`) calls `install()` on every PostgreSQL connection: `_guard` goes first in
+`execute_wrappers` (Django's `execute_wrapper()` pops the last one on exit), the
+connection's `_commit` / `_rollback` are wrapped, and a `_SessionGUCs` tracker is attached.
+Before each statement on an alias in `conf.DATABASES` with `USE_LOCAL_SET=False`, the guard
+compares the active context's values (`state._get_context_gucs()`: a `ContextGucs` named
+tuple, or `None`) with what the tracker says the session holds and, if they differ, runs
+`write_gucs()` (one `set_config()` pair) first; a failure propagates. So every configured
+alias follows the context, whichever alias it was entered on. The `ContextVar` holds a
+`_Live` holder that `_reset_context_gucs()` / `_clear_context_gucs()` end for every copy,
+so a hop or task inherits a context only while its block is live. `_reset_context_gucs()`
+also ends a newer holder left current in its place, and the current one for a token used
+twice, but not on `ValueError` (a token from another `Context`): that context's holder is
+not the block's. asgiref copies a value into the coroutine `async_to_sync` runs and back
+from a `sync_to_async` call where it compares unequal (`!=`). `_Live.__ne__` keeps a
+block's holder (`block=True`) from replacing a holder the destination has, so a cancelled
+call's still-running block never reaches a caller that holds one, while `async_to_sync`
+inside a block inherits it (its task holds no holder, or a copy of the same one); `==` is
+identity. Only `process_request` sets `block=False`, since `MiddlewareMixin` runs it in a
+hop of its own. A request always holds a holder: its own context's (native path,
+authenticated) or `_holder_for_the_request()`'s (the one found, or one of no context; WSGI,
+the native anonymous path, the hook path), restored by token, on the hook path after the
+cleanup hop.
+The wrapped `_commit` / `_rollback` read the libpq status before and after (a commit of a
+failed transaction is a rollback; a call that ended nothing is ignored; an exception other
+than `DatabaseError` from a commit leaves values the transaction changed unknown).
+
+Rules for code that sets a context or writes the admin/tenant GUCs:
+
+- Every library entry point that sets the tenant `ContextVar`s sets the guard's too, to
+  exactly the values it writes: the context managers and `_rls_scope()` use
+  `context._rls_state()`, which sets and resets all three; the middleware keeps what
+  `_set_context_gucs()` returned on the request (`__acall__` too, for `process_exception`'s
+  hop) and ends it first, with `_end_context_gucs()`. The context managers pass the
+  enclosing holder (`state._current_live()`, read on entry) and the DB-API connection they
+  entered on (`_session_of()`) to `_restore_tenant_gucs(..., enclosing=..., session=...)`,
+  which clears instead of restoring when that context has ended meanwhile. When the
+  current holder is not `enclosing`, the block exited in another `Context`: it restores the
+  snapshot only on `session`, recording `UNKNOWN`, and only forgets on any other session.
+  The guard never infers a context from `get_current_tenant_id()` /
+  `get_rls_context_active()`, which are public.
+- The middleware records the holder a request found (`_FoundContext` on
+  `request._rls_found_context`). `_end_blocks_left_open()` ends a newer current holder
+  that is not the request's own (a block the view left open) before Django builds the
+  error response: from `process_exception` (in a `finally` after the cleanup) and from the
+  `got_request_exception` receiver in `apps.py` (500s `process_exception` does not see).
+  `_release_context_gucs()` ends one at the end of the request, and `_cleanup_rls_state()`
+  scrubs the tenant values of a request that set none only when it was not served inside
+  a live context.
+- `_Live.serial` orders holders: `_end_if_newer()` ends a holder left current only if it is
+  newer than the one being reset or released, so an exit out of order (an inner block whose
+  enclosing request context was reset below it) does not end an older enclosing context.
+- The library's own GUC writes run inside `writing(alias_or_connection, values)`, which
+  keeps the guard out of the way and records `values` (`UNKNOWN` if the block raises). A
+  restore records `_get_context_gucs()` read after the `ContextVar` reset
+  (`_restore_tenant_gucs()` in `context.py`, which also settles the thread's other
+  configured aliases): the guard reconciled the snapshot reads, so the snapshot holds the
+  enclosing context's values. A snapshot taken inside `writing()` needs
+  `apply_active_context()` first (`_enter_tenant_gucs()`).
+- Writes by other code (`set_guc()`, `rls_context()`) are deliberately not recorded.
+
+PostgreSQL undoes `set_config()` calls made in a rolled-back transaction or savepoint, so
+the tracker follows Django's commit and rollback (the wrapped `_commit` / `_rollback`), the
+libpq transaction status, and the statements in `_FOLLOWED` that run through Django's cursor
+(savepoint stack, `ROLLBACK`/`COMMIT` as SQL, `RESET ALL`/`DISCARD ALL`/`RESET` of the two
+GUCs; leading comments skipped, compound statements forgotten); what it cannot follow
+becomes `UNKNOWN` and is applied again before the next statement. Transaction-control
+statements, failed transactions and `needs_rollback` are never reconciled. In tests, a test
+that leaves a context open relies on the autouse `_clear_gucs_after_test` fixture, which
+calls `_clear_context_gucs()`; a test that checks what a session holds regardless of the
+guard reads it with a driver cursor (`tests/session_gucs.py`); a test that counts
+statements runs one first, so the guard has settled the connection.
+
 ### Strict Mode
 
 When `STRICT_MODE=True`, `TenantQuerySet` evaluation methods raise
@@ -152,7 +230,8 @@ When `STRICT_MODE=True`, `TenantQuerySet` evaluation methods raise
 context. This distinguishes "no context" (should raise) from "admin context"
 (both have `_current_tenant_id=None`). All entry points (including
 `TenantQuerySet._rls_scope()`) set the flag to `True` on entry and restore via token on
-exit. The guard is in `TenantQuerySet._check_strict_mode()`.
+exit. The guard is in `TenantQuerySet._check_strict_mode()`. A third, private `ContextVar`
+(`_context_gucs`) drives the GUC affinity guard (see above).
 
 ### `for_user()` Scope
 
@@ -174,8 +253,10 @@ clears the GUCs. Never set or reset a `ContextVar` inside a `sync_to_async` hop 
 belongs to a copied context, #58), and never use `thread_sensitive=False` in library code
 (another thread means another connection). `process_exception` must keep ending the context
 under ASGI, because Django builds the error response on another thread and connection.
-Errors Django builds without calling `process_exception` (an unresolvable URL, for one) rely
-on the `connection_created` thread check instead (#130).
+Errors Django builds without calling `process_exception` (an unresolvable URL, for one) are
+not ended by it: the `connection_created` thread check clears a connection opened for them,
+and the GUC affinity guard applies the copied context to their statements and takes it off
+the connection before the next statement run without it (#130, #41).
 A subclass that overrides `process_request` or `process_response` is detected in `__init__`
 and served by `_acall_through_sync_hooks` (`MiddlewareMixin.__acall__`), so changes to the
 sync hooks must keep that path working too.
