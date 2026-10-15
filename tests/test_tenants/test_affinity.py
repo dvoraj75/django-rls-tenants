@@ -19,6 +19,7 @@ from django.core.signals import got_request_exception, request_finished
 from django.db import (
     DEFAULT_DB_ALIAS,
     DatabaseError,
+    Error,
     IntegrityError,
     OperationalError,
     close_old_connections,
@@ -2290,3 +2291,17 @@ class TestTransactionEndBranches:
 
         with tenant_context(tenant_a.pk):
             assert _in_atomic(set_it, roll_back=True) is affinity.UNKNOWN
+
+
+@pytest.mark.django_db(transaction=True)
+class TestClosedConnection:
+    """A cursor used after ``connection.close()`` fails with Django's error, not the guard's."""
+
+    def test_the_statement_raises_djangos_database_error(self):
+        with connection.cursor() as cursor:
+            connection.close()
+            with pytest.raises(Error):
+                cursor.execute("SELECT 1")
+        # The next session is tracked from the start.
+        assert _gucs() == _NO_GUCS
+        assert _tracker().raw is connection.connection

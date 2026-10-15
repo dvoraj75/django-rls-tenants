@@ -94,6 +94,16 @@ If no context is active when the task is enqueued, nothing is captured and the
 task runs unscoped (fail-closed) — unless you opt into
 [`rls_require_context`](#requiring-a-context).
 
+What is captured is the context the library set up: the innermost live
+`tenant_context()` / `admin_context()` block or middleware request (the same record the
+[GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) applies), not the
+public tenant state on its own. A `sync_to_async` call cancelled while its function is inside
+another block copies that block's public values into the caller, but not the record, so a
+task enqueued afterwards still carries the caller's own context. A context that has ended
+but is still current (work that outlived its block) captures nothing. Only outside any such
+scope does a context built by hand with `set_current_tenant_id()` /
+`set_rls_context_active()` propagate.
+
 ## The `RLSTask` base class
 
 `@rls_task` is sugar for `shared_task(base=RLSTask)`. Use the base class

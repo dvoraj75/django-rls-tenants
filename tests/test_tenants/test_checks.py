@@ -10,11 +10,12 @@ from django.core.checks import Warning as CheckWarning
 from django.db import connection
 from django.test import override_settings
 
-from django_rls_tenants.pool import reset_rls_gucs
+from django_rls_tenants.pool import _policy_guc_names, reset_rls_gucs
 from django_rls_tenants.tenants.checks import (
     _check_conn_max_age_with_session_gucs,
     _check_databases_alias_exists,
     _check_guc_prefix_mismatch,
+    _check_policy_guc_defaults,
     _check_pool_without_reset,
     _check_superuser_connection,
     _check_tenant_fk_field_exists,
@@ -69,6 +70,7 @@ class TestCheckRlsConfig:
     # aggregation test, even when the real helper would return no warnings.
     _HELPERS = (
         "_check_superuser_connection",
+        "_check_policy_guc_defaults",
         "_check_guc_prefix_mismatch",
         "_check_conn_max_age_with_session_gucs",
         "_check_pool_without_reset",
@@ -565,6 +567,115 @@ class TestCheckSuperuserConnection:
         assert [w.id for w in warnings] == ["django_rls_tenants.W005"]
         assert f"'{role}' has the BYPASSRLS attribute" in warnings[0].msg
         assert "superuser and" not in warnings[0].msg
+
+
+def _run_policy_default_check_with_rows(rows):
+    """Run ``_check_policy_guc_defaults`` against mocked ``pg_db_role_setting`` rows."""
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = rows
+    mock_cursor.__enter__ = lambda self: self
+    mock_cursor.__exit__ = MagicMock(return_value=False)
+    with patch("django_rls_tenants.tenants.checks.connection") as mock_conn:
+        mock_conn.cursor.return_value = mock_cursor
+        mock_conn.ops.quote_name.side_effect = lambda name: f'"{name}"'
+        return _check_policy_guc_defaults()
+
+
+class TestCheckPolicyGucDefaults:
+    """Tests for _check_policy_guc_defaults (W011).
+
+    A default set with ``ALTER DATABASE ... SET`` or ``ALTER ROLE ... SET`` is in
+    force in every new session before any RLS context is set, and the library
+    never clears it.
+    """
+
+    def test_no_warning_without_defaults(self):
+        assert _run_policy_default_check_with_rows([]) == []
+
+    def test_w011_for_a_database_default(self):
+        warnings = _run_policy_default_check_with_rows(
+            [("app_db", None, ["search_path=public", "rls.is_admin=true"])]
+        )
+
+        assert [w.id for w in warnings] == ["django_rls_tenants.W011"]
+        assert "rls.is_admin = 'true'" in warnings[0].msg
+        assert "for database 'app_db'" in warnings[0].msg
+        assert 'ALTER DATABASE "app_db" RESET rls.is_admin;' in str(warnings[0].hint)
+
+    def test_w011_for_a_role_default(self):
+        warnings = _run_policy_default_check_with_rows([(None, "app", ["rls.current_tenant=7"])])
+
+        assert [w.id for w in warnings] == ["django_rls_tenants.W011"]
+        assert "for role 'app' in every database" in warnings[0].msg
+        assert 'ALTER ROLE "app" RESET rls.current_tenant;' in str(warnings[0].hint)
+
+    def test_w011_for_a_role_default_in_one_database(self):
+        """GUC names are compared case-insensitively, as PostgreSQL does."""
+        warnings = _run_policy_default_check_with_rows([("app_db", "app", ["RLS.IS_ADMIN=true"])])
+
+        assert [w.id for w in warnings] == ["django_rls_tenants.W011"]
+        assert "for role 'app' in database 'app_db'" in warnings[0].msg
+        assert 'ALTER ROLE "app" IN DATABASE "app_db" RESET RLS.IS_ADMIN;' in str(warnings[0].hint)
+
+    def test_covers_every_guc_the_policies_read(self):
+        """Bypass flags declared on the models' constraints count too, one warning each."""
+        names = _policy_guc_names()
+        assert len(names) > 2  # the configured pair plus the test models' bypass flags
+        warnings = _run_policy_default_check_with_rows(
+            [("app_db", None, [f"{name}=true" for name in names])]
+        )
+
+        assert [w.id for w in warnings] == ["django_rls_tenants.W011"] * len(names)
+        assert [w.msg.split(" = ")[0].rsplit(" ", 1)[1] for w in warnings] == list(names)
+
+    def test_other_gucs_are_ignored(self):
+        rows = [("app_db", None, ["work_mem=64MB", "rls.unrelated=1"]), (None, "app", None)]
+        assert _run_policy_default_check_with_rows(rows) == []
+
+    def test_no_warning_when_db_unavailable(self):
+        with patch("django_rls_tenants.tenants.checks.connection") as mock_conn:
+            mock_conn.cursor.side_effect = Exception("no database")
+            assert _check_policy_guc_defaults() == []
+
+    @pytest.mark.integration
+    @pytest.mark.superuser_only
+    def test_w011_for_real_defaults(self):
+        """Against live PostgreSQL: a database default and a role-in-database default.
+
+        Both are set for the test database only, so a parallel run on the same
+        server is not affected, and both are transactional and reset again.
+        Setting a default for a custom (placeholder) GUC with ``ALTER DATABASE``
+        / ``ALTER ROLE`` needs a superuser on PostgreSQL 15+, so on a plain role
+        the test fails instead of skipping (deselect it with
+        ``-m "not superuser_only"``, see #110).
+        """
+        if not _is_superuser():
+            pytest.fail(
+                "test_w011_for_real_defaults needs a PostgreSQL superuser connection to ALTER "
+                "DATABASE ... SET a custom GUC, but the test connection is a plain role. "
+                'Run as a superuser or deselect it with -m "not superuser_only".'
+            )
+        with connection.cursor() as cur:
+            cur.execute("SELECT current_database()")
+            database = connection.ops.quote_name(cur.fetchone()[0])
+            cur.execute(f"ALTER DATABASE {database} SET rls.is_admin = 'true'")
+            cur.execute(
+                f"ALTER ROLE CURRENT_USER IN DATABASE {database} SET rls.current_tenant = '7'"
+            )
+        try:
+            warnings = _check_policy_guc_defaults()
+        finally:
+            with connection.cursor() as cur:
+                cur.execute(f"ALTER DATABASE {database} RESET rls.is_admin")
+                cur.execute(
+                    f"ALTER ROLE CURRENT_USER IN DATABASE {database} RESET rls.current_tenant"
+                )
+
+        assert [w.id for w in warnings] == ["django_rls_tenants.W011"] * 2
+        assert "rls.is_admin = 'true'" in warnings[0].msg
+        assert "rls.current_tenant = '7'" in warnings[1].msg
+        assert "in database" in warnings[1].msg
+        assert _check_policy_guc_defaults() == []
 
 
 class TestCheckDatabasesAliasExists:

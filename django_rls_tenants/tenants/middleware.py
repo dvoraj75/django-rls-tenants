@@ -38,6 +38,8 @@ from django_rls_tenants.tenants.state import (
     _reset_context_gucs,
     _set_context_gucs,
     _values_of,
+    get_current_tenant_id,
+    get_rls_context_active,
     reset_current_tenant_id,
     reset_rls_context_active,
     set_current_tenant_id,
@@ -273,6 +275,23 @@ def _clear_gucs_on_all_databases(conf: Any) -> None:
     for db_alias in conf.DATABASES:
         # Best-effort cleanup: the connection may be dead.
         with suppress(Exception):
+            _clear_alias_gucs(conf, db_alias)
+
+
+def _clear_gucs_on_open_databases(conf: RLSTenantsConfig) -> None:
+    """Best-effort clear of GUCs on the configured aliases this thread has a connection open on.
+
+    For a request cancelled while its ``process_request`` hop may still be
+    writing the GUCs (see ``_acall_through_sync_hooks``): the hop's connection is
+    open on this thread; an alias it never touched is left closed.
+
+    Args:
+        conf: ``RLSTenantsConfig`` instance.
+    """
+    for db_alias in conf.DATABASES:
+        if connections[db_alias].connection is None:
+            continue
+        with suppress(Exception):  # best-effort cleanup
             _clear_alias_gucs(conf, db_alias)
 
 
@@ -562,19 +581,39 @@ class RLSTenantMiddleware(MiddlewareMixin):
         Used for subclasses that override ``process_request`` or
         ``process_response``. Each hook runs in its own ``sync_to_async`` hop,
         so cleanup clears the ``ContextVar`` values instead of resetting them
-        (see ``_reset_or_clear``). A cancelled request skips Django's response
-        and exception hooks, so the ``finally`` block cleans it up instead.
-        With ``USE_LOCAL_SET=True`` no transaction is opened here either, and
-        ``process_request`` writes no GUC (see ``__acall__``).
+        (see ``_reset_or_clear``); asgiref then hands the cleared tenant and
+        strict-mode values back to the request by value, so the values the
+        request found are put back afterwards, for a request served inside a
+        live context (a test's block). A cancelled request skips Django's
+        response and exception hooks, so the ``finally`` block cleans it up
+        instead. Cancelled while ``process_request`` is still writing the GUCs
+        in its hop, the request never learns of them (asgiref copies the hop's
+        ``ContextVar`` values at the cancellation, before the hop marks them
+        set), so the GUCs are cleared in a hop queued behind that one, as
+        ``_aenter_request`` does. With ``USE_LOCAL_SET=True`` no transaction
+        is opened here either, and ``process_request`` writes no GUC (see
+        ``__acall__``).
         """
+        tenant_id = get_current_tenant_id()
+        active = get_rls_context_active()
         # process_request's values replace the holder; a cancelled call's block
         # cannot. Held until the cleanup below has run.
         with _holder_for_the_request(request):
             try:
                 return await super().__acall__(request)
+            except asyncio.CancelledError:
+                if not _were_gucs_set():
+                    await sync_to_async(_clear_gucs_on_open_databases, thread_sensitive=True)(
+                        rls_tenants_config
+                    )
+                raise
             finally:
                 if getattr(request, "_rls_state_reset", False) is not True or _were_gucs_set():
                     await sync_to_async(self._cleanup_rls_state, thread_sensitive=True)(request)
+                if get_current_tenant_id() != tenant_id:
+                    set_current_tenant_id(tenant_id)
+                if get_rls_context_active() != active:
+                    set_rls_context_active(active)
 
     async def _aget_response(self, request: HttpRequest) -> HttpResponseBase:
         """Await the downstream chain; ``async_mode`` guarantees it is a coroutine function."""
@@ -684,8 +723,10 @@ class RLSTenantMiddleware(MiddlewareMixin):
 
         Either way, a context block the view left open (a generator suspended
         inside one) is ended, so the error response does not run in it. With
-        a middleware-owned transaction that response then runs with no
-        context (fail-closed), as it does without one.
+        a middleware-owned transaction the request's own context stays in
+        force while the error response is built (the rollback is deferred, so
+        error handlers can still query); without one the response runs with
+        no context (fail-closed).
         """
         try:
             if getattr(request, "_rls_owns_transaction", False) is True:

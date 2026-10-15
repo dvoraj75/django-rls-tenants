@@ -67,6 +67,7 @@ jobs:
     # a user's `pip install`.
     name: Example app against the built wheel (PostgreSQL 16)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:16
@@ -203,6 +204,7 @@ jobs:
   test:
     name: Test (Python ${{ matrix.python-version }}, Django ${{ matrix.django-version }}, ${{ matrix.driver }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       pull-requests: write
@@ -239,7 +241,6 @@ jobs:
           --health-retries 5
 
     env:
-      DATABASE_URL: postgres://postgres:postgres@localhost:5432/django_rls_tenants_test
       UV_PYTHON: ${{ matrix.python-version }}
       DJANGO_VERSION: ${{ matrix.django-version }}
       DRIVER: ${{ matrix.driver }}
@@ -323,6 +324,7 @@ jobs:
     # (16 stays the default everywhere else).
     name: Test (PostgreSQL ${{ matrix.postgres }}, Django ${{ matrix.django-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
     strategy:
@@ -352,7 +354,6 @@ jobs:
           --health-retries 5
 
     env:
-      DATABASE_URL: postgres://postgres:postgres@localhost:5432/django_rls_tenants_test
       UV_PYTHON: ${{ matrix.python-version }}
       DJANGO_VERSION: ${{ matrix.django-version }}
       RLS_FAIL_ON_SKIPPED: "1"
@@ -399,6 +400,7 @@ jobs:
     # superuser carry the superuser_only marker and are deselected.
     name: Test (non-superuser role, PostgreSQL 16)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
 

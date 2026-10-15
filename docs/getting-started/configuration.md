@@ -258,8 +258,8 @@ When `True`, uses `SET LOCAL` (transaction-scoped) instead of `set_config()`
   still worth it for performance (see
   [Code Outside a Request Transaction](../guides/connection-pooling.md#code-outside-a-request-transaction)
   for the cost by placement). This holds for aliases in `RLS_TENANTS["DATABASES"]`; on any
-  other alias a context manager outside `atomic()` raises `RuntimeError`
-  (`RLSConfigurationError` for the async managers), as before. `for_user()`'s
+  other alias a context manager outside `atomic()` raises (`RuntimeError` from the sync
+  managers, `RLSConfigurationError` from the async ones). `for_user()`'s
   `update_or_create()`, `bulk_create()`, `bulk_update()` and `delete()` still open a
   transaction of their own when none is open.
 - When a context ends, and on any connection after a statement run under a context's
@@ -297,6 +297,7 @@ django-rls-tenants registers Django system checks that warn about common misconf
 | `W008` | Warning | `RLS_TENANTS['TENANT_MODEL']` does not resolve to an installed model |
 | `W009` | Warning | Tenant field referenced by an `RLSProtectedModel`'s RLS policy is missing |
 | `W010` | Warning | Django's connection pool (`OPTIONS["pool"]`) with `USE_LOCAL_SET=False` and no pool `reset` callback |
+| `W011` | Warning | PostgreSQL applies a database- or role-level default (`ALTER DATABASE/ROLE ... SET`) for a GUC the RLS policies read, in force in every new session |
 
 Run `python manage.py check` to see any warnings.
 

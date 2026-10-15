@@ -20,12 +20,12 @@ env:
   DJANGO_SERIES: "6.1"
   # Zero-skipped rule: a skipped RLS test must fail the leg (tests/conftest.py).
   RLS_FAIL_ON_SKIPPED: "1"
-  DATABASE_URL: postgres://postgres:postgres@localhost:5432/django_rls_tenants_test
 
 jobs:
   django-main:
     name: Canary (Django main)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       UV_PYTHON: "3.14"
     services:
@@ -69,6 +69,7 @@ jobs:
   python-next:
     name: Canary (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
         # Bump when the next Python appears. uv may install a release candidate
@@ -116,11 +117,12 @@ jobs:
   postgres-next:
     name: Canary (PostgreSQL ${{ matrix.postgres }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
         # Bump to 19rc1 / 19 as Docker Hub publishes them. A single-value matrix
         # because service containers cannot read env.
-        postgres: ["19beta2"]
+        postgres: ["19beta4"]
     env:
       UV_PYTHON: "3.14"
     services:

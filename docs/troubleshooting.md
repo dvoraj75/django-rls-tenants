@@ -172,10 +172,8 @@ or set `USE_LOCAL_SET=False`.
 ### `RLSConfigurationError: async_tenant_context() and async_admin_context() cannot use RLS_TENANTS['USE_LOCAL_SET'] = True on alias '...' here`
 
 **Symptom:** `async with async_tenant_context(..., using="analytics")` or
-`async_admin_context(using=...)` fails on entry with this error, naming the alias. Since
-1.4.0 it only happens for an alias that is **not** in `RLS_TENANTS["DATABASES"]`. On 1.3.4 and
-earlier the message had no alias and the error came from every async block outside
-`transaction.atomic()`.
+`async_admin_context(using=...)` fails on entry with this error, naming the alias. It only
+happens for an alias that is **not** in `RLS_TENANTS["DATABASES"]`.
 
 **Cause:** `SET LOCAL` needs `transaction.atomic()` open on the thread that runs the
 database calls, and a coroutine cannot open one. For an alias in
@@ -185,8 +183,7 @@ instead, but it leaves other aliases alone, so the block would otherwise fail in
 
 **Fix:** Add the alias to `RLS_TENANTS["DATABASES"]`. If the coroutine is called from
 synchronous code, you can instead wrap that call in `transaction.atomic(using=alias)` and
-run the coroutine with `async_to_sync`; the managers then use `SET LOCAL`. On 1.3.4 and
-earlier, set `USE_LOCAL_SET=False` for async deployments.
+run the coroutine with `async_to_sync`; the managers then use `SET LOCAL`.
 
 **See:** [`USE_LOCAL_SET=True` in async code](guides/context-managers.md#use_local_settrue-in-async-code).
 
@@ -458,6 +455,30 @@ Or set `USE_LOCAL_SET=True`. Any `reset`, including your own, silences the warni
 
 **See:** [Django's Connection Pool](guides/connection-pooling.md#djangos-connection-pool),
 [W010 in Connection Pooling](guides/connection-pooling.md#w010-djangos-connection-pool-without-a-reset-callback).
+
+### W011: PostgreSQL applies a default for a policy GUC
+
+**Symptom:** `(django_rls_tenants.W011) PostgreSQL sets rls.is_admin = 'true' at the start
+of every session for database 'app_db'. The RLS policies read this GUC, so every session
+starts with that value in force instead of no RLS context (fail-closed), and
+django-rls-tenants never clears it: an admin value bypasses the policies, a tenant value
+shows that tenant's rows to everyone.`
+
+**Cause:** A superuser ran `ALTER DATABASE app_db SET rls.is_admin = 'true'` or
+`ALTER ROLE app SET ...`, often to make a `psql` session or a migration "just work"
+(PostgreSQL 15+ lets only a superuser set such a default for a custom parameter).
+PostgreSQL applies it when a session starts, before the middleware or a context manager
+runs. The library assumes a new session holds no value for these GUCs, so it never
+clears the default: with an admin default every connection bypasses RLS, with a tenant
+default everyone sees that tenant's rows. The check reads `pg_db_role_setting` for the
+connected database and for role-level defaults, for every GUC the installed policies read
+(bypass flags included).
+
+**Fix:** Remove the default with the statement the hint names (`ALTER DATABASE app_db RESET
+rls.is_admin;`, `ALTER ROLE app RESET rls.is_admin;` or `ALTER ROLE app IN DATABASE app_db
+RESET rls.is_admin;`) and reconnect. Set the RLS context per request or block instead (see
+[Context Managers](guides/context-managers.md)); for a one-off maintenance session, use
+`admin_context()`, or `SET rls.is_admin = 'true'` in that session only.
 
 ### W006 / W008 / W009: alias, tenant model or tenant field not found
 

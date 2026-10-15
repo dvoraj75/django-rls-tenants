@@ -28,6 +28,8 @@ from django_rls_tenants.tenants.state import (
     ADMIN_GUCS,
     ContextGucs,
     _set_context_gucs,
+    get_current_tenant_id,
+    get_rls_context_active,
     set_current_tenant_id,
     set_rls_context_active,
 )
@@ -84,6 +86,21 @@ class TestRequestFinishedSafetyNet:
         request_finished.send(sender=self.__class__)
 
         assert _were_gucs_set() is False
+
+    def test_resets_the_tenant_state_too(self):
+        """The auto-scope tenant and the strict-mode flag go with the GUCs.
+
+        Under WSGI the thread's ``Context`` serves the next request; a flag left
+        ``True`` would let strict mode pass there without a context.
+        """
+        set_current_tenant_id(7)
+        set_rls_context_active(True)
+        _mark_gucs_set()
+
+        request_finished.send(sender=self.__class__)
+
+        assert get_current_tenant_id() is None
+        assert get_rls_context_active() is False
 
     def test_skips_clear_when_use_local_set_true(self):
         """Handler does NOT clear GUCs when USE_LOCAL_SET=True.

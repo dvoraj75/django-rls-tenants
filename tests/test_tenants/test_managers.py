@@ -193,7 +193,9 @@ class TestAutoScope:
             b_products = list(Order.objects.values_list("product", flat=True))
             assert b_products == ["Gadget B1"]
 
-    def test_for_user_still_works_with_auto_scope(self, sample_orders, tenant_a_user, tenant_a):
+    def test_for_user_still_works_with_auto_scope(
+        self, sample_orders, tenant_a_user, tenant_a, enforce_rls
+    ):
         """for_user() still works correctly even when auto-scope is also active.
 
         Both add a WHERE tenant_id = X clause. The redundancy is by design
@@ -468,7 +470,7 @@ class TestSelectRelated:
             # Admin context: no auto-scope filter
             assert "WHERE" not in sql
 
-    def test_select_related_with_for_user(self, sample_order_items, tenant_a_user):
+    def test_select_related_with_for_user(self, sample_order_items, tenant_a_user, enforce_rls):
         """select_related() works correctly with for_user()."""
         qs = OrderItem.objects.for_user(tenant_a_user).select_related("order")
         items = list(qs)
@@ -725,13 +727,12 @@ def _strict_mode():
 class TestStrictModeDisabled:
     """Tests that strict mode off (default) preserves existing behavior."""
 
-    def test_no_context_returns_empty(self, sample_orders):
+    def test_no_context_returns_empty(self, sample_orders, enforce_rls):
         """Without context and strict mode off, queries return empty (fail-closed)."""
         assert get_current_tenant_id() is None
         qs = Order.objects.all()
-        # No strict mode error; just returns all rows (superuser test DB)
-        # or empty (if RLS enforced). The key point: no exception.
-        list(qs)
+        # No strict mode error: RLS hides every row instead.
+        assert list(qs) == []
 
 
 class TestStrictModeRaises:
@@ -860,7 +861,7 @@ class TestStrictModeAllowsContext:
             assert count == 3
 
     @pytest.mark.usefixtures("_strict_mode")
-    def test_for_user_allows_query(self, sample_orders, tenant_a_user):
+    def test_for_user_allows_query(self, sample_orders, tenant_a_user, enforce_rls):
         """No error when for_user() was called."""
         qs = Order.objects.for_user(tenant_a_user)
         products = list(qs.values_list("product", flat=True))
@@ -1793,3 +1794,18 @@ class TestForUserAliases:
         with override_settings(DATABASE_ROUTERS=[_ALTERNATING_READS]):
             assert check(Order.objects.for_user(tenant_a_user)) is True
         _assert_no_rls_context()
+
+
+class TestManagerHints:
+    """``RLSManager.get_queryset()`` keeps the manager's router hints, as Django's does."""
+
+    def test_db_manager_hints_reach_the_queryset(self, sample_orders):
+        order = Order.objects.first()
+        qs = Order.objects.db_manager(hints={"instance": order}).all()
+        assert qs._hints == {"instance": order}
+        assert qs._rls_user is None
+
+    def test_for_user_keeps_the_hints(self, sample_orders, tenant_a_user):
+        order = Order.objects.first()
+        qs = Order.objects.db_manager(hints={"instance": order}).for_user(tenant_a_user)
+        assert qs._hints == {"instance": order}

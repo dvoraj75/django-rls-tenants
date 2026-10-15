@@ -125,6 +125,10 @@ migration that assigns the correct tenant to each existing record.
 
 ### From 1.3.4 to 1.4.0
 
+- **Django 4.2, 5.0 and 5.1 and Python 3.11 are no longer supported.** 1.4.0 needs
+  Django 5.2+ on Python 3.12+ (see
+  [Supported versions](../getting-started/installation.md#supported-versions)). Upgrade
+  them first, or pin `django-rls-tenants<1.4`, which keeps working on the old versions.
 - **`@with_rls_context` rejects generator functions.** Decorating a `def` or
   `async def` function that contains `yield` now raises `TypeError` when the decorator is
   applied, which for a module-level function means at import. Such a body never ran under
@@ -212,14 +216,16 @@ migration that assigns the correct tenant to each existing record.
   never stay on the session or on a pooled connection. What used to raise now works;
   WSGI requests are unchanged. If you use this mode, check:
     - *Context managers, `for_user()` and the testing helpers outside `atomic()`.* On an
-      alias in `RLS_TENANTS["DATABASES"]` they no longer raise `RuntimeError`
-      (`RLSConfigurationError` for the async managers). The context managers and the
-      `for_user()` scope write nothing on entry or exit (a transaction still open at exit,
-      from `AUTOCOMMIT=False` or an SQL `BEGIN`, may get one transaction-local clear), and
+      alias in `RLS_TENANTS["DATABASES"]` they no longer raise `RuntimeError`. The context
+      managers and the `for_user()` scope write nothing on entry or exit (a transaction
+      still open at exit, from `AUTOCOMMIT=False` or an SQL `BEGIN`, may get one
+      `set_config()` statement that puts the enclosing context's values back, or clears
+      them for the session when there is none, so the clear stays after the commit), and
       the guard applies the context to each statement. Celery tasks, management commands and scripts need no
       `transaction.atomic()` any more; code that keeps it still works, and is cheaper for a
-      batch (see the round trips below). On an alias outside the list they still raise, and
-      the async managers' message now names the alias. Inside `atomic()` nothing changes.
+      batch (see the round trips below). On an alias outside the list they still raise
+      (`RuntimeError`; `RLSConfigurationError` from the async managers). Inside `atomic()`
+      nothing changes.
       `assert_rls_blocks_without_context()` also works outside `atomic()` in this mode: it
       still clears and restores the GUCs for the session around its count.
     - *The middleware's async path (ASGI).* The middleware no longer raises
@@ -288,8 +294,11 @@ migration that assigns the correct tenant to each existing record.
       and logged a warning); the guard applies the values to its statements. A connection
       that was already open when the app's `ready()` ran gets the guard there.
     - *System checks.* The text of `W004` now ends "...which scopes the GUCs to
-      transactions, so they never stay on a connection.", and the `W010` hint no longer says
-      "(WSGI only)". Update any filter that matches the old text.
+      transactions, so they never stay on a connection.". Update any filter that matches the
+      old text. A new check, `W011`, warns when PostgreSQL applies a database- or role-level
+      default (`ALTER DATABASE ... SET`, `ALTER ROLE ... SET`) for a GUC the RLS policies
+      read: such a value is in force in every new session, before any context is set, and
+      the library never clears it.
     - *Limits that stay.* The guard covers only aliases in `RLS_TENANTS["DATABASES"]` and
       only the admin and tenant GUCs; bypass flags keep their explicit `is_local` parameter
       (default `False`). SQL that bypasses Django's cursor is not seen.

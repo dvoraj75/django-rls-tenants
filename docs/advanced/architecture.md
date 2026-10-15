@@ -27,9 +27,9 @@ tenants, users, or Django multitenancy concepts**:
 
 | Module | Purpose |
 |--------|---------|
-| `rls/guc.py` | `set_guc()`, `get_guc()`, `clear_guc()` -- manage PostgreSQL GUC variables |
+| `rls/guc.py` | `set_guc()`, `get_guc()`, `clear_guc()`, `restore_guc()` and their `a`-prefixed async counterparts -- manage PostgreSQL GUC variables |
 | `rls/constraints.py` | `RLSConstraint` -- Django `BaseConstraint` that generates `CREATE POLICY` SQL. `RLSM2MConstraint` -- subquery-based policies for M2M join tables |
-| `rls/context.py` | `rls_context()` -- generic context manager for setting/restoring GUC variables |
+| `rls/context.py` | `rls_context()`, `bypass_flag()` and their `async with` counterparts `async_rls_context()`, `async_bypass_flag()` -- generic context managers for setting/restoring GUC variables |
 
 This layer is reusable outside the multitenancy use case. You could use `RLSConstraint`
 and `rls_context()` to implement any RLS-based access control pattern.
@@ -45,10 +45,10 @@ The upper layer builds Django multitenancy on top of `rls/`:
 | `operations.py` | `AddM2MRLSPolicy` -- reversible migration operation for M2M RLS policies |
 | `pool.py` | `reset_rls_gucs()` -- `reset` callback for Django's psycopg connection pool. Also the single statement that clears every GUC the policies read, which the `connection_created` handler runs on each checkout from a pool. Importable from `settings.py` (no `tenants/` import at module level) |
 | `tenants/managers.py` | `TenantQuerySet`, `RLSManager` -- lazy GUC setting at query eval time |
-| `tenants/context.py` | `tenant_context()`, `admin_context()`, `@with_rls_context` |
+| `tenants/context.py` | `tenant_context()`, `admin_context()`, `async_tenant_context()`, `async_admin_context()`, `@with_rls_context` |
 | `tenants/middleware.py` | `RLSTenantMiddleware` -- per-request RLS context, with a native async path for ASGI |
 | `tenants/affinity.py` | The GUC affinity guard -- an execute wrapper that applies the active context's GUCs on whichever connection a statement runs on (see [GUC Affinity Guard](#guc-affinity-guard)) |
-| `tenants/bypass.py` | `set_bypass_flag()`, `clear_bypass_flag()`, `bypass_flag()` |
+| `tenants/bypass.py` | `set_bypass_flag()`, `clear_bypass_flag()`, `bypass_flag()`, `async_bypass_flag()` |
 | `tenants/testing.py` | Test helpers: `rls_bypass`, `rls_as_tenant`, assertion functions, and their async counterparts (`async_rls_bypass`, `async_rls_as_tenant`, `aassert_*`) |
 | `tenants/types.py` | `TenantUser` protocol |
 | `tenants/state.py` | `get_current_tenant_id()`, `set_current_tenant_id()`, `reset_current_tenant_id()` -- `ContextVar`-based tenant state for auto-scoping. Also `get_rls_context_active()`, `set_rls_context_active()`, `reset_rls_context_active()` -- tracks whether any RLS context is active (used by strict mode). A private third `ContextVar` holds the GUC values the library applied for the active context, for the GUC affinity guard |
@@ -120,8 +120,8 @@ set_config('rls.current_tenant', ..., false)` on the same connection (`true` ins
 outside any context. The statement goes through Django's cursor, so query logs show it, and
 the `django_rls_tenants` logger names each one at `DEBUG` level. If it fails, the error
 propagates and the original statement does not run. A context therefore applies to every
-alias in `RLS_TENANTS["DATABASES"]`, whichever alias it was entered on, including one
-outside the list.
+alias in `RLS_TENANTS["DATABASES"]`, whichever alias it was entered on (that alias may
+itself be outside the list).
 
 ```
 Request thread                       Worker thread (hop with a copy of the context)
@@ -311,13 +311,15 @@ The library's own entry points cooperate. In this mode the context managers, the
 `for_user()` scope and the middleware on its async path write nothing outside a
 transaction (inside `transaction.atomic()` they still write `SET LOCAL` values on entry
 and restore them on exit; a transaction still open at a block's exit, from
-`AUTOCOMMIT=False` or an SQL `BEGIN`, may get one transaction-local clear), and the `connection_created` handler no longer writes the
+`AUTOCOMMIT=False` or an SQL `BEGIN`, may get one `set_config()` statement that puts the
+enclosing context's values back, or clears them for the session when there is none), and
+the `connection_created` handler no longer writes the
 request's GUCs eagerly on a connection opened on the request thread. A `for_user()` call
 that opens a transaction of its own (`update_or_create()`, `bulk_create()`,
 `bulk_update()`, `delete()`) on a configured alias lets the guard set the values in it,
 one `set_config()`, and take them off at the scope's exit, one more. At `DEBUG` level the
-`django_rls_tenants` logger names every write the guard makes except the `set_config()`
-inside its own `BEGIN` ... `COMMIT`, the clear outside a context included; that one shows
+`django_rls_tenants` logger names every write the guard makes, the clear outside a context
+included, except the `set_config()` inside its own `BEGIN` ... `COMMIT`; that one shows
 only in `connection.queries` and on `django.db.backends`, with the `BEGIN` and `COMMIT`
 around it.
 
@@ -516,7 +518,8 @@ A `for_user()` queryset does not cover SQL that runs outside its own methods:
 - Combining querysets with `|`, `&`, `^` or `union()` keeps only the left operand's user,
   and a sliced operand turns the result into a plain queryset.
 - Instances it returned load deferred fields, foreign keys and related managers
-  (`order.items.all()`) later, after the call, under whatever context is active then.
+  (`order.items.all()`) later, after the call, under whatever context is active then; so
+  do their `save()`, `delete()` and `refresh_from_db()`.
 
 Use `tenant_context()` / `admin_context()` around such code.
 

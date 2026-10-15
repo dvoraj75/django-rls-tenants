@@ -26,6 +26,7 @@ from django.db import (
     connections,
     transaction,
 )
+from django.db.backends.postgresql.psycopg_any import sql as psycopg_sql
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 
@@ -201,6 +202,25 @@ def test_an_unreadable_statement_is_not_refused():
     assert affinity._refused_in_a_transaction(None) is False
 
 
+def test_a_leading_comment_longer_than_the_head_is_skipped():
+    """The command is read past a comment longer than ``_SQL_HEAD``, not given up on."""
+    comment = "/* " + "x" * (affinity._SQL_HEAD + 50) + " */"
+    statement = affinity._parse(f"{comment} VACUUM test_order")
+    assert statement is not None
+    assert statement.command == "VACUUM"
+    assert affinity._refused_in_a_transaction(statement) is True
+    line_comment = "-- " + "x" * (affinity._SQL_HEAD + 50) + "\n"
+    assert affinity._parse(f"{line_comment}SELECT 1").command == "SELECT"
+    assert affinity._parse(f"{comment}  ") is None
+
+
+def test_a_composable_that_cannot_be_rendered_is_unreadable():
+    """``psycopg.sql`` objects are rendered with the driver cursor; without one they cannot be."""
+    assert (
+        affinity._parse(psycopg_sql.SQL("VACUUM {}").format(psycopg_sql.Identifier("t"))) is None
+    )
+
+
 @pytest.mark.parametrize(
     ("sql", "control"),
     [
@@ -373,6 +393,27 @@ class TestAutocommit:
             cursor.execute("CREATE INDEX CONCURRENTLY probe_refused_v ON probe_refused (v)")
             cursor.execute("DROP INDEX CONCURRENTLY probe_refused_v")
             cursor.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        assert _status() == _IDLE
+
+    def test_composed_and_commented_statements_are_read_before_being_wrapped(self, sample_orders):
+        """A ``psycopg.sql`` object or a long leading comment must not hide a refused command.
+
+        Unreadable, the statement would get the guard's transaction and PostgreSQL
+        would refuse it there. A composable is rendered with the driver cursor; a
+        comment longer than the head the guard reads is skipped on the whole text.
+        """
+        composed = psycopg_sql.SQL("VACUUM {}").format(psycopg_sql.Identifier("test_order"))
+        comment = "/* " + "x" * (affinity._SQL_HEAD + 50) + " */"
+        with admin_context(), connection.cursor() as cursor:
+            cursor.execute(composed)
+            cursor.execute(f"{comment} VACUUM test_order")
+            # A composed data statement still gets the context.
+            cursor.execute(
+                psycopg_sql.SQL("SELECT product FROM {} ORDER BY product").format(
+                    psycopg_sql.Identifier("test_order")
+                )
+            )
+            assert [row[0] for row in cursor.fetchall()] == _ALL_PRODUCTS
         assert _status() == _IDLE
 
     def test_a_compound_statement_leaves_unknown_values(self, tenant_a):

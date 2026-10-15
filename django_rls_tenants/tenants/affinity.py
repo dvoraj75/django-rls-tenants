@@ -66,12 +66,18 @@ Limits: the guard covers the admin and tenant GUCs, not bypass flags or other
 GUCs set with ``rls_context()``. With ``USE_LOCAL_SET=True``, a procedure or
 ``DO`` block that commits or rolls back cannot run inside a context in
 autocommit (PostgreSQL refuses it inside the guard's transaction), and an
-``executemany()`` there commits or fails as a whole. It cannot see SQL that bypasses Django's
-execute wrappers (a driver cursor, ``CursorWrapper.callproc()``, the driver's
-``copy`` methods, the ``FETCH`` of a server-side cursor that is already open);
-on a connection the guard has used, such SQL sees whatever values it left
-there until the next statement it sees (with ``USE_LOCAL_SET=True``, outside a
-transaction, none).
+``executemany()`` there commits or fails as a whole; a statement PostgreSQL
+allows only in a transaction block (``DECLARE`` of a cursor without ``WITH
+HOLD``, ``LOCK TABLE``, ``SET LOCAL``) runs there inside the guard's
+transaction, and its effect ends at the guard's ``COMMIT``. It cannot see SQL
+that bypasses Django's execute wrappers (a driver cursor,
+``CursorWrapper.callproc()``, the driver's ``copy`` methods, the ``FETCH`` of
+a server-side cursor that is already open); on a connection the guard has
+used, such SQL sees whatever values it left there until the next statement it
+sees (with ``USE_LOCAL_SET=True``, outside a transaction, none). It assumes
+that a new session holds no value for the two GUCs: a default set with
+``ALTER DATABASE ... SET`` or ``ALTER ROLE ... SET`` is in force in every new
+session and is never cleared (system check ``W011`` warns about one).
 """
 
 from __future__ import annotations
@@ -291,8 +297,9 @@ class _SessionGUCs:
 
         A rollback undoes every value written during the transaction, and any
         end undoes the transaction-local ones; a commit keeps those written
-        for the session. When both kinds were written, which one a commit
-        leaves depends on their order, so the values become unknown.
+        for the session. When both kinds were written, a commit keeps the last
+        value written for the session, which the tracker does not hold
+        separately from the local one, so the values become unknown.
 
         Args:
             committed: Whether the transaction committed; ``None`` if that is
@@ -351,8 +358,14 @@ def _will_run_in_transaction(connection: BaseDatabaseWrapper, status: int) -> bo
 
 
 def _observe(connection: BaseDatabaseWrapper, tracker: _SessionGUCs) -> int:
-    """Bring ``tracker`` up to date with ``connection``'s session, and return its status."""
+    """Bring ``tracker`` up to date with ``connection``'s session, and return its status.
+
+    A closed connection (a cursor used after ``connection.close()``) has no
+    session to reconcile: the statement fails on its own, with Django's error.
+    """
     raw = connection.connection
+    if raw is None:
+        return _CONNECTION_BAD
     if raw is not tracker.raw:
         # A session install() did not see open, such as one an alias had
         # before it joined RLS_TENANTS["DATABASES"].
@@ -802,13 +815,28 @@ def _skip_leading_comments(sql: str) -> str:
     return text
 
 
-def _parse(sql: object) -> _Statement | None:
-    """Read the command of ``sql``; ``None`` if it cannot be read (not text, or only comments)."""
+def _parse(sql: object, cursor: Any = None) -> _Statement | None:  # Any: a driver cursor
+    """Read the command of ``sql``; ``None`` if it cannot be read (not text, or only comments).
+
+    A statement composed with ``psycopg2.sql`` / ``psycopg.sql`` is rendered
+    with ``cursor``, the driver cursor it runs on; one that cannot be rendered
+    is unreadable.
+    """
+    render = getattr(sql, "as_string", None)
+    if render is not None:
+        try:
+            sql = render(cursor)
+        except Exception:
+            return None
     if isinstance(sql, bytes):
         sql = sql.decode("latin-1")  # only ASCII keywords are looked at
     if not isinstance(sql, str):
         return None
-    words = _skip_leading_comments(sql[:_SQL_HEAD]).split()
+    text = _skip_leading_comments(sql[:_SQL_HEAD])
+    if not text and len(sql) > _SQL_HEAD:
+        # A leading comment that runs past the head: skip it on the whole text.
+        text = _skip_leading_comments(sql)[:_SQL_HEAD]
+    words = text.split()
     if not words:
         return None if sql.strip() else _Statement("", [], compound=False)
     semicolon = sql.find(";")
@@ -1043,7 +1071,8 @@ def _guard(
     tracker = _tracker_of(connection)
     if tracker is None:
         return execute(sql, params, many, context)
-    statement = _parse(sql)
+    # context["cursor"] is Django's CursorWrapper; its .cursor is the driver's.
+    statement = _parse(sql, getattr(context.get("cursor"), "cursor", None))
     control = _controls_the_transaction(statement)
     own_transaction = False
     if _writes.depth or control:

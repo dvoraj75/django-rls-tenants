@@ -204,7 +204,7 @@ def test_ci_plain_role_leg():
 def test_ci_coverage_gate_names_a_real_leg():
     """The coverage comment and upload must be pinned to a leg that exists.
 
-    Dropping Django 5.1 without moving this gate would silently disable coverage reporting.
+    Dropping a Django series without moving this gate would silently disable coverage reporting.
     """
     rel = ".github/workflows/ci.yml"
     steps = _workflow(rel)["jobs"]["test"]["steps"]

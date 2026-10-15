@@ -138,7 +138,8 @@ managers behave as described above: they snapshot, `SET LOCAL` on entry and rest
 exit. Outside `atomic()`, on an alias in `RLS_TENANTS["DATABASES"]`, they no longer raise
 `RuntimeError`. They write nothing on entry or exit and only set the Python-side context
 (if a transaction is still open at exit, from `AUTOCOMMIT=False` or an SQL `BEGIN`, the
-exit may send one transaction-local clear). The
+exit may send one `set_config()` statement that puts the enclosing context's values back,
+or clears them for the session when there is none). The
 [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard)
 applies the values to each statement, transaction-locally: in a transaction of its own for
 a statement run in autocommit (`BEGIN`, the `set_config()` statement, your statement,

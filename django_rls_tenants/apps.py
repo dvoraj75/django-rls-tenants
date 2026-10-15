@@ -242,9 +242,11 @@ class DjangoRlsTenantsConfig(AppConfig):
                 from django_rls_tenants.tenants.state import (  # noqa: PLC0415
                     _clear_context_gucs,
                     set_current_tenant_id,
+                    set_rls_context_active,
                 )
 
                 set_current_tenant_id(None)
+                set_rls_context_active(False)
                 # Otherwise the affinity guard would apply the request's GUCs
                 # again before the next statement in this context.
                 _clear_context_gucs()

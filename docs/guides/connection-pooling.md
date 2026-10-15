@@ -99,8 +99,8 @@ synchronously even under ASGI, and the request transaction applies as under WSGI
 
 *Changed in 1.4.0.* Management commands, Celery tasks, scripts and requests on the
 middleware's async path have no transaction that the middleware opened. Before 1.4.0 a
-context manager entered without `transaction.atomic()` raised `RuntimeError`
-(`RLSConfigurationError` for the async managers), so you had to open one yourself. Now the
+context manager entered without `transaction.atomic()` raised `RuntimeError`, so you had
+to open one yourself. Now the
 context managers write nothing there: they set the Python-side context, and the
 [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) writes the GUCs
 transaction-locally (`set_config(name, value, true)`) on every alias in

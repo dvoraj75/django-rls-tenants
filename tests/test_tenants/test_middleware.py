@@ -1460,6 +1460,63 @@ class TestSubclassWithSyncHooks:
 
         assert seen == {"calls": ["process_request"], "state": (None, False, False), "guc": None}
 
+    def test_cancelled_while_process_request_writes_the_gucs_still_clears_them(
+        self, tenant_a_user, monkeypatch
+    ):
+        """asgiref copies the hop's values at the cancellation, before the hop marks the GUCs set.
+
+        The request then never learns of the GUCs the hop goes on to write, so
+        the cleanup would find nothing to clear: a clear is queued behind the hop
+        instead (the native path does the same in ``_aenter_request``).
+        """
+        real_set = RLSTenantMiddleware._set_gucs_on_all_databases
+        seen = {}
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            box = {}
+
+            def slow_set(guc_vars, conf):
+                loop.call_soon_threadsafe(box["task"].cancel)
+                time.sleep(0.2)  # the loop handles the cancellation meanwhile
+                real_set(guc_vars, conf)
+
+            monkeypatch.setattr(
+                RLSTenantMiddleware, "_set_gucs_on_all_databases", staticmethod(slow_set)
+            )
+
+            async def aget_response(request):
+                raise AssertionError("the view must not run")
+
+            mw = _HookOverridingMiddleware(get_response=aget_response)
+            box["task"] = asyncio.create_task(mw(_make_request(user=tenant_a_user)))
+            with pytest.raises(asyncio.CancelledError):
+                await box["task"]
+            seen["session"] = await sync_to_async(session_gucs, thread_sensitive=True)()
+            seen["state"] = _state()
+
+        async_to_sync(run)()
+
+        assert seen == {"session": (None, None), "state": (None, False, False)}
+        _assert_async_request_left_nothing_behind()
+
+    def test_request_inside_a_block_leaves_the_blocks_values_in_place(
+        self, tenant_a_user, tenant_b
+    ):
+        """The hooks' hops hand cleared values back by value; the request puts the block's back."""
+
+        async def aget_response(request):
+            return MagicMock(name="response")
+
+        mw = _HookOverridingMiddleware(get_response=aget_response)
+        with tenant_context(tenant_b.pk):
+            async_to_sync(mw)(_make_request(user=tenant_a_user))
+
+            assert (get_current_tenant_id(), get_rls_context_active()) == (tenant_b.pk, True)
+            # The guard puts the block's GUCs back before the next statement.
+            assert get_guc("rls.current_tenant") == str(tenant_b.pk)
+        _assert_async_request_left_nothing_behind()
+
     @pytest.mark.django_db(transaction=True)
     @override_settings(RLS_TENANTS=_LOCAL_SET)
     def test_use_local_set_serves_the_request_without_a_transaction(self, tenant_a_user):

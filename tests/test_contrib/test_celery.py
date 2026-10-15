@@ -45,6 +45,12 @@ from django_rls_tenants.contrib.celery import (
 from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.tenants.context import admin_context, tenant_context
 from django_rls_tenants.tenants.state import (
+    ADMIN_GUCS,
+    ContextGucs,
+    _hold_context_gucs,
+    _release_context_gucs,
+    _reset_context_gucs,
+    _set_context_gucs,
     get_current_tenant_id,
     get_rls_context_active,
     set_current_tenant_id,
@@ -214,6 +220,69 @@ class TestCapture:
         """tenant_id=0 is falsy but not None -- it must be captured, not skipped."""
         set_current_tenant_id(0)
         assert _capture() == {_TENANT_HEADER: 0, _ADMIN_HEADER: False}
+
+    def test_the_librarys_record_beats_polluted_public_state(self):
+        """Inside a block the library set up, its record of the context is authoritative.
+
+        A ``sync_to_async`` call cancelled while its function is inside another
+        block copies that block's public tenant id into the caller (the record
+        is not copied, see ``state._Live``); the task must not inherit it.
+        """
+        entered = _set_context_gucs(ContextGucs.for_tenant(7))
+        try:
+            set_rls_context_active(True)
+            set_current_tenant_id(9)
+            assert _capture() == {_TENANT_HEADER: "7", _ADMIN_HEADER: False}
+            set_current_tenant_id(None)
+            assert _capture() == {_TENANT_HEADER: "7", _ADMIN_HEADER: False}
+            # When the public state agrees, the id keeps its type.
+            set_current_tenant_id(7)
+            assert _capture() == {_TENANT_HEADER: 7, _ADMIN_HEADER: False}
+        finally:
+            _reset_context_gucs(entered)
+
+    def test_the_librarys_admin_record_beats_polluted_public_state(self):
+        entered = _set_context_gucs(ADMIN_GUCS)
+        try:
+            set_rls_context_active(True)
+            set_current_tenant_id(9)
+            assert _capture() == {_TENANT_HEADER: None, _ADMIN_HEADER: True}
+        finally:
+            _reset_context_gucs(entered)
+
+    def test_a_tenant_record_beats_a_polluted_admin_flag(self):
+        """``admin_context()`` in a cancelled hop leaves the flag set and no tenant id."""
+        entered = _set_context_gucs(ContextGucs.for_tenant(7))
+        try:
+            set_rls_context_active(True)
+            set_current_tenant_id(None)
+            assert _capture() == {_TENANT_HEADER: "7", _ADMIN_HEADER: False}
+        finally:
+            _reset_context_gucs(entered)
+
+    def test_an_ended_context_captures_nothing(self, monkeypatch):
+        """Work that outlived its block runs without it; the canvas fallback still applies."""
+        entered = _set_context_gucs(ContextGucs.for_tenant(7))
+        try:
+            set_rls_context_active(True)
+            set_current_tenant_id(7)
+            entered.live.alive = False
+            assert _capture() == {}
+            fake = SimpleNamespace(request=SimpleNamespace(headers={_TENANT_HEADER: 42}))
+            monkeypatch.setattr(celery_mod, "current_task", fake)
+            assert _capture() == {_TENANT_HEADER: 42, _ADMIN_HEADER: False}
+        finally:
+            _reset_context_gucs(entered)
+
+    def test_a_scope_without_a_context_ignores_public_state(self):
+        """Inside a request that set no context (anonymous), public state alone is not trusted."""
+        held = _hold_context_gucs()
+        try:
+            set_rls_context_active(True)
+            set_current_tenant_id(7)
+            assert _capture() == {}
+        finally:
+            _release_context_gucs(held)
 
 
 # ---------------------------------------------------------------------------

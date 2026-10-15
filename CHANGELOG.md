@@ -143,7 +143,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `assert_rls_blocks_without_context()`) work on every alias in
     `RLS_TENANTS["DATABASES"]`; the context managers and `for_user()` write nothing on
     entry or exit there (a transaction still open at exit, from `AUTOCOMMIT=False` or an
-    SQL `BEGIN`, may get one transaction-local clear). Celery tasks, management commands
+    SQL `BEGIN`, may get one `set_config()` statement that puts the enclosing context's
+    values back, or clears them for the session when there is none). Celery tasks,
+    management commands
     and scripts need no `atomic()`. `RLSTenantMiddleware` serves the mode on its async
     path (ASGI, when every middleware listed after it is async-capable): no request
     transaction there, the guard applies the request's context to each statement. The
@@ -158,10 +160,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     transaction that runs it, on the async path and outside `atomic()` too.
   - Unchanged: on an alias outside `RLS_TENANTS["DATABASES"]` the mode still needs
     `transaction.atomic()` (`RuntimeError`, or `RLSConfigurationError` from the async
-    managers, whose message now names the alias), bypass flags keep their explicit
+    managers), bypass flags keep their explicit
     `is_local`, and the pool's checkout clear still runs. With this mode, a connection the
     request thread opens mid-request no longer gets a `SET LOCAL` attempt that failed and
-    logged a warning. System checks `W004` and `W010` no longer call the mode WSGI-only.
+    logged a warning. System check `W004` no longer calls the mode WSGI-only.
 - **`RLSTenantMiddleware` ends the request context when a `BaseException` escapes the view**
   (#41). Under WSGI, Django turns every `Exception` into a response, but a
   `BaseException` (`KeyboardInterrupt`, a server's timeout) skipped `process_response`, and
@@ -207,6 +209,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the real-pool tests) carry it, and `tests/conftest.py` deselects them when Django runs
   on psycopg2. They are deselected, not skipped, so the zero-skipped rule still holds. Only
   the psycopg 3 CI leg runs them; a missing `psycopg_pool` there fails them.
+- **System check `W011`: a database- or role-level default for a policy GUC.**
+  `ALTER DATABASE ... SET rls.is_admin = 'true'` (or `ALTER ROLE ... SET`) puts that value
+  in force at the start of every session of that database or role, before any RLS context
+  is set, and the library never clears it: an admin value bypasses the policies in every
+  session, a tenant value shows that tenant's rows to everyone. The check reads
+  `pg_db_role_setting` for every GUC the installed policies read (the configured pair,
+  the constraints' GUCs and `extra_bypass_flags`) and names the `ALTER ... RESET` that
+  removes the default.
 
 ### Changed
 
@@ -257,6 +267,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Celery integration could capture a stale tenant or admin header.**
+  `django_rls_tenants.contrib.celery` captured the task's context from the public tenant
+  state alone. A `sync_to_async` call cancelled (or timed out) while its function was inside
+  another `tenant_context()` / `admin_context()` copies that block's public values into the
+  calling request, so a task enqueued afterwards carried that block's tenant, or an admin
+  header. Inside a request or block the library set up, capture now reads the library's own
+  record of the active context (the one the GUC affinity guard applies), which such a copy
+  cannot change; a context that has ended but is still current captures nothing. Outside any
+  such scope the public state still counts, so a context built by hand with
+  `set_current_tenant_id()` / `set_rls_context_active()` propagates as before.
+- **`RLSManager.get_queryset()` dropped the manager's router hints.** Django's manager
+  passes `self._hints` to the queryset; `RLSManager` did not, so `db_manager(hints=...)`
+  and the `instance` hint Django adds for related objects never reached a database router
+  through a `TenantQuerySet`. They do now.
+- **A request cancelled while `process_request` was writing the GUCs could leave them on
+  the connection** on the hook-based async path (`MiddlewareMixin.__acall__`, which a
+  subclass overriding `process_request` or `process_response` still uses). asgiref copies
+  the hop's `ContextVar` values at the cancellation, before the hop marks the GUCs set, so
+  the cleanup found nothing to clear. The GUCs are now cleared in a hop queued behind that
+  one, as the native path does. Such a request served inside a live context (a test's
+  block) also no longer takes the block's tenant and strict-mode values off the caller.
 - **Security: under ASGI, an error page could leave a request's tenant context on a
   worker thread's connection** (#130). Django builds some error responses in a
   `sync_to_async(..., thread_sensitive=False)` hop while the request context is still
@@ -358,7 +389,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that run with strict mode could not use it. Inside `rls_bypass()` or `rls_as_tenant()`
   it counted with that context and failed with "RLS may not be enforced". Both counts are
   now raw SQL on the model's table, and the no-context count runs with the admin and
-  tenant GUCs cleared, then restored (with `SET LOCAL` under `USE_LOCAL_SET=True`). The
+  tenant GUCs cleared, then restored (with `SET LOCAL` under `USE_LOCAL_SET=True` inside
+  `transaction.atomic()`). The
   helper works under strict mode, gives the same result inside an admin or tenant
   context, leaves that context intact, and no longer needs a manager named `objects`.
   Default-manager filters no longer apply, so every row in the table must be hidden.

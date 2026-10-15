@@ -247,8 +247,7 @@ the transaction it sees. That thread depends on how the test runs the coroutine:
 - **`async def` methods on a `TransactionTestCase`.** The hops also run on the test thread
   and use its connection, but no test transaction is open. Writes are committed, and the
   tables are flushed after each test. With `USE_LOCAL_SET=True`, the async context managers
-  write nothing there and the guard gives each statement a transaction of its own (before
-  1.4.0 they raised `RLSConfigurationError`).
+  write nothing there and the guard gives each statement a transaction of its own.
 - **A sync pytest test that drives a coroutine with `async_to_sync`.** The hops run on the
   test thread too. With plain `@pytest.mark.django_db` this behaves like a `TestCase` and
   works with your usual fixtures. With `transaction=True` it behaves like a
@@ -378,8 +377,8 @@ def sample_data():
 
 The assertion functions work under strict mode. `assert_rls_enabled()` and
 `assert_rls_policy_exists()` only read the PostgreSQL catalog, and
-`assert_rls_blocks_without_context()` counts rows with raw SQL, which the guard does not
-see. You do not have to turn `STRICT_MODE` off to use these helpers.
+`assert_rls_blocks_without_context()` counts rows with raw SQL, which the `STRICT_MODE`
+check does not cover. You do not have to turn `STRICT_MODE` off to use these helpers.
 
 To explicitly test that strict mode raises, use `pytest.raises`:
 

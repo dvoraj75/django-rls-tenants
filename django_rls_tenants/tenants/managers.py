@@ -761,6 +761,9 @@ class RLSManager(models.Manager):  # type: ignore[type-arg]
     ``prepare_tenant_in_model_data()`` for resolving tenant FKs.
     """
 
+    # Django's router hints (``db_manager(hints=...)``); django-stubs does not declare it.
+    _hints: dict[str, Any]
+
     def get_queryset(self) -> TenantQuerySet:
         """Return a ``TenantQuerySet`` instance, auto-scoped if a tenant context is active.
 
@@ -769,7 +772,9 @@ class RLSManager(models.Manager):  # type: ignore[type-arg]
         ``WHERE tenant_id = X``. This enables PostgreSQL to use composite indexes
         instead of relying solely on RLS ``current_setting()`` calls.
         """
-        qs = TenantQuerySet(self.model, using=self._db)
+        # hints too, as BaseManager.get_queryset() passes them: a router reads
+        # them (db_manager(hints=...), the hint Django adds for related objects).
+        qs = TenantQuerySet(self.model, using=self._db, hints=self._hints)
         tenant_id = get_current_tenant_id()
         if tenant_id is not None:
             conf = rls_tenants_config

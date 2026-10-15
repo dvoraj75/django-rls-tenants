@@ -251,6 +251,7 @@ See [Connection Pooling](../guides/connection-pooling.md) for details.
 |--------|-------------|
 | Arbitrary SQL on the application connection | SQL injection, compromised code, or a `dbshell` with the app credentials can call `set_config()` to change the tenant or admin GUC |
 | Superuser or `BYPASSRLS` role | These roles bypass all RLS (`W005` warns) |
+| Database- or role-level default for a policy GUC (`ALTER DATABASE/ROLE ... SET`) | In force in every new session before any context is set, and never cleared by the library (`W011` warns) |
 | Cross-tenant FK references | Referential-integrity checks are exempt from RLS |
 | Cross-tenant uniqueness probes | Unique indexes are exempt from RLS and span all tenants |
 | Schema-level information leaks | Shared tables, sequences, indexes |

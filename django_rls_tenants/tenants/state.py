@@ -159,6 +159,14 @@ class _Live:
     that must replace one (``block=False``): ``MiddlewareMixin`` runs it in a
     ``sync_to_async`` hop of its own under ASGI. ``==`` is identity.
 
+    The two copies cannot be told apart, so a destination without a holder
+    also receives the block of a ``sync_to_async`` call it cancels while the
+    call's function is inside that block: a coroutine outside any context and
+    any request (a background job, say) then runs with that block's values
+    until the block exits in its thread. Requests hold a holder for their whole
+    duration (``middleware._holder_for_the_request``); other coroutines can do
+    the same by entering a context of their own around such calls.
+
     ``serial`` orders holders by creation: a holder that is current where a
     newer one was expected (see :func:`_reset_context_gucs`) is an enclosing
     context brought back by an exit out of order, not a block left open.
@@ -250,10 +258,13 @@ def _reset_context_gucs(entered: _ContextGucsToken) -> None:
     The context's own holder is ended first, so the context is over for every
     copy even if the reset fails. A newer holder that was current in its place
     (an inner block left without its exit) is ended too, and so is the current
-    one when the token was used before. A token from another ``Context`` (a
-    generator closed there, a hook run in a hop of its own) raises
-    ``ValueError`` and leaves that context's current holder alone: it is not
-    this block's.
+    one when the token was used before. A block entered while this one was
+    left current by a suspended generator, and still open when the generator
+    is closed, is such a newer holder as well: it is ended (fail-closed), since
+    nothing tells it apart from a block nested in this one. A token from another
+    ``Context`` (a generator closed there, a hook run in a hop of its own)
+    raises ``ValueError`` and leaves that context's current holder alone: it is
+    not this block's.
 
     Args:
         entered: What the corresponding ``_set_context_gucs()`` call returned.

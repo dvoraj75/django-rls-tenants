@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: 2026-10-13
+> Last updated: 2026-10-15
 >
 > Priorities may shift based on community feedback.
 > Have a suggestion? [Open an issue](https://github.com/dvoraj75/django-rls-tenants/issues).
@@ -172,7 +172,7 @@ up through middleware and context managers.
 
 ### Tier 0: Platform
 
-- [ ] **Supported-versions policy and matrix refresh** (#114) — A written policy (every
+- [x] **Supported-versions policy and matrix refresh** (#114) — A written policy (every
   Django series upstream supports; the Python versions all of them support; an explicit
   PostgreSQL list), applied: drop Django 4.2/5.0/5.1 and Python 3.11, add Django 6.1,
   PostgreSQL 15–18 with CI on 15 and 18, a psycopg 3 CI leg. On Django 6.1 the

@@ -4,6 +4,8 @@ Detects configuration issues at startup that would otherwise cause
 silent failures at runtime:
 
 - Superuser or ``BYPASSRLS`` database connections (RLS is completely bypassed — warning).
+- A database- or role-level default (``ALTER DATABASE/ROLE ... SET``) for a GUC the
+  RLS policies read, in force in every new session before any context is set.
 - ``GUC_PREFIX`` mismatch between runtime config and ``RLSConstraint`` defaults.
 - ``CONN_MAX_AGE > 0`` with ``USE_LOCAL_SET=False`` (connection-pool GUC leak risk).
 - Django's connection pool with ``USE_LOCAL_SET=False`` and no pool ``reset``.
@@ -42,6 +44,7 @@ def check_rls_config(
     """Run all RLS configuration checks."""
     errors: list[CheckWarning] = []
     errors.extend(_check_superuser_connection())
+    errors.extend(_check_policy_guc_defaults())
     errors.extend(_check_guc_prefix_mismatch())
     errors.extend(_check_conn_max_age_with_session_gucs())
     errors.extend(_check_pool_without_reset())
@@ -107,6 +110,78 @@ def _check_superuser_connection() -> list[CheckWarning]:
             "Could not check RLS-bypass role attributes (database may be unavailable).",
             exc_info=True,
         )
+    return warnings
+
+
+def _check_policy_guc_defaults() -> list[CheckWarning]:
+    """Warn if PostgreSQL applies a default value for a GUC the RLS policies read.
+
+    ``ALTER DATABASE ... SET rls.is_admin = 'true'`` or ``ALTER ROLE ... SET``
+    makes PostgreSQL set that value at the start of every session of that
+    database or role. The policies then read it before any RLS context is set:
+    an admin default bypasses them in every session, and a tenant default
+    shows that tenant's rows to everyone. The library assumes a new session
+    holds no value for these GUCs (the GUC affinity guard clears a session's
+    own values only after a context has used it), so such a default is never
+    cleared. Reads ``pg_db_role_setting`` on the default connection, for the
+    connected database and for cluster-wide (role-only) defaults: role-only
+    defaults first, then the database's, then those of a role in the database.
+    """
+    from django_rls_tenants.pool import _policy_guc_names  # noqa: PLC0415
+
+    warnings: list[CheckWarning] = []
+    names = {name.lower() for name in _policy_guc_names()}
+    if not names:
+        return warnings
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT d.datname, r.rolname, s.setconfig "
+                "FROM pg_db_role_setting AS s "
+                "LEFT JOIN pg_database AS d ON d.oid = s.setdatabase "
+                "LEFT JOIN pg_roles AS r ON r.oid = s.setrole "
+                "WHERE s.setdatabase = 0 OR d.datname = current_database() "
+                "ORDER BY d.datname NULLS FIRST, r.rolname NULLS FIRST"
+            )
+            rows = cursor.fetchall()
+    except Exception:
+        # Database may not be available at check time; see _check_superuser_connection().
+        logger.debug(
+            "Could not check for database or role defaults of the RLS GUCs "
+            "(database may be unavailable).",
+            exc_info=True,
+        )
+        return warnings
+    quote = connection.ops.quote_name
+    for database, role, setconfig in rows:
+        for entry in setconfig or ():
+            name, _, value = entry.partition("=")
+            if name.lower() not in names:
+                continue
+            if role is None:
+                scope = f"database {database!r}"
+                target = f"DATABASE {quote(database)}"
+            elif database is None:
+                scope = f"role {role!r} in every database"
+                target = f"ROLE {quote(role)}"
+            else:
+                scope = f"role {role!r} in database {database!r}"
+                target = f"ROLE {quote(role)} IN DATABASE {quote(database)}"
+            warnings.append(
+                CheckWarning(
+                    f"PostgreSQL sets {name} = {value!r} at the start of every session "
+                    f"for {scope}. The RLS policies read this GUC, so every session "
+                    f"starts with that value in force instead of no RLS context "
+                    f"(fail-closed), and django-rls-tenants never clears it: an admin "
+                    f"value bypasses the policies, a tenant value shows that tenant's "
+                    f"rows to everyone.",
+                    hint=(
+                        f"Remove the default: ALTER {target} RESET {name}; "
+                        f"and set the RLS context per request or block instead."
+                    ),
+                    id="django_rls_tenants.W011",
+                )
+            )
     return warnings
 
 

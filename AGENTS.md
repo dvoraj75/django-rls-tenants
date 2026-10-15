@@ -143,7 +143,9 @@ installed models' constraints (`RLSConstraint` GUCs and `extra_bypass_flags`,
 `AddM2MRLSPolicy` with non-default names are not covered. The registry part is cached once
 `apps.ready` and dropped on an `INSTALLED_APPS` change. The safety net skips a closed
 connection (with a pool, Django has already returned it). System check `W010` asks for
-`reset_rls_gucs` as the pool's `reset`.
+`reset_rls_gucs` as the pool's `reset`; `W011` warns about a database- or role-level
+default (`ALTER DATABASE/ROLE ... SET`) for a policy GUC, which every new session starts
+with and the guard (which assumes a new session holds none) never clears.
 
 When modifying middleware or GUC-related code, ensure all database iteration
 uses `conf.DATABASES` rather than hardcoding `"default"`.
@@ -253,11 +255,16 @@ Rules for code that sets a context or writes the admin/tenant GUCs:
 - Writes by other code (`set_guc()`, `rls_context()`) are deliberately not recorded. With
   `USE_LOCAL_SET=True` they do not narrow a context in autocommit: the guard's own
   transaction sets the context's values over them.
+- `contrib/celery._capture()` reads the holder too: inside a request or block the library
+  set up, `_values_of(_current_live())` is authoritative (a cancelled hop copies the public
+  `ContextVar`s by value, not the holder); only with no holder at all does it fall back to
+  `get_current_tenant_id()` / `get_rls_context_active()`.
 
 PostgreSQL undoes `set_config()` calls made in a rolled-back transaction or savepoint, and
 transaction-local ones at any end of their transaction (`_SessionGUCs.end_transaction()`
 reads `wrote_local` / `wrote_session`; both kinds in one committed transaction leave the
-values `UNKNOWN`, since which one survives depends on their order), so
+values `UNKNOWN`: a commit keeps the last session-level write, which the tracker does not
+hold separately), so
 the tracker follows Django's commit and rollback (the wrapped `_commit` / `_rollback`), the
 libpq transaction status, and the statements in `_FOLLOWED` that run through Django's cursor
 (savepoint stack, `ROLLBACK`/`COMMIT` as SQL, `RESET ALL`/`DISCARD ALL`/`RESET` of the two
@@ -311,7 +318,11 @@ and the GUC affinity guard applies the copied context to their statements and ta
 the connection before the next statement run without it (#130, #41).
 A subclass that overrides `process_request` or `process_response` is detected in `__init__`
 and served by `_acall_through_sync_hooks` (`MiddlewareMixin.__acall__`), so changes to the
-sync hooks must keep that path working too. With `USE_LOCAL_SET=True` neither async path
+sync hooks must keep that path working too. That path clears the GUCs itself when the
+request is cancelled while `process_request`'s hop may still be writing them (asgiref copies
+the hop's `ContextVar`s at the cancellation, before `_mark_gucs_set()`), and puts back the
+tenant and strict-mode values the request found, which the cleanup's clear fallback took off
+an enclosing block. With `USE_LOCAL_SET=True` neither async path
 opens a transaction or writes a GUC (the guard applies the request's values per statement,
 #96); only the sync `__call__` (`_call_sync`) owns a request transaction, so `__init__`
 checks the exception-middleware order only when `async_mode` is off. `async_mode` is off

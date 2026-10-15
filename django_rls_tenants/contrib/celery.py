@@ -54,7 +54,12 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.tenants.context import admin_context, tenant_context
 from django_rls_tenants.tenants.errors import HINT_NO_CONTEXT
-from django_rls_tenants.tenants.state import get_current_tenant_id, get_rls_context_active
+from django_rls_tenants.tenants.state import (
+    _current_live,
+    _values_of,
+    get_current_tenant_id,
+    get_rls_context_active,
+)
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
@@ -72,9 +77,20 @@ def _capture() -> dict[str, Any]:
 
     Resolution order:
 
-    1. A live ``tenant_context()`` -- the common case, enqueuing from a view,
-       the middleware's request context, or an explicit ``tenant_context()``.
-    2. A live ``admin_context()`` (active flag set but no tenant id).
+    1. The context the library set up, when one is current: the GUC values it
+       recorded for the innermost live ``tenant_context()`` /
+       ``admin_context()`` or middleware request (the record the GUC affinity
+       guard applies) -- the common case, enqueuing from a view. The record is
+       read instead of the public tenant state because a ``sync_to_async``
+       call cancelled while its function is inside another block copies that
+       block's public values into the caller, but not the record (see
+       ``state._Live``). The tenant id keeps its original type when the public
+       state agrees with the record. A request or block that holds no context,
+       or a context that has ended but is still current (work that outlived
+       its block), captures nothing from the public state.
+    2. Outside any scope the library set up, the public tenant state: a live
+       tenant id, or the active flag alone for admin (a context built by hand
+       with ``set_current_tenant_id()`` / ``set_rls_context_active()``).
     3. The currently-executing task's headers. On a worker, the next step of a
        canvas is enqueued *after* the upstream task's ``tenant_context`` has
        closed, but while that task is still :data:`celery.current_task`, so its
@@ -84,11 +100,23 @@ def _capture() -> dict[str, Any]:
         A header dict to merge into the outgoing task, or an empty dict when no
         context is active (the task is enqueued unscoped -- fail-closed).
     """
-    tenant_id = get_current_tenant_id()
-    if tenant_id is not None:
-        return {_TENANT_HEADER: tenant_id, _ADMIN_HEADER: False}
-    if get_rls_context_active():
-        return {_TENANT_HEADER: None, _ADMIN_HEADER: True}
+    live = _current_live()
+    if live is not None:
+        values = _values_of(live)
+        if values is not None:
+            if values.is_admin == "true":
+                return {_TENANT_HEADER: None, _ADMIN_HEADER: True}
+            if values.current_tenant:
+                tenant_id: Any = get_current_tenant_id()
+                if tenant_id is None or str(tenant_id) != values.current_tenant:
+                    tenant_id = values.current_tenant
+                return {_TENANT_HEADER: tenant_id, _ADMIN_HEADER: False}
+    else:
+        tenant_id = get_current_tenant_id()
+        if tenant_id is not None:
+            return {_TENANT_HEADER: tenant_id, _ADMIN_HEADER: False}
+        if get_rls_context_active():
+            return {_TENANT_HEADER: None, _ADMIN_HEADER: True}
 
     # Canvas propagation. ``current_task`` outside a task is a proxy wrapping
     # ``None`` whose attribute access raises -- ``getattr(..., None)`` turns that
