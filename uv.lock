@@ -489,6 +489,7 @@ drf = [
 [package.dev-dependencies]
 dev = [
     { name = "django-stubs", extra = ["compatible-mypy"] },
+    { name = "djangorestframework" },
     { name = "djangorestframework-stubs" },
     { name = "mypy" },
     { name = "pre-commit" },
@@ -525,6 +526,7 @@ provides-extras = ["celery", "drf"]
 [package.metadata.requires-dev]
 dev = [
     { name = "django-stubs", extras = ["compatible-mypy"], specifier = ">=5.0" },
+    { name = "djangorestframework", specifier = ">=3.16" },
     { name = "djangorestframework-stubs", specifier = ">=3.16" },
     { name = "mypy", specifier = ">=1.13" },
     { name = "pre-commit", specifier = ">=3.0" },

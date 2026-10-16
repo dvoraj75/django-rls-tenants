@@ -186,6 +186,25 @@ warning means a check could not run on a reachable database. See
 [E001](../troubleshooting.md#e001-the-connection-role-bypasses-rls-with-debug-off) and
 [W013](../troubleshooting.md#w013-a-database-check-could-not-be-determined).
 
+#### `W012`: unique fields that span tenants are reported
+
+`python manage.py check` now warns (`django_rls_tenants.W012`) about each `unique=True`
+field, `unique_together` entry and `UniqueConstraint` of a model with an `RLSConstraint`
+that does not include the tenant field. PostgreSQL checks unique indexes outside the RLS
+policies, so the `IntegrityError` on a value held by another tenant tells the writer
+that it exists. An existing project can therefore see new warnings after the upgrade;
+nothing fails and no behaviour changes. For each one either:
+
+- replace the global rule with a per-tenant one,
+  `UniqueConstraint(fields=["tenant", ...], name=...)`, in a migration (make sure the
+  existing rows do not collide, and keep `*RLSProtectedModel.Meta.constraints` in
+  `Meta.constraints`), or
+- if uniqueness across tenants is intended, list it in
+  `RLS_TENANTS["UNIQUE_ACROSS_TENANTS"] = {"app_label.ModelName": ["field_or_constraint_name"]}`.
+
+See [W012](../troubleshooting.md#w012-a-unique-field-or-constraint-spans-all-tenants) and
+[`UNIQUE_ACROSS_TENANTS`](../getting-started/configuration.md#unique_across_tenants).
+
 ### From 1.3.4 to 1.4.0
 
 - **Django 4.2, 5.0 and 5.1 and Python 3.11 are no longer supported.** 1.4.0 needs

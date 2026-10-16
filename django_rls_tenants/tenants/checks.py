@@ -15,6 +15,9 @@ silent failures at runtime:
 - ``DATABASES`` contains aliases not in ``settings.DATABASES``.
 - ``TENANT_MODEL`` does not resolve to an installed model.
 - ``TENANT_FK_FIELD`` missing on an ``RLSProtectedModel`` subclass.
+- A unique field or constraint on an RLS-protected model that omits the tenant
+  field (``W012``): unique indexes are checked outside the RLS policies, so the
+  ``IntegrityError`` tells one tenant that a value exists in another.
 
 Check IDs are never renumbered. ``W003`` (retired in 1.3.1) and ``W007``
 (retired in 1.3.2) are no longer emitted: ``RLSTenantMiddleware`` opens its
@@ -27,7 +30,7 @@ that mode.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from django.core.checks import CheckMessage, register
 from django.core.checks import Error as CheckError
@@ -36,7 +39,9 @@ from django.core.exceptions import ImproperlyConfigured
 from django.db import Error, InterfaceError, OperationalError, connections
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Iterable, Iterator, Sequence
+
+    from django.db import models
 
 logger = logging.getLogger("django_rls_tenants")
 
@@ -56,6 +61,7 @@ def check_rls_config(
     errors.extend(_check_databases_alias_exists())
     errors.extend(_check_tenant_model_resolves())
     errors.extend(_check_tenant_fk_field_exists())
+    errors.extend(_check_unique_across_tenants())
     return errors
 
 
@@ -553,3 +559,234 @@ def _check_tenant_fk_field_exists() -> list[CheckWarning]:
                 )
             )
     return warnings
+
+
+class _UniqueSet(NamedTuple):
+    """A set of columns PostgreSQL keeps unique across one model's table."""
+
+    description: str
+    fields: tuple[str, ...]  # resolved names, in declared order
+    name: str  # the field or constraint name; empty for a ``unique_together`` entry
+    by_expressions: bool
+
+
+def _check_unique_across_tenants() -> list[CheckWarning]:
+    """Warn about unique fields and constraints that omit the tenant field (``W012``).
+
+    PostgreSQL checks unique indexes outside the row-security policies, so a
+    unique index on an RLS-protected table spans every tenant: a write whose
+    value exists only in another tenant fails with an ``IntegrityError``, which
+    tells the writer that the value exists (a company registration number, a
+    slug). Walks every concrete model with an ``RLSConstraint`` and reports each
+    ``unique=True`` field other than the primary key, ``unique_together`` entry
+    and ``UniqueConstraint`` that does not include the tenant field (the
+    ``RLSConstraint``'s ``field``). A ``UniqueConstraint`` on expressions
+    includes it when one of them references the field.
+
+    Uniqueness across tenants that is intended is listed in
+    ``RLS_TENANTS["UNIQUE_ACROSS_TENANTS"]``; an entry there that matches no
+    reported unique set (a stale label or name) is reported too. A model whose
+    tenant field does not exist is left to ``W009``.
+    """
+    from django.apps import apps  # noqa: PLC0415
+    from django.core.exceptions import FieldDoesNotExist  # noqa: PLC0415
+
+    from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
+    from django_rls_tenants.tenants.models import _get_tenant_fk_field  # noqa: PLC0415
+
+    allowlist = rls_tenants_config.UNIQUE_ACROSS_TENANTS
+    # Labels are case-insensitive, so two spellings of one label list the same model.
+    entries_by_label: dict[str, list[str | tuple[str, ...]]] = {}
+    for label, entries in allowlist.items():
+        entries_by_label.setdefault(label.lower(), []).extend(entries)
+    warnings: list[CheckWarning] = []
+    checked: set[str] = set()
+    for model in apps.get_models():
+        fk_field = _get_tenant_fk_field(model)
+        if fk_field is None or model._meta.proxy:  # noqa: SLF001
+            continue
+        label = model._meta.label_lower  # noqa: SLF001
+        checked.add(label)
+        try:
+            tenant_field = model._meta.get_field(fk_field).name  # noqa: SLF001
+        except FieldDoesNotExist:
+            continue
+        warnings.extend(
+            _unique_across_tenants_warnings(
+                model,
+                tenant_field,
+                entries_by_label.get(label, []),
+            )
+        )
+    warnings.extend(
+        CheckWarning(
+            f"RLS_TENANTS['UNIQUE_ACROSS_TENANTS'] lists {label!r}, which names no "
+            f"installed, non-proxy model with an RLSConstraint.",
+            hint=(
+                "Remove the entry, or correct the label to '<app_label>.<ModelName>' "
+                "of an RLS-protected model."
+            ),
+            id="django_rls_tenants.W012",
+        )
+        for label in allowlist
+        if label.lower() not in checked
+    )
+    return warnings
+
+
+def _unique_across_tenants_warnings(
+    model: type[models.Model],
+    tenant_field: str,
+    entries: list[str | tuple[str, ...]],
+) -> list[CheckWarning]:
+    """Build ``W012`` for each unique set of ``model`` that omits ``tenant_field``.
+
+    ``entries`` is the model's ``UNIQUE_ACROSS_TENANTS`` list; each entry that
+    matches none of the reported sets gets a ``W012`` of its own.
+    """
+    resolve = _field_name_resolver(model)
+    label = model._meta.label  # noqa: SLF001
+    warnings: list[CheckWarning] = []
+    used: set[str | tuple[str, ...]] = set()
+    for unique_set in _unique_sets(model):
+        if tenant_field in unique_set.fields:
+            continue
+        matched = [entry for entry in entries if _allowlists(entry, unique_set, resolve)]
+        if matched:
+            used.update(matched)
+            continue
+        if unique_set.by_expressions:
+            suggestion: str | tuple[str, ...] = unique_set.name
+            fix = f"reference {tenant_field!r} in the constraint's expressions"
+        else:
+            suggestion = unique_set.fields[0] if len(unique_set.fields) == 1 else unique_set.fields
+            fields = ", ".join(repr(name) for name in (tenant_field, *unique_set.fields))
+            fix = f"declare models.UniqueConstraint(fields=[{fields}], name=...) in its place"
+        warnings.append(
+            CheckWarning(
+                f"{unique_set.description} is unique across all tenants: it does not "
+                f"include the tenant field {tenant_field!r}. PostgreSQL checks unique "
+                f"indexes outside the RLS policies, so a write whose value exists only "
+                f"in another tenant fails with an IntegrityError, telling the writer "
+                f"that the value exists there.",
+                hint=(
+                    f"Scope it to the tenant: {fix}. If uniqueness across tenants is "
+                    f"intended, list it in RLS_TENANTS['UNIQUE_ACROSS_TENANTS'] = "
+                    f"{{{label!r}: [{suggestion!r}]}}."
+                ),
+                id="django_rls_tenants.W012",
+                obj=model,
+            )
+        )
+    warnings.extend(
+        CheckWarning(
+            f"RLS_TENANTS['UNIQUE_ACROSS_TENANTS'][{label!r}] lists {entry!r}, which "
+            f"matches no unique field or constraint of {label} that omits the tenant "
+            f"field {tenant_field!r}.",
+            hint=(
+                "Remove the entry, or correct it to a unique field's name, a "
+                "UniqueConstraint's name, or the tuple of a unique set's field names."
+            ),
+            id="django_rls_tenants.W012",
+            obj=model,
+        )
+        for entry in entries
+        if entry not in used
+    )
+    return warnings
+
+
+def _field_name_resolver(model: type[models.Model]) -> Callable[[str], str]:
+    """Return a function mapping a field name or attname (``tenant_id``) to the name."""
+    from django.core.exceptions import FieldDoesNotExist  # noqa: PLC0415
+
+    def resolve(name: str) -> str:
+        try:
+            return model._meta.get_field(name).name  # noqa: SLF001
+        except FieldDoesNotExist:
+            return name  # Django's own model checks report the unknown name
+
+    return resolve
+
+
+def _unique_sets(model: type[models.Model]) -> Iterator[_UniqueSet]:
+    """Yield every set of columns ``model`` declares unique, except its primary key.
+
+    Only the model's own fields: a multi-table-inheritance parent's unique
+    fields live in the parent's table and are reported on the parent.
+    """
+    from django.db.models import UniqueConstraint  # noqa: PLC0415
+
+    opts = model._meta  # noqa: SLF001
+    resolve = _field_name_resolver(model)
+    for field in opts.local_concrete_fields:
+        if field.unique and not field.primary_key:
+            yield _UniqueSet(
+                f"Field {field.name!r} (unique=True)",
+                (field.name,),
+                field.name,
+                by_expressions=False,
+            )
+    for together in opts.unique_together:
+        yield _UniqueSet(
+            f"unique_together entry {tuple(together)!r}",
+            tuple(resolve(name) for name in together),
+            "",
+            by_expressions=False,
+        )
+    for constraint in opts.constraints:
+        if not isinstance(constraint, UniqueConstraint):
+            continue
+        if constraint.fields:
+            yield _UniqueSet(
+                f"UniqueConstraint {constraint.name!r} on {tuple(constraint.fields)!r}",
+                tuple(resolve(name) for name in constraint.fields),
+                constraint.name,
+                by_expressions=False,
+            )
+        else:
+            yield _UniqueSet(
+                f"UniqueConstraint {constraint.name!r} on expressions",
+                tuple(
+                    resolve(name)
+                    for expression in constraint.expressions
+                    for name in _referenced_field_names(expression)
+                ),
+                constraint.name,
+                by_expressions=True,
+            )
+
+
+def _referenced_field_names(expression: Any) -> Iterator[str]:
+    """Yield the field each ``F()`` in ``expression`` references (``a__b`` gives ``a``)."""
+    from django.db.models import F  # noqa: PLC0415
+    from django.db.models.constants import LOOKUP_SEP  # noqa: PLC0415
+
+    # A bare ``F()`` has no ``flatten()``; an expression's yields every node, ``F()``s included.
+    nodes: Iterable[Any] = (
+        [expression] if isinstance(expression, F) else getattr(expression, "flatten", tuple)()
+    )
+    for node in nodes:
+        if isinstance(node, F):
+            name: str = node.name  # type: ignore[attr-defined]  # set in F.__init__, not in the stubs
+            yield name.split(LOOKUP_SEP, 1)[0]
+
+
+def _allowlists(
+    entry: str | tuple[str, ...],
+    unique_set: _UniqueSet,
+    resolve: Callable[[str], str],
+) -> bool:
+    """Whether ``UNIQUE_ACROSS_TENANTS`` ``entry`` names ``unique_set``.
+
+    A string names a ``UniqueConstraint`` by its name, or a unique set of that
+    one field; a tuple names a unique set of exactly those fields. Field sets
+    only match sets declared by field names, not by expressions.
+    """
+    if isinstance(entry, str):
+        if unique_set.name and entry == unique_set.name:
+            return True
+        entry = (entry,)
+    return not unique_set.by_expressions and (
+        {resolve(name) for name in entry} == set(unique_set.fields)
+    )

@@ -128,7 +128,9 @@ uniqueness.
 - **Unique indexes span all tenants.** A global unique constraint rejects a value
   that exists only in another tenant, and the resulting `IntegrityError` tells the
   writer that the value exists. Django's `validate_unique()` queries through RLS, so
-  it cannot see the conflicting row and lets the save reach the database.
+  it cannot see the conflicting row and lets the save reach the database. System check
+  `W012` warns about each such unique field or constraint (see
+  [Cross-Tenant Unique Constraints](#cross-tenant-unique-constraints)).
 
 ### Cross-Tenant Unique Constraints
 
@@ -141,12 +143,58 @@ class Invoice(RLSProtectedModel):
 
     class Meta(RLSProtectedModel.Meta):
         constraints = [
+            *RLSProtectedModel.Meta.constraints,
             models.UniqueConstraint(
                 fields=["tenant", "number"],
                 name="unique_invoice_per_tenant",
             ),
         ]
 ```
+
+!!! warning
+    Keep `*RLSProtectedModel.Meta.constraints` in the list. Assigning `constraints`
+    without it replaces the model's `RLSConstraint`, and the table gets no RLS policy.
+
+A `unique=True` field (`number = models.CharField(unique=True)`), a `unique_together`
+entry or a `UniqueConstraint` that leaves the tenant out is unique across **all**
+tenants. Saving a value that only another tenant holds fails with an `IntegrityError`,
+which tells the writer that the value exists there: a company registration number, a
+slug or a tag name becomes an existence oracle. System check `W012`
+(`django_rls_tenants.W012`) reports every such set on a model that has an
+`RLSConstraint`, primary keys excepted:
+
+- `unique=True` fields (a `OneToOneField` is one; a unique tenant field itself, as on a
+  one-row-per-tenant model, is fine),
+- `Meta.unique_together` entries,
+- `UniqueConstraint(fields=...)`, conditional ones included,
+- `UniqueConstraint` on expressions, which passes when one expression references the
+  tenant field: `UniqueConstraint(Lower("slug"), "tenant", name=...)`.
+
+Fix it by scoping the rule to the tenant, as above. Uniqueness that really is global
+(a registration number the business guarantees to be unique, where telling a tenant that
+it is taken is acceptable) is recorded in `RLS_TENANTS["UNIQUE_ACROSS_TENANTS"]`, keyed
+by model label (case-insensitive):
+
+```python title="settings.py"
+RLS_TENANTS = {
+    "TENANT_MODEL": "billing.Tenant",
+    "UNIQUE_ACROSS_TENANTS": {
+        "billing.Company": [
+            "registration_number",      # unique=True field
+            "company_lower_name_uniq",  # UniqueConstraint name
+            ("country", "vat_id"),      # unique_together / UniqueConstraint(fields=...)
+        ],
+    },
+}
+```
+
+A string is a field name or a `UniqueConstraint` name (the only way to list an
+expression constraint); a tuple of field names matches a `unique_together` entry or a
+`UniqueConstraint(fields=...)` with exactly those fields, in any order. An entry that
+matches nothing, or a label that names no RLS-protected model, is reported as `W012`
+too, so the list cannot go stale. Only a model's own fields are checked: the unique
+fields of a multi-table-inheritance parent are reported on the parent. See
+[`UNIQUE_ACROSS_TENANTS`](../getting-started/configuration.md#unique_across_tenants).
 
 ### Aggregate Leaks
 
@@ -344,7 +392,8 @@ See [Configuration](../getting-started/configuration.md#strict_mode) for setup.
 3. **Enable `USE_LOCAL_SET`** behind an external pooler in transaction mode (PgBouncer),
    and set `reset_rls_gucs` as the `reset` callback of Django's connection pool.
 4. **Use UUIDs** for tenant PKs if sequence-based leaks are a concern.
-5. **Include tenant FK in unique constraints** that should be per-tenant.
+5. **Include tenant FK in unique constraints** that should be per-tenant, and keep
+   `W012` clean (see [Cross-Tenant Unique Constraints](#cross-tenant-unique-constraints)).
 6. **Validate FK targets through tenant-scoped managers** (or composite FKs) -- RLS
    does not check the tenant of referenced rows.
 7. **Run `check_rls`** in CI to verify policies exist.

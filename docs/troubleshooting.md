@@ -590,6 +590,58 @@ RESET rls.is_admin;`) and reconnect. Set the RLS context per request or block in
 [Context Managers](guides/context-managers.md)); for a one-off maintenance session, use
 `admin_context()`, or `SET rls.is_admin = 'true'` in that session only.
 
+### W012: a unique field or constraint spans all tenants
+
+**Symptom:** `billing.Company: (django_rls_tenants.W012) Field 'registration_number'
+(unique=True) is unique across all tenants: it does not include the tenant field
+'tenant'. PostgreSQL checks unique indexes outside the RLS policies, so a write whose
+value exists only in another tenant fails with an IntegrityError, telling the writer
+that the value exists there.` The same check reports `unique_together` entries,
+`UniqueConstraint(fields=...)` and `UniqueConstraint` on expressions that leave the
+tenant field out, and a stale `RLS_TENANTS["UNIQUE_ACROSS_TENANTS"]` entry (`...
+lists 'registration_numbr', which matches no unique field or constraint of
+billing.Company that omits the tenant field 'tenant'`, or a label that names no
+RLS-protected model).
+
+**Cause:** The unique index covers the whole table, and PostgreSQL enforces it without
+applying the RLS policies. Tenant A saving a value that only tenant B holds gets an
+`IntegrityError`, so tenant A learns that tenant B has a company with that registration
+number, slug or tag. Django's `validate_unique()` and `ModelForm` validation query
+through RLS, cannot see tenant B's row and let the save reach the database. After an
+upgrade to 1.5.0 this check can report models that were already like this. It walks every
+concrete model that has an `RLSConstraint`; primary keys, proxy models and a tenant field
+that is itself unique are not reported.
+
+**Fix:** Scope the rule to the tenant, with a migration (check that existing rows do not
+collide first):
+
+```python
+class Company(RLSProtectedModel):
+    registration_number = models.CharField(max_length=50)  # was unique=True
+
+    class Meta(RLSProtectedModel.Meta):
+        constraints = [
+            *RLSProtectedModel.Meta.constraints,
+            models.UniqueConstraint(
+                fields=["tenant", "registration_number"],
+                name="company_registration_number_per_tenant",
+            ),
+        ]
+```
+
+For a constraint on expressions, reference the tenant field in it
+(`UniqueConstraint(Lower("slug"), "tenant", name=...)`). If uniqueness across tenants is
+intended, list it, by field name, `UniqueConstraint` name or tuple of field names:
+
+```python
+RLS_TENANTS = {
+    "UNIQUE_ACROSS_TENANTS": {"billing.Company": ["registration_number"]},
+}
+```
+
+**See:** [`UNIQUE_ACROSS_TENANTS`](getting-started/configuration.md#unique_across_tenants),
+[Cross-Tenant Unique Constraints](advanced/security.md#cross-tenant-unique-constraints).
+
 ### W006 / W008 / W009: alias, tenant model or tenant field not found
 
 | ID | Message | Cause | Fix |

@@ -22,6 +22,7 @@ _KNOWN_KEYS = frozenset(
         "TENANT_FK_FIELD",
         "TENANT_MODEL",
         "TENANT_PK_TYPE",
+        "UNIQUE_ACROSS_TENANTS",
         "USE_LOCAL_SET",
         "USER_PARAM_NAME",
     }
@@ -42,6 +43,7 @@ class RLSTenantsConfig:
             "USER_PARAM_NAME": "as_user",          # Default: "as_user"
             "TENANT_PK_TYPE": "int",               # Default: "int"
             "USE_LOCAL_SET": False,                 # Default: False
+            "UNIQUE_ACROSS_TENANTS": {},           # Default: {}
         }
     """
 
@@ -121,6 +123,48 @@ class RLSTenantsConfig:
         """
         return self._get("DATABASES", ["default"])  # type: ignore[no-any-return]
 
+    @property
+    def UNIQUE_ACROSS_TENANTS(self) -> dict[str, list[str | tuple[str, ...]]]:
+        """Unique fields and constraints meant to span tenants. Default: ``{}``.
+
+        Maps a model label (``"app_label.ModelName"``) to the unique sets of
+        that model that check ``W012`` must not report: a field name (a
+        ``unique=True`` field, or a unique set of that one field), a
+        ``UniqueConstraint`` name, or a tuple of field names (a
+        ``unique_together`` entry or a ``UniqueConstraint(fields=...)`` with
+        exactly those fields)::
+
+            RLS_TENANTS = {
+                "UNIQUE_ACROSS_TENANTS": {
+                    "billing.Company": ["registration_number", ("country", "vat_id")],
+                },
+            }
+
+        Raises:
+            RLSConfigurationError: If the value is not a dict of lists of field
+                names, constraint names and tuples of field names.
+        """
+        value = self._get("UNIQUE_ACROSS_TENANTS", {})
+        if not isinstance(value, dict):
+            msg = (
+                f"RLS_TENANTS['UNIQUE_ACROSS_TENANTS'] must be a dict mapping model "
+                f"labels to lists, got {type(value).__name__}. Example: "
+                f"{{'billing.Company': ['registration_number']}}."
+            )
+            raise RLSConfigurationError(msg)
+        allowlist: dict[str, list[str | tuple[str, ...]]] = {}
+        for label, entries in value.items():
+            if not isinstance(label, str) or not isinstance(entries, (list, tuple)):
+                msg = (
+                    f"RLS_TENANTS['UNIQUE_ACROSS_TENANTS'] maps {label!r} to {entries!r}: "
+                    f"each key must be a model label ('app_label.ModelName') and each "
+                    f"value a list of field names, constraint names and tuples of field "
+                    f"names, e.g. {{'billing.Company': ['registration_number']}}."
+                )
+                raise RLSConfigurationError(msg)
+            allowlist[label] = [_allowlist_entry(label, entry) for entry in entries]
+        return allowlist
+
     def __repr__(self) -> str:
         try:
             model = self.TENANT_MODEL
@@ -187,6 +231,24 @@ class RLSTenantsConfig:
                 UserWarning,
                 stacklevel=4,
             )
+
+
+def _allowlist_entry(label: str, entry: Any) -> str | tuple[str, ...]:
+    """Validate one ``UNIQUE_ACROSS_TENANTS`` entry; a list of names becomes a tuple.
+
+    Raises:
+        RLSConfigurationError: If ``entry`` is neither a name nor a sequence of names.
+    """
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, (list, tuple)) and entry and all(isinstance(name, str) for name in entry):
+        return tuple(entry)
+    msg = (
+        f"RLS_TENANTS['UNIQUE_ACROSS_TENANTS'][{label!r}] contains {entry!r}: an entry "
+        f"must be a field or constraint name (a string) or a non-empty tuple of field "
+        f"names, e.g. ('country', 'vat_id')."
+    )
+    raise RLSConfigurationError(msg)
 
 
 rls_tenants_config = RLSTenantsConfig()

@@ -124,6 +124,46 @@ class TestRLSTenantsConfig:
             conf = RLSTenantsConfig()
             assert conf.STRICT_MODE is True
 
+    def test_unique_across_tenants_default(self):
+        """UNIQUE_ACROSS_TENANTS defaults to an empty dict."""
+        with override_settings(RLS_TENANTS={"TENANT_MODEL": "x.Y"}):
+            conf = RLSTenantsConfig()
+            assert conf.UNIQUE_ACROSS_TENANTS == {}
+
+    def test_unique_across_tenants_turns_name_lists_into_tuples(self):
+        """Names stay strings; a list or tuple of field names becomes a tuple."""
+        allowlist = {"billing.Company": ["slug", ["country", "vat_id"], ("a", "b")]}
+        with override_settings(
+            RLS_TENANTS={"TENANT_MODEL": "x.Y", "UNIQUE_ACROSS_TENANTS": allowlist},
+        ):
+            conf = RLSTenantsConfig()
+            with w.catch_warnings():
+                w.simplefilter("error")  # a known key: no unknown-key warning
+                assert conf.UNIQUE_ACROSS_TENANTS == {
+                    "billing.Company": ["slug", ("country", "vat_id"), ("a", "b")],
+                }
+
+    @pytest.mark.parametrize(
+        ("value", "match"),
+        [
+            (["billing.Company"], "must be a dict"),
+            ({"billing.Company": "slug"}, "each key must be a model label"),
+            ({1: ["slug"]}, "each key must be a model label"),
+            ({"billing.Company": [1]}, r"contains 1: an entry"),
+            ({"billing.Company": [()]}, r"contains \(\): an entry"),
+            ({"billing.Company": [("a", 1)]}, r"contains \('a', 1\): an entry"),
+        ],
+        ids=["not_a_dict", "string_value", "non_string_label", "int_entry", "empty", "mixed"],
+    )
+    def test_unique_across_tenants_rejects_malformed_values(self, value, match):
+        """A malformed UNIQUE_ACROSS_TENANTS raises RLSConfigurationError naming the fix."""
+        with override_settings(
+            RLS_TENANTS={"TENANT_MODEL": "x.Y", "UNIQUE_ACROSS_TENANTS": value},
+        ):
+            conf = RLSTenantsConfig()
+            with pytest.raises(RLSConfigurationError, match=match):
+                _ = conf.UNIQUE_ACROSS_TENANTS
+
     def test_unknown_key_warns(self):
         """Unrecognized keys in RLS_TENANTS emit a UserWarning."""
         with override_settings(
