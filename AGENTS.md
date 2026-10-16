@@ -61,9 +61,13 @@ environment: installing psycopg 3 switches Django's driver for the whole process
 **Plain-role rule.** CI's `test-plain-role` job runs the whole library suite as a
 non-superuser role (`-m "not superuser_only"`). A superuser bypasses RLS, so any test that
 asserts database-level filtering (including `for_user()` results) must request the
-`enforce_rls` fixture: it switches a superuser connection to a plain role and is a no-op
-on one. Rows a test needs must be created inside `admin_context()` / `tenant_context()`,
-since a plain role cannot insert them without a context.
+`enforce_rls` fixture: it switches a `SUPERUSER` / `BYPASSRLS` connection to a plain role
+with `SET ROLE` and is a no-op on a plain one. `enforce_rls`, `rls_role` and
+`enforce_rls_on_other_threads` come from the shipped plugin
+`django_rls_tenants/pytest_plugin.py` (#97; see Architecture), which the suite dogfoods:
+`tests/conftest.py` only adds `replica` and `pooled`, built on `rls_role`. Rows a test needs
+must be created inside `admin_context()` / `tenant_context()`, since a plain role cannot
+insert them without a context.
 
 ### Test Organization
 
@@ -71,6 +75,7 @@ since a plain role cannot insert them without a context.
 tests/
 ├── conftest.py              # shared fixtures
 ├── settings.py              # Django settings for test suite
+├── test_pytest_plugin.py    # the shipped pytest plugin (fixtures, ini options)
 ├── test_rls/                # unit tests for rls/ layer
 ├── test_tenants/            # unit tests for tenants/ layer
 ├── test_integration/        # end-to-end tests (marked @pytest.mark.integration)
@@ -91,6 +96,15 @@ The library has two internal layers with a strict import boundary:
   psycopg connection pool, and the single statement that clears every GUC the policies
   read (used by the `connection_created` handler too). `settings.py` imports it before
   Django is set up, so it must not import `tenants/` at module level.
+- **`django_rls_tenants/pytest_plugin.py`** — the shipped pytest plugin (#97): the
+  `rls_role`, `enforce_rls` and `enforce_rls_on_other_threads` fixtures and the `rls_role` /
+  `rls_role_aliases` ini options, registered through `[project.entry-points.pytest11]`
+  (`django_rls_tenants`) in `pyproject.toml`, so it loads in every pytest run where the
+  package is installed (`-p no:django_rls_tenants` opts out). pytest imports it at startup,
+  before Django settings exist, and `tenants/__init__.py` imports models, so it sits at the
+  package root and **must not import Django or the rest of the package at module level**
+  (imports go inside the fixtures). Its twin in `tenants/testing.py` is
+  `assert_rls_enforced()` / `aassert_rls_enforced()`.
 
 This boundary is enforced by `tests/test_layering.py`. Never import from `tenants/` in `rls/`.
 
@@ -135,8 +149,9 @@ copied context to that thread's statements (#41). Code that sets the flag from a
 different thread than the one that set the GUCs must pass that thread's marker (the
 async path takes it from the enter hop); `_mark_gucs_set()` alone marks the current
 thread. The safety-net `request_finished` handler clears GUCs on all configured aliases,
-and ends the guard's context. The sync `__call__` also cleans up when a `BaseException`
-skips `process_response`.
+and ends the guard's context. In session mode the middleware sets and clears both GUCs
+with one `write_gucs()` statement per alias (#137), and so does the safety net. The sync
+`__call__` also cleans up when a `BaseException` skips `process_response`.
 
 On an alias with `OPTIONS["pool"]` (Django's psycopg pool, `_is_pooled()` in `apps.py`),
 Django sends `connection_created` on every checkout, and the handler first clears every
@@ -156,7 +171,10 @@ installed models' constraints (`RLSConstraint` GUCs and `extra_bypass_flags`,
 connection (with a pool, Django has already returned it). System check `W010` asks for
 `reset_rls_gucs` as the pool's `reset`; `W011` warns about a database- or role-level
 default (`ALTER DATABASE/ROLE ... SET`) for a policy GUC, which every new session starts
-with and the guard (which assumes a new session holds none) never clears.
+with and the guard (which assumes a new session holds none) never clears. `W005` (the
+`E001` error with `DEBUG` off), `W011` and `W013` query every alias in `conf.DATABASES`; a
+check that could not run on a reachable database reports `W013` instead of staying silent
+(an unreachable one is skipped, logged at `DEBUG`).
 
 When modifying middleware or GUC-related code, ensure all database iteration
 uses `conf.DATABASES` rather than hardcoding `"default"`.
@@ -205,12 +223,22 @@ have written the GUCs for the session and nothing restores them. It runs from
 marks a connection's session the same way after a statement that ran under local values
 (in its own transaction, or in a transaction with `wrote_local`), which reaches
 connections of other threads that no block exit reaches. In a transaction the mark takes
-effect at the commit. The context managers, `_rls_scope()` and the
-middleware write nothing outside `transaction.atomic()` on a configured alias
-(`context._writes_gucs()`, which `_rls_scope()` decides before its own transaction opens;
-the restore then gets `previous=None` and only settles), and the middleware's async path
-opens no request transaction. `ready()` calls `_guard_open_connections()` so connections
-opened earlier get the guard (`guard_open_connection()`). The `ContextVar` holds a
+effect at the commit. With `USE_LOCAL_SET=True` the context managers, `_rls_scope()` and
+the middleware write nothing on a configured alias, inside `transaction.atomic()` or not
+(#137; `context._writes_gucs()` is `not is_local or alias not in conf.DATABASES`, and
+`_rls_scope()` decides it before its own transaction opens): the guard applies the values
+(one `set_config()`, both GUCs) before the first statement that needs them, and again
+only when the context changes. The restore then gets `previous=None` and only settles:
+`settle_other_aliases(None)` puts the enclosing context's values back (transaction-local),
+or clears for the session when there is none, with one `set_config()` on each configured
+alias whose session still holds the block's values, while a transaction is open. So SQL
+past Django's cursor never sees a block's values after the block, but inside a block,
+until its first cursor statement, it sees the enclosing values (or none); and a
+session-level write of the GUCs inside a block in `atomic()` does not survive a block
+with no enclosing context. The middleware's async path opens no request transaction; the
+sync path's (#95) holds no writes of the middleware's. `ready()` calls
+`_guard_open_connections()` so connections opened earlier get the guard
+(`guard_open_connection()`). The `ContextVar` holds a
 `_Live` holder that `_reset_context_gucs()` / `_clear_context_gucs()` end for every copy,
 so a hop or task inherits a context only while its block is live. `_reset_context_gucs()`
 also ends a newer holder left current in its place, and the current one for a token used
@@ -306,13 +334,19 @@ inside `_rls_scope()` (`for_write=True` for writes, so the router's write alias 
 which pins that alias on the queryset for the call, sets the GUCs that differ from the
 user's values and the tenant `ContextVar`s, then restores the previous values. A new
 override that runs SQL must use it. `iterator()` / `aiterator()` enter it once per chunk
-and never across a `yield`. A queryset with cached results must skip both the scope and
+and never across a `yield`; `_scoped_chunks()` calls `apply_active_context()` inside each
+scope because the server-side cursor's `FETCH` runs past Django's cursor, where the guard
+cannot set the user's values (in a transaction the previous chunk's exit took them off; in
+autocommit the `WITH HOLD` cursor is computed when it opens, so nothing is written). A
+queryset with cached results must skip both the scope and
 `_check_strict_mode()`. Methods Django runs in a transaction of their own pass
 `own_transaction=True`, so their `SET LOCAL` lands in that transaction (on a configured
 alias with `USE_LOCAL_SET=True` the scope writes nothing in it and the guard sets the
 values there, one `set_config()`, and takes them off at the scope's exit). With
-`USE_LOCAL_SET=True` outside `transaction.atomic()` on a configured alias the scope only
-sets the `ContextVar`s, and the GUC affinity guard applies the user's values per statement.
+`USE_LOCAL_SET=True` on a configured alias, inside `transaction.atomic()` or not (#137),
+the scope only sets the `ContextVar`s, and the GUC affinity guard applies the user's values
+per statement (autocommit) or once per transaction and context change. Only an alias outside
+`conf.DATABASES` still snapshots, writes `SET LOCAL` and restores.
 
 ### Async Middleware Path
 
@@ -535,7 +569,9 @@ does not ship, so `pyproject.toml` excludes it from the sdist.
 The `example-smoke` job tests the **built wheel**, not the source tree: `uv build`, an
 inline check that the wheel holds only `django_rls_tenants/` + `*.dist-info/` (every
 package dir has `__init__.py`; `py.typed`, the management commands and `contrib/celery.py`
-are present), then `uv pip install dist/*.whl` into a clean `.wheel-venv` with the locked
+are present, and `pytest_plugin.py` plus the `pytest11` entry point in
+`*.dist-info/entry_points.txt`, which the example suite's autouse `enforce_rls` fixture
+needs), then `uv pip install dist/*.whl` into a clean `.wheel-venv` with the locked
 Django/test deps (`uv export --group test --no-emit-project`). It runs
 `example/manage.py check` and `pytest --collect-only` with no database (so `example/` must
 keep importing cleanly), then `makemigrations --check --dry-run` and the example suite as

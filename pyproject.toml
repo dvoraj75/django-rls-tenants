@@ -63,6 +63,12 @@ drf = [
     "djangorestframework>=3.16",
 ]
 
+# pytest plugin (django_rls_tenants.pytest_plugin): the enforce_rls fixtures.
+# Loaded in every pytest run with the package installed; -p no:django_rls_tenants
+# turns it off.
+[project.entry-points.pytest11]
+django_rls_tenants = "django_rls_tenants.pytest_plugin"
+
 [project.urls]
 Homepage = "https://github.com/dvoraj75/django-rls-tenants"
 Documentation = "https://dvoraj75.github.io/django-rls-tenants/"
@@ -82,6 +88,8 @@ dev = [
     # Types for contrib.drf; the lint job installs only this group.
     "djangorestframework-stubs>=3.16",
     "psycopg2-binary>=2.9",
+    # mypy type-checks django_rls_tenants.pytest_plugin, which imports pytest.
+    "pytest>=8.0",
 ]
 test = [
     "pytest>=8.0",

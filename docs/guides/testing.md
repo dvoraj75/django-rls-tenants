@@ -68,6 +68,25 @@ def test_tenant_isolation():
 
 ## Assertion Functions
 
+### assert_rls_enforced
+
+*Added in 1.5.0.* Verifies that the test connection's role is one PostgreSQL applies RLS
+to:
+
+```python
+from django_rls_tenants.tenants.testing import assert_rls_enforced
+
+def test_connection_is_subject_to_rls():
+    assert_rls_enforced()
+```
+
+Raises `AssertionError` if the connection's current role is a superuser or has
+`BYPASSRLS`. Such a role skips every policy, so isolation tests on it pass whether or not
+the policies work. The check reads `current_user`, so it sees the role
+[`enforce_rls`](#enforcing-rls-in-tests) switched to with `SET ROLE`, not the login role.
+Pass `using="replica"` to check another alias. Put one such test in your suite and the
+others cannot pass vacuously on a connection that bypasses RLS.
+
 ### assert_rls_enabled
 
 Verifies that RLS is enabled and forced on a table:
@@ -122,12 +141,13 @@ This function:
 1. Enters `admin_context()` to verify the table has at least one row (prevents
    vacuous passes on empty tables).
 2. Clears the admin and tenant GUCs on the `using` connection, counts the rows again and
-   restores the GUCs to their previous values (with `SET LOCAL` when
-   `USE_LOCAL_SET=True` inside `transaction.atomic()`). The restore happens before the
+   restores the GUCs to their previous values. The restore happens before the
    assertion, so the caller's context is intact even when the assertion fails. With
-   `USE_LOCAL_SET=True` outside `atomic()` (*1.4.0+*), the count runs with the
+   `USE_LOCAL_SET=True` on an alias in `RLS_TENANTS["DATABASES"]` (*1.4.0+* outside
+   `atomic()`, *1.5.0+* inside it), the count runs with the
    [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) seeing no context,
-   and the GUCs are cleared and restored on the session.
+   and the GUCs are cleared and restored on the session. On any other alias that mode uses
+   `SET LOCAL`, inside `transaction.atomic()`.
 3. Asserts that the second count is zero.
 
 Both counts are raw SQL on the model's table (`SELECT COUNT(*)`), not ORM queries. The
@@ -146,8 +166,9 @@ Raises `AssertionError` if:
 
 - Rows are returned (RLS is not enforcing isolation). Common causes: the test connects as
   a superuser or a role with `BYPASSRLS` (see
-  [W005](../troubleshooting.md#w005-the-connection-role-is-a-superuser-or-has-bypassrls)),
-  or RLS is not enabled and forced on the table.
+  [W005](../troubleshooting.md#w005-the-connection-role-is-a-superuser-or-has-bypassrls);
+  request [`enforce_rls`](#enforcing-rls-in-tests) to fix it in a test suite), or RLS is
+  not enabled and forced on the table.
 - The table is empty (would pass vacuously).
 
 Raises `RuntimeError` if:
@@ -155,6 +176,155 @@ Raises `RuntimeError` if:
 - `USE_LOCAL_SET=True`, `using` is not in `RLS_TENANTS["DATABASES"]` and its connection is
   not inside `transaction.atomic()`. Before 1.4.0 it raised for every alias outside
   `atomic()`.
+
+## Enforcing RLS in Tests
+
+*Added in 1.5.0.* A superuser, or a role with `BYPASSRLS`, skips every RLS policy, even
+with `FORCE ROW LEVEL SECURITY`. Development and CI databases often connect as one (the
+official `postgres` image's default user is a superuser). On such a connection a test of
+tenant isolation passes whether or not the policies work, and system check
+[`W005`](../troubleshooting.md#w005-the-connection-role-is-a-superuser-or-has-bypassrls)
+only warns. The fixtures below make the tests run as a role RLS applies to.
+
+Installing the package registers a pytest plugin (the `pytest11` entry point
+`django_rls_tenants`), so the fixtures are available in every pytest run with no
+`conftest.py` change. They need [pytest-django](https://pytest-django.readthedocs.io/).
+
+| Fixture | Scope | What it does |
+|---------|-------|--------------|
+| `rls_role` | session | Returns the role name. On each configured alias whose connection bypasses RLS, creates the role (`NOLOGIN`) if it is missing and grants it access to the test database. |
+| `enforce_rls` | function | Requests `db`, then switches each configured alias whose connection bypasses RLS to `rls_role` with `SET ROLE`, and runs `RESET ROLE` after the test. A connection the test closes and reopens is switched again as it opens. Does nothing on a plain role. |
+| `enforce_rls_on_other_threads` | function | Switches connections opened on other threads (on configured aliases) as they open. |
+
+Request `enforce_rls` in every test that asserts database-level row filtering:
+
+```python
+import pytest
+
+from django_rls_tenants.tenants.testing import assert_rls_enforced, rls_as_tenant
+
+pytestmark = pytest.mark.django_db
+
+
+def test_tenant_sees_own_orders(enforce_rls, tenant_a, sample_orders):
+    assert_rls_enforced()
+    with rls_as_tenant(tenant_id=tenant_a.pk):
+        assert Order.objects.count() == 2
+```
+
+To apply it to a whole suite, wrap it in an autouse fixture. The example project does this
+in [`example/tests/conftest.py`](https://github.com/dvoraj75/django-rls-tenants/blob/main/example/tests/conftest.py),
+so its tests also pass as the Docker image's `demo` superuser:
+
+```python title="conftest.py"
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _enforce_rls(enforce_rls):
+    """Run every test as a role PostgreSQL applies RLS to."""
+```
+
+Rows a test creates must be created inside `rls_bypass()` or `rls_as_tenant()`: a plain
+role cannot insert into an RLS-protected table without a context.
+
+### What the role gets
+
+`rls_role` creates the role once per session, and only if the connection bypasses RLS. On
+a plain-role connection it creates nothing, and `enforce_rls` switches nothing. On each
+such alias it grants the role:
+
+- `USAGE` on every schema in the connection's `search_path`.
+- `ALL` on every table in those schemas (this includes `django_migrations`) and on every
+  sequence.
+- The same on tables and sequences the connecting role creates in those schemas later
+  (`ALTER DEFAULT PRIVILEGES`), so tables created during the session are covered too.
+
+The grants live in the test database and go away with it. The role is cluster-wide and
+stays after the session; it is `NOLOGIN` and harmless. If a role of that name already
+exists and is a superuser or has `BYPASSRLS`, the test fails with a message saying so.
+The plugin tolerates a concurrent `CREATE ROLE` from a pytest-xdist worker.
+
+### Configuration
+
+Two ini options in `pytest.ini`, `pyproject.toml` (`[tool.pytest.ini_options]`) or
+`setup.cfg`:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `rls_role` | `rls_test_role` | Role to switch to. A lowercase unquoted identifier of at most 63 characters (letters, digits, underscores). Anything else is a pytest `UsageError` at startup. |
+| `rls_role_aliases` | `default` | Database aliases to switch. Aliases the test may not use (`django_db(databases=...)`) are skipped. An empty list is a `UsageError`. |
+
+```toml title="pyproject.toml"
+[tool.pytest.ini_options]
+rls_role = "myapp_rls_test"
+rls_role_aliases = ["default", "replica"]
+```
+
+To turn the plugin off, run pytest with `-p no:django_rls_tenants`.
+
+### Limitations
+
+- The session needs permission to create roles: a superuser, or a role with `CREATEROLE`.
+- A non-superuser `BYPASSRLS` role must also be allowed to `SET ROLE` to `rls_role`. On
+  PostgreSQL 16 and later, a `CREATEROLE` role that creates a role gets `ADMIN` on it but
+  not `SET`, unless `createrole_self_grant` includes `set`. Without it `SET ROLE` fails
+  with "permission denied to set role".
+- `rls_role` must be set up outside a test transaction, or the rollback drops the role.
+  Request it, or `enforce_rls`, as a fixture argument (pytest sets session fixtures up
+  first). First requested with `request.getfixturevalue()` from inside a transaction, on a
+  connection that bypasses RLS, it fails with a message saying so.
+- Connections opened on other threads are not switched by `enforce_rls`. Under ASGI,
+  Django serves error pages and `thread_sensitive=False` hops on such threads. Request
+  `enforce_rls_on_other_threads` as well. Those connections see committed rows only, so
+  use it with `@pytest.mark.django_db(transaction=True)`.
+
+### Django `TestCase` without pytest
+
+The plugin needs pytest. With Django's own test runner, create the role and switch to it
+in a base class. The role must exist before the class's transaction opens, so the setup
+runs before `super().setUpClass()`:
+
+```python title="tests/base.py"
+from django.db import connection
+from django.test import TestCase
+
+ROLE = "rls_test_role"
+
+
+class RLSTestCase(TestCase):
+    """Run the class's tests as a role PostgreSQL applies RLS to."""
+
+    @classmethod
+    def setUpClass(cls):
+        with connection.cursor() as cursor:
+            # A plain role needs no switch (and usually cannot CREATE ROLE).
+            cursor.execute(
+                "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user"
+            )
+            if cursor.fetchone()[0]:
+                cursor.execute(
+                    f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{ROLE}') "
+                    f"THEN CREATE ROLE {ROLE} NOLOGIN; END IF; END $$"
+                )
+                cursor.execute(f"GRANT USAGE ON SCHEMA public TO {ROLE}")
+                cursor.execute(f"GRANT ALL ON ALL TABLES IN SCHEMA public TO {ROLE}")
+                cursor.execute(f"GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {ROLE}")
+                cursor.execute(f"SET ROLE {ROLE}")
+                cls.addClassCleanup(cls._reset_role)
+        super().setUpClass()
+
+    @classmethod
+    def _reset_role(cls):
+        # A TestCase closes its connection at the end of the class, which ends the SET ROLE.
+        if connection.connection is not None:
+            with connection.cursor() as cursor:
+                cursor.execute("RESET ROLE")
+```
+
+Subclass `RLSTestCase` instead of `TestCase`; `setUpTestData` and the tests then run as the
+plain role. The same works for `TransactionTestCase`, which keeps its connection open,
+hence the reset. Adjust the schema if your tables are not in `public`.
 
 ## pytest Integration
 
@@ -215,6 +385,22 @@ def test_rls_with_transactions(tenant_a):
     ...
 ```
 
+### Django's Test Runner
+
+pytest-django never runs the system checks. `manage.py test` does, and Django's test runner
+sets `settings.DEBUG = False` before it runs them. A test database that Django reaches as a
+superuser or a `BYPASSRLS` role (common in CI, where the service container's user is a
+superuser) therefore fails with the
+[`E001`](../troubleshooting.md#e001-the-connection-role-bypasses-rls-with-debug-off) error
+instead of the `W005` warning. Record the choice in the test settings:
+
+```python title="settings_test.py"
+SILENCED_SYSTEM_CHECKS = ["django_rls_tenants.E001"]
+```
+
+Silencing the error does not restore isolation: a superuser still sees every row, so
+tests that assert isolation need a plain role.
+
 ## Async Tests
 
 *Added in 1.4.0.* Every helper has an async counterpart for `async def` tests, in the same
@@ -224,6 +410,7 @@ module and with the same arguments:
 |-------------|--------------|-------------|
 | `rls_bypass()` | `async_rls_bypass()` | `async with` |
 | `rls_as_tenant()` | `async_rls_as_tenant()` | `async with` |
+| `assert_rls_enforced()` | `aassert_rls_enforced()` | `await` |
 | `assert_rls_enabled()` | `aassert_rls_enabled()` | `await` |
 | `assert_rls_policy_exists()` | `aassert_rls_policy_exists()` | `await` |
 | `assert_rls_blocks_without_context()` | `aassert_rls_blocks_without_context()` | `await` |
@@ -292,7 +479,8 @@ class OrderIsolationTests(TestCase):
 
 Like its sync version, `aassert_rls_blocks_without_context()` passes only when the test
 connects with a role that RLS applies to. A superuser, or a role with `BYPASSRLS`, sees
-every row.
+every row. Request [`enforce_rls`](#enforcing-rls-in-tests) to run the test as such a
+role.
 
 ```python title="pytest: sync test + async_to_sync"
 import pytest
@@ -327,7 +515,8 @@ def test_async_report_is_scoped(tenant_a, sample_orders):
       does not apply. If RLS is only enforced after such a `SET ROLE` (because the tests
       connect as a superuser), it is bypassed on the executor connection. ORM-level
       isolation checks still pass there, because of the auto-scope filter, so they pass for
-      the wrong reason.
+      the wrong reason. The `enforce_rls_on_other_threads` fixture switches that
+      connection as it opens (see [Enforcing RLS in Tests](#enforcing-rls-in-tests)).
     - The extra connection stays open, so pytest-django cannot drop the test database at
       the end of the session. It reports this only as a `PytestWarning` ("database ... is
       being accessed by other users") and leaves the database behind.

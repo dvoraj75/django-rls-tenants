@@ -117,8 +117,7 @@ def _clear_finished_request_gucs() -> None:
     """
     from django.db import connections  # noqa: PLC0415
 
-    from django_rls_tenants.rls.guc import clear_guc  # noqa: PLC0415
-    from django_rls_tenants.tenants.affinity import suspect_sessions, writing  # noqa: PLC0415
+    from django_rls_tenants.tenants.affinity import suspect_sessions, write_gucs  # noqa: PLC0415
     from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
 
     conf = rls_tenants_config
@@ -126,11 +125,10 @@ def _clear_finished_request_gucs() -> None:
         suspect_sessions()
         return
     for db_alias in conf.DATABASES:
-        if connections[db_alias].connection is None:
+        connection = connections[db_alias]
+        if connection.connection is None:
             continue
-        with writing(db_alias, None):
-            clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
-            clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
+        write_gucs(connection, None)
 
 
 def _guard_open_connections() -> None:
@@ -138,8 +136,7 @@ def _guard_open_connections() -> None:
 
     Called from ``ready()``: a connection opened before (in an earlier app's
     ``ready()``, say) got no ``connection_created`` call from the handler. With
-    ``USE_LOCAL_SET=True`` a context entered outside ``transaction.atomic()``
-    relies on the guard alone.
+    ``USE_LOCAL_SET=True`` a context relies on the guard alone.
     """
     from django.db import connections  # noqa: PLC0415
 

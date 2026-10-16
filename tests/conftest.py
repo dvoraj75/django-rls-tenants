@@ -1,16 +1,20 @@
-"""Shared pytest fixtures for the test suite."""
+"""Shared pytest fixtures for the test suite.
+
+``rls_role``, ``enforce_rls`` and ``enforce_rls_on_other_threads`` come from the
+library's own pytest plugin (``django_rls_tenants.pytest_plugin``), which the
+``pytest11`` entry point loads, so the suite runs on the fixtures it ships.
+"""
 
 from __future__ import annotations
 
 import contextlib
 import os
-import threading
 from decimal import Decimal
 
 import pytest
-from django.db import DEFAULT_DB_ALIAS, connection, connections
-from django.db.backends.signals import connection_created
+from django.db import DEFAULT_DB_ALIAS, connections
 
+from django_rls_tenants.pytest_plugin import _bypasses_rls, _switch_role
 from django_rls_tenants.rls.guc import clear_guc
 from django_rls_tenants.tenants.context import admin_context
 from django_rls_tenants.tenants.middleware import _clear_gucs_set_flag
@@ -34,7 +38,6 @@ from tests.test_app.models import (
     TenantUser,
 )
 
-_RLS_ROLE = "rls_test_role"
 _POOLED_ALIAS = "pooled"
 
 # Zero-skipped-tests rule (#110). A skipped RLS test is indistinguishable from
@@ -141,73 +144,8 @@ def _clear_gucs_after_test(db):
                 clear_guc(name)
 
 
-def _connection_bypasses_rls(cursor, *, role="current_user"):
-    """Return whether the test connection's role bypasses RLS (superuser or ``BYPASSRLS``).
-
-    ``role="session_user"`` asks about the login role, which ``SET ROLE`` does not change.
-    """
-    cursor.execute(
-        f"SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = {role}",
-    )
-    row = cursor.fetchone()
-    return bool(row and row[0])
-
-
-@pytest.fixture(scope="session")
-def _rls_role(django_db_setup, django_db_blocker):
-    """Create a non-superuser role for RLS enforcement (once per session).
-
-    PostgreSQL superusers always bypass RLS, even with FORCE ROW LEVEL
-    SECURITY.  This fixture creates a plain role and grants it full DML
-    access so that ``SET ROLE`` makes the connection subject to RLS.
-
-    On a connection RLS applies to (the CI leg run with ``-m "not superuser_only"``)
-    it already applies and ``enforce_rls`` never switches roles, so nothing
-    is created: such a role usually lacks ``CREATEROLE``.
-    """
-    with django_db_blocker.unblock(), connection.cursor() as cur:
-        if not _connection_bypasses_rls(cur):
-            return
-        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", [_RLS_ROLE])
-        if cur.fetchone() is None:
-            cur.execute(f"CREATE ROLE {_RLS_ROLE} NOLOGIN")
-        cur.execute(f"GRANT ALL ON ALL TABLES IN SCHEMA public TO {_RLS_ROLE}")
-        cur.execute(f"GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {_RLS_ROLE}")
-
-
-def _switch_to_rls_role(conn):
-    """Run ``conn`` as the RLS test role if its role bypasses RLS.
-
-    Returns:
-        ``True`` if the role was switched (the caller resets it), ``False``
-        if the connection's role is already subject to RLS.
-    """
-    with conn.cursor() as cur:
-        bypasses = _connection_bypasses_rls(cur)
-        if bypasses:
-            cur.execute(f"SET ROLE {_RLS_ROLE}")
-    return bypasses
-
-
 @pytest.fixture
-def enforce_rls(_rls_role, db):
-    """Switch to a plain role so PostgreSQL RLS is enforced.
-
-    Use this fixture (or the autouse version in test_integration/) for any
-    test that verifies database-level row filtering, including ``for_user()``:
-    under a superuser connection RLS is bypassed and such a test passes
-    whether or not the GUCs were set (#131). Only a connection that bypasses
-    RLS (superuser or ``BYPASSRLS``) is switched; on a plain role it is a no-op.
-    """
-    switched = _switch_to_rls_role(connection)
-    yield
-    if switched:
-        with connection.cursor() as cur:
-            cur.execute("RESET ROLE")
-
-
-@pytest.fixture
-def replica(_rls_role, transactional_db):
+def replica(rls_role, transactional_db):
     """A second connection to the test database, registered as the ``replica`` alias.
 
     It is a separate session, so it sees committed rows only (hence
@@ -219,7 +157,7 @@ def replica(_rls_role, transactional_db):
     conn = type(default)(default.settings_dict, alias="replica")
     connections["replica"] = conn
     try:
-        _switch_to_rls_role(conn)
+        _switch_role(conn, rls_role)
         yield "replica"
     finally:
         del connections["replica"]
@@ -227,7 +165,7 @@ def replica(_rls_role, transactional_db):
 
 
 @pytest.fixture
-def pooled(request, _rls_role, transactional_db):
+def pooled(request, rls_role, transactional_db):
     """A ``pooled`` alias on the test database, served by Django's pool of one connection.
 
     Every checkout gets the same physical connection, so a test sees what the
@@ -249,9 +187,8 @@ def pooled(request, _rls_role, transactional_db):
         "pool": {"min_size": 1, "max_size": 1, "timeout": 10, **getattr(request, "param", {})},
     }
     # session_user: enforce_rls may already have switched current_user.
-    with default.cursor() as cur:
-        if _connection_bypasses_rls(cur, role="session_user"):
-            options["options"] = f"-c role={_RLS_ROLE}"
+    if _bypasses_rls(default, role="session_user"):
+        options["options"] = f"-c role={rls_role}"
     conn = type(default)({**default.settings_dict, "OPTIONS": options}, alias=_POOLED_ALIAS)
     connections[_POOLED_ALIAS] = conn
     try:
@@ -262,29 +199,6 @@ def pooled(request, _rls_role, transactional_db):
             conn.close()
         finally:
             conn.close_pool()
-
-
-@pytest.fixture
-def enforce_rls_on_other_threads(_rls_role):
-    """Run connections opened on other threads as a role RLS applies to.
-
-    ``enforce_rls`` switches the test thread's connection only. Under ASGI,
-    Django runs some work (error pages, ``thread_sensitive=False`` hops) on
-    worker threads with connections of their own; this receiver switches each
-    of those as it opens. Connected after the library's ``connection_created``
-    handler, so it runs after that handler has applied or cleared the GUCs.
-    """
-    test_thread = threading.get_ident()
-
-    def switch_role(sender, connection, **kwargs):
-        if threading.get_ident() != test_thread:
-            _switch_to_rls_role(connection)
-
-    connection_created.connect(switch_role, weak=False)
-    try:
-        yield
-    finally:
-        connection_created.disconnect(switch_role)
 
 
 @pytest.fixture

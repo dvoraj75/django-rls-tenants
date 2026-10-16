@@ -55,6 +55,7 @@ the [Security Model](advanced/security.md) for what that does and does not cover
 | Use the tenant context in an async view or consumer | [Async Code](guides/context-managers.md#async-code) |
 | Use the Django admin across tenants | [Admin](guides/admin.md) |
 | Write a test that proves isolation fails closed | [Testing](guides/testing.md) |
+| Run my tests as a role RLS applies to (not a superuser) | [Enforcing RLS in Tests](guides/testing.md#enforcing-rls-in-tests) |
 | Test async code under a tenant context | [Async Tests](guides/testing.md#async-tests) |
 | Write raw SQL that stays tenant-scoped | [Raw SQL](guides/raw-sql.md) |
 | Let authentication or migrations bypass RLS | [Bypass Mode](guides/bypass-mode.md) |

@@ -1,10 +1,13 @@
 """Test helpers for verifying RLS behavior.
 
 Provides context managers for test setup (``rls_bypass``, ``rls_as_tenant``)
-and assertion functions for verifying RLS policies are applied correctly,
-plus their counterparts for ``async def`` tests (``async_rls_bypass``,
-``async_rls_as_tenant``, ``aassert_rls_enabled``, ``aassert_rls_policy_exists``
-and ``aassert_rls_blocks_without_context``).
+and assertion functions for verifying RLS policies are applied correctly
+(``assert_rls_enforced`` checks the connection's role itself), plus their
+counterparts for ``async def`` tests (``async_rls_bypass``,
+``async_rls_as_tenant``, ``aassert_rls_enforced``, ``aassert_rls_enabled``,
+``aassert_rls_policy_exists`` and ``aassert_rls_blocks_without_context``).
+The ``enforce_rls`` fixture lives in the pytest plugin,
+``django_rls_tenants.pytest_plugin``.
 """
 
 from __future__ import annotations
@@ -63,6 +66,46 @@ def rls_as_tenant(tenant_id: int | str, *, using: str = "default") -> Iterator[N
     """
     with tenant_context(tenant_id, using=using):
         yield
+
+
+def assert_rls_enforced(*, using: str = "default") -> None:
+    """Assert that PostgreSQL applies RLS to the ``using`` connection's current role.
+
+    A superuser, or a role with ``BYPASSRLS``, bypasses every RLS policy, even
+    with ``FORCE ROW LEVEL SECURITY``, so every isolation test on such a
+    connection passes whether or not the policies work. The check reads
+    ``current_user``, the role ``SET ROLE`` switches to (the ``enforce_rls``
+    fixture), not the login role.
+
+    Args:
+        using: Database alias. Default: ``"default"``.
+
+    Raises:
+        AssertionError: If the connection's current role is a superuser or has
+            ``BYPASSRLS``.
+    """
+    conn = connections[using]
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT rolname, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user"
+        )
+        row = cursor.fetchone()
+    assert row is not None, f"The current role of the {using!r} connection is not in pg_roles"
+    role, is_superuser, bypasses_rls = row
+    reasons = [
+        reason
+        for reason, applies in (
+            ("is a PostgreSQL superuser", is_superuser),
+            ("has the BYPASSRLS attribute", bypasses_rls),
+        )
+        if applies
+    ]
+    assert not reasons, (
+        f"The {using!r} connection runs as role {role!r}, which {' and '.join(reasons)}, "
+        f"so it bypasses every RLS policy and tests on it prove nothing about tenant "
+        f"isolation. Connect as a role with NOSUPERUSER and NOBYPASSRLS, or request the "
+        f"enforce_rls pytest fixture, which switches to such a role with SET ROLE."
+    )
 
 
 def assert_rls_enabled(table_name: str, *, using: str = "default") -> None:
@@ -164,14 +207,15 @@ def assert_rls_blocks_without_context(
        vacuously.
     2. With the admin and tenant GUCs cleared on the ``using`` connection, the
        table must return zero rows. The GUCs are restored before the
-       assertion (with ``SET LOCAL`` when ``USE_LOCAL_SET=True``), so the
-       result does not depend on the caller's admin or tenant context, and
-       such a context (for example :func:`rls_bypass` or
+       assertion, so the result does not depend on the caller's admin or
+       tenant context, and such a context (for example :func:`rls_bypass` or
        :func:`rls_as_tenant`) is intact when the helper returns or fails.
-       With ``USE_LOCAL_SET=True`` outside ``transaction.atomic()``, where
-       such a context lives in the ``ContextVar`` values only and the GUC
-       affinity guard applies it to each statement, the count runs without
-       it, and the GUCs are cleared and restored for the session.
+       With ``USE_LOCAL_SET=True`` on an alias in
+       ``RLS_TENANTS["DATABASES"]``, where such a context lives in the
+       ``ContextVar`` values only and the GUC affinity guard applies it to
+       each statement, the count runs without it, and the GUCs are cleared
+       and restored for the session. On any other alias that mode uses
+       ``SET LOCAL``.
        Other GUCs, such as a flag set with ``bypass_flag()``, are left as they
        are.
 
@@ -210,8 +254,8 @@ def assert_rls_blocks_without_context(
         with rls_context(no_context, is_local=conf.USE_LOCAL_SET, using=using):
             count = _count_rows(model_class, using=using)
     else:
-        # USE_LOCAL_SET=True outside a transaction: the guard would run the count in
-        # a transaction of its own with the caller's context.
+        # USE_LOCAL_SET=True on a guarded alias: the guard would apply the caller's
+        # context before the count.
         with _no_context_for_the_guard(), rls_context(no_context, using=using):
             count = _count_rows(model_class, using=using)
     table = model_class._meta.db_table  # noqa: SLF001  -- standard Django _meta access
@@ -281,6 +325,23 @@ async def async_rls_as_tenant(
     """
     async with async_tenant_context(tenant_id, using=using):
         yield
+
+
+async def aassert_rls_enforced(*, using: str = "default") -> None:
+    """Async counterpart of :func:`assert_rls_enforced`.
+
+    Runs the sync assertion in one ``thread_sensitive`` ``sync_to_async`` hop,
+    so it checks the connection of the thread the hop lands on (see the testing
+    guide, "Async Tests").
+
+    Args:
+        using: Database alias. Default: ``"default"``.
+
+    Raises:
+        AssertionError: If the connection's current role is a superuser or has
+            ``BYPASSRLS``.
+    """
+    await sync_to_async(assert_rls_enforced, thread_sensitive=True)(using=using)
 
 
 async def aassert_rls_enabled(table_name: str, *, using: str = "default") -> None:

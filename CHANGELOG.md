@@ -42,6 +42,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entered. The example project gains a token-authenticated notes API at `/api/notes/`,
   with a router whose API root uses the mixin.
   See the new [Django REST Framework guide](https://dvoraj75.github.io/django-rls-tenants/guides/drf/).
+- **`E001`: an error for an RLS-bypassing connection role in production** (#108). When
+  `settings.DEBUG` is `False` and the connection role of an alias in
+  `RLS_TENANTS["DATABASES"]` is a superuser or has `BYPASSRLS`, the system checks report
+  the `django_rls_tenants.E001` error instead of the `W005` warning. See the first entry
+  under Changed for what this does to `check`, `migrate` and the test runner.
+- **`W013`: a database check that could not run no longer stays silent** (#108). When the
+  database is reachable but the catalogue query behind `W005`/`E001` or `W011` fails (for
+  example `permission denied for view pg_roles`, or a statement timeout), the checks now
+  report `W013` naming the error and the alias, so a clean `check` is not read as a pass.
+  It stays a warning with `DEBUG` off. Inside a transaction (`call_command("check")` in a
+  test) the query runs in a savepoint, so the failure does not abort the caller's
+  transaction. When no connection can be opened (the database is
+  not provisioned yet, or a command runs without one), the checks are still skipped
+  quietly, with a `DEBUG` log line on the `django_rls_tenants` logger.
+
+### Changed
+
+- **`E001` can turn a passing `manage.py check` into a failing one, and it aborts `migrate`
+  and every other command that runs the system checks** (#108). It applies with
+  `DEBUG = False` and a connection role that is a superuser or has `BYPASSRLS`: `migrate`,
+  `createsuperuser`, `check_rls`, `setup_m2m_rls`, and `manage.py test` (Django's test
+  runner sets `DEBUG = False` before it runs the checks). Servers (gunicorn, uvicorn),
+  pytest-django and `call_command()` do not run the checks and are not affected. Connect
+  as a `NOSUPERUSER NOBYPASSRLS` role and run migrations as the table owner, which is an
+  ordinary role. If a settings module has to use such a role on purpose (a migration job
+  on a superuser, a superuser test database in CI), add
+  `SILENCED_SYSTEM_CHECKS = ["django_rls_tenants.E001"]` to that module only, never to the
+  settings the application serves requests with; `migrate --skip-checks` skips every check
+  for one run. This replaces the earlier advice that a superuser is fine for migrations.
+- **`W005` and `W011` check every alias in `RLS_TENANTS["DATABASES"]`** (#108), not only
+  `default`. The `W005` message now reads "The connection role 'x' of DATABASES['alias']
+  ...", and the `W011` message names the alias after the scope. An alias missing from
+  `settings.DATABASES` is skipped (`W006` reports it), as is one that is not PostgreSQL.
+- **`check_rls` fails cleanly when it cannot verify** (#108). If the `pg_class` or
+  `pg_policies` query fails, it prints "Could not determine the RLS status of the protected
+  tables on database 'x' ... Nothing was verified" to stderr and exits with status 1,
+  instead of a traceback.
+- **pytest plugin and `assert_rls_enforced()` for running tests as a role RLS applies to**
+  (#97). A superuser or `BYPASSRLS` connection skips every policy, so isolation tests on
+  it pass whether or not the policies work. Installing the package now registers a pytest
+  plugin through the `pytest11` entry point `django_rls_tenants` (it needs pytest-django
+  for the fixtures; `-p no:django_rls_tenants` turns it off) with three fixtures:
+  `rls_role` (session; creates a `NOLOGIN` role if missing and grants it `USAGE` on the
+  `search_path` schemas, `ALL` on their tables and sequences and default privileges for
+  later ones), `enforce_rls` (switches each configured alias that bypasses RLS to that
+  role with `SET ROLE` for the test, a connection the test reopens included; a no-op on a
+  plain role) and
+  `enforce_rls_on_other_threads` (does the same for connections opened on other threads,
+  such as ASGI error pages). Two ini options configure it: `rls_role` (default
+  `rls_test_role`) and `rls_role_aliases` (default `default`). `assert_rls_enforced()` and
+  `aassert_rls_enforced()` in `django_rls_tenants.tenants.testing` fail when the
+  connection's current role is a superuser or has `BYPASSRLS`. The example project's tests
+  now run as its Docker superuser too. See "Enforcing RLS in Tests" in the testing guide.
+
+### Changed
+
+- **`USE_LOCAL_SET=True`: context blocks inside `transaction.atomic()` leave the GUC
+  writes to the GUC affinity guard** (#137). On an alias in `RLS_TENANTS["DATABASES"]`,
+  `tenant_context()`, `admin_context()`, `async_tenant_context()` /
+  `async_admin_context()` (also when driven by `async_to_sync` inside `atomic()`), the
+  `for_user()` scope and `RLSTenantMiddleware` now do inside a transaction what they did
+  outside one since 1.4.0: they set the Python-side context, and the GUC affinity guard
+  applies the values transaction-locally, both GUCs in one `set_config()` statement,
+  before the first statement that needs them and again only when the context changes.
+  Before, each block wrote two `current_setting()` reads and two `SET LOCAL` statements on
+  entry and two `SET LOCAL` statements on exit (every `for_user()` call did the same).
+  When a block exits while its transaction is still open, one `set_config()` statement per
+  configured alias puts the enclosing context's values back, or clears both GUCs for the
+  session when there is none, so SQL that bypasses Django's cursor (a driver cursor,
+  `callproc()`, the `FETCH` of an open server-side cursor) never sees a block's values
+  after the block. `for_user().iterator()`, whose scope closes between chunks, applies the
+  user's values itself before each chunk, since the next `FETCH` runs past Django's cursor
+  (one `set_config()` per chunk in a transaction, none in autocommit). Statements counted in
+  `connection.queries`, `BEGIN` and `COMMIT` included:
+
+  | Inside `atomic()` | Before | Now |
+  |---|---|---|
+  | `tenant_context(A)` around 5 `count()` | 13 | 9 |
+  | `tenant_context(A)` inside `tenant_context(A)`, one `count()` | 15 | 5 |
+  | 3 `for_user(user).count()` calls | 23 | 11 |
+  | A: `count()`, B: `count()`, admin: `count()`, then A: `count()` | 24 | 12 |
+
+  A WSGI request with one query in this mode is `BEGIN`, `set_config()`, the query,
+  `COMMIT` (before, `BEGIN`, two `SET LOCAL`, the query, `COMMIT`). Two limits come with
+  it, both already true outside `atomic()`: inside a block, until its first statement
+  through Django's cursor, SQL that bypasses it sees the enclosing context's values (or
+  none), not the block's; and a session-level write of the admin or tenant GUC by code
+  inside a block (`set_guc()`, `rls_context()` without `is_local=True`) no longer survives
+  a block with no enclosing context. An alias outside `RLS_TENANTS["DATABASES"]` and
+  `USE_LOCAL_SET=False` are unchanged. `assert_rls_blocks_without_context()` uses the same
+  path inside `atomic()` as outside it. Tests that count queries inside `atomic()` see
+  fewer statements.
+- **`RLSTenantMiddleware` sets and clears both GUCs in one statement per alias**
+  (`USE_LOCAL_SET=False`, #137). It sent two `set_config()` statements to set them and two
+  to clear them at the end of the request; now one each, so a request costs two
+  statements per alias instead of four. The `request_finished` safety net clears in one
+  statement per alias too.
 
 ## [1.4.0] - 2026-10-16
 

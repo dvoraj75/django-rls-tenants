@@ -40,7 +40,7 @@ roll back.
 ## How It Works
 
 The phases below are the synchronous (WSGI) path. Under ASGI the middleware does the same
-work in its own async path (with `USE_LOCAL_SET=True` it writes no GUC there); see
+work in its own async path; see
 [Running under ASGI](#running-under-asgi).
 
 ### Request Phase (`process_request`)
@@ -51,8 +51,11 @@ work in its own async path (with `USE_LOCAL_SET=True` it writes no GUC there); s
     - `is_tenant_admin`: if `True`, sets `rls.is_admin = 'true'` and clears `rls.current_tenant`.
     - `rls_tenant_id`: if not admin, sets `rls.current_tenant = str(tenant_id)` and `rls.is_admin = 'false'`.
 4. Sets GUCs on **all database aliases** listed in `RLS_TENANTS["DATABASES"]` (default:
-   `["default"]`). If setting GUCs on one alias fails, all previously-set aliases are
-   cleaned up before the exception propagates.
+   `["default"]`), both GUCs in one `set_config()` statement per alias (*changed in
+   1.5.0*; before, one statement per GUC). If setting GUCs on one alias fails, all
+   previously-set aliases are cleaned up before the exception propagates. With
+   `USE_LOCAL_SET=True` this step writes nothing; the GUC affinity guard applies the values
+   (see [Transaction Per Request](#transaction-per-request-use_local_settrue)).
 5. Sets the internal `ContextVar` state for automatic query scoping (tenant users get
    auto-scoped queries; admin users and unauthenticated requests do not).
 6. Sets `_rls_context_active=True` to mark that an RLS context is active. This is used
@@ -65,13 +68,18 @@ work in its own async path (with `USE_LOCAL_SET=True` it writes no GUC there); s
 
 ### Transaction Per Request (`USE_LOCAL_SET=True`)
 
-With `RLS_TENANTS["USE_LOCAL_SET"] = True` the GUCs are set with `SET LOCAL`, which only
+With `RLS_TENANTS["USE_LOCAL_SET"] = True` the GUCs are transaction-local, which only
 exists inside a transaction. Django's `ATOMIC_REQUESTS` wraps the view callable only, so
 it cannot cover `process_request`. The middleware therefore opens the transaction
 itself: for every authenticated request it enters `transaction.atomic(using=alias)` for
 each alias in `RLS_TENANTS["DATABASES"]` *before* `process_request` and leaves it
 *after* `process_response`. The GUCs live exactly as long as the request and vanish at
 the commit (or rollback) that ends it. Unauthenticated requests get no transaction.
+*Changed in 1.5.0:* the middleware opens the transaction but writes nothing in it; the
+[GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) sends one
+`set_config()` statement per alias before the view's first query on it. A WSGI request
+with one query runs `BEGIN`, `set_config()`, the query, `COMMIT` (before, `BEGIN`, two
+`SET LOCAL` statements, the query, `COMMIT`).
 This is the synchronous path (WSGI, or ASGI with a synchronous-only middleware listed
 after this one); on the async path there is no request transaction (see
 [`USE_LOCAL_SET` and ASGI](#use_local_set-and-asgi)).
@@ -102,8 +110,8 @@ Transaction behavior and limitations:
   `tenant_context(tenant_id, using=alias)` (or `admin_context(using=alias)`), using
   the database alias queried by the generator. Since 1.4.0 the `atomic()` is optional on
   an alias in `RLS_TENANTS["DATABASES"]`: without it, the GUC affinity guard gives each
-  statement the context in a transaction of its own; with it, the block writes its GUCs
-  once for the transaction.
+  statement the context in a transaction of its own; with it, the guard sets the context's
+  values once for the transaction (the block itself writes nothing, *changed in 1.5.0*).
 
 With the default `USE_LOCAL_SET=False` nothing changes: the view runs in autocommit (or
 under `ATOMIC_REQUESTS`, if you enable it) exactly as before.
@@ -129,8 +137,9 @@ transaction-locally:
 - Inside a transaction, such as a sync view under `ATOMIC_REQUESTS` (Django does not
   support `ATOMIC_REQUESTS` for async views) or an `atomic()` block in the view, the guard
   sets the request's GUCs once per transaction, since the request's context was entered
-  before it. A context the view itself enters inside an `atomic()` block writes its own
-  values instead.
+  before it. A context the view itself enters inside an `atomic()` block is applied the
+  same way: one `set_config()` before its first statement (before 1.5.0 the block wrote
+  its own `SET LOCAL` values).
 
 **A WSGI request is atomic in this mode and a request on the async path is not.** On the
 synchronous path the middleware's transaction commits or rolls back everything the request
@@ -230,7 +239,9 @@ a synchronous one.
    client in `tenant_context()`, say) leaves that block's values alone (*changed in
    1.4.0*).
 4. If `USE_LOCAL_SET` is `False` (default): clears both GUC variables on **all
-   configured database aliases** to prevent cross-request leaks on persistent connections.
+   configured database aliases** to prevent cross-request leaks on persistent connections,
+   in one `set_config()` statement per alias (*changed in 1.5.0*; before, one per GUC). The
+   `request_finished` safety net clears the same way.
 5. If `USE_LOCAL_SET` is `True`: the GUCs are transaction-local and end with their
    transaction (by PostgreSQL), so no clearing statement runs. What the sessions of the
    configured aliases hold for themselves counts as unknown from now on (*added in
@@ -335,7 +346,7 @@ RLSTenantMiddleware.process_response()  (or process_exception on error)
     ├── RESET auto-scope ContextVar (via saved token)
     ├── USE_LOCAL_SET == False → CLEAR both GUCs
     └── USE_LOCAL_SET == True  → no statement: mark the sessions' own values unknown,
-                                 then COMMIT/ROLLBACK drops the SET LOCAL values
+                                 then COMMIT/ROLLBACK drops the transaction-local values
 ```
 
 ## Multi-Database Support

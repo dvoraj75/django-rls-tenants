@@ -228,22 +228,28 @@ RLS_TENANTS = {
 | **Type** | `bool` |
 | **Default** | `False` |
 
-When `True`, uses `SET LOCAL` (transaction-scoped) instead of `set_config()`
-(session-scoped) to set GUC variables.
+When `True`, GUC variables are transaction-scoped (`set_config(..., true)`, the same as
+`SET LOCAL`) instead of session-scoped. On an alias in `RLS_TENANTS["DATABASES"]` the
+[GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) writes them, before
+the first statement that needs them; the context managers, `for_user()` and the
+middleware only record the context (*changed in 1.5.0*: also inside
+`transaction.atomic()`). On any other alias they write with `SET LOCAL` themselves.
 
 **When to enable:**
 
 - You are using a connection pooler (PgBouncer, pgpool) in **transaction mode**.
-- `SET LOCAL` ensures GUCs are automatically cleared at transaction end,
+- Transaction-local GUCs are automatically cleared at transaction end,
   preventing cross-request leaks through pooled connections.
 
 **What changes when enabled:**
 
 - On the synchronous path (WSGI, or ASGI with a synchronous-only middleware listed after
   it), `RLSTenantMiddleware` opens `transaction.atomic()` on every configured alias
-  around each authenticated request, so the `SET LOCAL` GUCs cover the whole request and
-  are cleared at commit/rollback. `ATOMIC_REQUESTS` is not required (it nests as a
-  savepoint if you keep it).
+  around each authenticated request, so the transaction-local GUCs cover the whole request
+  and are cleared at commit/rollback. `ATOMIC_REQUESTS` is not required (it nests as a
+  savepoint if you keep it). Since 1.5.0 the middleware writes nothing in that
+  transaction: the guard sets the GUCs with one `set_config()` statement before the view's
+  first query.
 - On the middleware's async path (*1.4.0+*; ASGI, when every middleware listed after it can
   run asynchronously), it opens no transaction and writes no GUC. The
   [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) sets the request's
@@ -254,7 +260,13 @@ When `True`, uses `SET LOCAL` (transaction-scoped) instead of `set_config()`
 - Outside a request (Celery tasks, management commands, scripts), the context managers and
   `for_user()` no longer need `transaction.atomic()` (*1.4.0+*): the guard gives each
   statement the context in a transaction of its own, which costs three extra round trips
-  per statement in autocommit. Wrapping a batch of statements in `transaction.atomic()` is
+  per statement in autocommit. Inside `transaction.atomic()` they write nothing either
+  (*1.5.0+*; before, they wrote `SET LOCAL` values there): the guard sends one
+  `set_config()` statement before the block's first statement, and one more when the block
+  exits with the transaction still open, to put the enclosing context's values back or
+  clear them. Inside a block, until its first statement through Django's cursor, SQL that
+  bypasses the cursor (a driver cursor, `callproc()`) sees the enclosing context's values.
+  Wrapping a batch of statements in `transaction.atomic()` is
   still worth it for performance (see
   [Code Outside a Request Transaction](../guides/connection-pooling.md#code-outside-a-request-transaction)
   for the cost by placement). This holds for aliases in `RLS_TENANTS["DATABASES"]`; on any
@@ -293,15 +305,35 @@ django-rls-tenants registers Django system checks that warn about common misconf
 | `W002` | Warning | `RLSConstraint.guc_admin_var` doesn't match `GUC_PREFIX`-derived name |
 | `W003` | — | *Retired in 1.3.1 (duplicate of `W007`)* |
 | `W004` | Warning | `CONN_MAX_AGE > 0` with `USE_LOCAL_SET=False` (session GUCs may leak) |
-| `W005` | Warning | Default database connection role is a superuser or has `BYPASSRLS` (RLS bypassed) |
+| `W005` | Warning | The connection role of a `DATABASES` alias is a superuser or has `BYPASSRLS` (RLS bypassed); checked on every alias in `RLS_TENANTS["DATABASES"]`. With `settings.DEBUG = False` this is the error `E001` instead |
 | `W006` | Warning | `DATABASES` contains an alias not defined in `settings.DATABASES` |
 | `W007` | — | *Retired in 1.3.2; the middleware opens its own transaction, so `ATOMIC_REQUESTS` is no longer required for `USE_LOCAL_SET`* |
 | `W008` | Warning | `RLS_TENANTS['TENANT_MODEL']` does not resolve to an installed model |
 | `W009` | Warning | Tenant field referenced by an `RLSProtectedModel`'s RLS policy is missing |
 | `W010` | Warning | Django's connection pool (`OPTIONS["pool"]`) with `USE_LOCAL_SET=False` and no pool `reset` callback |
-| `W011` | Warning | PostgreSQL applies a database- or role-level default (`ALTER DATABASE/ROLE ... SET`) for a GUC the RLS policies read, in force in every new session |
+| `W011` | Warning | PostgreSQL applies a database- or role-level default (`ALTER DATABASE/ROLE ... SET`) for a GUC the RLS policies read, in force in every new session; checked on every alias in `RLS_TENANTS["DATABASES"]` |
+| `W013` | Warning | `W005`/`E001` or `W011` could not be determined: the database was reachable but the catalogue query failed (for example `permission denied for view pg_roles`). A clean `check` is not a pass |
+| `E001` | Error | The connection role of a `DATABASES` alias is a superuser or has `BYPASSRLS` and `settings.DEBUG` is `False` (a production deployment). Replaces `W005`; fails `manage.py check` and every command that runs the system checks, such as `migrate` |
 
-Run `python manage.py check` to see any warnings.
+Run `python manage.py check` to see any warnings and errors.
+
+`W005`, `W011` and `W013` stay warnings. `E001` is an error, so it also aborts `migrate`,
+`createsuperuser`, `check_rls`, `setup_m2m_rls` and Django's test runner (which sets
+`DEBUG = False` before it runs the checks). If a settings module has to connect as such a
+role on purpose (a migration job, a superuser test database), record that decision there
+and only there:
+
+```python title="settings_migrate.py"
+SILENCED_SYSTEM_CHECKS = ["django_rls_tenants.E001"]
+```
+
+Do not silence it in the settings your application serves requests with. See
+[E001 in Troubleshooting](../troubleshooting.md#e001-the-connection-role-bypasses-rls-with-debug-off).
+
+A connection that cannot be opened (the database is not provisioned yet, or a command runs
+without one) skips these two database checks quietly, as `check` always has; the reason is
+logged at `DEBUG` on the `django_rls_tenants` logger. Only a reachable database whose
+catalogue query fails produces `W013`.
 
 ## Typo Detection
 

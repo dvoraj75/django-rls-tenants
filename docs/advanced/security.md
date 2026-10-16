@@ -168,8 +168,12 @@ owner, not to these roles.
 !!! warning
     Never connect Django as a superuser or a `BYPASSRLS` role in production. Use a
     regular role with `NOSUPERUSER NOBYPASSRLS` that owns the application tables.
-    System check `W005` warns at startup when the default connection's role has
-    either attribute.
+    System check `W005` warns when the role of any alias in `RLS_TENANTS["DATABASES"]`
+    has either attribute. With `settings.DEBUG = False` it is the error `E001` instead,
+    which fails `manage.py check` and every command that runs the checks (`migrate`
+    included). Run migrations as the table owner, an ordinary role. If a migration or
+    test settings module must use a superuser, silence `E001` there only, never in the
+    runtime settings.
 
 ```sql
 CREATE ROLE app LOGIN PASSWORD '...' NOSUPERUSER NOBYPASSRLS;
@@ -283,8 +287,8 @@ Three properties of the DRF side are worth knowing:
 | Threat | Explanation |
 |--------|-------------|
 | Arbitrary SQL on the application connection | SQL injection, compromised code, or a `dbshell` with the app credentials can call `set_config()` to change the tenant or admin GUC |
-| Superuser or `BYPASSRLS` role | These roles bypass all RLS (`W005` warns) |
-| Database- or role-level default for a policy GUC (`ALTER DATABASE/ROLE ... SET`) | In force in every new session before any context is set, and never cleared by the library (`W011` warns) |
+| Superuser or `BYPASSRLS` role | These roles bypass all RLS (`W005` warns; `E001` is an error with `DEBUG = False`) |
+| Database- or role-level default for a policy GUC (`ALTER DATABASE/ROLE ... SET`) | In force in every new session before any context is set, and never cleared by the library (`W011` warns on every configured alias) |
 | Cross-tenant FK references | Referential-integrity checks are exempt from RLS |
 | Cross-tenant uniqueness probes | Unique indexes are exempt from RLS and span all tenants |
 | Schema-level information leaks | Shared tables, sequences, indexes |
@@ -333,7 +337,9 @@ See [Configuration](../getting-started/configuration.md#strict_mode) for setup.
 
 ## Recommendations
 
-1. **Connect as a `NOSUPERUSER NOBYPASSRLS` role** in production, and keep `W005` unsilenced.
+1. **Connect as a `NOSUPERUSER NOBYPASSRLS` role** in production, and keep `W005` and
+   `E001` unsilenced in the runtime settings. Treat a `W013` (a check that could not run)
+   as an open finding, not as a pass.
 2. **Enable `STRICT_MODE`** in development and staging to catch missing context early.
 3. **Enable `USE_LOCAL_SET`** behind an external pooler in transaction mode (PgBouncer),
    and set `reset_rls_gucs` as the `reset` callback of Django's connection pool.

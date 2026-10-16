@@ -3,9 +3,12 @@
 Detects configuration issues at startup that would otherwise cause
 silent failures at runtime:
 
-- Superuser or ``BYPASSRLS`` database connections (RLS is completely bypassed — warning).
+- Superuser or ``BYPASSRLS`` database connections (RLS is completely bypassed): a
+  warning with ``DEBUG`` on, the ``E001`` error with it off.
 - A database- or role-level default (``ALTER DATABASE/ROLE ... SET``) for a GUC the
   RLS policies read, in force in every new session before any context is set.
+- Either of those two could not be determined on a reachable database (``W013``):
+  silence from a check that could not run is not a pass.
 - ``GUC_PREFIX`` mismatch between runtime config and ``RLSConstraint`` defaults.
 - ``CONN_MAX_AGE > 0`` with ``USE_LOCAL_SET=False`` (connection-pool GUC leak risk).
 - Django's connection pool with ``USE_LOCAL_SET=False`` and no pool ``reset``.
@@ -26,9 +29,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from django.core.checks import CheckMessage, register
+from django.core.checks import Error as CheckError
 from django.core.checks import Warning as CheckWarning
-from django.core.checks import register
-from django.db import connection
+from django.core.exceptions import ImproperlyConfigured
+from django.db import Error, InterfaceError, OperationalError, connections
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -40,9 +45,9 @@ logger = logging.getLogger("django_rls_tenants")
 def check_rls_config(
     app_configs: Sequence[Any] | None = None,  # noqa: ARG001  -- Django check API
     **kwargs: Any,  # noqa: ARG001  -- Django check API
-) -> list[CheckWarning]:
+) -> list[CheckMessage]:
     """Run all RLS configuration checks."""
-    errors: list[CheckWarning] = []
+    errors: list[CheckMessage] = []
     errors.extend(_check_superuser_connection())
     errors.extend(_check_policy_guc_defaults())
     errors.extend(_check_guc_prefix_mismatch())
@@ -54,8 +59,95 @@ def check_rls_config(
     return errors
 
 
-def _check_superuser_connection() -> list[CheckWarning]:
-    """Warn if the default database connection uses a role that bypasses RLS.
+def _checked_aliases() -> list[str]:
+    """Return the aliases in ``RLS_TENANTS["DATABASES"]`` the database checks query.
+
+    An alias missing from ``settings.DATABASES`` is left to ``W006``.
+    """
+    from django.conf import settings  # noqa: PLC0415
+
+    from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
+
+    django_databases = getattr(settings, "DATABASES", {})
+    return [alias for alias in rls_tenants_config.DATABASES if alias in django_databases]
+
+
+def _read_catalogue(
+    alias: str,
+    sql: str,
+    *,
+    subject: str,
+    unconfirmed: str,
+) -> list[tuple[Any, ...]] | CheckWarning | None:
+    """Run a catalogue query on ``alias`` for one of the database checks.
+
+    Returns the rows, or ``None`` when the check does not apply: the alias is not
+    a PostgreSQL database, or no connection could be opened (the database may not
+    be provisioned yet, or a command that needs none runs without one; logged at
+    ``DEBUG``). When the database was reached but the query failed (a missing
+    privilege, a failing connection hook), the check could not run, and a clean
+    ``check`` must not be read as a pass: that returns ``W013``, naming the
+    exception, ``subject`` (what could not be determined) and ``unconfirmed``
+    (the check whose absence proves nothing).
+
+    Inside a transaction (``call_command("check")`` in a test, for one) the query
+    runs in a savepoint, so a failure aborts only that savepoint and the caller's
+    transaction stays usable; in autocommit no savepoint is needed.
+    """
+    connection = connections[alias]
+    if connection.vendor != "postgresql":
+        return None
+    try:
+        cursor = connection.cursor()
+    except (ImproperlyConfigured, InterfaceError, OperationalError):
+        logger.debug(
+            "Skipping %s on DATABASES[%r]: could not connect (database may be unavailable).",
+            unconfirmed,
+            alias,
+            exc_info=True,
+        )
+        return None
+    except Error as exc:
+        return _undetermined(alias, exc, subject=subject, unconfirmed=unconfirmed)
+    try:
+        savepoint = connection.savepoint()  # None outside a transaction
+        try:
+            with cursor:
+                cursor.execute(sql)
+                rows = list(cursor.fetchall())
+        except Error:
+            if savepoint is not None:
+                connection.savepoint_rollback(savepoint)
+            raise
+        if savepoint is not None:
+            connection.savepoint_commit(savepoint)
+    except Error as exc:
+        return _undetermined(alias, exc, subject=subject, unconfirmed=unconfirmed)
+    return rows
+
+
+def _describe_error(exc: BaseException) -> str:
+    """Name ``exc`` and the first line of its message (drivers add context lines)."""
+    detail = str(exc).strip()
+    return type(exc).__name__ + (f": {detail.splitlines()[0]}" if detail else "")
+
+
+def _undetermined(alias: str, exc: Exception, *, subject: str, unconfirmed: str) -> CheckWarning:
+    """Build the ``W013`` warning for a database check that could not run."""
+    return CheckWarning(
+        f"Could not determine {subject} on DATABASES[{alias!r}]: the query failed "
+        f"with {_describe_error(exc)}. Do not read the absence of {unconfirmed} as a pass.",
+        hint=(
+            f"DATABASES[{alias!r}] was reachable, but the check's catalogue query did "
+            f"not complete. Fix the cause named above (often a missing privilege on a "
+            f"pg_catalog view) and run `python manage.py check` again."
+        ),
+        id="django_rls_tenants.W013",
+    )
+
+
+def _check_superuser_connection() -> list[CheckMessage]:
+    """Report every configured alias whose connection role bypasses RLS.
 
     Two role attributes make PostgreSQL skip Row-Level Security entirely,
     even with ``FORCE ROW LEVEL SECURITY``:
@@ -67,50 +159,65 @@ def _check_superuser_connection() -> list[CheckWarning]:
     If the Django application connects as such a role, tenant isolation is
     completely disabled -- every query returns all rows regardless of GUC
     settings. Both attributes are read from ``pg_roles`` (which, unlike
-    ``pg_user``, also lists ``NOLOGIN`` roles reached via ``SET ROLE``).
+    ``pg_user``, also lists ``NOLOGIN`` roles reached via ``SET ROLE``), on
+    every alias in ``RLS_TENANTS["DATABASES"]``.
+
+    With ``settings.DEBUG`` on this is ``W005``; with it off (a production
+    deployment, but also Django's test runner) it is the ``E001`` error, which
+    fails ``check`` and every command that runs the system checks. A query that
+    fails on a reachable database gives ``W013`` (see ``_read_catalogue()``).
     """
-    warnings: list[CheckWarning] = []
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT rolname, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user"
-            )
-            row = cursor.fetchone()
-            if row is not None:
-                role, is_superuser, bypasses_rls = row
-                reasons: list[str] = []
-                if is_superuser:
-                    reasons.append("is a PostgreSQL superuser")
-                if bypasses_rls:
-                    reasons.append("has the BYPASSRLS attribute")
-                if reasons:
-                    quoted_role = connection.ops.quote_name(role)
-                    warnings.append(
-                        CheckWarning(
-                            f"The default database connection role {role!r} "
-                            f"{' and '.join(reasons)}. Superusers and BYPASSRLS "
-                            "roles bypass ALL Row-Level Security policies, "
-                            "completely disabling tenant isolation.",
-                            hint=(
-                                "Connect Django as a role with NOSUPERUSER and "
-                                "NOBYPASSRLS and set it in DATABASES['default']. "
-                                "Example: CREATE ROLE app LOGIN PASSWORD 'secret' "
-                                "NOSUPERUSER NOBYPASSRLS; GRANT ALL ON ALL TABLES "
-                                "IN SCHEMA public TO app; -- or fix the existing "
-                                f"role: ALTER ROLE {quoted_role} NOSUPERUSER NOBYPASSRLS;"
-                            ),
-                            id="django_rls_tenants.W005",
-                        )
-                    )
-    except Exception:
-        # Database may not be available at check time (e.g., during
-        # collectstatic or other commands that don't need a DB).
-        # Skip the check silently -- it will be caught at runtime.
-        logger.debug(
-            "Could not check RLS-bypass role attributes (database may be unavailable).",
-            exc_info=True,
+    from django.conf import settings  # noqa: PLC0415
+
+    messages: list[CheckMessage] = []
+    for alias in _checked_aliases():
+        rows = _read_catalogue(
+            alias,
+            "SELECT rolname, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user",
+            subject="whether the connection role bypasses RLS",
+            unconfirmed="W005 and E001",
         )
-    return warnings
+        if not isinstance(rows, list):
+            if rows is not None:
+                messages.append(rows)
+            continue
+        if not rows:
+            continue
+        role, is_superuser, bypasses_rls = rows[0]
+        reasons: list[str] = []
+        if is_superuser:
+            reasons.append("is a PostgreSQL superuser")
+        if bypasses_rls:
+            reasons.append("has the BYPASSRLS attribute")
+        if not reasons:
+            continue
+        quoted_role = connections[alias].ops.quote_name(role)
+        msg = (
+            f"The connection role {role!r} of DATABASES[{alias!r}] "
+            f"{' and '.join(reasons)}. Superusers and BYPASSRLS roles bypass ALL "
+            "Row-Level Security policies, completely disabling tenant isolation."
+        )
+        hint = (
+            "Connect Django as a role with NOSUPERUSER and NOBYPASSRLS and set it in "
+            f"DATABASES[{alias!r}]. Example: CREATE ROLE app LOGIN PASSWORD 'secret' "
+            "NOSUPERUSER NOBYPASSRLS; GRANT ALL ON ALL TABLES IN SCHEMA public TO app; "
+            f"-- or fix the existing role: ALTER ROLE {quoted_role} NOSUPERUSER NOBYPASSRLS;"
+        )
+        if settings.DEBUG:
+            messages.append(CheckWarning(msg, hint=hint, id="django_rls_tenants.W005"))
+            continue
+        messages.append(
+            CheckError(
+                f"{msg} settings.DEBUG is False, so this is treated as a production deployment.",
+                hint=(
+                    f"{hint} If these settings must use such a role (a test or migration "
+                    "settings module), record that with "
+                    "SILENCED_SYSTEM_CHECKS = ['django_rls_tenants.E001']."
+                ),
+                id="django_rls_tenants.E001",
+            )
+        )
+    return messages
 
 
 def _check_policy_guc_defaults() -> list[CheckWarning]:
@@ -123,9 +230,11 @@ def _check_policy_guc_defaults() -> list[CheckWarning]:
     shows that tenant's rows to everyone. The library assumes a new session
     holds no value for these GUCs (the GUC affinity guard clears a session's
     own values only after a context has used it), so such a default is never
-    cleared. Reads ``pg_db_role_setting`` on the default connection, for the
-    connected database and for cluster-wide (role-only) defaults: role-only
-    defaults first, then the database's, then those of a role in the database.
+    cleared. Reads ``pg_db_role_setting`` on every alias in
+    ``RLS_TENANTS["DATABASES"]``, for the connected database and for
+    cluster-wide (role-only) defaults: role-only defaults first, then the
+    database's, then those of a role in the database. A query that fails on a
+    reachable database gives ``W013`` (see ``_read_catalogue()``).
     """
     from django_rls_tenants.pool import _policy_guc_names  # noqa: PLC0415
 
@@ -133,26 +242,34 @@ def _check_policy_guc_defaults() -> list[CheckWarning]:
     names = {name.lower() for name in _policy_guc_names()}
     if not names:
         return warnings
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT d.datname, r.rolname, s.setconfig "
-                "FROM pg_db_role_setting AS s "
-                "LEFT JOIN pg_database AS d ON d.oid = s.setdatabase "
-                "LEFT JOIN pg_roles AS r ON r.oid = s.setrole "
-                "WHERE s.setdatabase = 0 OR d.datname = current_database() "
-                "ORDER BY d.datname NULLS FIRST, r.rolname NULLS FIRST"
-            )
-            rows = cursor.fetchall()
-    except Exception:
-        # Database may not be available at check time; see _check_superuser_connection().
-        logger.debug(
-            "Could not check for database or role defaults of the RLS GUCs "
-            "(database may be unavailable).",
-            exc_info=True,
+    for alias in _checked_aliases():
+        rows = _read_catalogue(
+            alias,
+            "SELECT d.datname, r.rolname, s.setconfig "
+            "FROM pg_db_role_setting AS s "
+            "LEFT JOIN pg_database AS d ON d.oid = s.setdatabase "
+            "LEFT JOIN pg_roles AS r ON r.oid = s.setrole "
+            "WHERE s.setdatabase = 0 OR d.datname = current_database() "
+            "ORDER BY d.datname NULLS FIRST, r.rolname NULLS FIRST",
+            subject="whether PostgreSQL applies a default for a GUC the RLS policies read",
+            unconfirmed="W011",
         )
-        return warnings
-    quote = connection.ops.quote_name
+        if not isinstance(rows, list):
+            if rows is not None:
+                warnings.append(rows)
+            continue
+        warnings.extend(_policy_guc_default_warnings(alias, rows, names))
+    return warnings
+
+
+def _policy_guc_default_warnings(
+    alias: str,
+    rows: list[tuple[Any, ...]],
+    names: set[str],
+) -> list[CheckWarning]:
+    """Build one ``W011`` per default in ``rows`` for a GUC in ``names`` (lower-case)."""
+    quote = connections[alias].ops.quote_name
+    warnings: list[CheckWarning] = []
     for database, role, setconfig in rows:
         for entry in setconfig or ():
             name, _, value = entry.partition("=")
@@ -170,11 +287,11 @@ def _check_policy_guc_defaults() -> list[CheckWarning]:
             warnings.append(
                 CheckWarning(
                     f"PostgreSQL sets {name} = {value!r} at the start of every session "
-                    f"for {scope}. The RLS policies read this GUC, so every session "
-                    f"starts with that value in force instead of no RLS context "
-                    f"(fail-closed), and django-rls-tenants never clears it: an admin "
-                    f"value bypasses the policies, a tenant value shows that tenant's "
-                    f"rows to everyone.",
+                    f"for {scope} (DATABASES[{alias!r}]). The RLS policies read this GUC, "
+                    f"so every session starts with that value in force instead of no RLS "
+                    f"context (fail-closed), and django-rls-tenants never clears it: an "
+                    f"admin value bypasses the policies, a tenant value shows that "
+                    f"tenant's rows to everyone.",
                     hint=(
                         f"Remove the default: ALTER {target} RESET {name}; "
                         f"and set the RLS context per request or block instead."

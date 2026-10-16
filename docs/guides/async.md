@@ -267,9 +267,10 @@ async with async_tenant_context(tenant_id):     # writes nothing with USE_LOCAL_
 A few more consequences:
 
 - **Code driven by `async_to_sync` from inside `transaction.atomic()`** runs its hops on the
-  calling thread, in that transaction. The async managers then write `SET LOCAL` values
-  into it, as the sync ones do (see
-  [`USE_LOCAL_SET=True` in async code](context-managers.md#use_local_settrue-in-async-code)).
+  calling thread, in that transaction. The async managers write nothing there either (since
+  1.5.0; before, they wrote `SET LOCAL` values into it): the guard sets the values in that
+  transaction, as for the sync ones (see
+  [`USE_LOCAL_SET=True` in async code](context-managers.md#async-code)).
 - **`thread_sensitive=False` work is outside your transaction.** It runs on another
   connection, so it does not see the transaction's uncommitted rows. With
   `USE_LOCAL_SET=True` each of its statements gets a transaction of its own.
@@ -315,9 +316,9 @@ A few more consequences:
       `@with_rls_context` sits directly on the `async def`.
 - [ ] No database work goes to `thread_sensitive=False`, `run_in_executor()` or a bare thread
       pool unless it opens its own context.
-- [ ] Every alias connects as a role without `SUPERUSER` or `BYPASSRLS`. `W005` checks the
-      `default` alias; check the roles of the others yourself.
-- [ ] `python manage.py check` shows no `W004`, `W005`, `W010` or `W011`.
+- [ ] Every alias connects as a role without `SUPERUSER` or `BYPASSRLS`. `W005` (`E001` with
+      `DEBUG = False`) checks every alias in `RLS_TENANTS["DATABASES"]`.
+- [ ] `python manage.py check` shows no `W004`, `W005`, `E001`, `W010`, `W011` or `W013`.
 
 ## See also
 

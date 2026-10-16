@@ -60,6 +60,10 @@ pip install "django-rls-tenants<1.4"
     poetry add django-rls-tenants
     ```
 
+Installing the package also registers a pytest plugin (the `pytest11` entry point
+`django_rls_tenants`) that provides the `enforce_rls` test fixtures. It does nothing unless
+a test requests them; see [Enforcing RLS in Tests](../guides/testing.md#enforcing-rls-in-tests).
+
 ## Optional Extras
 
 ### Celery
@@ -146,17 +150,24 @@ setting must have permission to:
 
 In most setups the database owner (the user who created the database) already has these
 permissions. If you are using a restricted role, grant ownership of the relevant tables
-or use a superuser for migrations.
+or run migrations as a role that owns them.
 
 !!! warning
     Superusers and roles with the `BYPASSRLS` attribute skip every RLS policy. The role
     your application **runs as** must be `NOSUPERUSER NOBYPASSRLS`, otherwise tenant
-    isolation is silently disabled. A superuser is fine for running migrations only.
-    System check `W005` warns when the default connection's role has either attribute.
+    isolation is silently disabled. Run migrations as the table owner, which is an
+    ordinary `NOSUPERUSER NOBYPASSRLS` role (owners are subject to `FORCE ROW LEVEL
+    SECURITY`). System check `W005` warns when the role of any configured alias has either
+    attribute; with `DEBUG = False` it is the error `E001`, which also stops `migrate`.
+    A migration job that must use a superuser silences `E001` in its own settings only
+    (see [E001](../troubleshooting.md#e001-the-connection-role-bypasses-rls-with-debug-off)).
 
     ```sql
     CREATE ROLE myproject_user LOGIN PASSWORD '...' NOSUPERUSER NOBYPASSRLS;
     ```
+
+    To run a test suite as such a role while the database connects as a superuser, see
+    [Enforcing RLS in Tests](../guides/testing.md#enforcing-rls-in-tests).
 
 ```python title="settings.py"
 DATABASES = {

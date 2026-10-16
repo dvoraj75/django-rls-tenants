@@ -110,8 +110,9 @@ See [Requiring a context](guides/celery-tasks.md#requiring-a-context).
 
 **Cause:** `USE_LOCAL_SET=True` makes a GUC write a `SET LOCAL`, which PostgreSQL only
 accepts inside a transaction. Since 1.4.0 a context manager entered outside
-`transaction.atomic()` on an alias in `RLS_TENANTS["DATABASES"]` writes nothing, and the
-GUC affinity guard applies the context to each statement, so the error is left for:
+`transaction.atomic()` on an alias in `RLS_TENANTS["DATABASES"]` writes nothing (since 1.5.0
+inside it too), and the GUC affinity guard applies the context to each statement, so the
+error is left for:
 
 - a context entered on an alias that is **not** in `RLS_TENANTS["DATABASES"]` (the guard
   leaves such an alias alone);
@@ -184,9 +185,9 @@ instead, but it leaves other aliases alone, so the block would otherwise fail in
 
 **Fix:** Add the alias to `RLS_TENANTS["DATABASES"]`. If the coroutine is called from
 synchronous code, you can instead wrap that call in `transaction.atomic(using=alias)` and
-run the coroutine with `async_to_sync`; the managers then use `SET LOCAL`.
+run the coroutine with `async_to_sync`; the managers then use `SET LOCAL` on that alias.
 
-**See:** [`USE_LOCAL_SET=True` in async code](guides/context-managers.md#use_local_settrue-in-async-code).
+**See:** [`USE_LOCAL_SET=True` in async code](guides/context-managers.md#async-code).
 
 ### A procedure that commits fails with `invalid transaction termination`
 
@@ -350,8 +351,12 @@ required setting.
 **Cause:** Those statements require ownership of the table, and the role running
 `migrate` does not own it (typically because a different role created the schema).
 
-**Fix:** Run migrations as the table owner (or a superuser), and keep the *application*
-role a plain `NOSUPERUSER NOBYPASSRLS` role. Two roles, two jobs.
+**Fix:** Run migrations as the table owner, and keep the *application* role a plain
+`NOSUPERUSER NOBYPASSRLS` role. Two roles, two jobs. The owner is not a superuser, so
+[`E001`](#e001-the-connection-role-bypasses-rls-with-debug-off) does not apply to it. If the
+migration job has to use a superuser and `DEBUG` is `False`, silence `E001` in that job's
+settings only (see `E001`), or pass `--skip-checks` to `migrate`, which skips every system
+check.
 
 **See:** [PostgreSQL Setup](getting-started/installation.md#postgresql-setup).
 
@@ -395,20 +400,22 @@ first access. For the admin, replace `list_select_related = True` with a list of
 
 ## System check warnings
 
-`python manage.py check` prints these. IDs are never renumbered; W003 and W007 are
-retired (see below). The full table is in
+`python manage.py check` prints these; `E001` is an error, the rest are warnings. IDs are
+never renumbered; W003 and W007 are retired (see below). The full table is in
 [Configuration: System Checks](getting-started/configuration.md#system-checks).
 
 ### W005: the connection role is a superuser or has `BYPASSRLS`
 
-**Symptom:** `(django_rls_tenants.W005) The default database connection role 'postgres'
-is a PostgreSQL superuser. ...` Often seen on a fresh Docker database, or when tests
-asserting isolation (`assert_rls_blocks_without_context`) fail because every query
-returns all rows.
+**Symptom:** `(django_rls_tenants.W005) The connection role 'postgres' of
+DATABASES['default'] is a PostgreSQL superuser. ...` Often seen on a fresh Docker
+database, or when tests asserting isolation (`assert_rls_blocks_without_context`) fail
+because every query returns all rows.
 
 **Cause:** PostgreSQL skips every RLS policy for superusers and `BYPASSRLS` roles, even
 with `FORCE ROW LEVEL SECURITY`. The official `postgres` image's default user is a
-superuser.
+superuser. The check runs on every alias in `RLS_TENANTS["DATABASES"]` and names the alias.
+It is a warning while `settings.DEBUG` is `True`; with `DEBUG = False` the same condition is
+reported as [`E001`](#e001-the-connection-role-bypasses-rls-with-debug-off) instead.
 
 **Fix:** Create a plain role and connect Django as it. The hint carries a ready-to-run
 statement:
@@ -422,8 +429,77 @@ ALTER ROLE app NOSUPERUSER NOBYPASSRLS;
 
 The example project's `docker/init-db.sql` does exactly this.
 
+In a test suite, request the `enforce_rls` pytest fixture: it switches a superuser or
+`BYPASSRLS` connection to a plain role for the test, and `assert_rls_enforced()` fails when
+the connection still bypasses RLS. See
+[Enforcing RLS in Tests](guides/testing.md#enforcing-rls-in-tests).
+
 **See:** [PostgreSQL Setup](getting-started/installation.md#postgresql-setup),
 [Superuser and BYPASSRLS Roles](advanced/security.md#superuser-and-bypassrls-roles).
+
+### E001: the connection role bypasses RLS with `DEBUG` off
+
+**Symptom:** `python manage.py check` fails, and so does every management command that runs
+the system checks (`migrate`, `createsuperuser`, `check_rls`, `setup_m2m_rls`, Django's test
+runner):
+
+```text
+SystemCheckError: System check identified some issues:
+
+ERRORS:
+?: (django_rls_tenants.E001) The connection role 'postgres' of DATABASES['default'] is a
+PostgreSQL superuser. ... settings.DEBUG is False, so this is treated as a production
+deployment.
+```
+
+**Cause:** The role of a `DATABASES` alias in `RLS_TENANTS["DATABASES"]` is a superuser or
+has `BYPASSRLS`, so PostgreSQL skips every RLS policy, and `DEBUG` is `False`. The library
+treats that as a production deployment and fails the checks instead of warning. With `DEBUG`
+on, the same condition is `W005`. Django's test runner sets `DEBUG = False` before it runs
+the checks, so a test database reached as a superuser fails here too. A server that does
+not run the system checks (gunicorn, uvicorn) and pytest-django (which never runs them) are
+not affected.
+
+**Fix:** Connect as a `NOSUPERUSER NOBYPASSRLS` role, as for [`W005`](#w005-the-connection-role-is-a-superuser-or-has-bypassrls).
+Migrations run as the table owner, which is an ordinary role and passes. Only when a
+settings module has to use such a role on purpose (a migration job on a superuser, a test
+database in CI), record that in that module:
+
+```python title="settings_migrate.py"
+from myproject.settings import *  # noqa: F403
+
+SILENCED_SYSTEM_CHECKS = ["django_rls_tenants.E001"]
+```
+
+or read it from the environment in a settings module that only that job uses. For a single
+`migrate` run, `manage.py migrate --skip-checks` also works, but it skips every check. Never
+silence `E001` in the settings the application serves requests with: that is the
+configuration it exists to catch.
+
+**See:** [Superuser and BYPASSRLS Roles](advanced/security.md#superuser-and-bypassrls-roles),
+[Testing: Django's test runner](guides/testing.md#djangos-test-runner).
+
+### W013: a database check could not be determined
+
+**Symptom:** `(django_rls_tenants.W013) Could not determine whether the connection role
+bypasses RLS on DATABASES['default']: the query failed with ProgrammingError: permission
+denied for view pg_roles. Do not read the absence of W005 and E001 as a pass.` The same
+message exists for `W011` ("... whether PostgreSQL applies a default for a GUC the RLS
+policies read ...").
+
+**Cause:** The database was reachable, but the check's catalogue query failed: a missing
+privilege on a `pg_catalog` view, a statement timeout, or a failing connection hook. The
+check could not run, so a clean result for `W005`, `E001` or `W011` proves nothing. Each
+alias is checked separately. `W013` stays a warning even with `DEBUG = False`. Inside a
+transaction (`call_command("check")` in a test, for one) the query runs in a savepoint, so
+the failure does not abort the transaction around it. (When no
+connection can be opened at all, because the database is not provisioned yet or the command
+runs without one, the checks are skipped quietly instead, with a `DEBUG` log line.)
+
+**Fix:** Fix the cause named in the message (usually grant the connection role access to
+the catalogue view, or raise the timeout) and run `python manage.py check` again.
+
+**See:** [Configuration: System Checks](getting-started/configuration.md#system-checks).
 
 ### W001 / W002: `guc_tenant_var` or `guc_admin_var` does not match `GUC_PREFIX`
 
@@ -493,7 +569,7 @@ Or set `USE_LOCAL_SET=True`. Any `reset`, including your own, silences the warni
 ### W011: PostgreSQL applies a default for a policy GUC
 
 **Symptom:** `(django_rls_tenants.W011) PostgreSQL sets rls.is_admin = 'true' at the start
-of every session for database 'app_db'. The RLS policies read this GUC, so every session
+of every session for database 'app_db' (DATABASES['default']). The RLS policies read this GUC, so every session
 starts with that value in force instead of no RLS context (fail-closed), and
 django-rls-tenants never clears it: an admin value bypasses the policies, a tenant value
 shows that tenant's rows to everyone.`
@@ -506,7 +582,7 @@ runs. The library assumes a new session holds no value for these GUCs, so it nev
 clears the default: with an admin default every connection bypasses RLS, with a tenant
 default everyone sees that tenant's rows. The check reads `pg_db_role_setting` for the
 connected database and for role-level defaults, for every GUC the installed policies read
-(bypass flags included).
+(bypass flags included), on every alias in `RLS_TENANTS["DATABASES"]`.
 
 **Fix:** Remove the default with the statement the hint names (`ALTER DATABASE app_db RESET
 rls.is_admin;`, `ALTER ROLE app RESET rls.is_admin;` or `ALTER ROLE app IN DATABASE app_db
@@ -726,8 +802,10 @@ Typical reasons:
   they count: the statement counts as **four** queries, and `connection.queries` lists it
   last, because Django logs it when it finishes. For a transaction opened inside a context
   the guard sends one `set_config()` per transaction; a context entered inside
-  `transaction.atomic()` writes its own GUCs instead, and the guard sends none while its
-  tracker is clean (one clear first after an earlier context has ended on that connection);
+  `transaction.atomic()` is applied the same way (*1.5.0+*: one `set_config()` before its
+  first statement, and one when it exits with the transaction still open, which puts the
+  enclosing context's values back or clears them; one clear first after an earlier context
+  has ended on that connection);
 - `USE_LOCAL_SET=True`: the next statement run outside any context, in autocommit or in a
   transaction, after a context has ended (or after a statement run under a context's
   values on that connection) sends one `set_config()` that clears what the session may hold
@@ -749,9 +827,10 @@ block in one `transaction.atomic()` inside the context (the count then includes 
 `BEGIN` and `COMMIT`, plus one `set_config()`; a block nested in an enclosing transaction,
 as in a `TestCase`, shows only `SAVEPOINT`, your statements and `RELEASE SAVEPOINT`, because
 the `set_config()` falls on the enclosing transaction's first statement). Inside a test
-transaction (`TestCase`, `django_db`), a context entered in the test writes its own GUCs
-(two `current_setting()` reads and two `SET LOCAL` statements on entry, two on exit) and
-the guard sends none while its tracker is clean; enter it before the counted block so the
-count stays flat.
+transaction (`TestCase`, `django_db`), a context entered in the test sends one
+`set_config()` before its first statement and one when it exits (before 1.5.0 it wrote its
+own GUCs: two `current_setting()` reads and two `SET LOCAL` statements on entry, two on
+exit); run a statement under the context before the counted block so the count stays
+flat.
 
 **See:** [GUC Affinity Guard](advanced/architecture.md#guc-affinity-guard).
