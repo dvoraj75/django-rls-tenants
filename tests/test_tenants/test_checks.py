@@ -456,11 +456,20 @@ class TestCheckPoolWithoutReset:
         assert warnings == []
 
 
-def _fake_connection(rows=(), *, connect_error=None, query_error=None, vendor="postgresql"):
+def _fake_connection(
+    rows=(),
+    *,
+    connect_error=None,
+    query_error=None,
+    vendor="postgresql",
+    savepoint=None,
+):
     """Return a mocked connection whose catalogue query returns ``rows``, and its cursor.
 
     ``connect_error`` is raised by ``cursor()`` (opening the connection),
-    ``query_error`` by ``execute()`` (the query itself).
+    ``query_error`` by ``execute()`` (the query itself). ``savepoint`` is what
+    ``connection.savepoint()`` returns: ``None`` outside a transaction (Django's
+    behaviour in autocommit), a savepoint id inside one.
     """
     cursor = MagicMock()
     cursor.fetchall.return_value = list(rows)
@@ -469,6 +478,7 @@ def _fake_connection(rows=(), *, connect_error=None, query_error=None, vendor="p
     cursor.execute.side_effect = query_error
     conn = MagicMock()
     conn.vendor = vendor
+    conn.savepoint.return_value = savepoint
     conn.ops.quote_name.side_effect = connection.ops.quote_name
     if connect_error is None:
         conn.cursor.return_value = cursor
@@ -655,6 +665,43 @@ class TestCheckSuperuserConnection:
         assert [w.id for w in warnings] == ["django_rls_tenants.W013"]
         assert "ProgrammingError: clearing the GUCs failed" in warnings[0].msg
 
+    def test_query_runs_in_a_savepoint_inside_a_transaction(self):
+        """In a transaction the query runs in a savepoint, released on success."""
+        conn, _ = _fake_connection([("app", False, False)], savepoint="sp1")
+        with _fake_aliases(default=conn):
+            assert _check_superuser_connection() == []
+        conn.savepoint_commit.assert_called_once_with("sp1")
+        conn.savepoint_rollback.assert_not_called()
+
+    def test_failed_query_rolls_back_to_its_savepoint(self):
+        """A failure rolls back to the savepoint, so the caller's transaction survives."""
+        conn, _ = _fake_connection(query_error=ProgrammingError("denied"), savepoint="sp1")
+        with _fake_aliases(default=conn):
+            warnings = _check_superuser_connection()
+        assert [w.id for w in warnings] == ["django_rls_tenants.W013"]
+        conn.savepoint_rollback.assert_called_once_with("sp1")
+        conn.savepoint_commit.assert_not_called()
+
+    def test_no_savepoint_in_autocommit(self):
+        """Outside a transaction Django's ``savepoint()`` is ``None``: nothing to release."""
+        conn, _ = _fake_connection(query_error=ProgrammingError("denied"))
+        with _fake_aliases(default=conn):
+            _check_superuser_connection()
+        conn.savepoint_rollback.assert_not_called()
+        conn.savepoint_commit.assert_not_called()
+
+    def test_w013_when_the_savepoint_cannot_be_set(self):
+        """A transaction already aborted before the check is W013, not a traceback."""
+        conn, cursor = _fake_connection()
+        conn.savepoint.side_effect = ProgrammingError(
+            "current transaction is aborted, commands ignored until end of transaction block"
+        )
+        with _fake_aliases(default=conn):
+            warnings = _check_superuser_connection()
+        assert [w.id for w in warnings] == ["django_rls_tenants.W013"]
+        assert "current transaction is aborted" in warnings[0].msg
+        cursor.execute.assert_not_called()
+
     def test_w013_on_one_alias_does_not_hide_another(self):
         """Each alias is checked on its own: a failing replica still reports default."""
         default, _ = _fake_connection([("postgres", True, False)])
@@ -734,9 +781,9 @@ class TestCheckSuperuserConnection:
 
         ``REVOKE`` on the catalogue view needs a superuser (see
         ``test_real_bypassrls_role`` for why it fails instead of skipping). The
-        failed query aborts the transaction, so the test works in a savepoint and
-        rolls back to it: that also undoes the ``REVOKE``, the ``CREATE ROLE`` and the
-        ``SET ROLE``.
+        check runs its query in a savepoint of its own, so the failure does not
+        abort the test transaction: a statement still runs afterwards. The test's
+        own savepoint undoes the ``REVOKE``, the ``CREATE ROLE`` and the ``SET ROLE``.
         """
         if not _is_superuser():
             pytest.fail(
@@ -751,6 +798,9 @@ class TestCheckSuperuserConnection:
             cur.execute("SET ROLE rls_w013_role")
         try:
             warnings = _check_superuser_connection()
+            with connection.cursor() as cur:
+                cur.execute("SELECT 1")  # the test transaction is not aborted
+                assert cur.fetchone() == (1,)
         finally:
             with connection.cursor() as cur:
                 cur.execute("ROLLBACK TO SAVEPOINT w013")

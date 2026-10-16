@@ -18,7 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   database is reachable but the catalogue query behind `W005`/`E001` or `W011` fails (for
   example `permission denied for view pg_roles`, or a statement timeout), the checks now
   report `W013` naming the error and the alias, so a clean `check` is not read as a pass.
-  It stays a warning with `DEBUG` off. When no connection can be opened (the database is
+  It stays a warning with `DEBUG` off. Inside a transaction (`call_command("check")` in a
+  test) the query runs in a savepoint, so the failure does not abort the caller's
+  transaction. When no connection can be opened (the database is
   not provisioned yet, or a command runs without one), the checks are still skipped
   quietly, with a `DEBUG` log line on the `django_rls_tenants` logger.
 

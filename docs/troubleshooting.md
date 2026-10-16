@@ -484,7 +484,9 @@ policies read ...").
 **Cause:** The database was reachable, but the check's catalogue query failed: a missing
 privilege on a `pg_catalog` view, a statement timeout, or a failing connection hook. The
 check could not run, so a clean result for `W005`, `E001` or `W011` proves nothing. Each
-alias is checked separately. `W013` stays a warning even with `DEBUG = False`. (When no
+alias is checked separately. `W013` stays a warning even with `DEBUG = False`. Inside a
+transaction (`call_command("check")` in a test, for one) the query runs in a savepoint, so
+the failure does not abort the transaction around it. (When no
 connection can be opened at all, because the database is not provisioned yet or the command
 runs without one, the checks are skipped quietly instead, with a `DEBUG` log line.)
 

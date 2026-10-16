@@ -89,6 +89,10 @@ def _read_catalogue(
     ``check`` must not be read as a pass: that returns ``W013``, naming the
     exception, ``subject`` (what could not be determined) and ``unconfirmed``
     (the check whose absence proves nothing).
+
+    Inside a transaction (``call_command("check")`` in a test, for one) the query
+    runs in a savepoint, so a failure aborts only that savepoint and the caller's
+    transaction stays usable; in autocommit no savepoint is needed.
     """
     connection = connections[alias]
     if connection.vendor != "postgresql":
@@ -106,11 +110,20 @@ def _read_catalogue(
     except Error as exc:
         return _undetermined(alias, exc, subject=subject, unconfirmed=unconfirmed)
     try:
-        with cursor:
-            cursor.execute(sql)
-            return list(cursor.fetchall())
+        savepoint = connection.savepoint()  # None outside a transaction
+        try:
+            with cursor:
+                cursor.execute(sql)
+                rows = list(cursor.fetchall())
+        except Error:
+            if savepoint is not None:
+                connection.savepoint_rollback(savepoint)
+            raise
+        if savepoint is not None:
+            connection.savepoint_commit(savepoint)
     except Error as exc:
         return _undetermined(alias, exc, subject=subject, unconfirmed=unconfirmed)
+    return rows
 
 
 def _describe_error(exc: BaseException) -> str:
