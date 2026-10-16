@@ -23,6 +23,10 @@ INSTALLED_APPS = [
     "django.contrib.admin",
     "django.contrib.sessions",
     "django.contrib.messages",
+    # contrib.drf tests (tests/test_contrib/test_drf.py); authtoken provides
+    # TokenAuthentication, the case RLSTenantMiddleware cannot serve.
+    "rest_framework",
+    "rest_framework.authtoken",
     "django_rls_tenants",
     "tests",
     "tests.test_app",
@@ -47,6 +51,16 @@ MIDDLEWARE = [
 ]
 
 ROOT_URLCONF = "tests.admin_urls"
+
+# As a project would configure it: DRF imports the default permission classes
+# while it builds APIView, so listing RLSTenantPermission here also proves that
+# contrib.drf can be imported from there (tests/test_contrib/test_drf.py).
+REST_FRAMEWORK = {
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticated",
+        "django_rls_tenants.contrib.drf.RLSTenantPermission",
+    ],
+}
 
 # A DjangoTemplates backend with the context processors the admin requires
 # (system checks admin.E402-E404).

@@ -32,10 +32,11 @@ the [Security Model](advanced/security.md) for what that does and does not cover
 - **Fail-closed by default** -- missing tenant context returns zero rows, never leaks data.
 - **Optional strict mode** -- `STRICT_MODE=True` raises `NoTenantContextError` on unscoped queries, turning silent empty results into loud errors during development.
 - **Single schema, single database** -- no schema-per-tenant overhead.
-- **API-agnostic** -- works with Django REST Framework, GraphQL, async views, management commands.
+- **API-agnostic** -- works with GraphQL, async views, management commands, and (through the DRF integration) Django REST Framework.
 - **M2M isolation** -- auto-detected subquery-based RLS policies on M2M through tables.
 - **Tenant-aware Django admin** -- `RLSTenantModelAdmin` scopes changelists, forms, and related dropdowns to the current tenant, with a tenant switcher for cross-tenant admins. See the [Admin guide](guides/admin.md).
 - **Native Celery integration** -- `@rls_task` carries the active tenant context from enqueue to the worker, across chains, groups, and chords. See the [Celery Tasks guide](guides/celery-tasks.md).
+- **Django REST Framework integration** -- `RLSTenantAPIViewMixin` opens the RLS context after DRF authenticates the user (token and JWT clients included, which the middleware cannot see), `RLSTenantPermission` refuses a view that runs outside it, and `RLSTenantModelSerializer` fills the tenant FK from it. See the [Django REST Framework guide](guides/drf.md).
 - **Raw SQL helpers** -- `safe_tenant_sql()` builds a tenant-filter predicate; `current_tenant_value_sql()` returns the current tenant ID expression for inserts and projections. Both reuse the expressions used by RLS policies. See the [Raw SQL guide](guides/raw-sql.md).
 - **Clean internal layering** -- generic `rls/` primitives separate from `tenants/` conveniences.
 - **Configurable escape hatches** -- bypass flags for authentication, admin, migrations.
@@ -50,6 +51,7 @@ the [Security Model](advanced/security.md) for what that does and does not cover
 | Set the tenant context for every request | [Middleware](guides/middleware.md) |
 | Set the context in a script or management command | [Context Managers](guides/context-managers.md) |
 | Run a Celery task under the right tenant | [Celery Tasks](guides/celery-tasks.md) |
+| Scope a DRF API to the user's tenant | [Django REST Framework](guides/drf.md) |
 | Use the tenant context in an async view or consumer | [Async Code](guides/context-managers.md#async-code) |
 | Use the Django admin across tenants | [Admin](guides/admin.md) |
 | Write a test that proves isolation fails closed | [Testing](guides/testing.md) |

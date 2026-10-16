@@ -324,8 +324,12 @@ See [1.4.0](changelog.md#140-2026-10-16).
 First-class support for the most popular Django API framework.
 
 - [ ] **Django REST Framework integration** (`contrib/drf.py`) —
-  `RLSTenantPermission`, `RLSTenantViewSetMixin`,
-  `TenantContextAuthentication`, and an auto-hidden tenant FK serializer field.
+  `RLSTenantAPIViewMixin` (opens the context after DRF authenticates, for any
+  `APIView`, generic view or viewset), `RLSTenantPermission`,
+  `RLSTenantSerializerMixin` / `RLSTenantModelSerializer` with
+  `CurrentTenantDefault` (an auto-hidden tenant FK serializer field). The
+  planned `TenantContextAuthentication` was dropped: an authentication class is
+  never called back when the request ends, so it could not exit its context.
   Installable as `pip install django-rls-tenants[drf]`.
   *Why:* DRF is the dominant API framework for Django. Library-level
   integration removes boilerplate and prevents misconfiguration.

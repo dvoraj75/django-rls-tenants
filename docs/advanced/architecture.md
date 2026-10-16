@@ -65,6 +65,15 @@ This constraint ensures:
 - Changes to the `tenants/` layer cannot break the `rls/` layer.
 - The dependency graph is a clean DAG (no cycles).
 
+### Optional integrations
+
+`contrib/` holds integrations with third-party libraries, each behind a pip extra:
+`contrib/celery.py` (`celery`) and `contrib/drf.py` (`drf`). Neither `rls/` nor
+`tenants/` imports them, nor Celery or Django REST Framework themselves (enforced by
+`tests/test_layering.py`), so the core library imports without the extras. See the
+[Celery](../guides/celery-tasks.md) and
+[Django REST Framework](../guides/drf.md) guides.
+
 ## GUC Variable Flow
 
 PostgreSQL GUC (Grand Unified Configuration) variables are the mechanism for

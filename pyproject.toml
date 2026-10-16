@@ -56,6 +56,12 @@ dependencies = [
 celery = [
     "celery>=5.3",
 ]
+# Django REST Framework integration (contrib.drf): RLSTenantAPIViewMixin,
+# RLSTenantPermission, RLSTenantSerializerMixin. Optional -- the core library
+# never imports rest_framework.
+drf = [
+    "djangorestframework>=3.16",
+]
 
 # pytest plugin (django_rls_tenants.pytest_plugin): the enforce_rls fixtures.
 # Loaded in every pytest run with the package installed; -p no:django_rls_tenants
@@ -79,6 +85,8 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "django-stubs[compatible-mypy]>=5.0",
+    # Types for contrib.drf; the lint job installs only this group.
+    "djangorestframework-stubs>=3.16",
     "psycopg2-binary>=2.9",
     # mypy type-checks django_rls_tenants.pytest_plugin, which imports pytest.
     "pytest>=8.0",
@@ -90,6 +98,7 @@ test = [
     "coverage[toml]>=7.0",
     "psycopg2-binary>=2.9",
     "celery>=5.3",
+    "djangorestframework>=3.16",
     # tests/test_support_matrix.py parses the CI workflows.
     "pyyaml>=6.0",
 ]
@@ -97,8 +106,9 @@ docs = [
     "mkdocs>=1.6",
     "mkdocs-material>=9.5",
     "mkdocstrings[python]>=0.27",
-    # mkdocstrings imports contrib.celery to render its API reference.
+    # mkdocstrings imports contrib.celery and contrib.drf to render their API reference.
     "celery>=5.3",
+    "djangorestframework>=3.16",
 ]
 
 # ---------------------------------------------------------------------------

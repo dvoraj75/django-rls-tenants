@@ -13,6 +13,8 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "rest_framework",
+    "rest_framework.authtoken",
     "django_rls_tenants",
     "tenants",
     "accounts",
@@ -79,6 +81,21 @@ RLS_TENANTS = {
 CELERY_BROKER_URL = "memory://"
 CELERY_TASK_ALWAYS_EAGER = True
 CELERY_TASK_EAGER_PROPAGATES = True
+
+# Django REST Framework (notes/api.py). Token clients reach RLSTenantMiddleware
+# as anonymous users -- DRF authenticates inside the view -- so the API views
+# use RLSTenantAPIViewMixin, and RLSTenantPermission refuses any API view that
+# would run outside the user's RLS context.
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.TokenAuthentication",
+        "rest_framework.authentication.SessionAuthentication",
+    ],
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticated",
+        "django_rls_tenants.contrib.drf.RLSTenantPermission",
+    ],
+}
 
 TEMPLATES = [
     {

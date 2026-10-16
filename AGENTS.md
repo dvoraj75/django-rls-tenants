@@ -108,6 +108,17 @@ The library has two internal layers with a strict import boundary:
 
 This boundary is enforced by `tests/test_layering.py`. Never import from `tenants/` in `rls/`.
 
+**`django_rls_tenants/contrib/`** — Integrations behind pip extras: `celery.py`
+(`celery`) and `drf.py` (`drf`, `RLSTenantAPIViewMixin`, `RLSTenantPermission`,
+`RLSTenantSerializerMixin` / `RLSTenantModelSerializer`, `CurrentTenantDefault`). Never
+imported by `rls/`, `tenants/` or the package root, and not re-exported top-level
+(`tests/test_layering.py::test_core_layers_never_import_the_optional_integrations`).
+`drf.py` must not import `rest_framework.views` at module level: `RLSTenantPermission`
+can be listed in `DEFAULT_PERMISSION_CLASSES`, which DRF imports while it builds
+`APIView`. It has no authentication class on purpose: DRF never calls an authenticator
+back at the end of the request, so one could not exit the context it entered; the mixin
+owns both the entry (`perform_authentication()`) and the exit (`dispatch()`).
+
 ### M2M RLS Support
 
 M2M through tables get `EXISTS`-based subquery RLS policies. Three components
@@ -518,7 +529,7 @@ example/
 ├── demo/                Project settings, urls, wsgi/asgi, Celery app (eager mode)
 ├── tenants/             Tenant model (shared, not RLS-protected)
 ├── accounts/            Custom User with TenantUser protocol
-├── notes/               RLS-protected Note model, views, services, tasks, templates, seed command
+├── notes/               RLS-protected Note model, views, services, tasks, DRF API (api.py), templates, seed command
 └── docker/              PostgreSQL init (creates non-superuser role for RLS)
 ```
 

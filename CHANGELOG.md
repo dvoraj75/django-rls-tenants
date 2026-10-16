@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Django REST Framework integration** (#43). A new optional `drf` extra
+  (`pip install "django-rls-tenants[drf]"`, `djangorestframework>=3.16`) adds `django_rls_tenants.contrib.drf`
+  (not re-exported from the top-level package). DRF authenticates inside the view,
+  after every middleware, so a token or JWT client reached `RLSTenantMiddleware` as an
+  anonymous user and the view read zero rows (or raised under `STRICT_MODE`).
+  `RLSTenantAPIViewMixin` (list it before the DRF class; works on any `APIView`,
+  generic views and viewsets included) enters `admin_context()` or
+  `tenant_context(user.rls_tenant_id)` right after authentication and keeps it through
+  the permission and throttle checks, the handler, DRF's exception handler and the
+  rendering of the response (lazy data in `Response(...)` and the browsable API's forms
+  are scoped too; a handled error under `ATOMIC_REQUESTS`, whose transaction is marked
+  for rollback, is left for Django to render), then exits it before `dispatch()`
+  returns, also on errors. For a request DRF did not authenticate it enters nothing
+  (an enclosing context, such as the middleware's for a session cookie the view does
+  not accept, stays active; `RLSTenantPermission` refuses such a request); a
+  non-admin without a tenant gets a 403.
+  `get_rls_context()` is the override hook (for example to let an admin choose a
+  tenant). When the middleware already set the user's context (session authentication)
+  the mixin enters nothing. `RLSTenantPermission` denies a request served outside the
+  context its user implies, so a view that forgot the mixin answers 401/403 instead of
+  an empty list, and denies an object of another tenant; it is safe in
+  `DEFAULT_PERMISSION_CLASSES`. `RLSTenantModelSerializer` /
+  `RLSTenantSerializerMixin` hide the tenant FK behind
+  `HiddenField(default=CurrentTenantDefault())` outside the admin context (the payload
+  value is ignored, other writable fields that would write the FK, such as `tenant_id`
+  or `source="tenant"`, are removed, create and update stamp the active tenant,
+  per-tenant `UniqueConstraint`s still validate as a 400) and leave it as declared for
+  admins.
+  There is deliberately no authentication class that sets the context: DRF never calls
+  an authenticator back when the request ends, so it could not exit the context it
+  entered. The example project gains a token-authenticated notes API at `/api/notes/`,
+  with a router whose API root uses the mixin.
+  See the new [Django REST Framework guide](https://dvoraj75.github.io/django-rls-tenants/guides/drf/).
 - **`E001`: an error for an RLS-bypassing connection role in production** (#108). When
   `settings.DEBUG` is `False` and the connection role of an alias in
   `RLS_TENANTS["DATABASES"]` is a superuser or has `BYPASSRLS`, the system checks report

@@ -257,3 +257,20 @@ for usage, chains/groups, and the `install()` escape hatch.
 ::: django_rls_tenants.contrib.celery.install
 
 ::: django_rls_tenants.contrib.celery.uninstall
+
+### Django REST Framework
+
+Native Django REST Framework integration. Requires the `drf` extra
+(`pip install django-rls-tenants[drf]`); import from
+`django_rls_tenants.contrib.drf`. See the [Django REST Framework guide](../guides/drf.md)
+for usage, the settings to add, and why there is no authentication class.
+
+::: django_rls_tenants.contrib.drf.RLSTenantAPIViewMixin
+
+::: django_rls_tenants.contrib.drf.RLSTenantPermission
+
+::: django_rls_tenants.contrib.drf.RLSTenantSerializerMixin
+
+::: django_rls_tenants.contrib.drf.RLSTenantModelSerializer
+
+::: django_rls_tenants.contrib.drf.CurrentTenantDefault

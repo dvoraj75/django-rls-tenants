@@ -93,6 +93,34 @@ Without the extra the core library is unaffected; importing
 `django_rls_tenants.contrib.celery` without Celery installed raises a clear
 `ImportError`. See the [Celery Tasks guide](../guides/celery-tasks.md).
 
+### Django REST Framework
+
+Native DRF integration (`RLSTenantAPIViewMixin`, `RLSTenantPermission`,
+`RLSTenantModelSerializer`) ships behind the `drf` extra, so Django REST Framework
+itself stays an optional dependency:
+
+=== "pip"
+
+    ```bash
+    pip install "django-rls-tenants[drf]"
+    ```
+
+=== "uv"
+
+    ```bash
+    uv add "django-rls-tenants[drf]"
+    ```
+
+=== "poetry"
+
+    ```bash
+    poetry add "django-rls-tenants[drf]"
+    ```
+
+Without the extra the core library is unaffected; importing
+`django_rls_tenants.contrib.drf` without Django REST Framework installed raises a
+clear `ImportError`. See the [Django REST Framework guide](../guides/drf.md).
+
 ## Add to INSTALLED_APPS
 
 ```python title="settings.py"
