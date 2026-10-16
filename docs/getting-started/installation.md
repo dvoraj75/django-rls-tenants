@@ -60,6 +60,10 @@ pip install "django-rls-tenants<1.4"
     poetry add django-rls-tenants
     ```
 
+Installing the package also registers a pytest plugin (the `pytest11` entry point
+`django_rls_tenants`) that provides the `enforce_rls` test fixtures. It does nothing unless
+a test requests them; see [Enforcing RLS in Tests](../guides/testing.md#enforcing-rls-in-tests).
+
 ## Optional Extras
 
 ### Celery
@@ -129,6 +133,9 @@ or use a superuser for migrations.
     ```sql
     CREATE ROLE myproject_user LOGIN PASSWORD '...' NOSUPERUSER NOBYPASSRLS;
     ```
+
+    To run a test suite as such a role while the database connects as a superuser, see
+    [Enforcing RLS in Tests](../guides/testing.md#enforcing-rls-in-tests).
 
 ```python title="settings.py"
 DATABASES = {

@@ -35,6 +35,18 @@ def pytest_sessionfinish(session, exitstatus):
     session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
+@pytest.fixture(autouse=True)
+def _enforce_rls(enforce_rls):
+    """Run every test as a role PostgreSQL applies RLS to.
+
+    ``enforce_rls`` comes from django-rls-tenants' pytest plugin, which
+    installing the library registers. On a plain role (CI connects as
+    ``app``) it does nothing; on a superuser such as the Docker image's
+    ``demo`` it switches to ``rls_test_role`` with ``SET ROLE`` for the test,
+    so the fail-closed tests prove the same thing locally.
+    """
+
+
 @pytest.fixture
 def tenant_acme(db):
     """Create a test tenant."""

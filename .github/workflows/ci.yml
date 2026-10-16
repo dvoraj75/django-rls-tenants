@@ -114,7 +114,8 @@ jobs:
           import zipfile
 
           package = "django_rls_tenants"
-          names = zipfile.ZipFile(sys.argv[1]).namelist()
+          wheel = zipfile.ZipFile(sys.argv[1])
+          names = wheel.namelist()
           problems = []
 
           required = [
@@ -123,8 +124,15 @@ jobs:
               f"{package}/contrib/celery.py",
               f"{package}/management/commands/check_rls.py",
               f"{package}/management/commands/setup_m2m_rls.py",
+              f"{package}/pytest_plugin.py",
           ]
           problems += [f"missing from wheel: {name}" for name in required if name not in names]
+
+          # The pytest11 entry point that loads the enforce_rls fixtures (#97).
+          entry_points = [n for n in names if n.endswith(".dist-info/entry_points.txt")]
+          plugin = f"{package} = {package}.pytest_plugin"
+          if not entry_points or plugin not in wheel.read(entry_points[0]).decode().splitlines():
+              problems.append(f"missing pytest11 entry point in wheel: {plugin}")
 
           # Every directory that holds a module must be an importable package.
           module_dirs = {posixpath.dirname(n) for n in names if n.endswith(".py")}

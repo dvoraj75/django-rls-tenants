@@ -100,6 +100,7 @@ tests/
 ├── conftest.py              # Shared fixtures
 ├── settings.py              # Django settings for test suite
 ├── test_app/                # Test-only Django app (models, migrations)
+├── test_pytest_plugin.py    # The shipped pytest plugin
 ├── test_rls/                # rls/ layer unit tests
 ├── test_tenants/            # tenants/ layer unit tests
 ├── test_integration/        # End-to-end tests (@pytest.mark.integration)
@@ -141,7 +142,9 @@ uv run pytest -m "not superuser_only"
 
 CI runs the suite this way too, so a test that checks database-level filtering must hold
 under a plain role. Under the superuser it should use the `enforce_rls` fixture, which
-switches the connection to a plain role for the test (a no-op when it already is one).
+comes from the library's own pytest plugin (`django_rls_tenants/pytest_plugin.py`, loaded
+through the `pytest11` entry point; the suite uses what the library ships) and switches the
+connection to a plain role for the test (a no-op when it already is one).
 Without it the superuser bypasses RLS and the test passes whatever the GUCs are.
 
 To run the suite the way that CI leg does, create a plain role once

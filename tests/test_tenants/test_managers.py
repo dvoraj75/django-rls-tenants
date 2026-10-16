@@ -522,7 +522,7 @@ class TestSelectRelatedNestedNullable:
     """
 
     @pytest.fixture(autouse=True, params=[False, True], ids=["orm", "rls"])
-    def _rls_enforcement(self, request, _rls_role):
+    def _rls_enforcement(self, request, rls_role):
         """Exercise ORM filtering both with and without database RLS enforcement."""
         if request.param:
             request.getfixturevalue("enforce_rls")

@@ -422,6 +422,11 @@ ALTER ROLE app NOSUPERUSER NOBYPASSRLS;
 
 The example project's `docker/init-db.sql` does exactly this.
 
+In a test suite, request the `enforce_rls` pytest fixture: it switches a superuser or
+`BYPASSRLS` connection to a plain role for the test, and `assert_rls_enforced()` fails when
+the connection still bypasses RLS. See
+[Enforcing RLS in Tests](guides/testing.md#enforcing-rls-in-tests).
+
 **See:** [PostgreSQL Setup](getting-started/installation.md#postgresql-setup),
 [Superuser and BYPASSRLS Roles](advanced/security.md#superuser-and-bypassrls-roles).
 
