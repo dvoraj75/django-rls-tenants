@@ -46,6 +46,12 @@ returns zero rows, never leaked data.
   enqueue to worker, including across chains, groups, and chords
   (`pip install "django-rls-tenants[celery]"`).
   [Celery guide →](https://dvoraj75.github.io/django-rls-tenants/guides/celery-tasks/)
+- **Django REST Framework integration** -- `RLSTenantAPIViewMixin` opens the RLS context
+  after DRF authenticates the user (token and JWT clients included, which the middleware
+  cannot see), `RLSTenantPermission` refuses a view that runs outside it, and
+  `RLSTenantModelSerializer` fills the tenant FK from it
+  (`pip install "django-rls-tenants[drf]"`).
+  [DRF guide →](https://dvoraj75.github.io/django-rls-tenants/guides/drf/)
 - **Async context managers** -- `async with async_tenant_context(...)` for async views,
   consumers and tasks; tenant state is set in the coroutine, so the async ORM is scoped.
   [Async context managers →](https://dvoraj75.github.io/django-rls-tenants/guides/context-managers/#async-code)

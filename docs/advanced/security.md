@@ -49,7 +49,10 @@ optimization; the fail-closed semantics are identical. Measured plans are in the
 
 This means:
 
-- Unauthenticated requests see zero rows (middleware does not set GUCs).
+- Unauthenticated requests see zero rows (middleware does not set GUCs). So do token
+  and JWT clients of a Django REST Framework view that does not use
+  `RLSTenantAPIViewMixin`: DRF authenticates after the middleware, which sees them as
+  anonymous (see [Django REST Framework](#django-rest-framework)).
 - Misconfigured middleware results in zero rows, not data leaks.
 - Background tasks without explicit context see zero rows.
 - Raw SQL queries without GUC context see zero rows.
@@ -232,6 +235,33 @@ See [Connection Pooling](../guides/connection-pooling.md) for details, and
 [Async Deployment](../guides/async.md#connections-and-pooling) for the safe combinations
 under ASGI.
 
+### Django REST Framework
+
+DRF authenticates inside the view, so `RLSTenantMiddleware` cannot set the context for
+a token or JWT client. Isolation does not depend on getting this right: a view that
+runs without a context reads zero rows (fail-closed). To serve such clients, use
+`RLSTenantAPIViewMixin`, and list `RLSTenantPermission` in
+`REST_FRAMEWORK["DEFAULT_PERMISSION_CLASSES"]` so that a view which forgot the mixin
+answers `401`/`403` instead of an empty list. See the
+[Django REST Framework guide](../guides/drf.md).
+
+Three properties of the DRF side are worth knowing:
+
+- `RLSTenantModelSerializer` takes the tenant FK from the active context, ignores
+  a `tenant` value in the payload and removes other writable fields that would write
+  the FK (`tenant_id`, `source="tenant"`), so a client cannot write into another
+  tenant; the `WITH CHECK` clause is the backstop either way.
+- DRF views are exempt from Django's CSRF middleware; only `SessionAuthentication`
+  enforces CSRF. When DRF does not accept a request's session (a token-only view),
+  the mixin enters nothing and the view keeps the context `RLSTenantMiddleware` set
+  for the session cookie's user. `RLSTenantPermission` refuses such a request; keep
+  it in the default permission classes.
+- DRF's `ModelSerializer` does not call `Model.full_clean()`, so model-level
+  validation does not run on API writes. The caveats in
+  [Referential Integrity and Unique Indexes](#referential-integrity-and-unique-indexes)
+  apply regardless; per-tenant uniqueness belongs in a `UniqueConstraint` that
+  includes the tenant FK, which the serializer then validates as a `400`.
+
 ## Threat Model
 
 ### Protected Against
@@ -243,6 +273,7 @@ under ASGI.
 | Third-party library bypasses ORM | RLS policy applies at database level |
 | Missing middleware (misconfiguration) | Fail-closed: zero rows returned |
 | Unauthenticated access | No GUCs set → zero rows |
+| DRF view that forgot `RLSTenantAPIViewMixin` | Fail-closed: zero rows; `RLSTenantPermission` answers `401`/`403` instead |
 | Background job without tenant context | Fail-closed: zero rows returned |
 | INSERT/UPDATE to wrong tenant | `WITH CHECK` clause validates writes |
 | M2M link to wrong tenant's records | `EXISTS`-based subquery policies on M2M through tables |

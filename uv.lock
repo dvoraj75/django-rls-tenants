@@ -482,10 +482,14 @@ dependencies = [
 celery = [
     { name = "celery" },
 ]
+drf = [
+    { name = "djangorestframework" },
+]
 
 [package.dev-dependencies]
 dev = [
     { name = "django-stubs", extra = ["compatible-mypy"] },
+    { name = "djangorestframework-stubs" },
     { name = "mypy" },
     { name = "pre-commit" },
     { name = "psycopg2-binary" },
@@ -493,6 +497,7 @@ dev = [
 ]
 docs = [
     { name = "celery" },
+    { name = "djangorestframework" },
     { name = "mkdocs" },
     { name = "mkdocs-material" },
     { name = "mkdocstrings", extra = ["python"] },
@@ -500,6 +505,7 @@ docs = [
 test = [
     { name = "celery" },
     { name = "coverage" },
+    { name = "djangorestframework" },
     { name = "psycopg2-binary" },
     { name = "pytest" },
     { name = "pytest-cov" },
@@ -511,12 +517,14 @@ test = [
 requires-dist = [
     { name = "celery", marker = "extra == 'celery'", specifier = ">=5.3" },
     { name = "django", specifier = ">=5.2" },
+    { name = "djangorestframework", marker = "extra == 'drf'", specifier = ">=3.16" },
 ]
-provides-extras = ["celery"]
+provides-extras = ["celery", "drf"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "django-stubs", extras = ["compatible-mypy"], specifier = ">=5.0" },
+    { name = "djangorestframework-stubs", specifier = ">=3.16" },
     { name = "mypy", specifier = ">=1.13" },
     { name = "pre-commit", specifier = ">=3.0" },
     { name = "psycopg2-binary", specifier = ">=2.9" },
@@ -524,6 +532,7 @@ dev = [
 ]
 docs = [
     { name = "celery", specifier = ">=5.3" },
+    { name = "djangorestframework", specifier = ">=3.16" },
     { name = "mkdocs", specifier = ">=1.6" },
     { name = "mkdocs-material", specifier = ">=9.5" },
     { name = "mkdocstrings", extras = ["python"], specifier = ">=0.27" },
@@ -531,6 +540,7 @@ docs = [
 test = [
     { name = "celery", specifier = ">=5.3" },
     { name = "coverage", extras = ["toml"], specifier = ">=7.0" },
+    { name = "djangorestframework", specifier = ">=3.16" },
     { name = "psycopg2-binary", specifier = ">=2.9" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-cov", specifier = ">=6.0" },
@@ -569,6 +579,32 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/d9/62/de532d58736d671b9ac0c0467909a9429758ae579d636e868ce74519566b/django_stubs_ext-6.1.2.tar.gz", hash = "sha256:2142da7fffbbe897ccecf9b4c97e09ea1a2e9291760b0a824b4c402b375ce6f9", size = 7221, upload-time = "2026-10-05T06:46:43.717Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/21/bb/393c3c1e24aaf37d62918ea50f3ea22e30d5f3162fc62f4c3bf3275e5ed3/django_stubs_ext-6.1.2-py3-none-any.whl", hash = "sha256:7334e687ab6dc78a6c3da90ab1ccb0e412efd827ea11de8d3f85adbad948abb1", size = 10850, upload-time = "2026-10-05T06:46:42.647Z" },
+]
+
+[[package]]
+name = "djangorestframework"
+version = "3.18.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "django" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8d/b2/1cee76b188301f7d03169ca77fab2b3d3ec5d01b3469189f944af2d7f11a/djangorestframework-3.18.3.tar.gz", hash = "sha256:446a9b352e7eff630421ab3f2328bd2401b109a9470afa4a31189994911ed030", size = 923563, upload-time = "2026-10-06T21:33:51.521Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c4/dd/de5f4543765bec94e036a5e9593a42f8fa7efec8de78eb56b9ca834385f3/djangorestframework-3.18.3-py3-none-any.whl", hash = "sha256:8544bb674846731b1e3c9b309236ee1dc412905a0aa725be2ec193ca950a7d12", size = 903986, upload-time = "2026-10-06T21:33:49.917Z" },
+]
+
+[[package]]
+name = "djangorestframework-stubs"
+version = "3.18.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "django-stubs" },
+    { name = "types-pyyaml" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6b/71/a7727b07e0433da02fb1ea22994f492ecb437a1fe7be5bf952dbb545a0f5/djangorestframework_stubs-3.18.1.tar.gz", hash = "sha256:65ed4a9ea094616759a2cba4fe0ad85efe25b471b28281b790bfefb46704c64a", size = 32439, upload-time = "2026-08-25T22:49:27.506Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f7/1c/e266828fe2b78484651667976f8539e47b4e511a266424b890f613c6b7ad/djangorestframework_stubs-3.18.1-py3-none-any.whl", hash = "sha256:a2021f45f7759b493504c2a721f112ec4fd677753590c1ba346f4ebfb49a7f03", size = 55685, upload-time = "2026-08-25T22:49:26.178Z" },
 ]
 
 [[package]]

@@ -184,6 +184,29 @@ Open **<http://localhost:8000>** and log in with any demo account:
     [Performance & Indexing](https://dvoraj75.github.io/django-rls-tenants/guides/performance/)
     guides.
 
+11. **REST API with token authentication** -- `notes/api.py` is a DRF
+    `ModelViewSet` at `/api/notes/` with no `.filter()` and no `tenant=` in it.
+    DRF authenticates inside the view, after `RLSTenantMiddleware`, so a client
+    that sends a token reaches the middleware as an anonymous user;
+    `RLSTenantAPIViewMixin` opens the RLS context once DRF knows the user.
+    `RLSTenantPermission` (in `REST_FRAMEWORK` in `demo/settings.py`) refuses any
+    API view that would run outside the user's context, and
+    `RLSTenantModelSerializer` hides the `tenant` field and stamps it from the
+    context. Create a token for Alice and call the API:
+    ```bash
+    docker compose exec web python manage.py drf_create_token alice
+    # -> Generated token <key> for user alice
+    curl -H "Authorization: Token <key>" http://localhost:8000/api/notes/
+    # -> Acme's notes only
+    curl -X POST -H "Authorization: Token <key>" -H "Content-Type: application/json" \
+      -d '{"title": "From the API", "content": "stamped with Acme"}' \
+      http://localhost:8000/api/notes/
+    ```
+    A `tenant` value in the payload is ignored, and the same token cannot read
+    or edit another tenant's note (`404`). A token for `admin` lists every
+    tenant's notes. Without a token the API answers `401`.
+    `tests/test_api.py` runs this under the non-superuser role.
+
 ## Library Features Demonstrated
 
 | Feature | Where |
@@ -199,6 +222,9 @@ Open **<http://localhost:8000>** and log in with any demo account:
 | `safe_tenant_sql()` | `notes/services.py` -- `get_raw_note_stats()`, a raw aggregate scoped like the policy |
 | `@rls_task` (Celery) | `notes/tasks.py` -- `count_notes` inherits the caller's context; `demo/celery.py` is the eager-mode app |
 | `rls_require_context` | `notes/tasks.py` -- `export_notes` fails fast instead of running tenant-blind |
+| `RLSTenantAPIViewMixin` (DRF) | `notes/api.py` -- `NoteViewSet` opens the context after DRF authenticates (item 11) |
+| `RLSTenantPermission` (DRF) | `demo/settings.py` -- in `REST_FRAMEWORK["DEFAULT_PERMISSION_CLASSES"]` |
+| `RLSTenantModelSerializer` (DRF) | `notes/api.py` -- `NoteSerializer` hides and stamps the tenant FK |
 | `admin_context()` | `seed_demo.py` -- bulk data creation bypassing RLS |
 | `tenant_context()` | `seed_demo.py` -- programmatic tenant scoping for verification |
 | `check_rls` command | `docker-compose.yml` -- runs after migrations; `--verbose` prints the live policy SQL (item 6) |
@@ -211,6 +237,7 @@ Open **<http://localhost:8000>** and log in with any demo account:
 | Strict mode tests | `tests/test_rls.py` -- `TestStrictMode` class |
 | Celery task tests | `tests/test_tasks.py` -- eager-mode round-trips for `count_notes` and `export_notes` |
 | Raw SQL tests | `tests/test_services.py` -- raw figures equal the ORM's for a tenant user and for admin |
+| REST API tests | `tests/test_api.py` -- token clients, isolation, tenant stamping and the admin view of `/api/notes/` |
 
 ## How It Works
 
@@ -240,16 +267,18 @@ example/
 ├── docker-compose.yml   Docker Compose for db + web
 ├── Dockerfile           Builds from library source + example app
 ├── manage.py            Django management script
-├── demo/                Django project: settings, urls, wsgi/asgi, Celery app (eager mode)
+├── demo/                Django project: settings (incl. REST_FRAMEWORK), urls, wsgi/asgi, Celery app (eager mode)
 ├── tenants/             Tenant model (shared, not RLS-protected)
 ├── accounts/            Custom User model with tenant FK + TenantUser protocol
 ├── notes/               RLS-protected Note + Category models, views, services
-│                        (safe_tenant_sql), tasks (@rls_task), templates, admin,
+│                        (safe_tenant_sql), tasks (@rls_task), REST API (api.py),
+│                        templates, admin,
 │                        seed command, committed migrations (0001_initial.py
 │                        carries the RLS policy DDL)
 └── tests/               Example tests using django-rls-tenants testing utilities
     ├── conftest.py      Fixtures using rls_bypass for test data setup
     ├── test_admin.py    RLSTenantModelAdmin scoping, FK hiding and switcher tests
+    ├── test_api.py      REST API (/api/notes/) with token auth under the non-superuser role
     ├── test_rls.py      RLS policy verification and tenant isolation tests
     ├── test_seed_demo.py  Seeded staff account and idempotent re-seeding tests
     ├── test_services.py   safe_tenant_sql() raw aggregate vs. the ORM
@@ -281,8 +310,9 @@ python -m venv .venv
 source .venv/bin/activate
 
 # Install the library from the parent directory ([celery] adds Celery for
-# the @rls_task demo in notes/tasks.py)
-pip install -e "..[celery]"
+# the @rls_task demo in notes/tasks.py, [drf] adds Django REST Framework for
+# the API in notes/api.py)
+pip install -e "..[celery,drf]"
 pip install psycopg2-binary
 
 # Configure database (PostgreSQL required -- SQLite will not work)

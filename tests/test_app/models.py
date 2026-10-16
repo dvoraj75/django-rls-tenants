@@ -245,3 +245,23 @@ class SelfRefModel(RLSProtectedModel):
 
     class Meta(RLSProtectedModel.Meta):
         db_table = "test_selfref"
+
+
+class Invoice(RLSProtectedModel):
+    """RLS-protected model with a per-tenant unique number.
+
+    Used by the DRF tests: ``RLSTenantSerializerMixin`` hides the tenant FK, and
+    the ``UniqueConstraint`` that includes it must still be validated.
+    """
+
+    number = models.CharField(max_length=50)
+
+    class Meta(RLSProtectedModel.Meta):
+        db_table = "test_invoice"
+        constraints = [  # noqa: RUF012  -- Django Meta convention
+            *RLSProtectedModel.Meta.constraints,
+            models.UniqueConstraint(
+                fields=["tenant", "number"],
+                name="test_invoice_tenant_number_uniq",
+            ),
+        ]

@@ -386,7 +386,7 @@ callback, if one is set) cleans it.
 The middleware is API-agnostic. It works identically for:
 
 - Django views and templates
-- Django REST Framework
+- Django REST Framework views served to **session-authenticated** users (see below)
 - GraphQL (Graphene, Strawberry, Ariadne)
 - Async views and ASGI servers (a native async path, see
   [Running under ASGI](#running-under-asgi); with `USE_LOCAL_SET=True` a request on the
@@ -394,7 +394,18 @@ The middleware is API-agnostic. It works identically for:
   [`USE_LOCAL_SET` and ASGI](#use_local_set-and-asgi))
 - Any other Django-compatible request handler
 
-The only requirement is that `request.user` satisfies the `TenantUser` protocol.
+The only requirement is that `request.user` satisfies the `TenantUser` protocol, and
+that the user is resolved **before** the middleware runs.
+
+!!! warning "Token and JWT clients of Django REST Framework"
+    DRF authenticates inside the view (`APIView.initial()`), after every middleware.
+    A client that sends a token or a JWT reaches `RLSTenantMiddleware` as
+    `AnonymousUser`, so the middleware sets no context and the view reads zero rows
+    (or raises under `STRICT_MODE`). Use `RLSTenantAPIViewMixin`, which opens the
+    context once DRF has authenticated the user: see the
+    [Django REST Framework guide](drf.md). Users that DRF's `SessionAuthentication`
+    serves are resolved by `AuthenticationMiddleware` first, so the middleware
+    covers them.
 
 ## Strict Mode
 

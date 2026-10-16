@@ -1,6 +1,7 @@
 """Layering enforcement and package structure tests.
 
-Verifies that the ``rls/`` layer has zero imports from ``tenants/``,
+Verifies that the ``rls/`` layer has zero imports from ``tenants/``, that the
+core layers never import the optional integrations (``contrib/``, Celery, DRF),
 and that the top-level ``__init__.py`` lazy imports resolve correctly.
 """
 
@@ -33,6 +34,34 @@ def test_rls_has_no_tenant_imports():
 
     assert not violations, (
         f"rls/ layer must not import from tenants/. "
+        f"Found {len(violations)} violation(s):\n" + "\n".join(violations)
+    )
+
+
+def test_core_layers_never_import_the_optional_integrations():
+    """``rls/``, ``tenants/`` and the package root import neither the extras nor ``contrib/``.
+
+    Celery and Django REST Framework are optional extras: a project without them
+    must be able to import the whole core library.
+    """
+    package_dir = Path(__file__).resolve().parent.parent / "django_rls_tenants"
+    forbidden = ("celery", "rest_framework", "django_rls_tenants.contrib")
+    violations = []
+
+    for py_file in sorted(package_dir.rglob("*.py")):
+        if "contrib" in py_file.relative_to(package_dir).parts:
+            continue
+        for i, line in enumerate(py_file.read_text().splitlines(), start=1):
+            words = line.split()
+            if len(words) < 2 or words[0] not in ("import", "from"):
+                continue
+            module = words[1]
+            if any(module == name or module.startswith(f"{name}.") for name in forbidden):
+                rel_path = py_file.relative_to(package_dir.parent)
+                violations.append(f"  {rel_path}:{i}: {line.strip()}")
+
+    assert not violations, (
+        "The core library must not import an optional integration. "
         f"Found {len(violations)} violation(s):\n" + "\n".join(violations)
     )
 
