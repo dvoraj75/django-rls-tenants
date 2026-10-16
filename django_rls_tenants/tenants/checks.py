@@ -595,7 +595,10 @@ def _check_unique_across_tenants() -> list[CheckWarning]:
     from django_rls_tenants.tenants.models import _get_tenant_fk_field  # noqa: PLC0415
 
     allowlist = rls_tenants_config.UNIQUE_ACROSS_TENANTS
-    entries_by_label = {label.lower(): entries for label, entries in allowlist.items()}
+    # Labels are case-insensitive, so two spellings of one label list the same model.
+    entries_by_label: dict[str, list[str | tuple[str, ...]]] = {}
+    for label, entries in allowlist.items():
+        entries_by_label.setdefault(label.lower(), []).extend(entries)
     warnings: list[CheckWarning] = []
     checked: set[str] = set()
     for model in apps.get_models():

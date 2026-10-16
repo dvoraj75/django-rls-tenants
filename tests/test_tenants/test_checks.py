@@ -1503,6 +1503,16 @@ class TestCheckUniqueAcrossTenants:
         assert len(warnings) == 2  # the constraint, and the entry that matched nothing
         assert _w012([company], {"test_app.Company": ["company_lower_name"]}) == []
 
+    def test_allowlist_labels_merge_across_case(self):
+        """Two spellings of one label list the same model; neither entry is dropped."""
+        company = _protected(
+            "Company",
+            slug=models.SlugField(unique=True),
+            code=models.CharField(max_length=10, unique=True),
+        )
+        allowlist = {"test_app.Company": ["slug"], "TEST_APP.company": ["code"]}
+        assert _w012([company], allowlist) == []
+
     def test_allowlist_is_per_model(self):
         """An entry silences only the model it is listed under."""
         company = _protected("Company", slug=models.SlugField(unique=True))
