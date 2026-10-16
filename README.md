@@ -27,7 +27,8 @@ returns zero rows, never leaked data.
 
 - **Database-enforced isolation** -- RLS policies protect tenant tables across ORM
   queries, raw SQL, `dbshell`, and data migrations when using a database role subject
-  to RLS (not a superuser or `BYPASSRLS` role; system check `W005` warns about those).
+  to RLS (not a superuser or `BYPASSRLS` role; system check `W005` warns about those,
+  and `E001` is an error for them when `DEBUG` is off).
   It guards against omitted tenant scoping, not arbitrary SQL on the app connection --
   see the [security model](https://dvoraj75.github.io/django-rls-tenants/advanced/security/).
 - **Fail-closed by default** -- missing tenant context returns zero rows; optional

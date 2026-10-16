@@ -560,9 +560,10 @@ of three hundred extra round trips, and its writes commit together. See
 
 1. **Connect as the application role.** `EXPLAIN` from a superuser session shows no
    policy at all. If `python manage.py check` reports `W005`, fix the role before
-   trusting any plan. `W005` checks only the default alias and skips unavailable
-   connections, so its absence alone is not proof. On the connection being measured,
-   verify that both role flags are false. In `psql`:
+   trusting any plan. `W005` (`E001` with `DEBUG = False`) checks every alias in
+   `RLS_TENANTS["DATABASES"]` and skips a database it cannot connect to, so its absence
+   alone is not proof (a failed catalogue query on a reachable database gives `W013`).
+   On the connection being measured, verify that both role flags are false. In `psql`:
 
     ```sql
     SELECT current_user, rolsuper, rolbypassrls

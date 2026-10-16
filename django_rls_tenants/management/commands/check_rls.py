@@ -11,7 +11,9 @@ from __future__ import annotations
 from typing import Any
 
 from django.core.management.base import BaseCommand
-from django.db import connections
+from django.db import Error, connections
+
+from django_rls_tenants.tenants.checks import _describe_error
 
 
 def _collect_rls_tables() -> dict[str, str]:
@@ -136,7 +138,43 @@ class Command(BaseCommand):
 
         errors: list[str] = []
 
-        # Check standard RLS-protected tables
+        try:
+            self._check_tables(
+                table_to_model, m2m_tables, errors, db_alias=db_alias, quiet=quiet, verbose=verbose
+            )
+        except Error as exc:
+            # A check that could not run must not look like one that passed (#108).
+            self.stderr.write(
+                self.style.ERROR(
+                    f"\nCould not determine the RLS status of the protected tables on "
+                    f"database {db_alias!r}: the catalogue query failed with "
+                    f"{_describe_error(exc)}. Nothing was verified; fix the cause and run "
+                    f"check_rls again."
+                )
+            )
+            raise SystemExit(1) from exc
+
+        if errors:
+            self.stderr.write(self.style.ERROR(f"\nFound {len(errors)} issue(s):"))
+            for error in errors:
+                self.stderr.write(self.style.ERROR(error))
+            raise SystemExit(1)
+
+        if not quiet:
+            total = len(table_to_model) + len(m2m_tables)
+            self.stdout.write(self.style.SUCCESS(f"\nAll {total} RLS-protected tables verified."))
+
+    def _check_tables(
+        self,
+        table_to_model: dict[str, str],
+        m2m_tables: dict[str, dict[str, Any]],
+        errors: list[str],
+        *,
+        db_alias: str,
+        quiet: bool,
+        verbose: bool,
+    ) -> None:
+        """Check the RLS-protected tables, then the M2M through tables, on ``db_alias``."""
         if table_to_model:
             tables = list(table_to_model.keys())
             self._check_rls_status(tables, table_to_model, errors, db_alias=db_alias)
@@ -144,7 +182,6 @@ class Command(BaseCommand):
                 tables, table_to_model, errors, db_alias=db_alias, quiet=quiet, verbose=verbose
             )
 
-        # Check M2M through tables
         if m2m_tables:
             if not quiet:
                 self.stdout.write("\nM2M through tables:")
@@ -159,16 +196,6 @@ class Command(BaseCommand):
                 quiet=quiet,
                 verbose=verbose,
             )
-
-        if errors:
-            self.stderr.write(self.style.ERROR(f"\nFound {len(errors)} issue(s):"))
-            for error in errors:
-                self.stderr.write(self.style.ERROR(error))
-            raise SystemExit(1)
-
-        if not quiet:
-            total = len(table_to_model) + len(m2m_tables)
-            self.stdout.write(self.style.SUCCESS(f"\nAll {total} RLS-protected tables verified."))
 
     def _check_rls_status(
         self,

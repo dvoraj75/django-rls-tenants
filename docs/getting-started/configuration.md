@@ -305,15 +305,35 @@ django-rls-tenants registers Django system checks that warn about common misconf
 | `W002` | Warning | `RLSConstraint.guc_admin_var` doesn't match `GUC_PREFIX`-derived name |
 | `W003` | — | *Retired in 1.3.1 (duplicate of `W007`)* |
 | `W004` | Warning | `CONN_MAX_AGE > 0` with `USE_LOCAL_SET=False` (session GUCs may leak) |
-| `W005` | Warning | Default database connection role is a superuser or has `BYPASSRLS` (RLS bypassed) |
+| `W005` | Warning | The connection role of a `DATABASES` alias is a superuser or has `BYPASSRLS` (RLS bypassed); checked on every alias in `RLS_TENANTS["DATABASES"]`. With `settings.DEBUG = False` this is the error `E001` instead |
 | `W006` | Warning | `DATABASES` contains an alias not defined in `settings.DATABASES` |
 | `W007` | — | *Retired in 1.3.2; the middleware opens its own transaction, so `ATOMIC_REQUESTS` is no longer required for `USE_LOCAL_SET`* |
 | `W008` | Warning | `RLS_TENANTS['TENANT_MODEL']` does not resolve to an installed model |
 | `W009` | Warning | Tenant field referenced by an `RLSProtectedModel`'s RLS policy is missing |
 | `W010` | Warning | Django's connection pool (`OPTIONS["pool"]`) with `USE_LOCAL_SET=False` and no pool `reset` callback |
-| `W011` | Warning | PostgreSQL applies a database- or role-level default (`ALTER DATABASE/ROLE ... SET`) for a GUC the RLS policies read, in force in every new session |
+| `W011` | Warning | PostgreSQL applies a database- or role-level default (`ALTER DATABASE/ROLE ... SET`) for a GUC the RLS policies read, in force in every new session; checked on every alias in `RLS_TENANTS["DATABASES"]` |
+| `W013` | Warning | `W005`/`E001` or `W011` could not be determined: the database was reachable but the catalogue query failed (for example `permission denied for view pg_roles`). A clean `check` is not a pass |
+| `E001` | Error | The connection role of a `DATABASES` alias is a superuser or has `BYPASSRLS` and `settings.DEBUG` is `False` (a production deployment). Replaces `W005`; fails `manage.py check` and every command that runs the system checks, such as `migrate` |
 
-Run `python manage.py check` to see any warnings.
+Run `python manage.py check` to see any warnings and errors.
+
+`W005`, `W011` and `W013` stay warnings. `E001` is an error, so it also aborts `migrate`,
+`createsuperuser`, `check_rls`, `setup_m2m_rls` and Django's test runner (which sets
+`DEBUG = False` before it runs the checks). If a settings module has to connect as such a
+role on purpose (a migration job, a superuser test database), record that decision there
+and only there:
+
+```python title="settings_migrate.py"
+SILENCED_SYSTEM_CHECKS = ["django_rls_tenants.E001"]
+```
+
+Do not silence it in the settings your application serves requests with. See
+[E001 in Troubleshooting](../troubleshooting.md#e001-the-connection-role-bypasses-rls-with-debug-off).
+
+A connection that cannot be opened (the database is not provisioned yet, or a command runs
+without one) skips these two database checks quietly, as `check` always has; the reason is
+logged at `DEBUG` on the `django_rls_tenants` logger. Only a reachable database whose
+catalogue query fails produces `W013`.
 
 ## Typo Detection
 
