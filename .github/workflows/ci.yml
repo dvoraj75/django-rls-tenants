@@ -121,6 +121,7 @@ jobs:
               f"{package}/__init__.py",
               f"{package}/py.typed",
               f"{package}/contrib/celery.py",
+              f"{package}/contrib/drf.py",
               f"{package}/management/commands/check_rls.py",
               f"{package}/management/commands/setup_m2m_rls.py",
           ]
