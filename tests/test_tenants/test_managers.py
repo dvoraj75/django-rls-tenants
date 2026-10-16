@@ -963,6 +963,49 @@ class TestPrefetchRelated:
             items = list(qs.fetch_mode(FETCH_PEERS))
         assert {item.order._state.fetch_mode for item in items} == {FETCH_PEERS}
 
+    @pytest.mark.parametrize(
+        ("root_peers", "inner_peers"),
+        [
+            pytest.param(True, None, id="after-a-reverse-fk"),
+            pytest.param(False, True, id="after-a-prefetch-queryset"),
+            pytest.param(True, False, id="after-a-prefetch-queryset-in-default-mode"),
+        ],
+    )
+    def test_fetch_mode_is_the_hop_instances(
+        self, sample_nested_rows, tenant_a, root_peers, inner_peers
+    ):
+        """A later hop's objects get the fetch mode Django's own prefetch gives them.
+
+        Django 6.1 prefetches a forward foreign key in the mode of the instances
+        the hop starts from: a reverse foreign-key hop's objects start in the
+        related manager's default mode, whatever the root queryset's, and a
+        ``Prefetch`` queryset's objects carry its mode. The filtered prefetch
+        (``tenant_context()``) must match the unfiltered one (``admin_context()``).
+        """
+        if django.VERSION < (6, 1):
+            return
+        from django.db.models import FETCH_PEERS  # noqa: PLC0415  -- Django 6.1+
+
+        def item_modes(context):
+            # Tenant A's rows in both contexts: admin_context() sees every tenant's.
+            tenant_rows = {"tenant_id": tenant_a.pk}
+            lookups = ["noterevision_set__item"]
+            if inner_peers is not None:
+                inner = NoteRevision.objects.filter(**tenant_rows)
+                if inner_peers:
+                    inner = inner.fetch_mode(FETCH_PEERS)
+                lookups.insert(0, Prefetch("noterevision_set", queryset=inner))
+            qs = OrderNote.objects.filter(**tenant_rows).order_by("pk").prefetch_related(*lookups)
+            if root_peers:
+                qs = qs.fetch_mode(FETCH_PEERS)
+            with context:
+                notes = list(qs)
+            return [r.item._state.fetch_mode for n in notes for r in n.noterevision_set.all()]
+
+        unfiltered = item_modes(admin_context())
+        assert unfiltered
+        assert item_modes(tenant_context(tenant_a.pk)) == unfiltered
+
 
 class TestPrefetchHop:
     """``_prefetch_hop()`` resolves each kind of prefetch hop."""

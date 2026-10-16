@@ -82,6 +82,10 @@ logger = logging.getLogger("django_rls_tenants")
 # same number of rows per scope, so each scope covers one cursor fetch.
 _ITERATOR_CHUNK_SIZE = 2000
 
+# The fetch mode a fresh queryset starts in (query.DEFAULT_FETCH_MODE, Django
+# 6.1); None on earlier versions, which have no fetch modes.
+_DEFAULT_FETCH_MODE: Any = getattr(models, "FETCH_ONE", None)
+
 
 def _next_chunk(rows: Iterator[Any], size: int) -> list[Any]:
     """Pull the next ``size`` items from ``rows``."""
@@ -322,7 +326,8 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         if tenant_id is None:
             return lookups
         # Django 6.1 prefetches related objects in the fetch mode of the
-        # instances they belong to; earlier versions have no fetch modes.
+        # instances they belong to, this queryset's for the first hop;
+        # earlier versions have no fetch modes.
         fetch_mode = getattr(self, "_fetch_mode", None)
         return _scoped_prefetch_lookups(self.model, lookups, tenant_id, fetch_mode)
 
@@ -347,7 +352,8 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         filled, so for a ``for_user()`` queryset it runs in the user's scope.
         The queryset keeps the lookups it was given.
         """
-        prefetch_related_objects(self._result_cache or [], *self._tenant_prefetch_lookups())
+        if self._result_cache:  # nothing to prefetch onto an empty result
+            prefetch_related_objects(self._result_cache, *self._tenant_prefetch_lookups())
         self._prefetch_done = True
 
     # ---- Strict mode guard ----
@@ -850,7 +856,7 @@ def _scoped_prefetch_lookups(
     *,
     prefix: str = "",
     with_queryset: set[str] | None = None,
-    targets: dict[str, type[models.Model]] | None = None,
+    targets: dict[str, tuple[type[models.Model], Any]] | None = None,
 ) -> tuple[Any, ...]:
     """Give the base-manager hops of ``prefetch_related()`` lookups a tenant filter.
 
@@ -874,17 +880,27 @@ def _scoped_prefetch_lookups(
     ``GenericForeignKey``, a generic relation, a property. A ``to_attr`` of
     an earlier lookup is followed.
 
+    On Django 6.1 the queryset gets the fetch mode Django's own prefetch
+    would give the hop's objects: that of the instances the hop starts
+    from. Those are the outer queryset's rows (``fetch_mode``), or the
+    objects of an earlier hop, which ``targets`` records: a base-manager
+    hop passes its instances' mode on, a reverse foreign-key or
+    many-to-many hop starts the related manager's fresh queryset
+    (``_DEFAULT_FETCH_MODE``), and a ``Prefetch`` queryset's objects carry
+    its mode.
+
     Args:
         model: The model the lookups start from.
         lookups: The ``_prefetch_related_lookups`` to rewrite.
         tenant_id: The tenant to filter on.
-        fetch_mode: Django 6.1's fetch mode for the querysets built here
-            (``None``: leave the default).
+        fetch_mode: Django 6.1's fetch mode of the instances the lookups
+            start from (``None``: no fetch modes).
         prefix: Path of ``model`` from the outermost queryset, ending in
             ``__``, when rewriting the lookups of a ``Prefetch`` queryset.
         with_queryset: Paths from the outermost queryset whose prefetch
             already has a queryset; Django refuses a second one.
-        targets: Model reached at each path from the outermost queryset.
+        targets: Model reached at each path from the outermost queryset,
+            with the fetch mode of its objects.
 
     Returns:
         The rewritten lookups, or ``lookups`` itself when nothing changed.
@@ -897,35 +913,45 @@ def _scoped_prefetch_lookups(
         prefetch: Any = lookup if isinstance(lookup, Prefetch) else Prefetch(lookup)
         hops = prefetch.prefetch_through.split(LOOKUP_SEP)
         current: type[models.Model] | None = model
+        mode = fetch_mode
         scope_leaf = False
         for level, name in enumerate(hops):
             # prefetch_to: ends in the to_attr at the last level, as Django names it.
             path = prefetch.get_current_prefetch_to(level)
             current, unscoped = _prefetch_hop(current, name)
-            if current is None:
-                current = targets.get(prefix + path)  # an earlier lookup's to_attr
-            if current is None:
+            known = targets.get(prefix + path)
+            if known is not None:
+                # Objects an earlier lookup fetched, which Django reuses for
+                # this one (also a to_attr, which no descriptor resolves).
+                current, mode = known
+            elif current is None:
                 break
-            targets[prefix + path] = current
+            elif not unscoped:
+                # The related manager's get_prefetch_querysets() starts from
+                # its class's get_queryset(), not from the instance's mode.
+                mode = _DEFAULT_FETCH_MODE
+            targets[prefix + path] = (current, mode)
             needs_scope = (
                 unscoped and _is_rls_protected(current) and prefix + path not in with_queryset
             )
             if level == len(hops) - 1:
                 scope_leaf = needs_scope
             elif needs_scope:
-                rows = _tenant_rows(current, tenant_id, fetch_mode)
+                rows = _tenant_rows(current, tenant_id, mode)
                 scoped.append(Prefetch(path, queryset=rows))
                 with_queryset.add(prefix + path)
                 changed = True
         result = lookup
         if prefetch.queryset is not None:
             with_queryset.add(prefix + prefetch.prefetch_to)
+            inner_mode = getattr(prefetch.queryset, "_fetch_mode", None)
+            targets[prefix + prefetch.prefetch_to] = (prefetch.queryset.model, inner_mode)
             inner = prefetch.queryset._prefetch_related_lookups  # noqa: SLF001
             scoped_inner = _scoped_prefetch_lookups(
                 prefetch.queryset.model,
                 inner,
                 tenant_id,
-                getattr(prefetch.queryset, "_fetch_mode", fetch_mode),
+                inner_mode,
                 prefix=prefix + prefetch.prefetch_to + LOOKUP_SEP,
                 with_queryset=with_queryset,
                 targets=targets,
@@ -936,7 +962,7 @@ def _scoped_prefetch_lookups(
                 result.queryset._prefetch_related_lookups = scoped_inner  # noqa: SLF001
                 changed = True
         elif scope_leaf and current is not None:
-            rows = _tenant_rows(current, tenant_id, fetch_mode)
+            rows = _tenant_rows(current, tenant_id, mode)
             result = Prefetch(prefetch.prefetch_through, queryset=rows, to_attr=prefetch.to_attr)
             with_queryset.add(prefix + prefetch.prefetch_to)
             changed = True

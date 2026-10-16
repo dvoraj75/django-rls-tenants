@@ -382,7 +382,10 @@ manager>.filter(tenant_id=X))` (`_scoped_prefetch_lookups()`, `_prefetch_hop()`,
 `aiterator()` run Django's implementation on a clone from `_with_tenant_prefetches()`,
 because it calls `prefetch_related_objects()` itself. A new override that evaluates a
 queryset by another route must do the same. A `Prefetch` with a caller-supplied queryset
-is left as given (its inner lookups are rewritten).
+is left as given (its inner lookups are rewritten). On Django 6.1 the filtered queryset
+gets the fetch mode Django's own prefetch would give the hop's objects (that of the
+instances the hop starts from; `targets` tracks it per path, since a reverse foreign-key
+or many-to-many hop starts the related manager's fresh queryset in the default mode).
 
 ### Async Middleware Path
 
