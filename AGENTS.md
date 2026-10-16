@@ -176,6 +176,14 @@ with and the guard (which assumes a new session holds none) never clears. `W005`
 check that could not run on a reachable database reports `W013` instead of staying silent
 (an unreachable one is skipped, logged at `DEBUG`).
 
+System check `W012` (#98, `_check_unique_across_tenants()` in `tenants/checks.py`) warns about
+each `unique=True` field, `unique_together` entry and `UniqueConstraint` of a concrete model
+with an `RLSConstraint` that omits the constraint's tenant field (PostgreSQL checks unique
+indexes outside the policies, so the `IntegrityError` is a cross-tenant existence oracle).
+`RLS_TENANTS["UNIQUE_ACROSS_TENANTS"]` (`{"app.Model": [name | tuple of fields]}`, validated
+in `conf.py`) allowlists intended ones; a stale entry is a `W012` too. `W014` is reserved
+for #46.
+
 When modifying middleware or GUC-related code, ensure all database iteration
 uses `conf.DATABASES` rather than hardcoding `"default"`.
 

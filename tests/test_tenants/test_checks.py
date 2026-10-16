@@ -7,13 +7,18 @@ from contextlib import ExitStack, contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
+from django.apps import apps
 from django.core.checks import Error as CheckError
 from django.core.checks import Warning as CheckWarning
 from django.core.exceptions import ImproperlyConfigured
-from django.db import InterfaceError, OperationalError, ProgrammingError, connection
+from django.db import InterfaceError, OperationalError, ProgrammingError, connection, models
+from django.db.models import F, Q
+from django.db.models.functions import Lower
 from django.test import override_settings
+from django.test.utils import isolate_apps
 
 from django_rls_tenants.pool import _policy_guc_names, reset_rls_gucs
+from django_rls_tenants.rls.constraints import RLSConstraint
 from django_rls_tenants.tenants.checks import (
     _check_conn_max_age_with_session_gucs,
     _check_databases_alias_exists,
@@ -23,10 +28,13 @@ from django_rls_tenants.tenants.checks import (
     _check_superuser_connection,
     _check_tenant_fk_field_exists,
     _check_tenant_model_resolves,
+    _check_unique_across_tenants,
     _checked_aliases,
     check_rls_config,
 )
 from django_rls_tenants.tenants.conf import RLSTenantsConfig
+from django_rls_tenants.tenants.models import RLSProtectedModel
+from tests.test_app.models import AdminUser, Tenant
 
 pytestmark = pytest.mark.django_db
 
@@ -81,6 +89,7 @@ class TestCheckRlsConfig:
         "_check_databases_alias_exists",
         "_check_tenant_model_resolves",
         "_check_tenant_fk_field_exists",
+        "_check_unique_across_tenants",
     )
 
     def test_aggregates_every_helper(self):
@@ -129,6 +138,24 @@ class TestCheckRlsConfig:
         ids = {w.id for w in warnings}
         assert ids == {"django_rls_tenants.W009"}
         assert len(warnings) >= 2  # one per concrete RLSProtectedModel subclass
+
+    def test_w012_surfaces_from_real_config(self):
+        """A stale UNIQUE_ACROSS_TENANTS label reaches the aggregated result as W012."""
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "UNIQUE_ACROSS_TENANTS": {"test_app.Nope": ["slug"]},
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+            patch(
+                "django_rls_tenants.tenants.checks._check_superuser_connection",
+                return_value=[],
+            ),
+        ):
+            warnings = check_rls_config()
+        assert [w.id for w in warnings] == ["django_rls_tenants.W012"]
 
     def test_w010_surfaces_from_real_config(self):
         """A pooled alias without a reset reaches the aggregated result as W010."""
@@ -1162,3 +1189,374 @@ class TestCheckTenantFkFieldExists:
         assert "nonexistent" in warnings[0].hint
         assert warnings[0].obj is not None
         assert isinstance(warnings[0], CheckWarning)
+
+
+@pytest.fixture
+def isolated_apps():
+    """Build test models in a registry of their own: the check reads only their metadata."""
+    with isolate_apps("tests.test_app"):
+        yield
+
+
+def _protected(model_name, /, constraints=(), **attrs):
+    """Build an ``RLSProtectedModel`` subclass; ``Meta`` options go in ``meta=``."""
+    meta_attrs = {
+        "app_label": "test_app",
+        "constraints": [*RLSProtectedModel.Meta.constraints, *constraints],
+        **attrs.pop("meta", {}),
+    }
+    meta = type("Meta", (RLSProtectedModel.Meta,), meta_attrs)
+    return type(model_name, (RLSProtectedModel,), {"__module__": __name__, "Meta": meta, **attrs})
+
+
+def _w012(models_, allowlist=None):
+    """Run the W012 check over ``models_`` only, with ``allowlist`` as UNIQUE_ACROSS_TENANTS."""
+    rls_tenants = {"TENANT_MODEL": "test_app.Tenant"}
+    if allowlist is not None:
+        rls_tenants["UNIQUE_ACROSS_TENANTS"] = allowlist
+    with (
+        override_settings(RLS_TENANTS=rls_tenants),
+        patch(_CONF_PATCH, RLSTenantsConfig()),
+        patch.object(apps, "get_models", return_value=list(models_)),
+    ):
+        return _check_unique_across_tenants()
+
+
+@pytest.mark.usefixtures("isolated_apps")
+class TestCheckUniqueAcrossTenants:
+    """Tests for _check_unique_across_tenants (W012)."""
+
+    def test_no_warning_with_default_config(self):
+        """The test app's only unique constraint includes the tenant field."""
+        assert _check_unique_across_tenants() == []
+
+    def test_unique_field_fires(self):
+        """A ``unique=True`` field is reported on its model, with the fix and the allowlist."""
+        company = _protected("Company", slug=models.SlugField(unique=True))
+        warnings = _w012([company])
+        assert [w.id for w in warnings] == ["django_rls_tenants.W012"]
+        assert isinstance(warnings[0], CheckWarning)
+        assert warnings[0].obj is company
+        assert "Field 'slug' (unique=True) is unique across all tenants" in warnings[0].msg
+        assert "tenant field 'tenant'" in warnings[0].msg
+        assert "IntegrityError" in warnings[0].msg
+        assert "UniqueConstraint(fields=['tenant', 'slug'], name=...)" in warnings[0].hint
+        assert "{'test_app.Company': ['slug']}" in warnings[0].hint
+
+    def test_one_to_one_field_fires(self):
+        """A ``OneToOneField`` is unique too: a profile per user spans every tenant."""
+        profile = _protected(
+            "Profile",
+            user=models.OneToOneField(AdminUser, on_delete=models.CASCADE),
+        )
+        warnings = _w012([profile])
+        assert len(warnings) == 1
+        assert "Field 'user' (unique=True)" in warnings[0].msg
+
+    def test_unique_tenant_field_is_scoped(self):
+        """A one-row-per-tenant model (a ``OneToOneField`` tenant) is per-tenant by definition."""
+        settings_model = _protected(
+            "TenantSettings",
+            tenant=models.OneToOneField(Tenant, on_delete=models.CASCADE),
+        )
+        assert _w012([settings_model]) == []
+
+    def test_primary_key_is_not_reported(self):
+        """The primary key is unique by nature and not a value one tenant chooses."""
+        coded = _protected("Coded", code=models.CharField(max_length=10, primary_key=True))
+        assert _w012([coded]) == []
+
+    def test_unique_together_without_tenant_fires(self):
+        """A ``unique_together`` entry without the tenant field is reported, as a tuple."""
+        company = _protected(
+            "Company",
+            country=models.CharField(max_length=2),
+            vat_id=models.CharField(max_length=20),
+            meta={"unique_together": [("country", "vat_id")]},
+        )
+        warnings = _w012([company])
+        assert len(warnings) == 1
+        assert "unique_together entry ('country', 'vat_id')" in warnings[0].msg
+        assert "fields=['tenant', 'country', 'vat_id']" in warnings[0].hint
+        assert "{'test_app.Company': [('country', 'vat_id')]}" in warnings[0].hint
+
+    def test_unique_together_with_tenant_is_scoped(self):
+        """A ``unique_together`` entry naming the tenant field, by name or attname, passes."""
+        company = _protected(
+            "Company",
+            slug=models.SlugField(),
+            code=models.CharField(max_length=10),
+            meta={"unique_together": [("tenant", "slug"), ("code", "tenant_id")]},
+        )
+        assert _w012([company]) == []
+
+    def test_unique_constraint_without_tenant_fires(self):
+        """A field-based ``UniqueConstraint`` without the tenant field is reported."""
+        company = _protected(
+            "Company",
+            constraints=[models.UniqueConstraint(fields=["slug"], name="company_slug_uniq")],
+            slug=models.SlugField(),
+        )
+        warnings = _w012([company])
+        assert len(warnings) == 1
+        assert "UniqueConstraint 'company_slug_uniq' on ('slug',)" in warnings[0].msg
+        assert "{'test_app.Company': ['slug']}" in warnings[0].hint
+
+    def test_conditional_unique_constraint_fires(self):
+        """A partial ``UniqueConstraint`` still spans tenants among the rows it covers."""
+        company = _protected(
+            "Company",
+            constraints=[
+                models.UniqueConstraint(
+                    fields=["slug"],
+                    condition=Q(active=True),
+                    name="company_active_slug_uniq",
+                ),
+            ],
+            slug=models.SlugField(),
+            active=models.BooleanField(default=True),
+        )
+        assert len(_w012([company])) == 1
+
+    def test_expression_constraint_without_tenant_fires(self):
+        """An expression ``UniqueConstraint`` that references no tenant field is reported."""
+        company = _protected(
+            "Company",
+            constraints=[models.UniqueConstraint(Lower("name"), name="company_lower_name")],
+            name=models.CharField(max_length=50),
+        )
+        warnings = _w012([company])
+        assert len(warnings) == 1
+        assert "UniqueConstraint 'company_lower_name' on expressions" in warnings[0].msg
+        assert "reference 'tenant' in the constraint's expressions" in warnings[0].hint
+        assert "{'test_app.Company': ['company_lower_name']}" in warnings[0].hint
+
+    @pytest.mark.parametrize(
+        "tenant_expression",
+        ["tenant", F("tenant"), F("tenant_id"), Lower("tenant")],
+        ids=["string", "f", "attname", "nested"],
+    )
+    def test_expression_constraint_with_tenant_is_scoped(self, tenant_expression):
+        """An expression constraint passes when any expression references the tenant field."""
+        company = _protected(
+            "Company",
+            constraints=[
+                models.UniqueConstraint(
+                    Lower("name"),
+                    tenant_expression,
+                    name="company_lower_name",
+                ),
+            ],
+            name=models.CharField(max_length=50),
+        )
+        assert _w012([company]) == []
+
+    def test_every_offending_set_is_reported(self):
+        """Each offending unique set gets its own warning, in declaration order."""
+        company = _protected(
+            "Company",
+            constraints=[models.UniqueConstraint(fields=["name"], name="company_name_uniq")],
+            slug=models.SlugField(unique=True),
+            name=models.CharField(max_length=50),
+            code=models.CharField(max_length=10),
+            meta={"unique_together": [("code", "name")]},
+        )
+        warnings = _w012([company])
+        assert [w.msg.split(" is unique")[0] for w in warnings] == [
+            "Field 'slug' (unique=True)",
+            "unique_together entry ('code', 'name')",
+            "UniqueConstraint 'company_name_uniq' on ('name',)",
+        ]
+
+    def test_models_with_an_rls_constraint_only(self):
+        """A model without an ``RLSConstraint`` is not RLS-protected, so it is not checked."""
+
+        class Plain(models.Model):  # noqa: DJ008  -- throwaway model, never printed
+            slug = models.SlugField(unique=True)
+
+            class Meta:
+                app_label = "test_app"
+
+        assert _w012([Plain]) == []
+
+    def test_proxy_model_is_skipped(self):
+        """A proxy shares its concrete model's table, which is reported once."""
+        company = _protected("Company", slug=models.SlugField(unique=True))
+        proxy = type(
+            "CompanyProxy",
+            (company,),
+            {
+                "__module__": __name__,
+                "Meta": type("Meta", (), {"proxy": True, "app_label": "test_app"}),
+            },
+        )
+        assert [w.obj for w in _w012([company, proxy])] == [company]
+
+    def test_multi_table_child_reports_only_its_own_fields(self):
+        """Any model with an ``RLSConstraint`` is checked; inherited fields stay on the parent."""
+
+        class Parent(models.Model):  # noqa: DJ008  -- throwaway model, never printed
+            tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE)
+            code = models.CharField(max_length=10, unique=True)
+
+            class Meta:
+                app_label = "test_app"
+                constraints = [RLSConstraint(field="tenant", name="parent_rls")]  # noqa: RUF012  -- Django Meta convention
+
+        class Child(Parent):  # noqa: DJ008  -- throwaway model, never printed
+            nickname = models.CharField(max_length=10, unique=True)
+
+            class Meta:
+                app_label = "test_app"
+                constraints = [RLSConstraint(field="tenant", name="child_rls")]  # noqa: RUF012  -- Django Meta convention
+
+        warnings = _w012([Parent, Child])
+        assert [(w.obj, w.msg.split(" is unique")[0]) for w in warnings] == [
+            (Parent, "Field 'code' (unique=True)"),
+            (Child, "Field 'nickname' (unique=True)"),
+        ]
+
+    def test_uses_the_constraints_field(self):
+        """The tenant field is the ``RLSConstraint``'s ``field``, not ``TENANT_FK_FIELD``."""
+
+        class Account(models.Model):  # noqa: DJ008  -- throwaway model, never printed
+            org = models.ForeignKey(Tenant, on_delete=models.CASCADE)
+            slug = models.SlugField()
+
+            class Meta:
+                app_label = "test_app"
+                constraints = [  # noqa: RUF012  -- Django Meta convention
+                    RLSConstraint(field="org", name="account_rls"),
+                    models.UniqueConstraint(fields=["org", "slug"], name="account_slug_uniq"),
+                    models.UniqueConstraint(fields=["slug"], name="account_slug_global"),
+                ]
+
+        warnings = _w012([Account])
+        assert len(warnings) == 1
+        assert "'account_slug_global'" in warnings[0].msg
+        assert "tenant field 'org'" in warnings[0].msg
+
+    def test_missing_tenant_field_is_left_to_w009(self):
+        """With no tenant field every unique set would fire; W009 reports the model instead."""
+        company = _protected("Company", slug=models.SlugField(unique=True))
+        with patch("django_rls_tenants.tenants.models._get_tenant_fk_field", return_value="org"):
+            assert _w012([company], {"test_app.Company": ["stale"]}) == []
+
+    @pytest.mark.parametrize(
+        "entry",
+        ["slug", "company_slug_uniq"],
+        ids=["field_name", "constraint_name"],
+    )
+    def test_allowlist_string_silences_single_field_constraint(self, entry):
+        """A string names a ``UniqueConstraint`` by name, or a one-field unique set."""
+        company = _protected(
+            "Company",
+            constraints=[models.UniqueConstraint(fields=["slug"], name="company_slug_uniq")],
+            slug=models.SlugField(),
+        )
+        assert _w012([company], {"test_app.Company": [entry]}) == []
+
+    def test_allowlist_silences_a_unique_field(self):
+        """A field name silences that ``unique=True`` field; the label is case-insensitive."""
+        company = _protected(
+            "Company",
+            slug=models.SlugField(unique=True),
+            user=models.OneToOneField(AdminUser, on_delete=models.CASCADE),
+        )
+        assert _w012([company], {"TEST_APP.company": ["slug", "user"]}) == []
+
+    @pytest.mark.parametrize(
+        "entry",
+        [("vat_id", "country"), ["country", "vat_id"], "company_vat_uniq"],
+        ids=["tuple_any_order", "list", "constraint_name"],
+    )
+    def test_allowlist_tuple_silences_multi_field_sets(self, entry):
+        """A tuple of field names, in any order, names a multi-field unique set."""
+        company = _protected(
+            "Company",
+            constraints=[
+                models.UniqueConstraint(fields=["country", "vat_id"], name="company_vat_uniq"),
+            ],
+            country=models.CharField(max_length=2),
+            vat_id=models.CharField(max_length=20),
+        )
+        assert _w012([company], {"test_app.Company": [entry]}) == []
+
+    def test_allowlist_tuple_silences_unique_together(self):
+        """A tuple names a ``unique_together`` entry, which has no name of its own."""
+        company = _protected(
+            "Company",
+            country=models.CharField(max_length=2),
+            vat_id=models.CharField(max_length=20),
+            meta={"unique_together": [("country", "vat_id")]},
+        )
+        assert _w012([company], {"test_app.Company": [("country", "vat_id")]}) == []
+
+    def test_allowlist_field_name_does_not_silence_an_expression(self):
+        """Only the name silences an expression constraint: ``Lower(name)`` is not ``name``."""
+        company = _protected(
+            "Company",
+            constraints=[models.UniqueConstraint(Lower("name"), name="company_lower_name")],
+            name=models.CharField(max_length=50),
+        )
+        warnings = _w012([company], {"test_app.Company": ["name"]})
+        assert len(warnings) == 2  # the constraint, and the entry that matched nothing
+        assert _w012([company], {"test_app.Company": ["company_lower_name"]}) == []
+
+    def test_allowlist_is_per_model(self):
+        """An entry silences only the model it is listed under."""
+        company = _protected("Company", slug=models.SlugField(unique=True))
+        brand = _protected("Brand", slug=models.SlugField(unique=True))
+        warnings = _w012([company, brand], {"test_app.Company": ["slug"]})
+        assert [w.obj for w in warnings] == [brand]
+
+    def test_stale_allowlist_entry_fires(self):
+        """An entry that matches no offending unique set is reported, naming it."""
+        company = _protected(
+            "Company",
+            constraints=[
+                models.UniqueConstraint(fields=["tenant", "slug"], name="company_slug_uniq"),
+            ],
+            slug=models.SlugField(),
+        )
+        warnings = _w012([company], {"test_app.Company": ["slg", "company_slug_uniq"]})
+        assert [w.id for w in warnings] == ["django_rls_tenants.W012"] * 2
+        assert "lists 'slg', which matches no unique field" in warnings[0].msg
+        assert "lists 'company_slug_uniq'" in warnings[1].msg  # already per-tenant
+        assert warnings[0].obj is company
+
+    def test_misspelled_allowlist_entry_silences_nothing(self):
+        """A typo in an entry leaves the unique field reported and reports the entry too."""
+        company = _protected("Company", slug=models.SlugField(unique=True))
+        warnings = _w012([company], {"test_app.Company": ["slg"]})
+        assert [w.msg.split(" is unique")[0].split(", which")[0] for w in warnings] == [
+            "Field 'slug' (unique=True)",
+            "RLS_TENANTS['UNIQUE_ACROSS_TENANTS']['test_app.Company'] lists 'slg'",
+        ]
+
+    @pytest.mark.parametrize(
+        "label",
+        ["test_app.Nope", "test_app.Tenant", "nope"],
+        ids=["unknown", "not_protected", "malformed"],
+    )
+    def test_stale_allowlist_label_fires(self, label):
+        """A label that names no RLS-protected model is reported."""
+        warnings = _w012([], {label: ["slug"]})
+        assert [w.id for w in warnings] == ["django_rls_tenants.W012"]
+        assert f"lists {label!r}, which names no installed, non-proxy model" in warnings[0].msg
+
+    def test_real_registry_stale_entry(self):
+        """Against the real registry, an entry for a per-tenant constraint is stale."""
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "UNIQUE_ACROSS_TENANTS": {"test_app.Invoice": [("tenant", "number")]},
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_unique_across_tenants()
+        assert len(warnings) == 1
+        assert "('tenant', 'number')" in warnings[0].msg
+        assert warnings[0].obj._meta.label == "test_app.Invoice"

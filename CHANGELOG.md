@@ -56,6 +56,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transaction. When no connection can be opened (the database is
   not provisioned yet, or a command runs without one), the checks are still skipped
   quietly, with a `DEBUG` log line on the `django_rls_tenants` logger.
+- **`W012`: a system check for unique fields and constraints that span tenants** (#98).
+  PostgreSQL checks unique indexes outside the RLS policies, so on an RLS-protected table
+  a `unique=True` field, `unique_together` entry or `UniqueConstraint` that does not
+  include the tenant field makes a write fail with an `IntegrityError` when the value
+  exists only in another tenant: the writer learns that a registration number, slug or
+  tag name is taken elsewhere, and Django's `validate_unique()` cannot see that row
+  through RLS. `manage.py check` now reports one `django_rls_tenants.W012` warning per
+  such unique set on every concrete model with an `RLSConstraint` (not only
+  `RLSProtectedModel` subclasses), primary keys excepted. A `UniqueConstraint` on
+  expressions passes when one of them references the tenant field, for example
+  `UniqueConstraint(Lower("slug"), "tenant", name=...)`. The hint names the fix:
+  `UniqueConstraint(fields=["tenant", ...], name=...)` in place of the global one.
+  A new setting, `RLS_TENANTS["UNIQUE_ACROSS_TENANTS"]`, lists uniqueness that is
+  intended, as `{"app_label.ModelName": [...]}` with a field name, a `UniqueConstraint`
+  name (the only way to list an expression constraint) or a tuple of field names (a
+  `unique_together` entry or `UniqueConstraint(fields=...)`) per entry. An entry that
+  matches nothing (a stale label, field or name) is reported as `W012` too, and a
+  malformed value raises `RLSConfigurationError`. **An existing project can see new
+  `W012` warnings after upgrading.** Replace the global constraint with a per-tenant one
+  (this needs a migration and a check that existing rows do not collide) or, where
+  uniqueness across tenants is intended, add it to `UNIQUE_ACROSS_TENANTS`; the warning
+  stays a warning, so it fails nothing. See
+  [Cross-Tenant Unique Constraints](https://dvoraj75.github.io/django-rls-tenants/advanced/security/#cross-tenant-unique-constraints).
 
 ### Changed
 

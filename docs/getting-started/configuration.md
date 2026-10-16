@@ -15,6 +15,7 @@ RLS_TENANTS = {
     "USER_PARAM_NAME": "as_user",
     "TENANT_PK_TYPE": "int",
     "USE_LOCAL_SET": False,
+    "UNIQUE_ACROSS_TENANTS": {},
 }
 ```
 
@@ -295,6 +296,43 @@ See [Connection Pooling](../guides/connection-pooling.md) for detailed setup ins
 [Async Deployment](../guides/async.md#set-local-without-async-transactions) for this mode
 under ASGI.
 
+### `UNIQUE_ACROSS_TENANTS`
+
+| | |
+|---|---|
+| **Type** | `dict[str, list[str \| tuple[str, ...]]]` |
+| **Default** | `{}` |
+| **Example** | `{"billing.Company": ["registration_number"]}` |
+
+Unique fields and constraints that are meant to span tenants, so that system check `W012`
+does not report them. Maps a model label (`"app_label.ModelName"`, case-insensitive) to a
+list of entries:
+
+- a string: a `unique=True` field name, a unique set of that one field, or a
+  `UniqueConstraint` by its `name` (the only way to list a constraint on expressions);
+- a tuple (or list) of field names: a `unique_together` entry or a
+  `UniqueConstraint(fields=...)` with exactly those fields, in any order.
+
+```python
+RLS_TENANTS = {
+    "TENANT_MODEL": "billing.Tenant",
+    "UNIQUE_ACROSS_TENANTS": {
+        "billing.Company": [
+            "registration_number",      # unique=True field
+            "company_lower_name_uniq",  # UniqueConstraint name
+            ("country", "vat_id"),      # unique_together / fields=
+        ],
+    },
+}
+```
+
+A value that is not a dict of lists, or an entry that is not a string or a non-empty
+tuple of strings, raises `RLSConfigurationError` when the check reads the setting. An
+entry that matches no unique set of the model, or a label that names no installed
+RLS-protected model, is reported as `W012`. See
+[Cross-Tenant Unique Constraints](../advanced/security.md#cross-tenant-unique-constraints)
+for why a unique index that spans tenants leaks, and how to scope it.
+
 ## System Checks
 
 django-rls-tenants registers Django system checks that warn about common misconfigurations:
@@ -312,12 +350,13 @@ django-rls-tenants registers Django system checks that warn about common misconf
 | `W009` | Warning | Tenant field referenced by an `RLSProtectedModel`'s RLS policy is missing |
 | `W010` | Warning | Django's connection pool (`OPTIONS["pool"]`) with `USE_LOCAL_SET=False` and no pool `reset` callback |
 | `W011` | Warning | PostgreSQL applies a database- or role-level default (`ALTER DATABASE/ROLE ... SET`) for a GUC the RLS policies read, in force in every new session; checked on every alias in `RLS_TENANTS["DATABASES"]` |
+| `W012` | Warning | A unique field, `unique_together` entry or `UniqueConstraint` of an RLS-protected model does not include the tenant field, so its `IntegrityError` reveals values held by other tenants; also a stale `UNIQUE_ACROSS_TENANTS` entry. Listed in [`UNIQUE_ACROSS_TENANTS`](#unique_across_tenants) when intended |
 | `W013` | Warning | `W005`/`E001` or `W011` could not be determined: the database was reachable but the catalogue query failed (for example `permission denied for view pg_roles`). A clean `check` is not a pass |
 | `E001` | Error | The connection role of a `DATABASES` alias is a superuser or has `BYPASSRLS` and `settings.DEBUG` is `False` (a production deployment). Replaces `W005`; fails `manage.py check` and every command that runs the system checks, such as `migrate` |
 
 Run `python manage.py check` to see any warnings and errors.
 
-`W005`, `W011` and `W013` stay warnings. `E001` is an error, so it also aborts `migrate`,
+`W005`, `W011`, `W012` and `W013` stay warnings. `E001` is an error, so it also aborts `migrate`,
 `createsuperuser`, `check_rls`, `setup_m2m_rls` and Django's test runner (which sets
 `DEBUG = False` before it runs the checks). If a settings module has to connect as such a
 role on purpose (a migration job, a superuser test database), record that decision there
