@@ -365,7 +365,9 @@ python manage.py run_for_all_tenants --parallel 4 --json my_report
 - The workers are **spawned**, not forked: a forked child would share the parent's
   PostgreSQL sockets. Each worker runs `django.setup()` with the parent's
   `settings.SETTINGS_MODULE` and the parent's database names (so a test database
-  reaches the workers) and opens its own connections.
+  reaches the workers) and opens its own connections. A spawned worker imports
+  `manage.py` as a module, so it must keep the `if __name__ == "__main__":` guard
+  Django's template gives it.
 - It needs a settings module (`DJANGO_SETTINGS_MODULE` or `--settings`). Settings
   built with `settings.configure()` cannot reach the workers, and the command stops with a
   `CommandError`.
@@ -391,8 +393,8 @@ connections, so size `N` to the database, not to the tenant count.
 the context on. It defaults to `default`. If the inner command declares its own
 `--database` option, the alias is passed on to it as `--database=<alias>`, so a
 command that takes `--database` works on the same database. It is only passed on when
-you give `--database`, and only to a command that declares the option. It is placed before your arguments, so an explicit
-`--database` written after the command's name wins:
+you give `--database`, and only to a command that declares the option. It is placed before
+your arguments, so an explicit `--database` written after the command's name wins:
 
 ```bash
 python manage.py run_for_all_tenants --database replica my_report            # my_report --database=replica

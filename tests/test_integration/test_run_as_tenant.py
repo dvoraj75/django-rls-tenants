@@ -11,7 +11,7 @@ import json
 from io import StringIO
 
 import pytest
-from django.core.management import call_command
+from django.core.management import call_command, get_commands, load_command_class
 from django.core.management.base import CommandError
 from django.test import override_settings
 
@@ -78,6 +78,14 @@ class TestArguments:
         # --tenant after the name goes to rls_echo, which has no such option.
         with pytest.raises(CommandError, match="unrecognized arguments: --tenant"):
             _run("--admin", "rls_echo", "--tenant", tenant_a.pk)
+
+    def test_a_loaded_command_object(self, tenant_a, monkeypatch):
+        # get_commands() may hold a command object instead of an app name, as
+        # call_command() allows; the --database check must load it the same way.
+        command = load_command_class("tests.test_app", "rls_probe")
+        monkeypatch.setitem(get_commands(), "rls_loaded", command)
+        probe = _run("--database", "default", "--tenant", tenant_a.pk, "rls_loaded")
+        assert (probe["tenant"], probe["database"]) == (tenant_a.pk, "default")
 
     def test_tenant_or_admin_required(self):
         with pytest.raises(CommandError, match="Pass --tenant <value>"):

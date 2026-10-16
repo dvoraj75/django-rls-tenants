@@ -219,6 +219,10 @@ class TestFailures:
 class TestParallel:
     """``--parallel`` runs tenants in spawned worker processes (committed rows only)."""
 
+    @pytest.fixture(autouse=True)
+    def _third_tenant(self, transactional_db):
+        Tenant.objects.create(name="Tenant C")
+
     def test_workers_run_each_tenant_in_its_context(self, tenant_a, tenant_b):
         out = StringIO()
         with pytest.raises(CommandError, match="failed for 1 of 3"):
@@ -239,10 +243,6 @@ class TestParallel:
         for tenant in (tenant_b, tenant_c):
             probe = _probe(records[tenant.pk])
             assert (probe["tenant"], probe["guc"]) == (tenant.pk, str(tenant.pk))
-
-    @pytest.fixture(autouse=True)
-    def _third_tenant(self, transactional_db):
-        Tenant.objects.create(name="Tenant C")
 
     def test_human_output(self, tenant_a, tenant_b):
         out, _ = _run("--parallel", "2", "rls_echo")

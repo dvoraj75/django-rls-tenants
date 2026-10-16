@@ -87,10 +87,12 @@ def _inner_args(command_name: str, args: Sequence[str], database: str | None) ->
     (argparse would reject it otherwise).
     """
     try:
-        app_name = get_commands()[command_name]
+        # The app's name, or a loaded command object (call_command() accepts
+        # both; django-stubs declares only the name).
+        entry: str | BaseCommand = get_commands()[command_name]
     except KeyError as exc:
         raise CommandError(f"Unknown command: {command_name!r}") from exc
-    command = load_command_class(app_name, command_name)
+    command = entry if isinstance(entry, BaseCommand) else load_command_class(entry, command_name)
     inner = list(args)
     if inner[:1] == ["--"]:
         inner = inner[1:]
