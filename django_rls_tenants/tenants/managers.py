@@ -11,11 +11,14 @@ Auto-scope support: when a tenant context is active (via
 the queryset automatically adds ``WHERE tenant_id = X`` to every query.
 For joins via ``select_related()``, tenant filters are also propagated
 to joined RLS-protected tables, enabling PostgreSQL to use composite
-indexes on both sides of the join.
+indexes on both sides of the join. ``prefetch_related()`` hops that Django
+fetches through the related model's base manager (forward foreign keys,
+one-to-one fields in both directions) get the same filter (#44).
 """
 
 from __future__ import annotations
 
+import copy
 import logging
 from contextlib import contextmanager, nullcontext
 from functools import lru_cache
@@ -25,7 +28,15 @@ from typing import TYPE_CHECKING, Any
 from asgiref.sync import sync_to_async
 from django.core.exceptions import FieldDoesNotExist
 from django.db import connections, models, router, transaction
-from django.db.models import Q
+from django.db.models import Prefetch, Q, prefetch_related_objects
+from django.db.models.constants import LOOKUP_SEP
+from django.db.models.fields.related_descriptors import (
+    ForwardManyToOneDescriptor,
+    ManyToManyDescriptor,
+    ReverseManyToOneDescriptor,
+    ReverseOneToOneDescriptor,
+)
+from django.db.models.fields.reverse_related import ManyToOneRel
 
 from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.guc import set_guc
@@ -144,7 +155,8 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
     When auto-scope is active (via ``tenant_context()`` or middleware),
     ``select_related()`` automatically adds ``WHERE related.tenant_id = X``
     for joined RLS-protected tables, enabling index usage on both sides
-    of the join.
+    of the join. ``prefetch_related()`` adds it to the prefetch queries
+    Django would run unfiltered (see :meth:`_tenant_prefetch_lookups`).
     """
 
     _rls_user: TenantUser | None
@@ -279,6 +291,64 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         clone: TenantQuerySet = super()._clone()  # type: ignore[misc]
         clone._rls_user = self._rls_user
         return clone
+
+    # ---- prefetch_related() tenant filters ----
+
+    def _tenant_prefetch_lookups(self) -> tuple[Any, ...]:
+        """Return the ``prefetch_related()`` lookups, with tenant-filtered querysets.
+
+        Django fetches reverse foreign-key and many-to-many prefetches
+        through the related model's default manager, which for an
+        ``RLSManager`` already filters by the active tenant. Forward
+        foreign keys and one-to-one fields (in both directions) go through
+        the base manager, which does not. For every such hop onto an
+        RLS-protected model, the lookups returned here carry a
+        ``Prefetch(path, queryset=...)`` whose queryset adds
+        ``WHERE tenant_id = X`` (see :func:`_scoped_prefetch_lookups`).
+
+        The tenant is the one the queryset's SQL runs under: the
+        ``for_user()`` user's (none for an admin), or else the active
+        context's. With no tenant (admin context, no context) the lookups
+        are returned unchanged, as they are when no hop needs a filter.
+        """
+        lookups = self._prefetch_related_lookups
+        if not lookups:
+            return lookups
+        user = self._rls_user
+        if user is None:
+            tenant_id = get_current_tenant_id()
+        else:
+            tenant_id = None if user.is_tenant_admin else user.rls_tenant_id
+        if tenant_id is None:
+            return lookups
+        # Django 6.1 prefetches related objects in the fetch mode of the
+        # instances they belong to; earlier versions have no fetch modes.
+        fetch_mode = getattr(self, "_fetch_mode", None)
+        return _scoped_prefetch_lookups(self.model, lookups, tenant_id, fetch_mode)
+
+    def _with_tenant_prefetches(self) -> TenantQuerySet:
+        """Return a clone carrying :meth:`_tenant_prefetch_lookups`, or ``self``.
+
+        For ``iterator()`` and ``aiterator()``, whose Django implementations
+        call ``prefetch_related_objects()`` with the lookups of the queryset
+        they run on, not through :meth:`_prefetch_related_objects`.
+        """
+        lookups = self._tenant_prefetch_lookups()
+        if lookups is self._prefetch_related_lookups:
+            return self
+        qs = self._clone()
+        qs._prefetch_related_lookups = lookups  # noqa: SLF001  -- a TenantQuerySet
+        return qs
+
+    def _prefetch_related_objects(self) -> None:
+        """Run the ``prefetch_related()`` lookups with :meth:`_tenant_prefetch_lookups`.
+
+        Django calls this from ``_fetch_all()`` once the result cache is
+        filled, so for a ``for_user()`` queryset it runs in the user's scope.
+        The queryset keeps the lookups it was given.
+        """
+        prefetch_related_objects(self._result_cache or [], *self._tenant_prefetch_lookups())
+        self._prefetch_done = True
 
     # ---- Strict mode guard ----
 
@@ -522,8 +592,17 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         lookups, inside its own scope. The scope is not held while the
         caller's loop body runs, so the user's context neither leaks into
         that code nor stays on the connection when the loop stops early.
+
+        The prefetches get the tenant filters of :meth:`_tenant_prefetch_lookups`,
+        for the tenant active when ``iterator()`` is called.
         """
         self._check_strict_mode()
+        # Django's iterator() prefetches with the lookups of the queryset it runs on.
+        qs = self._with_tenant_prefetches()
+        return qs._iterator_in_scope(chunk_size)  # noqa: SLF001  -- a TenantQuerySet
+
+    def _iterator_in_scope(self, chunk_size: int | None) -> Iterator[Any]:
+        """Run Django's ``iterator()``, each chunk in the ``for_user()`` scope."""
         if self._rls_user is None:
             return super().iterator(chunk_size=chunk_size)
         # Resolved once: the cursor and every chunk's scope use the same alias.
@@ -563,11 +642,14 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         ``for_user()`` user, each chunk is pulled from :meth:`iterator` in
         one thread-sensitive ``sync_to_async`` hop, so every scope is
         entered and left inside a hop, on the thread that owns the
-        connection.
+        connection. Without one, the prefetches get the tenant filters of
+        :meth:`_tenant_prefetch_lookups` as in :meth:`iterator`.
         """
         if self._rls_user is None:
             self._check_strict_mode()
-            async for item in super().aiterator(chunk_size=chunk_size):
+            # Django's aiterator() prefetches with the lookups of the queryset it runs on.
+            qs = self._with_tenant_prefetches()
+            async for item in super(TenantQuerySet, qs).aiterator(chunk_size=chunk_size):
                 yield item
             return
         if chunk_size <= 0:  # QuerySet.aiterator()'s check and message
@@ -758,6 +840,165 @@ def _resolve_related_model(
         The target model class, or ``None`` if the path is invalid.
     """
     return _resolve_related_path(model, field_path)[0]
+
+
+def _scoped_prefetch_lookups(
+    model: type[models.Model],
+    lookups: tuple[Any, ...],
+    tenant_id: int | str,
+    fetch_mode: Any = None,
+    *,
+    prefix: str = "",
+    with_queryset: set[str] | None = None,
+    targets: dict[str, type[models.Model]] | None = None,
+) -> tuple[Any, ...]:
+    """Give the base-manager hops of ``prefetch_related()`` lookups a tenant filter.
+
+    Walks each lookup (a path string or a ``Prefetch``) from ``model``. For
+    every hop that Django would fetch through the base manager (see
+    :func:`_prefetch_hop`) onto an RLS-protected model, and that no earlier
+    lookup gave a queryset:
+
+    - an intermediate hop gets a ``Prefetch(path, queryset=...)`` inserted
+      before the lookup, which Django then reuses for the rest of the path;
+    - the last hop replaces the lookup with a ``Prefetch`` of the same path
+      and ``to_attr``.
+
+    The queryset is the target's base manager filtered on
+    ``tenant_id = X`` (:func:`_tenant_rows`), so only the filter differs
+    from what Django would run. A ``Prefetch`` with a queryset of the
+    caller's is kept, but the lookups of that queryset are rewritten the
+    same way (Django runs them as lookups of the outer queryset).
+
+    Not followed past a hop it cannot resolve to a model: a
+    ``GenericForeignKey``, a generic relation, a property. A ``to_attr`` of
+    an earlier lookup is followed.
+
+    Args:
+        model: The model the lookups start from.
+        lookups: The ``_prefetch_related_lookups`` to rewrite.
+        tenant_id: The tenant to filter on.
+        fetch_mode: Django 6.1's fetch mode for the querysets built here
+            (``None``: leave the default).
+        prefix: Path of ``model`` from the outermost queryset, ending in
+            ``__``, when rewriting the lookups of a ``Prefetch`` queryset.
+        with_queryset: Paths from the outermost queryset whose prefetch
+            already has a queryset; Django refuses a second one.
+        targets: Model reached at each path from the outermost queryset.
+
+    Returns:
+        The rewritten lookups, or ``lookups`` itself when nothing changed.
+    """
+    with_queryset = set() if with_queryset is None else with_queryset
+    targets = {} if targets is None else targets
+    scoped: list[Any] = []
+    changed = False
+    for lookup in lookups:
+        prefetch: Any = lookup if isinstance(lookup, Prefetch) else Prefetch(lookup)
+        hops = prefetch.prefetch_through.split(LOOKUP_SEP)
+        current: type[models.Model] | None = model
+        scope_leaf = False
+        for level, name in enumerate(hops):
+            # prefetch_to: ends in the to_attr at the last level, as Django names it.
+            path = prefetch.get_current_prefetch_to(level)
+            current, unscoped = _prefetch_hop(current, name)
+            if current is None:
+                current = targets.get(prefix + path)  # an earlier lookup's to_attr
+            if current is None:
+                break
+            targets[prefix + path] = current
+            needs_scope = (
+                unscoped and _is_rls_protected(current) and prefix + path not in with_queryset
+            )
+            if level == len(hops) - 1:
+                scope_leaf = needs_scope
+            elif needs_scope:
+                rows = _tenant_rows(current, tenant_id, fetch_mode)
+                scoped.append(Prefetch(path, queryset=rows))
+                with_queryset.add(prefix + path)
+                changed = True
+        result = lookup
+        if prefetch.queryset is not None:
+            with_queryset.add(prefix + prefetch.prefetch_to)
+            inner = prefetch.queryset._prefetch_related_lookups  # noqa: SLF001
+            scoped_inner = _scoped_prefetch_lookups(
+                prefetch.queryset.model,
+                inner,
+                tenant_id,
+                getattr(prefetch.queryset, "_fetch_mode", fetch_mode),
+                prefix=prefix + prefetch.prefetch_to + LOOKUP_SEP,
+                with_queryset=with_queryset,
+                targets=targets,
+            )
+            if scoped_inner is not inner:
+                result = copy.copy(prefetch)
+                result.queryset = prefetch.queryset._chain()  # noqa: SLF001
+                result.queryset._prefetch_related_lookups = scoped_inner  # noqa: SLF001
+                changed = True
+        elif scope_leaf and current is not None:
+            rows = _tenant_rows(current, tenant_id, fetch_mode)
+            result = Prefetch(prefetch.prefetch_through, queryset=rows, to_attr=prefetch.to_attr)
+            with_queryset.add(prefix + prefetch.prefetch_to)
+            changed = True
+        scoped.append(result)
+    return tuple(scoped) if changed else lookups
+
+
+def _prefetch_hop(
+    model: type[models.Model] | None,
+    name: str,
+) -> tuple[type[models.Model] | None, bool]:
+    """Resolve one hop of a ``prefetch_related()`` path, as Django's descriptors do.
+
+    Args:
+        model: The model the hop starts from (``None``: unknown).
+        name: The attribute the hop follows.
+
+    Returns:
+        A ``(target_model, unscoped)`` pair. ``unscoped`` is ``True`` for a
+        forward foreign key or one-to-one field and a reverse one-to-one
+        relation: Django prefetches those through the target's base manager.
+        Reverse foreign keys and many-to-many relations go through its
+        default manager. ``target_model`` is ``None`` for anything else.
+    """
+    descriptor = getattr(model, name, None) if model is not None else None
+    target: Any
+    unscoped = False
+    if isinstance(descriptor, ForwardManyToOneDescriptor):  # includes forward one-to-one
+        target, unscoped = descriptor.field.remote_field.model, True
+    elif isinstance(descriptor, ReverseOneToOneDescriptor):
+        target, unscoped = descriptor.related.related_model, True
+    elif isinstance(descriptor, ManyToManyDescriptor):
+        rel = descriptor.rel
+        target = rel.related_model if descriptor.reverse else rel.model
+    elif isinstance(descriptor, ReverseManyToOneDescriptor) and isinstance(
+        descriptor.rel,
+        ManyToOneRel,  # not a generic relation's GenericRel
+    ):
+        target = descriptor.rel.related_model
+    else:
+        return None, False
+    if not isinstance(target, type):  # an unresolved lazy reference
+        return None, False
+    return target, unscoped
+
+
+def _tenant_rows(
+    model: type[models.Model],
+    tenant_id: int | str,
+    fetch_mode: Any,
+) -> models.QuerySet[Any]:
+    """Return ``model``'s base-manager rows of tenant ``tenant_id``.
+
+    The base manager is the one Django would prefetch through, so a filter
+    of the default manager (soft deletion, say) does not hide a related
+    object that the plain prefetch would find.
+    """
+    conf = rls_tenants_config
+    rows = model._base_manager.filter(**{f"{conf.TENANT_FK_FIELD}_id": tenant_id})  # noqa: SLF001
+    if fetch_mode is not None:
+        rows = rows.fetch_mode(fetch_mode)
+    return rows
 
 
 # Type ignore explanation: Same as TenantQuerySet: Manager is generic at runtime

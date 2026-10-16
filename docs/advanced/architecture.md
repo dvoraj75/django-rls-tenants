@@ -528,6 +528,25 @@ whole loop would also run the loop body as the user and leave the GUCs on the co
 when the loop stops early. `aiterator()` pulls each chunk in one thread-sensitive hop and
 enters the scope inside that hop.
 
+`prefetch_related()` lookups get their tenant predicate when the queryset is evaluated
+(*new in 1.5.0*), without the queryset's own lookups being modified. Django fetches reverse
+foreign-key and many-to-many prefetches through the related model's default manager
+(`RLSManager`, already filtered), but forward foreign keys, forward one-to-one fields and
+reverse one-to-one relations through its unfiltered base manager.
+`TenantQuerySet._tenant_prefetch_lookups()` walks each lookup hop by hop and, for every
+such hop onto an RLS-protected model, gives it a `Prefetch(path, queryset=...)` over the
+base manager filtered on the tenant column. The tenant is the `for_user()` user's, else
+the active context's; with none (admin, no context) the lookups stay as given.
+`_prefetch_related_objects()` runs them from `_fetch_all()`, inside the scope.
+`iterator()` and `aiterator()` instead run Django's implementation on a clone that
+carries the rewritten lookups, because it calls `prefetch_related_objects()` itself. A
+`Prefetch` with a queryset of the caller's is used as given, but its own
+`prefetch_related()` lookups are rewritten; a path is not followed past a hop that is not
+a plain relation (`GenericForeignKey`, generic relation, property). The base manager,
+not the default one, supplies the rows, so the filter is the only difference from
+Django's query. Lazy descriptor access (`item.order`) still goes through the base manager
+and relies on the policy.
+
 A queryset that has already been evaluated answers iteration, `len()`, `count()`,
 `exists()` and an ordered `first()` from its result cache. That runs no SQL, so there is
 no scope and no `STRICT_MODE` check. The querysets `prefetch_related()` caches on each

@@ -15,7 +15,7 @@ import pytest
 from asgiref.sync import async_to_sync
 from django.core.exceptions import FieldError
 from django.db import DatabaseError, DataError, NotSupportedError, connection, transaction
-from django.db.models import Count, F, QuerySet, Sum
+from django.db.models import Count, F, Prefetch, QuerySet, Sum
 from django.db.models.signals import pre_delete
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
@@ -34,8 +34,10 @@ from django_rls_tenants.tenants.managers import (
     RLSManager,
     TenantQuerySet,
     _is_rls_protected,
+    _prefetch_hop,
     _resolve_related_model,
     _resolve_related_path,
+    _scoped_prefetch_lookups,
 )
 from django_rls_tenants.tenants.middleware import RLSTenantMiddleware
 from django_rls_tenants.tenants.state import (
@@ -52,6 +54,9 @@ from tests.test_app.models import (
     OrderItem,
     OrderNote,
     OrderNoteAttachment,
+    OrderShipment,
+    Project,
+    ProtectedUser,
     Tenant,
     TenantUser,
 )
@@ -702,6 +707,294 @@ class TestResolveRelatedModel:
         """Returns None for a non-relation field (e.g., CharField)."""
         result = _resolve_related_model(Order, "product")
         assert result is None
+
+
+# ---- prefetch_related() tenant filters (#44) ----
+
+
+def _queries_on(captured, table):
+    """SQL of the captured queries that read ``table``."""
+    return [q["sql"] for q in captured.captured_queries if f'FROM "{table}"' in q["sql"]]
+
+
+def _filters_tenant(sql, table, tenant_id):
+    """Whether ``sql`` filters ``table`` on the tenant column."""
+    return f'"{table}"."tenant_id" = {tenant_id}' in sql
+
+
+def _filters_any_tenant(sql):
+    """Whether the ``WHERE`` clause of ``sql`` compares a tenant column."""
+    return '"tenant_id" =' in sql.partition(" WHERE ")[2]
+
+
+@pytest.fixture
+def sample_shipments(db, sample_orders):
+    """One shipment for order A1 and one for order B1 (one-to-one with ``Order``)."""
+    with admin_context():
+        return {
+            key: OrderShipment.objects.create(
+                order=sample_orders[key],
+                carrier=f"Carrier {key.upper()}",
+                tenant=sample_orders[key].tenant,
+            )
+            for key in ("a1", "b1")
+        }
+
+
+@pytest.fixture
+def cross_tenant_item(db, sample_orders, tenant_a):
+    """An item of tenant A whose order belongs to tenant B (a broken link)."""
+    with admin_context():
+        return OrderItem.objects.create(
+            order=sample_orders["b1"],
+            description="Cross-tenant part",
+            tenant=tenant_a,
+        )
+
+
+class TestPrefetchRelated:
+    """Tenant filters on the prefetches Django runs through the base manager (#44)."""
+
+    def test_forward_fk_prefetch_filters_the_tenant(self, sample_order_items, tenant_a):
+        with tenant_context(tenant_a.pk), CaptureQueriesContext(connection) as captured:
+            items = list(OrderItem.objects.order_by("pk").prefetch_related("order"))
+            assert [item.order.product for item in items] == ["Widget A1", "Widget A2"]
+        (sql,) = _queries_on(captured, "test_order")
+        assert _filters_tenant(sql, "test_order", tenant_a.pk)
+
+    def test_forward_one_to_one_prefetch_filters_the_tenant(self, sample_shipments, tenant_a):
+        with tenant_context(tenant_a.pk), CaptureQueriesContext(connection) as captured:
+            (shipment,) = OrderShipment.objects.prefetch_related("order")
+            assert shipment.order.product == "Widget A1"
+        (sql,) = _queries_on(captured, "test_order")
+        assert _filters_tenant(sql, "test_order", tenant_a.pk)
+
+    def test_reverse_one_to_one_prefetch_filters_the_tenant(self, sample_shipments, tenant_a):
+        with tenant_context(tenant_a.pk), CaptureQueriesContext(connection) as captured:
+            orders = list(Order.objects.order_by("pk").prefetch_related("shipment"))
+            assert orders[0].shipment.carrier == "Carrier A1"
+            assert not hasattr(orders[1], "shipment")  # A2 has none: cached as missing
+        (sql,) = _queries_on(captured, "test_order_shipment")
+        assert _filters_tenant(sql, "test_order_shipment", tenant_a.pk)
+
+    def test_every_forward_hop_of_a_path_is_filtered(self, sample_nested_rows, tenant_a):
+        """``item__order``: both hops get the filter, in Django's three queries."""
+        with tenant_context(tenant_a.pk), CaptureQueriesContext(connection) as captured:
+            revisions = list(NoteRevision.objects.order_by("pk").prefetch_related("item__order"))
+            assert [r.item.order.product for r in revisions] == ["Widget A1", "Widget A2"]
+        assert len(captured.captured_queries) == 3
+        (item_sql,) = _queries_on(captured, "test_order_item")
+        (order_sql,) = _queries_on(captured, "test_order")
+        assert _filters_tenant(item_sql, "test_order_item", tenant_a.pk)
+        assert _filters_tenant(order_sql, "test_order", tenant_a.pk)
+
+    def test_reverse_fk_prefetch_is_left_to_the_manager(self, sample_order_items, tenant_a):
+        """The default manager already filters reverse FKs: the lookups stay as given."""
+        with tenant_context(tenant_a.pk):
+            qs = Order.objects.prefetch_related("orderitem_set")
+            assert qs._tenant_prefetch_lookups() == ("orderitem_set",)
+            with CaptureQueriesContext(connection) as captured:
+                list(qs)
+        (sql,) = _queries_on(captured, "test_order_item")
+        assert _filters_tenant(sql, "test_order_item", tenant_a.pk)
+
+    def test_queryset_keeps_its_lookups(self, sample_order_items, tenant_a):
+        with tenant_context(tenant_a.pk):
+            qs = OrderItem.objects.prefetch_related("order")
+            list(qs)
+        assert qs._prefetch_related_lookups == ("order",)
+
+    def test_cross_tenant_target_is_not_prefetched(self, cross_tenant_item, tenant_a):
+        """Defense in depth: even a role that bypasses RLS does not get tenant B's order.
+
+        The item reads as it does under the RLS policy: its order is missing.
+        """
+        with tenant_context(tenant_a.pk):
+            (item,) = OrderItem.objects.filter(pk=cross_tenant_item.pk).prefetch_related("order")
+        assert item._state.fields_cache["order"] is None  # prefetched, no query on access
+        with pytest.raises(OrderItem.order.RelatedObjectDoesNotExist):
+            _ = item.order
+
+    def test_to_attr_is_filtered(self, sample_order_items, tenant_a):
+        with tenant_context(tenant_a.pk), CaptureQueriesContext(connection) as captured:
+            items = list(
+                OrderItem.objects.order_by("pk").prefetch_related(
+                    Prefetch("order", to_attr="the_order"),
+                )
+            )
+            assert [item.the_order.product for item in items] == ["Widget A1", "Widget A2"]
+        (sql,) = _queries_on(captured, "test_order")
+        assert _filters_tenant(sql, "test_order", tenant_a.pk)
+
+    def test_path_through_a_to_attr_is_followed(self, sample_nested_rows, tenant_a):
+        with tenant_context(tenant_a.pk), CaptureQueriesContext(connection) as captured:
+            notes = list(
+                OrderNote.objects.order_by("pk").prefetch_related(
+                    Prefetch("noterevision_set", to_attr="revisions"),
+                    "revisions__item",
+                )
+            )
+            items = sorted(r.item.description for n in notes for r in n.revisions)
+            assert items == ["Part A1-1", "Part A2-1"]
+        (sql,) = _queries_on(captured, "test_order_item")
+        assert _filters_tenant(sql, "test_order_item", tenant_a.pk)
+
+    def test_caller_queryset_is_left_alone(self, sample_order_items, tenant_a):
+        with tenant_context(tenant_a.pk), CaptureQueriesContext(connection) as captured:
+            list(
+                OrderItem.objects.prefetch_related(
+                    Prefetch("order", queryset=Order._base_manager.all()),
+                )
+            )
+        (sql,) = _queries_on(captured, "test_order")
+        assert not _filters_any_tenant(sql)
+
+    def test_lookups_of_a_caller_queryset_are_filtered(self, sample_nested_rows, tenant_a):
+        """Django runs a ``Prefetch`` queryset's own prefetches as the outer queryset's."""
+        inner = NoteRevision.objects.prefetch_related("item")
+        with tenant_context(tenant_a.pk), CaptureQueriesContext(connection) as captured:
+            notes = list(
+                OrderNote.objects.order_by("pk").prefetch_related(
+                    Prefetch("noterevision_set", queryset=inner),
+                    # Django reuses the inner prefetch of item for this path.
+                    "noterevision_set__item__order",
+                )
+            )
+            orders = sorted(r.item.order.product for n in notes for r in n.noterevision_set.all())
+            assert orders == ["Widget A1", "Widget A2"]
+        assert inner._prefetch_related_lookups == ("item",)
+        (item_sql,) = _queries_on(captured, "test_order_item")
+        (order_sql,) = _queries_on(captured, "test_order")
+        assert _filters_tenant(item_sql, "test_order_item", tenant_a.pk)
+        assert _filters_tenant(order_sql, "test_order", tenant_a.pk)
+
+    @pytest.mark.parametrize(
+        "lookups",
+        [
+            pytest.param(("item", "item"), id="duplicate"),
+            pytest.param(("item__order", "item"), id="prefix-after-path"),
+            pytest.param(("item", "item__order"), id="prefix-before-path"),
+        ],
+    )
+    def test_overlapping_lookups_run_one_query_per_hop(
+        self, sample_nested_rows, tenant_a, lookups
+    ):
+        with tenant_context(tenant_a.pk), CaptureQueriesContext(connection) as captured:
+            list(NoteRevision.objects.prefetch_related(*lookups))
+        item_queries = _queries_on(captured, "test_order_item")
+        assert len(item_queries) == 1
+        assert _filters_tenant(item_queries[0], "test_order_item", tenant_a.pk)
+
+    def test_for_user_without_context_filters_the_users_tenant(
+        self, sample_order_items, tenant_a, tenant_a_user, guc_mode, enforce_rls
+    ):
+        with CaptureQueriesContext(connection) as captured:
+            items = list(
+                OrderItem.objects.for_user(tenant_a_user).order_by("pk").prefetch_related("order")
+            )
+        assert [item.order.product for item in items] == ["Widget A1", "Widget A2"]
+        (sql,) = _queries_on(captured, "test_order")
+        assert _filters_tenant(sql, "test_order", tenant_a.pk)
+        _assert_no_rls_context()
+
+    def test_for_user_admin_adds_no_filter(self, sample_order_items, admin_user, enforce_rls):
+        with CaptureQueriesContext(connection) as captured:
+            items = list(OrderItem.objects.for_user(admin_user).prefetch_related("order"))
+        assert len({item.order.tenant_id for item in items}) == 2
+        (sql,) = _queries_on(captured, "test_order")
+        assert not _filters_any_tenant(sql)
+
+    def test_admin_context_adds_no_filter(self, sample_order_items):
+        with admin_context():
+            qs = OrderItem.objects.prefetch_related("order")
+            assert qs._tenant_prefetch_lookups() is qs._prefetch_related_lookups
+            with CaptureQueriesContext(connection) as captured:
+                list(qs)
+        (sql,) = _queries_on(captured, "test_order")
+        assert not _filters_any_tenant(sql)
+
+    def test_no_context_leaves_the_lookups_unchanged(self, sample_order_items):
+        qs = OrderItem.objects.prefetch_related("order")
+        assert qs._tenant_prefetch_lookups() is qs._prefetch_related_lookups
+
+    @pytest.mark.parametrize(
+        "collect",
+        [
+            pytest.param(lambda qs: list(qs.iterator(chunk_size=1)), id="iterator"),
+            pytest.param(
+                lambda qs: async_to_sync(_collect)(qs.aiterator(chunk_size=1)),
+                id="aiterator",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("via_for_user", [False, True], ids=["context", "for_user"])
+    def test_iterators_filter_every_chunk(
+        self,
+        sample_order_items,
+        tenant_a,
+        tenant_a_user,
+        guc_mode,
+        enforce_rls,
+        collect,
+        via_for_user,
+    ):
+        base = OrderItem.objects.order_by("pk").prefetch_related("order")
+        with CaptureQueriesContext(connection) as captured:
+            if via_for_user:
+                items = collect(base.for_user(tenant_a_user))
+            else:
+                with tenant_context(tenant_a.pk):
+                    items = collect(OrderItem.objects.order_by("pk").prefetch_related("order"))
+        assert [item.order.product for item in items] == ["Widget A1", "Widget A2"]
+        order_queries = _queries_on(captured, "test_order")
+        assert len(order_queries) == 2  # one per chunk
+        assert all(_filters_tenant(sql, "test_order", tenant_a.pk) for sql in order_queries)
+        _assert_no_rls_context()
+
+    def test_prefetched_objects_keep_the_fetch_mode(self, sample_order_items, tenant_a):
+        """Django 6.1 gives prefetched objects their instances' fetch mode; so do the filters."""
+        with tenant_context(tenant_a.pk):
+            qs = OrderItem.objects.prefetch_related("order")
+            if django.VERSION < (6, 1):
+                assert not hasattr(qs, "_fetch_mode")
+                return
+            from django.db.models import FETCH_PEERS  # noqa: PLC0415  -- Django 6.1+
+
+            items = list(qs.fetch_mode(FETCH_PEERS))
+        assert {item.order._state.fetch_mode for item in items} == {FETCH_PEERS}
+
+
+class TestPrefetchHop:
+    """``_prefetch_hop()`` resolves each kind of prefetch hop."""
+
+    @pytest.mark.parametrize(
+        ("model", "name", "expected"),
+        [
+            pytest.param(OrderItem, "order", (Order, True), id="forward-fk"),
+            pytest.param(OrderShipment, "order", (Order, True), id="forward-o2o"),
+            pytest.param(Order, "shipment", (OrderShipment, True), id="reverse-o2o"),
+            pytest.param(Order, "orderitem_set", (OrderItem, False), id="reverse-fk"),
+            pytest.param(Project, "members", (ProtectedUser, False), id="m2m"),
+            pytest.param(ProtectedUser, "project_set", (Project, False), id="reverse-m2m"),
+            pytest.param(Order, "product", (None, False), id="plain-field"),
+            pytest.param(Order, "missing", (None, False), id="missing"),
+            pytest.param(None, "order", (None, False), id="unknown-model"),
+        ],
+    )
+    def test_resolves(self, model, name, expected):
+        assert _prefetch_hop(model, name) == expected
+
+    def test_tenant_model_is_not_filtered(self, sample_orders, tenant_a):
+        """A hop onto a model without an ``RLSConstraint`` keeps Django's prefetch."""
+        with tenant_context(tenant_a.pk):
+            qs = Order.objects.prefetch_related("tenant")
+            assert qs._tenant_prefetch_lookups() is qs._prefetch_related_lookups
+
+    def test_scoped_lookups_are_reused_unchanged(self, tenant_a):
+        """Rewriting rewritten lookups changes nothing (no duplicate querysets)."""
+        once = _scoped_prefetch_lookups(NoteRevision, ("item__order",), tenant_a.pk)
+        assert [getattr(p, "prefetch_to", p) for p in once] == ["item", "item__order"]
+        assert _scoped_prefetch_lookups(NoteRevision, once, tenant_a.pk) is once
 
 
 # ---- Strict mode tests ----

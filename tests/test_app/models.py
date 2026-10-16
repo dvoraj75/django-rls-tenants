@@ -265,3 +265,18 @@ class Invoice(RLSProtectedModel):
                 name="test_invoice_tenant_number_uniq",
             ),
         ]
+
+
+class OrderShipment(RLSProtectedModel):
+    """RLS-protected model with a one-to-one field to ``Order``.
+
+    Used to test ``prefetch_related()`` tenant filters on the forward
+    (``shipment.order``) and reverse (``order.shipment``) one-to-one hops,
+    which Django fetches through the base manager (#44).
+    """
+
+    order = models.OneToOneField(Order, on_delete=models.CASCADE, related_name="shipment")
+    carrier = models.CharField(max_length=100)
+
+    class Meta(RLSProtectedModel.Meta):
+        db_table = "test_order_shipment"

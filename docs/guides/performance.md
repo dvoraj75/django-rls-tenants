@@ -393,10 +393,9 @@ primary-key join lookups can still use indexes.
 
 ### `prefetch_related()`
 
-`prefetch_related()` fetches related objects in separate queries. Reverse foreign-key
-and many-to-many prefetches normally use the related model's default manager. When that
-is `RLSManager` and a tenant context is active, the prefetch receives a tenant predicate.
-For example, prefetching an order's items produces:
+`prefetch_related()` fetches related objects in separate queries. When a tenant context
+is active, the prefetch queries of a `TenantQuerySet` carry the tenant predicate, with
+the exceptions listed below. Prefetching an order's items produces:
 
 ```sql
 SELECT ... FROM "orders" WHERE "orders"."tenant_id" = 42
@@ -404,24 +403,47 @@ SELECT ... FROM "order_items"
 WHERE ("order_items"."tenant_id" = 42 AND "order_items"."order_id" IN (1, 2, 3, ...))
 ```
 
-Forward foreign-key and one-to-one prefetches use Django's base manager by default,
-which is unscoped on `RLSProtectedModel`. Those queries remain RLS-protected and can use
-their primary-key `IN` lookup, but do not automatically add a tenant predicate. Supply
-an explicit queryset when you want one:
+Django fetches reverse foreign-key and many-to-many prefetches through the related
+model's default manager, which is `RLSManager` and adds the predicate itself. It fetches
+forward foreign keys, forward one-to-one fields and reverse one-to-one relations through
+the related model's base manager, which is unfiltered. `TenantQuerySet` closes that gap
+(*new in 1.5.0*): when it is evaluated, each such hop onto an RLS-protected model becomes
+`Prefetch(path, queryset=<base manager>.filter(tenant=X))`. So
+`OrderItem.objects.prefetch_related("order")` inside `tenant_context(tenant_id=42)` runs:
 
-```python
-from django.db.models import Prefetch
-
-with tenant_context(tenant_id=42):
-    items = list(
-        OrderItem.objects.prefetch_related(
-            Prefetch("order", queryset=Order.objects.all()),
-        )
-    )
+```sql
+SELECT ... FROM "orders"
+WHERE ("orders"."tenant_id" = 42 AND "orders"."id" IN (1, 2, 3, ...))
 ```
 
-The queryset passed to `Prefetch` must also be built inside the tenant context. See
-[Django's base manager behavior](https://docs.djangoproject.com/en/5.2/topics/db/managers/#base-managers).
+The number of queries does not change, and only the tenant predicate differs from the
+query Django would run: the filtered queryset comes from the base manager, not the
+default manager, so a default-manager filter (soft deletion, say) does not hide an object
+the plain prefetch would find.
+
+- **Tenant:** the `for_user()` user's tenant (none for an admin user), otherwise the
+  active context's (`tenant_context()`, the middleware). In an admin context, with no
+  context, or for an admin `for_user()` user the lookups are left as they are, as
+  `select_related()` adds nothing there either.
+- **Covered:** every way a queryset is evaluated, including `iterator()` and
+  `aiterator()` (each chunk's prefetches); every hop of a path
+  (`prefetch_related("item__order")` filters both `item` and `order`); `Prefetch` with
+  `to_attr`, and paths through the `to_attr` of an earlier lookup; and the
+  `prefetch_related()` lookups of a queryset you pass to `Prefetch`. The queryset's own
+  lookups are not modified; the rewrite happens when it is evaluated.
+- **Left alone:** a `Prefetch` whose `queryset` you supplied is used exactly as given;
+  build it from `Order.objects` inside the context if you want the filter (`RLSManager`
+  adds it). Paths are not followed past a hop that is not a plain relation (a
+  `GenericForeignKey`, a generic relation, a property). `prefetch_related_objects()`
+  called directly on a list of instances is not rewritten, nor is a queryset whose class
+  is not `TenantQuerySet`.
+
+Without `prefetch_related()`, descriptor access (`item.order` loaded lazily) still uses
+Django's base manager, as do `delete()` cascades and `refresh_from_db()`; those rely on
+the policy. On a role that bypasses RLS (superuser, `BYPASSRLS`) the prefetch is filtered
+all the same: a forward foreign key that points at another tenant's row prefetches as
+missing, as the policy would make it on a plain role. A nullable key reads `None`; a
+non-null key raises `RelatedObjectDoesNotExist` on access.
 
 Consider indexing the prefetched side as `(tenant, <fk>)` if the `IN` list gets long;
 the FK's own single-column index is often sufficient when the `IN` on `order_id` is
@@ -616,6 +638,8 @@ of three hundred extra round trips, and its writes commit together. See
 - [ ] Per-tenant unique rules are `UniqueConstraint(fields=["tenant", ...])`.
 - [ ] `select_related()` names its relations; the joined RLS tables have their own
       `tenant` index.
+- [ ] `Prefetch(queryset=...)` querysets are built from `Model.objects` inside the
+      context; `TenantQuerySet` filters the other `prefetch_related()` hops itself.
 - [ ] Raw SQL on a hot path uses `safe_tenant_sql(include_admin=False)` or a bind
       parameter for the tenant id, not the admin-inclusive fragment.
 - [ ] Tables created before v1.3.0 have had their policy recreated in the InitPlan form

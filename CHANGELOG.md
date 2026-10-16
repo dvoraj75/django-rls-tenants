@@ -180,6 +180,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to clear them at the end of the request; now one each, so a request costs two
   statements per alias instead of four. The `request_finished` safety net clears in one
   statement per alias too.
+- **`prefetch_related()` adds the tenant predicate to forward foreign-key and one-to-one
+  prefetches** (#44). Django fetches those through the related model's base manager, which
+  has no tenant filter, so `OrderItem.objects.prefetch_related("order")` inside
+  `tenant_context(42)` ran `SELECT ... FROM "orders" WHERE "orders"."id" IN (...)` and
+  relied on the policy alone. When a tenant is active (the `for_user()` user's, else the
+  context's), `TenantQuerySet` now gives each forward foreign key, forward one-to-one and
+  reverse one-to-one hop onto an RLS-protected model a tenant-filtered queryset (the base
+  manager plus `tenant_id = 42`), so the query reads `WHERE ("orders"."tenant_id" = 42 AND
+  "orders"."id" IN (...))`. The number of queries is unchanged. It covers every evaluation
+  path including `iterator()` and `aiterator()`, every hop of a path
+  (`"item__order"`), `Prefetch(..., to_attr=...)` and the lookups of a `Prefetch`
+  queryset; a `Prefetch` with a queryset of your own is used as given, and an admin
+  context or no context changes nothing. Reverse foreign-key and many-to-many prefetches
+  already had the predicate. On a role that bypasses RLS (a superuser or `BYPASSRLS`), a
+  forward foreign key that points at another tenant's row now prefetches as missing, as
+  the policy makes it on a plain role: a nullable key reads `None` and a non-null key
+  raises `RelatedObjectDoesNotExist` on access, where such a connection used to get the
+  other tenant's row. See the
+  [performance guide](https://dvoraj75.github.io/django-rls-tenants/guides/performance/#prefetch_related).
 
 ## [1.4.0] - 2026-10-16
 

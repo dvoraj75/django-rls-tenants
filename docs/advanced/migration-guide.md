@@ -163,6 +163,21 @@ migration that assigns the correct tenant to each existing record.
   GUCs and one to clear them at the request's end (the `request_finished` safety net too),
   where it sent two of each: four statements per alias per request become two. Update an
   `assertNumQueries` that counts a request's statements.
+- **`prefetch_related()` filters forward foreign-key and one-to-one prefetches by
+  tenant** (#44). Inside a tenant context, or for a `for_user()` user, a hop that Django
+  fetches through the related model's base manager (a forward foreign key, a forward
+  one-to-one field, a reverse one-to-one relation) onto an RLS-protected model now adds
+  `tenant_id = X` to its query, as reverse foreign-key and many-to-many prefetches always
+  did. The number of queries is the same; the SQL gains the predicate
+  (`WHERE ("orders"."tenant_id" = 42 AND "orders"."id" IN (...))`), which matters to a
+  test that asserts the SQL text. On a connection that bypasses RLS (superuser,
+  `BYPASSRLS`), a forward key that points at another tenant's row now prefetches as
+  missing: a nullable key reads `None`, a non-null key raises `RelatedObjectDoesNotExist`
+  on access. Before, such a connection returned the other tenant's row, and a plain role
+  never did. A `Prefetch` with a queryset you supplied is used as given. If you added
+  `Prefetch("order", queryset=Order.objects.all())` as a workaround, it can go. See
+  [Performance](../guides/performance.md#prefetch_related).
+
 #### `E001`: a superuser or `BYPASSRLS` role now fails the system checks with `DEBUG` off
 
 With `DEBUG = False`, a connection role that is a superuser or has `BYPASSRLS` used to give
