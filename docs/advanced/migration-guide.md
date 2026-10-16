@@ -125,6 +125,44 @@ migration that assigns the correct tenant to each existing record.
 
 ### From 1.4.0 to 1.5.0
 
+- **With `USE_LOCAL_SET=True`, nothing in the library writes the GUCs inside
+  `transaction.atomic()` any more** (#137). On an alias in `RLS_TENANTS["DATABASES"]`,
+  `tenant_context()`, `admin_context()`, their async counterparts (also when driven by
+  `async_to_sync` inside `atomic()`), the `for_user()` scope and `RLSTenantMiddleware`
+  now do inside a transaction what they already did outside one since 1.4.0: they set the
+  Python-side context, and the GUC affinity guard writes the values transaction-locally,
+  both GUCs in one `set_config()` statement, before the first statement that needs them.
+  Nothing else changes for code that reads rows through Django's cursor. Check:
+    - *Query counts.* Tests that count queries inside `atomic()` (`TestCase`,
+      `assertNumQueries`) see fewer statements: a block that wrote two `current_setting()`
+      reads and two `SET LOCAL` statements on entry and two on exit now costs one
+      `set_config()` before its first statement and one when it exits with the transaction
+      still open. A WSGI request with one query is `BEGIN`, `set_config()`, the query,
+      `COMMIT` (before, `BEGIN`, two `SET LOCAL`, the query, `COMMIT`). See
+      [Performance](../guides/performance.md#the-guc-affinity-guard) for the counts.
+    - *Raw driver SQL inside a block.* The block writes nothing on entry, so until its
+      first statement through Django's cursor, SQL that bypasses it (a driver cursor,
+      `callproc()`, the `FETCH` of an already open server-side cursor) sees the enclosing
+      context's values, or none, not the block's. Run one ORM query first if it needs the
+      block's values. After the block such SQL sees the block's values no longer: when a
+      block exits with its transaction still open, the guard puts the enclosing context's
+      values back, or clears both GUCs for the session when there is none.
+    - *Session writes inside a block.* Because of that clear, a session-level write of
+      the admin or tenant GUC made by code inside a block in `atomic()` (`set_guc()`,
+      `rls_context()` without `is_local=True`) no longer survives a block that has no
+      enclosing context.
+    - *`assert_rls_blocks_without_context()`* uses the same path inside `atomic()` as
+      outside it: the count runs with no context for the guard, and the GUCs are cleared
+      and restored for the session around it (before, it used `SET LOCAL` inside
+      `atomic()`).
+    - *Unchanged.* An alias outside `RLS_TENANTS["DATABASES"]` keeps the snapshot, `SET
+      LOCAL` and restore, and the `RuntimeError` / `RLSConfigurationError` outside
+      `atomic()`. With `USE_LOCAL_SET=False` contexts and `for_user()` work as before.
+- **The middleware sets and clears the GUCs in one statement per alias.** With
+  `USE_LOCAL_SET=False` it now sends one `set_config()` statement per alias to set both
+  GUCs and one to clear them at the request's end (the `request_finished` safety net too),
+  where it sent two of each: four statements per alias per request become two. Update an
+  `assertNumQueries` that counts a request's statements.
 #### `E001`: a superuser or `BYPASSRLS` role now fails the system checks with `DEBUG` off
 
 With `DEBUG = False`, a connection role that is a superuser or has `BYPASSRLS` used to give

@@ -413,8 +413,8 @@ def guard_open_connection(connection: BaseDatabaseWrapper) -> None:
     connected (in another app's ``ready()``, say). Its session's values are
     unknown, so the guard applies the context before its first statement.
     Session GUC writes install the guard on such a connection too (see
-    :func:`_record`), but with ``USE_LOCAL_SET=True`` a context entered outside
-    ``transaction.atomic()`` writes nothing: only the guard applies it.
+    :func:`_record`), but with ``USE_LOCAL_SET=True`` a context writes
+    nothing: only the guard applies it.
     """
     if connection.connection is not None and _tracker_of(connection) is None:
         install(connection, values=UNKNOWN)
@@ -650,7 +650,12 @@ def apply_active_context(connection: BaseDatabaseWrapper) -> None:
     """Apply the active context's GUC values on ``connection`` now, as the guard would.
 
     For code that reads a snapshot of the GUCs inside :func:`writing`, where
-    the guard stays out of the way. Opens the connection if needed.
+    the guard stays out of the way, and for SQL that runs past Django's
+    cursor, which the guard does not see (the ``FETCH`` of a server-side
+    cursor, see ``TenantQuerySet._scoped_chunks()``). Writes nothing when
+    the session holds the values already, or with ``USE_LOCAL_SET=True`` in
+    autocommit, where the guard gives each statement a transaction of its
+    own. Opens the connection if needed.
     """
     connection.ensure_connection()
     tracker = _tracker_of(connection)
@@ -667,13 +672,13 @@ def settle_other_aliases(using: str | None) -> None:
     until their next statement. A connection that holds a context's values
     other than the active context's gets the active one's (or none) now;
     one that holds none is left alone. With ``USE_LOCAL_SET=True`` that only
-    happens in a transaction still open: a transaction-local value is gone once
-    its transaction has ended.
+    happens in a transaction still open (``transaction.atomic()``, say): a
+    transaction-local value is gone once its transaction has ended.
 
     Args:
         using: The alias the block restored itself, or ``None`` for a block
-            that wrote nothing on entry (``USE_LOCAL_SET=True`` outside
-            ``atomic()``), so every configured alias is settled.
+            that wrote nothing on entry (``USE_LOCAL_SET=True`` on a
+            configured alias), so every configured alias is settled.
     """
     for alias in rls_tenants_config.DATABASES:
         if alias == using:

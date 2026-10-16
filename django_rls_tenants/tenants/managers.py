@@ -29,7 +29,7 @@ from django.db.models import Q
 
 from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.guc import set_guc
-from django_rls_tenants.tenants.affinity import writing
+from django_rls_tenants.tenants.affinity import apply_active_context, writing
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import (
     _context_gucs_of,
@@ -341,11 +341,12 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         and dropped, and the rollback undoes the change (see
         :func:`django_rls_tenants.rls.context.restore_gucs`).
 
-        With ``USE_LOCAL_SET=True`` outside ``transaction.atomic()``, steps 1,
-        2 and 4's restore are skipped on an alias in
-        ``RLS_TENANTS["DATABASES"]``: the GUC affinity guard sets the user's
-        values transaction-locally for each statement (see
-        ``context._writes_gucs()``).
+        With ``USE_LOCAL_SET=True``, steps 1, 2 and 4's restore are skipped on
+        an alias in ``RLS_TENANTS["DATABASES"]``, inside
+        ``transaction.atomic()`` or not: the GUC affinity guard sets the
+        user's values transaction-locally before the first statement that
+        needs them, and on exit inside a transaction it puts the enclosing
+        values back (see ``context._writes_gucs()``).
 
         The alias is resolved once and pinned on the queryset for the
         duration of the scope, so Django runs the SQL where the GUCs were
@@ -381,8 +382,8 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         if using is None:
             using = self._db_for_write() if for_write else self.db
         variables = _resolve_user_guc_vars(user, conf)
-        # Decided before the transaction below opens: on an alias the guard
-        # covers, it writes the values once, inside that transaction.
+        # False with USE_LOCAL_SET on an alias the guard covers: the guard writes
+        # the values (for own_transaction, once, inside the transaction below).
         writes = _writes_gucs(using, is_local=is_local)
         transaction_block = (
             transaction.atomic(using=using, savepoint=False)
@@ -539,10 +540,17 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         scope. A server-side cursor inside a transaction produces its rows
         at fetch time, and a part of the plan that a later fetch reaches
         first (a ``UNION ALL`` branch, say) evaluates the RLS policy only
-        then, so each fetch needs the user's GUCs.
+        then, so each fetch needs the user's GUCs. The ``FETCH`` runs past
+        Django's cursor, where the GUC affinity guard cannot set them, so a
+        scope that wrote nothing (``USE_LOCAL_SET=True`` on a configured
+        alias, #137) applies them before the chunk is pulled: one
+        ``set_config()`` in a transaction, where the previous scope's exit
+        took them off; nothing in autocommit, where the cursor is ``WITH
+        HOLD`` and computed when it opens, in a transaction of its own.
         """
         while True:
             with self._rls_scope(using=using):
+                apply_active_context(connections[using])
                 chunk = _next_chunk(rows, chunk_size)
             yield from chunk
             if len(chunk) < chunk_size:

@@ -307,7 +307,7 @@ class TestProcessRequestExceptionHandling:
         assert get_current_tenant_id() is None
 
     def test_survives_double_failure_on_cleanup(self):
-        """When both set_guc and cleanup clear_guc fail, the original error propagates."""
+        """When both the set and the cleanup's clear fail, the original error propagates."""
         mw = RLSTenantMiddleware(get_response=lambda r: MagicMock())
         user = MagicMock()
         user.is_authenticated = True
@@ -319,7 +319,7 @@ class TestProcessRequestExceptionHandling:
                 side_effect=RuntimeError("connection lost"),
             ),
             patch(
-                "django_rls_tenants.tenants.middleware.clear_guc",
+                "django_rls_tenants.tenants.middleware.write_gucs",
                 side_effect=RuntimeError("cleanup also failed"),
             ),
             pytest.raises(RuntimeError, match="connection lost"),
@@ -335,21 +335,21 @@ class TestMultiDatabaseGUC:
         mw = RLSTenantMiddleware(get_response=lambda r: MagicMock())
         request = _make_request(user=tenant_a_user)
 
-        # Mock set_guc to track all calls with their db_alias
+        # Track every write with the alias of its connection
         calls = []
-        original_set_guc = set_guc
+        original_write_gucs = middleware_module.write_gucs
 
-        def tracking_set_guc(name, value, *, is_local=False, using="default"):
-            calls.append({"name": name, "value": value, "using": using})
-            return original_set_guc(name, value, is_local=is_local, using=using)
+        def tracking_write_gucs(conn, values, *, is_local=False):
+            calls.append((conn.alias, values))
+            return original_write_gucs(conn, values, is_local=is_local)
 
         with (
             patch(
                 "django_rls_tenants.tenants.middleware.rls_tenants_config",
             ) as mock_conf,
             patch(
-                "django_rls_tenants.tenants.middleware.set_guc",
-                side_effect=tracking_set_guc,
+                "django_rls_tenants.tenants.middleware.write_gucs",
+                side_effect=tracking_write_gucs,
             ),
         ):
             mock_conf.DATABASES = ["default"]
@@ -359,9 +359,8 @@ class TestMultiDatabaseGUC:
             mock_conf.GUC_IS_ADMIN = "rls.is_admin"
             mw.process_request(request)
 
-        # Should have set GUCs on 'default'
-        default_calls = [c for c in calls if c["using"] == "default"]
-        assert len(default_calls) == 2
+        # Both GUCs set on 'default' in one statement
+        assert calls == [("default", ContextGucs.for_tenant(tenant_a_user.rls_tenant_id))]
 
     def test_cleanup_clears_all_databases(self, tenant_a_user):
         """_cleanup_rls_state clears GUCs on all configured database aliases."""
@@ -389,18 +388,12 @@ class TestMultiDatabaseGUC:
         user.rls_tenant_id = 42
         request = _make_request(user=user)
 
-        call_count = 0
-        cleared_aliases: list[str] = []
+        written: list[tuple[str, ContextGucs | None]] = []
 
-        def failing_set_guc(name, value, *, is_local=False, using="default"):
-            nonlocal call_count
-            call_count += 1
-            # Fail on 3rd call (first call to second DB alias)
-            if call_count >= 3:
+        def failing_write_gucs(conn, values, *, is_local=False):
+            written.append((conn.alias, values))
+            if conn.alias == "replica" and values is not None:
                 raise RuntimeError("Connection to replica failed")
-
-        def tracking_clear_guc(name, *, is_local=False, using="default"):
-            cleared_aliases.append(using)
 
         mock_conf = MagicMock()
         mock_conf.DATABASES = ["default", "replica"]
@@ -415,12 +408,12 @@ class TestMultiDatabaseGUC:
                 mock_conf,
             ),
             patch(
-                "django_rls_tenants.tenants.middleware.set_guc",
-                side_effect=failing_set_guc,
+                "django_rls_tenants.tenants.middleware.connections",
+                {alias: MagicMock(alias=alias) for alias in mock_conf.DATABASES},
             ),
             patch(
-                "django_rls_tenants.tenants.middleware.clear_guc",
-                side_effect=tracking_clear_guc,
+                "django_rls_tenants.tenants.middleware.write_gucs",
+                side_effect=failing_write_gucs,
             ),
             patch(
                 "django_rls_tenants.tenants.middleware._resolve_user_guc_vars",
@@ -437,8 +430,9 @@ class TestMultiDatabaseGUC:
         ):
             mw.process_request(request)
 
-        # "default" was completed, so it should be cleaned up
-        assert "default" in cleared_aliases
+        # "default" was completed, so it is cleaned up; "replica" is not
+        gucs = ContextGucs("false", "42")
+        assert written == [("default", gucs), ("replica", gucs), ("default", None)]
 
     def test_cleanup_iterates_configured_databases(self, tenant_a_user):
         """_cleanup_rls_state iterates over conf.DATABASES, not just default."""
@@ -447,13 +441,11 @@ class TestMultiDatabaseGUC:
         mw.process_request(request)
 
         clear_calls = []
-        original_clear_guc = __import__(
-            "django_rls_tenants.rls.guc", fromlist=["clear_guc"]
-        ).clear_guc
+        original_write_gucs = middleware_module.write_gucs
 
-        def tracking_clear_guc(name, *, is_local=False, using="default"):
-            clear_calls.append({"name": name, "using": using})
-            return original_clear_guc(name, is_local=is_local, using=using)
+        def tracking_write_gucs(conn, values, *, is_local=False):
+            clear_calls.append((conn.alias, values))
+            return original_write_gucs(conn, values, is_local=is_local)
 
         with (
             override_settings(
@@ -464,16 +456,15 @@ class TestMultiDatabaseGUC:
             ),
             patch(_CONF_PATCH, RLSTenantsConfig()),
             patch(
-                "django_rls_tenants.tenants.middleware.clear_guc",
-                side_effect=tracking_clear_guc,
+                "django_rls_tenants.tenants.middleware.write_gucs",
+                side_effect=tracking_write_gucs,
             ),
         ):
             response = MagicMock()
             mw.process_response(request, response)
 
-        # Should have cleared GUCs on 'default'
-        default_clears = [c for c in clear_calls if c["using"] == "default"]
-        assert len(default_clears) == 2  # is_admin + current_tenant
+        # Both GUCs cleared on 'default' in one statement
+        assert clear_calls == [("default", None)]
 
 
 # ---- USE_LOCAL_SET=True: middleware-owned transaction (#95) ----
@@ -1217,7 +1208,7 @@ class TestNativeAsyncPath:
             seen["values"] = _get_context_gucs()
             return MagicMock(name="response")
 
-        with patch.object(middleware_module, "set_guc", side_effect=AssertionError):
+        with patch.object(middleware_module, "write_gucs", side_effect=AssertionError):
             async_to_sync(_async_mw(aget_response))(_make_request(user=tenant_a_user))
 
         tenant_id = tenant_a_user.rls_tenant_id
@@ -1242,8 +1233,15 @@ class TestNativeAsyncPath:
         async def aget_response(request):
             pytest.fail("The chain must not run after a failed entry")
 
+        real_write_gucs = middleware_module.write_gucs
+
+        def failing_set(conn, values, *, is_local=False):
+            if values is not None:
+                raise OperationalError("db down")
+            return real_write_gucs(conn, values, is_local=is_local)
+
         with (
-            patch.object(middleware_module, "set_guc", side_effect=OperationalError("db down")),
+            patch.object(middleware_module, "write_gucs", side_effect=failing_set),
             patch.object(
                 middleware_module,
                 "_clear_gucs_on_all_databases",

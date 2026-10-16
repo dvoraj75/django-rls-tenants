@@ -519,10 +519,23 @@ context is entered:
   `ATOMIC_REQUESTS`): the guard sends one `set_config()` per transaction, plus one per
   context change inside it.
 - A context entered inside `transaction.atomic()` (a `TestCase`, the WSGI request
-  transaction): the block writes the GUCs itself, two `current_setting()` reads and two
-  `SET LOCAL` statements on entry and two `SET LOCAL` statements on exit. The guard sends
-  none for it while its tracker is clean (a test transaction, the WSGI request
-  transaction); after an earlier context has ended on that connection it first clears the
+  transaction, `ATOMIC_REQUESTS`, a Celery task or command that wraps its work in
+  `atomic()`): *changed in 1.5.0 (#137).* The block writes nothing; the guard sends one
+  `set_config()` before its first statement and none while the same values stay in force.
+  When the block exits with the transaction still open, one more `set_config()` puts the
+  enclosing context's values back or clears them, so SQL that bypasses Django's cursor
+  never sees them after the block. Counted in `connection.queries` (`BEGIN` and `COMMIT`
+  included, PostgreSQL 16, psycopg2), with `count()` standing for `Order.objects.count()`:
+
+    | Shape inside `atomic()` | 1.4.0 | 1.5.0 |
+    |---|---|---|
+    | `tenant_context(A)` around 5 `count()` | 13 | 9 |
+    | `tenant_context(A)` inside `tenant_context(A)`, one `count()` | 15 | 5 |
+    | 3 `for_user(user).count()` calls | 23 | 11 |
+    | A: `count()`, B: `count()`, admin: `count()`, then A: `count()` | 24 | 12 |
+
+  The exit settle is the price of the guarantee above; without it these would be 8, 4, 6
+  and 10. After an earlier context has ended on that connection the guard first clears the
   session's values, one more statement, and a loop that enters `atomic()` and a context on
   every iteration pays it every time.
 - In autocommit, a statement run under a context gets a transaction of its own: `BEGIN`,

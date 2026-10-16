@@ -228,22 +228,28 @@ RLS_TENANTS = {
 | **Type** | `bool` |
 | **Default** | `False` |
 
-When `True`, uses `SET LOCAL` (transaction-scoped) instead of `set_config()`
-(session-scoped) to set GUC variables.
+When `True`, GUC variables are transaction-scoped (`set_config(..., true)`, the same as
+`SET LOCAL`) instead of session-scoped. On an alias in `RLS_TENANTS["DATABASES"]` the
+[GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) writes them, before
+the first statement that needs them; the context managers, `for_user()` and the
+middleware only record the context (*changed in 1.5.0*: also inside
+`transaction.atomic()`). On any other alias they write with `SET LOCAL` themselves.
 
 **When to enable:**
 
 - You are using a connection pooler (PgBouncer, pgpool) in **transaction mode**.
-- `SET LOCAL` ensures GUCs are automatically cleared at transaction end,
+- Transaction-local GUCs are automatically cleared at transaction end,
   preventing cross-request leaks through pooled connections.
 
 **What changes when enabled:**
 
 - On the synchronous path (WSGI, or ASGI with a synchronous-only middleware listed after
   it), `RLSTenantMiddleware` opens `transaction.atomic()` on every configured alias
-  around each authenticated request, so the `SET LOCAL` GUCs cover the whole request and
-  are cleared at commit/rollback. `ATOMIC_REQUESTS` is not required (it nests as a
-  savepoint if you keep it).
+  around each authenticated request, so the transaction-local GUCs cover the whole request
+  and are cleared at commit/rollback. `ATOMIC_REQUESTS` is not required (it nests as a
+  savepoint if you keep it). Since 1.5.0 the middleware writes nothing in that
+  transaction: the guard sets the GUCs with one `set_config()` statement before the view's
+  first query.
 - On the middleware's async path (*1.4.0+*; ASGI, when every middleware listed after it can
   run asynchronously), it opens no transaction and writes no GUC. The
   [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) sets the request's
@@ -254,7 +260,13 @@ When `True`, uses `SET LOCAL` (transaction-scoped) instead of `set_config()`
 - Outside a request (Celery tasks, management commands, scripts), the context managers and
   `for_user()` no longer need `transaction.atomic()` (*1.4.0+*): the guard gives each
   statement the context in a transaction of its own, which costs three extra round trips
-  per statement in autocommit. Wrapping a batch of statements in `transaction.atomic()` is
+  per statement in autocommit. Inside `transaction.atomic()` they write nothing either
+  (*1.5.0+*; before, they wrote `SET LOCAL` values there): the guard sends one
+  `set_config()` statement before the block's first statement, and one more when the block
+  exits with the transaction still open, to put the enclosing context's values back or
+  clear them. Inside a block, until its first statement through Django's cursor, SQL that
+  bypasses the cursor (a driver cursor, `callproc()`) sees the enclosing context's values.
+  Wrapping a batch of statements in `transaction.atomic()` is
   still worth it for performance (see
   [Code Outside a Request Transaction](../guides/connection-pooling.md#code-outside-a-request-transaction)
   for the cost by placement). This holds for aliases in `RLS_TENANTS["DATABASES"]`; on any

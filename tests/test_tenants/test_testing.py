@@ -309,11 +309,15 @@ class TestAssertRlsBlocksWithoutContext:
             assert _context_state() == (None, True)
 
     @pytest.mark.django_db(transaction=True)
-    def test_use_local_set_restores_with_set_local(self, enforce_rls, sample_orders, settings):
-        """With USE_LOCAL_SET=True the clear and the restore are transaction-local.
+    def test_use_local_set_leaves_no_bypass_after_the_commit(
+        self, enforce_rls, sample_orders, settings
+    ):
+        """With USE_LOCAL_SET=True the admin bypass does not outlive the commit.
 
-        A session-level restore inside the transaction would outlive the commit
-        and leave the admin bypass on the connection.
+        The helper clears and restores the GUCs for the session around the
+        count (#137: the same path inside ``atomic()`` as outside it), so the
+        caller's context must come from the GUC affinity guard, which takes it
+        off the connection when ``rls_bypass()`` exits.
         """
         settings.RLS_TENANTS = {**settings.RLS_TENANTS, "USE_LOCAL_SET": True}
         with transaction.atomic(), rls_bypass():

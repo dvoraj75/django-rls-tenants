@@ -207,14 +207,15 @@ def assert_rls_blocks_without_context(
        vacuously.
     2. With the admin and tenant GUCs cleared on the ``using`` connection, the
        table must return zero rows. The GUCs are restored before the
-       assertion (with ``SET LOCAL`` when ``USE_LOCAL_SET=True``), so the
-       result does not depend on the caller's admin or tenant context, and
-       such a context (for example :func:`rls_bypass` or
+       assertion, so the result does not depend on the caller's admin or
+       tenant context, and such a context (for example :func:`rls_bypass` or
        :func:`rls_as_tenant`) is intact when the helper returns or fails.
-       With ``USE_LOCAL_SET=True`` outside ``transaction.atomic()``, where
-       such a context lives in the ``ContextVar`` values only and the GUC
-       affinity guard applies it to each statement, the count runs without
-       it, and the GUCs are cleared and restored for the session.
+       With ``USE_LOCAL_SET=True`` on an alias in
+       ``RLS_TENANTS["DATABASES"]``, where such a context lives in the
+       ``ContextVar`` values only and the GUC affinity guard applies it to
+       each statement, the count runs without it, and the GUCs are cleared
+       and restored for the session. On any other alias that mode uses
+       ``SET LOCAL``.
        Other GUCs, such as a flag set with ``bypass_flag()``, are left as they
        are.
 
@@ -253,8 +254,8 @@ def assert_rls_blocks_without_context(
         with rls_context(no_context, is_local=conf.USE_LOCAL_SET, using=using):
             count = _count_rows(model_class, using=using)
     else:
-        # USE_LOCAL_SET=True outside a transaction: the guard would run the count in
-        # a transaction of its own with the caller's context.
+        # USE_LOCAL_SET=True on a guarded alias: the guard would apply the caller's
+        # context before the count.
         with _no_context_for_the_guard(), rls_context(no_context, using=using):
             count = _count_rows(model_class, using=using)
     table = model_class._meta.db_table  # noqa: SLF001  -- standard Django _meta access

@@ -110,8 +110,9 @@ See [Requiring a context](guides/celery-tasks.md#requiring-a-context).
 
 **Cause:** `USE_LOCAL_SET=True` makes a GUC write a `SET LOCAL`, which PostgreSQL only
 accepts inside a transaction. Since 1.4.0 a context manager entered outside
-`transaction.atomic()` on an alias in `RLS_TENANTS["DATABASES"]` writes nothing, and the
-GUC affinity guard applies the context to each statement, so the error is left for:
+`transaction.atomic()` on an alias in `RLS_TENANTS["DATABASES"]` writes nothing (since 1.5.0
+inside it too), and the GUC affinity guard applies the context to each statement, so the
+error is left for:
 
 - a context entered on an alias that is **not** in `RLS_TENANTS["DATABASES"]` (the guard
   leaves such an alias alone);
@@ -184,9 +185,9 @@ instead, but it leaves other aliases alone, so the block would otherwise fail in
 
 **Fix:** Add the alias to `RLS_TENANTS["DATABASES"]`. If the coroutine is called from
 synchronous code, you can instead wrap that call in `transaction.atomic(using=alias)` and
-run the coroutine with `async_to_sync`; the managers then use `SET LOCAL`.
+run the coroutine with `async_to_sync`; the managers then use `SET LOCAL` on that alias.
 
-**See:** [`USE_LOCAL_SET=True` in async code](guides/context-managers.md#use_local_settrue-in-async-code).
+**See:** [`USE_LOCAL_SET=True` in async code](guides/context-managers.md#async-code).
 
 ### A procedure that commits fails with `invalid transaction termination`
 
@@ -801,8 +802,10 @@ Typical reasons:
   they count: the statement counts as **four** queries, and `connection.queries` lists it
   last, because Django logs it when it finishes. For a transaction opened inside a context
   the guard sends one `set_config()` per transaction; a context entered inside
-  `transaction.atomic()` writes its own GUCs instead, and the guard sends none while its
-  tracker is clean (one clear first after an earlier context has ended on that connection);
+  `transaction.atomic()` is applied the same way (*1.5.0+*: one `set_config()` before its
+  first statement, and one when it exits with the transaction still open, which puts the
+  enclosing context's values back or clears them; one clear first after an earlier context
+  has ended on that connection);
 - `USE_LOCAL_SET=True`: the next statement run outside any context, in autocommit or in a
   transaction, after a context has ended (or after a statement run under a context's
   values on that connection) sends one `set_config()` that clears what the session may hold
@@ -824,9 +827,10 @@ block in one `transaction.atomic()` inside the context (the count then includes 
 `BEGIN` and `COMMIT`, plus one `set_config()`; a block nested in an enclosing transaction,
 as in a `TestCase`, shows only `SAVEPOINT`, your statements and `RELEASE SAVEPOINT`, because
 the `set_config()` falls on the enclosing transaction's first statement). Inside a test
-transaction (`TestCase`, `django_db`), a context entered in the test writes its own GUCs
-(two `current_setting()` reads and two `SET LOCAL` statements on entry, two on exit) and
-the guard sends none while its tracker is clean; enter it before the counted block so the
-count stays flat.
+transaction (`TestCase`, `django_db`), a context entered in the test sends one
+`set_config()` before its first statement and one when it exits (before 1.5.0 it wrote its
+own GUCs: two `current_setting()` reads and two `SET LOCAL` statements on entry, two on
+exit); run a statement under the context before the counted block so the count stays
+flat.
 
 **See:** [GUC Affinity Guard](advanced/architecture.md#guc-affinity-guard).

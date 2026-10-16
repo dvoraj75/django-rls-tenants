@@ -792,7 +792,9 @@ class TestNormalFlowsAddNoStatement:
             list(Order.objects.all())
             middleware.process_response(request, None)
 
-        assert _guard_statements(queries) == []
+        # The middleware's own write and clear, one statement each; the guard adds none.
+        assert len(queries) == 3
+        assert _guard_statements(queries) == [queries[0]["sql"], queries[2]["sql"]]
 
     def test_for_user(self, tenant_a_user):
         with CaptureQueriesContext(connection) as queries:
@@ -896,11 +898,16 @@ class TestTracking:
 
         assert _gucs() == _NO_GUCS
 
-    def test_local_mode_records_what_a_block_writes(self, tenant_a):
-        """Inside the test transaction the block writes ``SET LOCAL`` values, and restores them."""
+    def test_local_mode_records_what_the_guard_writes_in_a_block(self, tenant_a):
+        """Inside the test transaction the block writes nothing; the guard sets local values.
+
+        The block's exit takes them off right away (#137).
+        """
         local = {**django_settings.RLS_TENANTS, "USE_LOCAL_SET": True}
         with override_settings(RLS_TENANTS=local):
             with tenant_context(tenant_a.pk):
+                assert _tracker().values is None
+                list(Order.objects.all())
                 assert _tracker().values == ContextGucs.for_tenant(tenant_a.pk)
                 assert _tracker().wrote_local is True
             assert _tracker().values is None
@@ -1968,16 +1975,22 @@ class TestBlockExitedInAnotherContext:
 
         assert seen == _NO_GUCS
 
-    def test_local_mode_restores_on_the_session_it_entered_on(
+    def test_local_mode_takes_the_values_off_the_session_it_entered_on(
         self,
         sample_orders,
         tenant_a,
         enforce_rls,
     ):
-        """With ``USE_LOCAL_SET=True`` the restore puts the ``SET LOCAL`` values back too."""
+        """With ``USE_LOCAL_SET=True`` the block's admin values do not outlive it there.
+
+        Neither block writes (#137): the guard applied the admin values in the
+        transaction, the exit settles them off, and the enclosing context's
+        values come back at the next statement.
+        """
 
         async def stream():
             async with async_admin_context():
+                await sync_to_async(_products)()  # the guard applies the admin values
                 yield
 
         async def close_in_another_task():
@@ -1993,9 +2006,9 @@ class TestBlockExitedInAnotherContext:
             tenant_context(tenant_a.pk),
         ):
             async_to_sync(close_in_another_task)()
-            seen = session_gucs(), _products()
+            seen = session_gucs(), _products(), session_gucs()
 
-        assert seen == (_read_as(tenant_a), _TENANT_A_PRODUCTS)
+        assert seen == (_NO_GUCS, _TENANT_A_PRODUCTS, _read_as(tenant_a))
 
     def test_local_mode_restores_no_ended_context(
         self,
@@ -2252,7 +2265,8 @@ class TestOtherAliasesOnExit:
 
         assert session_gucs(with_replica) == _NO_GUCS
         assert session_gucs() == _NO_GUCS
-        assert _guard_statements(queries) == []
+        # The safety net's own clear, one statement; the guard adds none.
+        assert len(_guard_statements(queries)) == len(queries) == 1
 
 
 class TestRecordOnAClosedConnection:

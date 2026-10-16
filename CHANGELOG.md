@@ -63,6 +63,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connection's current role is a superuser or has `BYPASSRLS`. The example project's tests
   now run as its Docker superuser too. See "Enforcing RLS in Tests" in the testing guide.
 
+### Changed
+
+- **`USE_LOCAL_SET=True`: context blocks inside `transaction.atomic()` leave the GUC
+  writes to the GUC affinity guard** (#137). On an alias in `RLS_TENANTS["DATABASES"]`,
+  `tenant_context()`, `admin_context()`, `async_tenant_context()` /
+  `async_admin_context()` (also when driven by `async_to_sync` inside `atomic()`), the
+  `for_user()` scope and `RLSTenantMiddleware` now do inside a transaction what they did
+  outside one since 1.4.0: they set the Python-side context, and the GUC affinity guard
+  applies the values transaction-locally, both GUCs in one `set_config()` statement,
+  before the first statement that needs them and again only when the context changes.
+  Before, each block wrote two `current_setting()` reads and two `SET LOCAL` statements on
+  entry and two `SET LOCAL` statements on exit (every `for_user()` call did the same).
+  When a block exits while its transaction is still open, one `set_config()` statement per
+  configured alias puts the enclosing context's values back, or clears both GUCs for the
+  session when there is none, so SQL that bypasses Django's cursor (a driver cursor,
+  `callproc()`, the `FETCH` of an open server-side cursor) never sees a block's values
+  after the block. `for_user().iterator()`, whose scope closes between chunks, applies the
+  user's values itself before each chunk, since the next `FETCH` runs past Django's cursor
+  (one `set_config()` per chunk in a transaction, none in autocommit). Statements counted in
+  `connection.queries`, `BEGIN` and `COMMIT` included:
+
+  | Inside `atomic()` | Before | Now |
+  |---|---|---|
+  | `tenant_context(A)` around 5 `count()` | 13 | 9 |
+  | `tenant_context(A)` inside `tenant_context(A)`, one `count()` | 15 | 5 |
+  | 3 `for_user(user).count()` calls | 23 | 11 |
+  | A: `count()`, B: `count()`, admin: `count()`, then A: `count()` | 24 | 12 |
+
+  A WSGI request with one query in this mode is `BEGIN`, `set_config()`, the query,
+  `COMMIT` (before, `BEGIN`, two `SET LOCAL`, the query, `COMMIT`). Two limits come with
+  it, both already true outside `atomic()`: inside a block, until its first statement
+  through Django's cursor, SQL that bypasses it sees the enclosing context's values (or
+  none), not the block's; and a session-level write of the admin or tenant GUC by code
+  inside a block (`set_guc()`, `rls_context()` without `is_local=True`) no longer survives
+  a block with no enclosing context. An alias outside `RLS_TENANTS["DATABASES"]` and
+  `USE_LOCAL_SET=False` are unchanged. `assert_rls_blocks_without_context()` uses the same
+  path inside `atomic()` as outside it. Tests that count queries inside `atomic()` see
+  fewer statements.
+- **`RLSTenantMiddleware` sets and clears both GUCs in one statement per alias**
+  (`USE_LOCAL_SET=False`, #137). It sent two `set_config()` statements to set them and two
+  to clear them at the end of the request; now one each, so a request costs two
+  statements per alias instead of four. The `request_finished` safety net clears in one
+  statement per alias too.
+
 ## [1.4.0] - 2026-10-16
 
 ### Removed
