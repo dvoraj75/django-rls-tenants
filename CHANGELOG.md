@@ -17,7 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rls_role` (session; creates a `NOLOGIN` role if missing and grants it `USAGE` on the
   `search_path` schemas, `ALL` on their tables and sequences and default privileges for
   later ones), `enforce_rls` (switches each configured alias that bypasses RLS to that
-  role with `SET ROLE` for the test; a no-op on a plain role) and
+  role with `SET ROLE` for the test, a connection the test reopens included; a no-op on a
+  plain role) and
   `enforce_rls_on_other_threads` (does the same for connections opened on other threads,
   such as ASGI error pages). Two ini options configure it: `rls_role` (default
   `rls_test_role`) and `rls_role_aliases` (default `default`). `assert_rls_enforced()` and

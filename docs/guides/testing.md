@@ -192,7 +192,7 @@ Installing the package registers a pytest plugin (the `pytest11` entry point
 | Fixture | Scope | What it does |
 |---------|-------|--------------|
 | `rls_role` | session | Returns the role name. On each configured alias whose connection bypasses RLS, creates the role (`NOLOGIN`) if it is missing and grants it access to the test database. |
-| `enforce_rls` | function | Requests `db`, then switches each configured alias whose connection bypasses RLS to `rls_role` with `SET ROLE`, and runs `RESET ROLE` after the test. Does nothing on a plain role. |
+| `enforce_rls` | function | Requests `db`, then switches each configured alias whose connection bypasses RLS to `rls_role` with `SET ROLE`, and runs `RESET ROLE` after the test. A connection the test closes and reopens is switched again as it opens. Does nothing on a plain role. |
 | `enforce_rls_on_other_threads` | function | Switches connections opened on other threads (on configured aliases) as they open. |
 
 Request `enforce_rls` in every test that asserts database-level row filtering:
@@ -269,8 +269,10 @@ To turn the plugin off, run pytest with `-p no:django_rls_tenants`.
   PostgreSQL 16 and later, a `CREATEROLE` role that creates a role gets `ADMIN` on it but
   not `SET`, unless `createrole_self_grant` includes `set`. Without it `SET ROLE` fails
   with "permission denied to set role".
-- `enforce_rls` switches the test thread's connections. A connection the test closes and
-  reopens comes back as the login role.
+- `rls_role` must be set up outside a test transaction, or the rollback drops the role.
+  Request it, or `enforce_rls`, as a fixture argument (pytest sets session fixtures up
+  first). First requested with `request.getfixturevalue()` from inside a transaction, on a
+  connection that bypasses RLS, it fails with a message saying so.
 - Connections opened on other threads are not switched by `enforce_rls`. Under ASGI,
   Django serves error pages and `thread_sensitive=False` hops on such threads. Request
   `enforce_rls_on_other_threads` as well. Those connections see committed rows only, so
@@ -295,17 +297,18 @@ class RLSTestCase(TestCase):
     @classmethod
     def setUpClass(cls):
         with connection.cursor() as cursor:
-            cursor.execute(
-                f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{ROLE}') "
-                f"THEN CREATE ROLE {ROLE} NOLOGIN; END IF; END $$"
-            )
-            cursor.execute(f"GRANT USAGE ON SCHEMA public TO {ROLE}")
-            cursor.execute(f"GRANT ALL ON ALL TABLES IN SCHEMA public TO {ROLE}")
-            cursor.execute(f"GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {ROLE}")
+            # A plain role needs no switch (and usually cannot CREATE ROLE).
             cursor.execute(
                 "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user"
             )
             if cursor.fetchone()[0]:
+                cursor.execute(
+                    f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{ROLE}') "
+                    f"THEN CREATE ROLE {ROLE} NOLOGIN; END IF; END $$"
+                )
+                cursor.execute(f"GRANT USAGE ON SCHEMA public TO {ROLE}")
+                cursor.execute(f"GRANT ALL ON ALL TABLES IN SCHEMA public TO {ROLE}")
+                cursor.execute(f"GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {ROLE}")
                 cursor.execute(f"SET ROLE {ROLE}")
                 cls.addClassCleanup(cls._reset_role)
         super().setUpClass()

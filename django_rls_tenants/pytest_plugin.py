@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Literal, Protocol
 import pytest
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from contextlib import AbstractContextManager
 
     from django.db.backends.base.base import BaseDatabaseWrapper
@@ -169,6 +169,64 @@ def _switch_role(conn: BaseDatabaseWrapper, role: str) -> bool:
     return bypasses
 
 
+def _fail_inside_a_test_transaction(conn: BaseDatabaseWrapper) -> None:
+    """Fail when ``rls_role`` would create the role inside a test transaction.
+
+    pytest sets session fixtures up before function ones, so this happens only when
+    ``rls_role`` is first requested from inside a test (``request.getfixturevalue()``) that
+    runs in a transaction. The rollback would drop the role and every later ``enforce_rls``
+    would fail with "role does not exist".
+
+    Raises:
+        pytest.fail.Exception: If ``conn`` is inside ``transaction.atomic()``.
+    """
+    if conn.in_atomic_block:
+        pytest.fail(
+            f"django-rls-tenants: rls_role was first requested inside a transaction on the "
+            f"{conn.alias!r} connection (request.getfixturevalue() in a test that is not "
+            f"django_db(transaction=True)?), so the CREATE ROLE and GRANTs it runs would be "
+            f"rolled back with the test, and later tests using enforce_rls would fail. "
+            f"Request rls_role or enforce_rls as an argument of the test or fixture instead, "
+            f"so it is set up before the test transaction opens.",
+            pytrace=False,
+        )
+
+
+def _switch_role_as_opened(
+    aliases: set[str],
+    role: str,
+    *,
+    on_this_thread: bool,
+    switched: list[BaseDatabaseWrapper] | None = None,
+) -> Callable[..., None]:
+    """Return a ``connection_created`` receiver that switches connections as they open.
+
+    Args:
+        aliases: Switch connections on these aliases only.
+        role: The role to switch to.
+        on_this_thread: ``True`` switches connections opened on the thread that built the
+            receiver (one the test closed and reopened), ``False`` those opened on every
+            other thread.
+        switched: If given, the wrappers the receiver switched are added to it (once each),
+            for the caller to reset.
+    """
+    this_thread = threading.get_ident()
+
+    def switch_role(
+        sender: type,  # noqa: ARG001  -- Django signal API
+        connection: BaseDatabaseWrapper,
+        **kwargs: object,  # noqa: ARG001  -- Django signal API
+    ) -> None:
+        if (threading.get_ident() == this_thread) is not on_this_thread:
+            return
+        if connection.alias not in aliases or not _switch_role(connection, role):
+            return
+        if switched is not None and connection not in switched:
+            switched.append(connection)
+
+    return switch_role
+
+
 @pytest.fixture(scope="session")
 def rls_role(
     request: pytest.FixtureRequest,
@@ -180,15 +238,20 @@ def rls_role(
     Once per session, on each alias in ``rls_role_aliases`` whose connection bypasses RLS,
     creates the role ``NOLOGIN`` if it is missing and grants it ``USAGE`` on the schemas of
     the ``search_path``, ``ALL`` on their tables and sequences, and the same on tables and
-    sequences created there later. This runs outside any test transaction, so a rollback
-    cannot undo it. Where the connection is already subject to RLS nothing is created.
+    sequences created there later. Where the connection is already subject to RLS nothing
+    is created. Request it (or ``enforce_rls``) as a fixture argument, so that it is set up
+    before the test transaction opens: first requested with ``request.getfixturevalue()``
+    inside a transaction, where the rollback would drop the role, it fails.
     """
     from django.db import connections  # noqa: PLC0415  -- see module docstring
 
     role: str = request.config.getini("rls_role")
     with django_db_blocker.unblock():
         for alias in _aliases(request.config):
-            _prepare_role(connections[alias], role)
+            conn = connections[alias]
+            if conn.in_atomic_block and _bypasses_rls(conn):
+                _fail_inside_a_test_transaction(conn)
+            _prepare_role(conn, role)
     return role
 
 
@@ -205,28 +268,40 @@ def enforce_rls(
     plain role it does nothing. Aliases the test may not use (pytest-django's
     ``django_db(databases=...)``) are left alone. Request it in every test that asserts
     database-level row filtering: on a superuser connection such a test passes whether or
-    not the policies work. Only the test thread's connections are switched; see
+    not the policies work. A connection the test closes and reopens is switched again as
+    it opens. Only the test thread's connections are switched; see
     ``enforce_rls_on_other_threads``.
     """
     from django.db import connections  # noqa: PLC0415  -- see module docstring
+    from django.db.backends.signals import connection_created  # noqa: PLC0415
 
     # Not in django-stubs; raised for an alias the test may not use.
     from django.test.testcases import (  # type: ignore[attr-defined]  # noqa: PLC0415
         DatabaseOperationForbidden,
     )
 
+    aliases = _aliases(request.config)
     switched: list[BaseDatabaseWrapper] = []
+    switch_reopened = _switch_role_as_opened(
+        set(aliases), rls_role, on_this_thread=True, switched=switched
+    )
     try:
-        for alias in _aliases(request.config):
+        for alias in aliases:
             conn = connections[alias]
             try:
                 if _switch_role(conn, rls_role):
                     switched.append(conn)
             except DatabaseOperationForbidden:
                 continue
+        connection_created.connect(switch_reopened, weak=False)
         yield
     finally:
+        connection_created.disconnect(switch_reopened)
         for conn in switched:
+            # A closed connection took its SET ROLE with it (a reopened one was switched
+            # again as it opened, and is reset here).
+            if conn.connection is None or conn.closed_in_transaction:
+                continue
             with conn.cursor() as cursor:
                 cursor.execute("RESET ROLE")
 
@@ -245,17 +320,9 @@ def enforce_rls_on_other_threads(request: pytest.FixtureRequest, rls_role: str) 
     """
     from django.db.backends.signals import connection_created  # noqa: PLC0415
 
-    aliases = set(_aliases(request.config))
-    test_thread = threading.get_ident()
-
-    def switch_role(
-        sender: type,  # noqa: ARG001  -- Django signal API
-        connection: BaseDatabaseWrapper,
-        **kwargs: object,  # noqa: ARG001  -- Django signal API
-    ) -> None:
-        if threading.get_ident() != test_thread and connection.alias in aliases:
-            _switch_role(connection, rls_role)
-
+    switch_role = _switch_role_as_opened(
+        set(_aliases(request.config)), rls_role, on_this_thread=False
+    )
     connection_created.connect(switch_role, weak=False)
     try:
         yield

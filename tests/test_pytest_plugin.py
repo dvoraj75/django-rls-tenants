@@ -125,6 +125,34 @@ class TestEnforceRls:
         reaching the test body is the assertion.
         """
 
+    @pytest.mark.django_db(transaction=True)
+    def test_a_reopened_connection_is_switched_again(self, enforce_rls):
+        """A connection the test closes comes back as ``rls_role``, not as the login role."""
+        connection.close()
+        assert_rls_enforced()
+        assert not _bypasses_rls(connection)
+
+    @pytest.mark.superuser_only
+    @pytest.mark.django_db(transaction=True)
+    def test_a_reopened_connection_runs_as_the_configured_role(self, enforce_rls, rls_role):
+        """The receiver switched the new session (and the teardown resets it)."""
+        _require_superuser("test_a_reopened_connection_runs_as_the_configured_role", "switch")
+        connection.close()
+        assert _current_user() == rls_role
+
+    def test_rls_role_fails_inside_a_test_transaction(self):
+        """First requested inside the test transaction, the role would roll back: fail."""
+        assert connection.in_atomic_block
+        with pytest.raises(pytest.fail.Exception, match="inside a transaction") as excinfo:
+            pytest_plugin._fail_inside_a_test_transaction(connection)
+        assert "request.getfixturevalue()" in str(excinfo.value)
+
+    @pytest.mark.django_db(transaction=True)
+    def test_rls_role_passes_outside_a_test_transaction(self):
+        """Outside a transaction (``transaction=True``) the role is created for good."""
+        assert not connection.in_atomic_block
+        pytest_plugin._fail_inside_a_test_transaction(connection)
+
     def test_tables_created_later_are_granted(self, request, rls_role):
         """``ALTER DEFAULT PRIVILEGES`` covers a table the connection's role creates later.
 
