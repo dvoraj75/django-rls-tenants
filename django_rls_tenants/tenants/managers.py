@@ -29,7 +29,7 @@ from django.db.models import Q
 
 from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.guc import set_guc
-from django_rls_tenants.tenants.affinity import writing
+from django_rls_tenants.tenants.affinity import apply_active_context, writing
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import (
     _context_gucs_of,
@@ -540,10 +540,17 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         scope. A server-side cursor inside a transaction produces its rows
         at fetch time, and a part of the plan that a later fetch reaches
         first (a ``UNION ALL`` branch, say) evaluates the RLS policy only
-        then, so each fetch needs the user's GUCs.
+        then, so each fetch needs the user's GUCs. The ``FETCH`` runs past
+        Django's cursor, where the GUC affinity guard cannot set them, so a
+        scope that wrote nothing (``USE_LOCAL_SET=True`` on a configured
+        alias, #137) applies them before the chunk is pulled: one
+        ``set_config()`` in a transaction, where the previous scope's exit
+        took them off; nothing in autocommit, where the cursor is ``WITH
+        HOLD`` and computed when it opens, in a transaction of its own.
         """
         while True:
             with self._rls_scope(using=using):
+                apply_active_context(connections[using])
                 chunk = _next_chunk(rows, chunk_size)
             yield from chunk
             if len(chunk) < chunk_size:

@@ -285,7 +285,10 @@ alone. It does not cover:
 - SQL that bypasses Django's execute wrappers: a driver cursor, `callproc()`, the driver's
   `copy` methods, and the `FETCH`es of a server-side cursor (`iterator()`) opened inside a
   transaction, whose rows PostgreSQL computes as they are fetched. Outside a transaction
-  (autocommit, Django's default) it computes them when the cursor opens.
+  (autocommit, Django's default) it computes them when the cursor opens. A block held
+  around the whole `iterator()` loop is fine: its values stay on the connection until the
+  block exits. `for_user().iterator()`, whose scope closes between chunks, applies the
+  user's values itself before each chunk.
 
 A task that a block starts and does not await gets the block's context only while the
 block is live: once the block has ended, that task's statements run without it

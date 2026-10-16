@@ -507,10 +507,16 @@ own error propagates (the same rule as the context managers).
 `prefetch_related()` lookups, inside its own scope, and closes the scope while your loop
 body runs. A server-side cursor inside a transaction produces its rows at fetch time, and
 a part of the plan that a later fetch reaches first (a `UNION ALL` branch, say) evaluates
-the RLS policy only then, so every fetch needs the GUCs. A scope held for the whole loop
-would also run the loop body as the user and leave the GUCs on the connection when the
-loop stops early. `aiterator()` pulls each chunk in one thread-sensitive hop and enters
-the scope inside that hop.
+the RLS policy only then, so every fetch needs the GUCs. The `FETCH` runs past Django's
+cursor, where the GUC affinity guard cannot set them, so with `USE_LOCAL_SET=True` on a
+configured alias, where the scope writes nothing itself, each chunk's scope applies the
+user's values before it pulls the chunk (`affinity.apply_active_context()`): in a
+transaction one `set_config()` per chunk, since the previous scope's exit took them off
+(the chunk's exit costs one more); in autocommit nothing, because the cursor is `WITH
+HOLD` and computed when it opens, in the guard's own transaction. A scope held for the
+whole loop would also run the loop body as the user and leave the GUCs on the connection
+when the loop stops early. `aiterator()` pulls each chunk in one thread-sensitive hop and
+enters the scope inside that hop.
 
 A queryset that has already been evaluated answers iteration, `len()`, `count()`,
 `exists()` and an ordered `first()` from its result cache. That runs no SQL, so there is

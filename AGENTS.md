@@ -320,7 +320,11 @@ inside `_rls_scope()` (`for_write=True` for writes, so the router's write alias 
 which pins that alias on the queryset for the call, sets the GUCs that differ from the
 user's values and the tenant `ContextVar`s, then restores the previous values. A new
 override that runs SQL must use it. `iterator()` / `aiterator()` enter it once per chunk
-and never across a `yield`. A queryset with cached results must skip both the scope and
+and never across a `yield`; `_scoped_chunks()` calls `apply_active_context()` inside each
+scope because the server-side cursor's `FETCH` runs past Django's cursor, where the guard
+cannot set the user's values (in a transaction the previous chunk's exit took them off; in
+autocommit the `WITH HOLD` cursor is computed when it opens, so nothing is written). A
+queryset with cached results must skip both the scope and
 `_check_strict_mode()`. Methods Django runs in a transaction of their own pass
 `own_transaction=True`, so their `SET LOCAL` lands in that transaction (on a configured
 alias with `USE_LOCAL_SET=True` the scope writes nothing in it and the guard sets the

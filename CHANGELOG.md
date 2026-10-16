@@ -35,13 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `for_user()` scope and `RLSTenantMiddleware` now do inside a transaction what they did
   outside one since 1.4.0: they set the Python-side context, and the GUC affinity guard
   applies the values transaction-locally, both GUCs in one `set_config()` statement,
-  before the first statement that needs them and again only when the context changes. Before, each block wrote two `current_setting()`
-  reads and two `SET LOCAL` statements on entry and two `SET LOCAL` statements on exit
-  (every `for_user()` call did the same). When a block exits while its transaction is
-  still open, one `set_config()` statement per configured alias puts the enclosing
-  context's values back, or clears both GUCs for the session when there is none, so SQL
-  that bypasses Django's cursor (a driver cursor, `callproc()`, the `FETCH` of an open
-  server-side cursor) never sees a block's values after the block. Statements counted in
+  before the first statement that needs them and again only when the context changes.
+  Before, each block wrote two `current_setting()` reads and two `SET LOCAL` statements on
+  entry and two `SET LOCAL` statements on exit (every `for_user()` call did the same).
+  When a block exits while its transaction is still open, one `set_config()` statement per
+  configured alias puts the enclosing context's values back, or clears both GUCs for the
+  session when there is none, so SQL that bypasses Django's cursor (a driver cursor,
+  `callproc()`, the `FETCH` of an open server-side cursor) never sees a block's values
+  after the block. `for_user().iterator()`, whose scope closes between chunks, applies the
+  user's values itself before each chunk, since the next `FETCH` runs past Django's cursor
+  (one `set_config()` per chunk in a transaction, none in autocommit). Statements counted in
   `connection.queries`, `BEGIN` and `COMMIT` included:
 
   | Inside `atomic()` | Before | Now |

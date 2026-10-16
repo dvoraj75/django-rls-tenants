@@ -650,7 +650,12 @@ def apply_active_context(connection: BaseDatabaseWrapper) -> None:
     """Apply the active context's GUC values on ``connection`` now, as the guard would.
 
     For code that reads a snapshot of the GUCs inside :func:`writing`, where
-    the guard stays out of the way. Opens the connection if needed.
+    the guard stays out of the way, and for SQL that runs past Django's
+    cursor, which the guard does not see (the ``FETCH`` of a server-side
+    cursor, see ``TenantQuerySet._scoped_chunks()``). Writes nothing when
+    the session holds the values already, or with ``USE_LOCAL_SET=True`` in
+    autocommit, where the guard gives each statement a transaction of its
+    own. Opens the connection if needed.
     """
     connection.ensure_connection()
     tracker = _tracker_of(connection)

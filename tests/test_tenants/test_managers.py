@@ -1509,17 +1509,62 @@ class TestForUserIterators:
         assert len(states) == expected
         assert set(states) == {(None, None, None, False)}
 
-    def test_every_fetch_runs_in_the_scope(self, sample_orders, scoped_user, enforce_rls):
+    def test_every_fetch_runs_in_the_scope(
+        self, sample_orders, scoped_user, guc_mode, enforce_rls
+    ):
         """A ``UNION ALL`` branch first reached by a later fetch still sees the user's GUCs.
 
         In the test transaction the cursor produces rows at fetch time, and
         PostgreSQL evaluates the policy of the second branch only when a fetch
-        reaches it.
+        reaches it. The ``FETCH`` bypasses the GUC affinity guard, so with
+        ``USE_LOCAL_SET=True`` the chunk's scope applies the values itself
+        (#137): the previous chunk's exit took them off the connection.
         """
         user, _ = scoped_user
         qs = Order.objects.for_user(user)
         both = qs.filter(product="Widget A1").union(qs.filter(product="Widget A2"), all=True)
         assert sorted(o.product for o in both.iterator(chunk_size=1)) == ["Widget A1", "Widget A2"]
+
+    def test_later_fetches_do_not_run_under_the_enclosing_context(
+        self, sample_orders, tenant_a_user, guc_mode, enforce_rls
+    ):
+        """A chunk fetched after the enclosing admin context came back sees the user's rows only.
+
+        Between chunks the scope is closed and the enclosing context's values
+        are back on the connection; the next chunk's ``FETCH`` must not run
+        under them (#137).
+        """
+        qs = Order.objects.for_user(tenant_a_user)
+        both = qs.filter(product="Widget A1").union(qs.filter(product="Gadget B1"), all=True)
+        with admin_context():
+            products = [o.product for o in both.iterator(chunk_size=1)]
+        assert products == ["Widget A1"]
+
+    def test_chunk_scopes_add_one_statement_each_in_local_mode(
+        self, sample_orders, tenant_a_user, enforce_rls, settings
+    ):
+        """In a transaction each chunk costs the scope's write and its exit's clear, no more.
+
+        The three ``FETCH``es (the last one empty) run past Django's cursor and
+        are not logged; the cursor's ``DECLARE`` is.
+        """
+        settings.RLS_TENANTS = {**settings.RLS_TENANTS, "USE_LOCAL_SET": True}
+        Order.objects.for_user(tenant_a_user).count()  # settles the connection
+        with CaptureQueriesContext(connection) as queries:
+            assert len(list(Order.objects.for_user(tenant_a_user).iterator(chunk_size=1))) == 2
+
+        def kind(sql):
+            if sql.startswith("DECLARE"):
+                return "DECLARE"
+            assert sql.count("set_config(") == 2, sql
+            return "SET" if ", true)" in sql else "CLEAR"
+
+        assert [kind(q["sql"]) for q in queries] == [
+            "SET",  # the first chunk's scope, before the DECLARE
+            "DECLARE",
+            "CLEAR",  # its exit: no enclosing context
+            *["SET", "CLEAR"] * 2,  # the second chunk, then the empty one
+        ]
 
     def test_breaking_out_leaves_no_context(self, sample_orders, tenant_a_user, enforce_rls):
         """Stopping early leaves nothing set: no scope was open between chunks."""
