@@ -85,8 +85,10 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "django-stubs[compatible-mypy]>=5.0",
-    # Types for contrib.drf; the lint job installs only this group.
+    # Types for contrib.drf; the lint job installs only this group. The django-stubs
+    # plugin boots Django with tests/settings.py, whose INSTALLED_APPS lists DRF.
     "djangorestframework-stubs>=3.16",
+    "djangorestframework>=3.16",
     "psycopg2-binary>=2.9",
     # mypy type-checks django_rls_tenants.pytest_plugin, which imports pytest.
     "pytest>=8.0",
