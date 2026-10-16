@@ -315,9 +315,9 @@ A few more consequences:
       `@with_rls_context` sits directly on the `async def`.
 - [ ] No database work goes to `thread_sensitive=False`, `run_in_executor()` or a bare thread
       pool unless it opens its own context.
-- [ ] Every alias connects as a role without `SUPERUSER` or `BYPASSRLS`. `W005` checks the
-      `default` alias; check the roles of the others yourself.
-- [ ] `python manage.py check` shows no `W004`, `W005`, `W010` or `W011`.
+- [ ] Every alias connects as a role without `SUPERUSER` or `BYPASSRLS`. `W005` (`E001` with
+      `DEBUG = False`) checks every alias in `RLS_TENANTS["DATABASES"]`.
+- [ ] `python manage.py check` shows no `W004`, `W005`, `E001`, `W010`, `W011` or `W013`.
 
 ## See also
 

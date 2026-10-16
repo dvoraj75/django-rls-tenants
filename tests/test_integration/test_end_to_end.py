@@ -9,10 +9,11 @@ from __future__ import annotations
 import json
 from decimal import Decimal
 from io import StringIO
+from unittest.mock import patch
 
 import pytest
 from django.core.management import call_command
-from django.db import connection
+from django.db import ProgrammingError, connection
 
 from django_rls_tenants.management.commands.check_rls import Command as CheckRlsCommand
 from django_rls_tenants.rls.guc import get_guc, set_guc
@@ -448,6 +449,60 @@ class TestCheckRlsCommand:
         out = StringIO()
         call_command("check_rls", "--quiet", "--verbose", stdout=out)
         assert out.getvalue() == ""
+
+    def test_catalogue_query_failure_is_reported_not_raised(self):
+        """A failing catalogue query exits 1 with "could not determine", not a traceback (#108)."""
+        error = ProgrammingError(
+            "permission denied for view pg_policies\nLINE 1: SELECT tablename FROM pg_policies"
+        )
+        out = StringIO()
+        err = StringIO()
+        with (
+            patch.object(CheckRlsCommand, "_check_policies", side_effect=error),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            call_command("check_rls", stdout=out, stderr=err)
+        assert exc_info.value.code == 1
+        assert (
+            "Could not determine the RLS status of the protected tables on database "
+            "'default': the catalogue query failed with ProgrammingError: permission "
+            "denied for view pg_policies. Nothing was verified" in err.getvalue()
+        )
+        assert "LINE 1" not in err.getvalue()
+        assert "verified." not in out.getvalue()
+
+    @pytest.mark.superuser_only
+    def test_real_catalogue_query_failure(self):
+        """Against live PostgreSQL, a role that cannot read ``pg_policies`` gets exit 1.
+
+        ``REVOKE`` on the catalogue view needs a superuser, so on a plain role the
+        test fails instead of skipping (deselect it with ``-m "not superuser_only"``,
+        see #110). The failed query aborts the transaction; rolling back to the
+        savepoint undoes the ``REVOKE``, the ``CREATE ROLE`` and both role switches.
+        """
+        with connection.cursor() as cur:
+            cur.execute("SELECT rolsuper FROM pg_roles WHERE rolname = session_user")
+            if not cur.fetchone()[0]:
+                pytest.fail(
+                    "test_real_catalogue_query_failure needs a PostgreSQL superuser "
+                    "connection to REVOKE SELECT on pg_policies, but the test connection "
+                    'is a plain role. Run as a superuser or deselect it with -m "not '
+                    'superuser_only".'
+                )
+            cur.execute("SAVEPOINT check_rls_failure")
+            cur.execute("RESET ROLE")
+            cur.execute("REVOKE SELECT ON pg_catalog.pg_policies FROM PUBLIC")
+            cur.execute("CREATE ROLE rls_check_rls_role NOLOGIN")
+            cur.execute("SET ROLE rls_check_rls_role")
+        err = StringIO()
+        try:
+            with pytest.raises(SystemExit) as exc_info:
+                call_command("check_rls", stdout=StringIO(), stderr=err)
+        finally:
+            with connection.cursor() as cur:
+                cur.execute("ROLLBACK TO SAVEPOINT check_rls_failure")
+        assert exc_info.value.code == 1
+        assert "permission denied for view pg_policies" in err.getvalue()
 
     def test_verbose_skips_null_policy_clause(self):
         """A NULL catalog clause is skipped rather than printed.

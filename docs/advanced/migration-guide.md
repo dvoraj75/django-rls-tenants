@@ -123,6 +123,31 @@ migration that assigns the correct tenant to each existing record.
 
 ## Upgrading django-rls-tenants
 
+### From 1.4.0 to 1.5.0
+
+#### `E001`: a superuser or `BYPASSRLS` role now fails the system checks with `DEBUG` off
+
+With `DEBUG = False`, a connection role that is a superuser or has `BYPASSRLS` used to give
+the `W005` warning. It is now the `E001` error, which fails `manage.py check` and every
+command that runs the system checks: `migrate`, `createsuperuser`, `check_rls`,
+`setup_m2m_rls`, and `manage.py test` (Django's test runner sets `DEBUG = False` before it
+runs the checks). Servers, pytest-django and `call_command()` do not run the checks.
+
+If one of those commands now stops with `E001`:
+
+- **Preferred:** connect as a `NOSUPERUSER NOBYPASSRLS` role. Run migrations as the table
+  owner; an owner is subject to `FORCE ROW LEVEL SECURITY` and passes the check.
+- **A migration job or test settings that must use a superuser:** put
+  `SILENCED_SYSTEM_CHECKS = ["django_rls_tenants.E001"]` in that settings module only (a
+  `settings_migrate.py`, or an environment-driven list). Do not silence it in the runtime
+  settings. `migrate --skip-checks` works for a single run but skips every check.
+
+`W005` and `W011` also check every alias in `RLS_TENANTS["DATABASES"]` now, not only
+`default`, so a clean `check` of 1.4.0 can report them on a secondary alias. A new `W013`
+warning means a check could not run on a reachable database. See
+[E001](../troubleshooting.md#e001-the-connection-role-bypasses-rls-with-debug-off) and
+[W013](../troubleshooting.md#w013-a-database-check-could-not-be-determined).
+
 ### From 1.3.4 to 1.4.0
 
 - **Django 4.2, 5.0 and 5.1 and Python 3.11 are no longer supported.** 1.4.0 needs

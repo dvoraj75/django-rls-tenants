@@ -65,6 +65,12 @@ TEMPLATES = [
     },
 ]
 
+# The superuser CI legs connect as ``postgres``, and DEBUG is False under a test runner,
+# so anything that runs the system checks with these settings would report E001 (#108).
+# Record that choice; the tests call the check functions directly, so this hides nothing
+# from them.
+SILENCED_SYSTEM_CHECKS = ["django_rls_tenants.E001"]
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 USE_TZ = True

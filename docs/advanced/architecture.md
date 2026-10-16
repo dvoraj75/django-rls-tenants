@@ -416,7 +416,8 @@ Key design decisions in the policy:
 - **`::int` cast**: ensures type safety. The cast type is configurable via `TENANT_PK_TYPE`.
 - **`FORCE ROW LEVEL SECURITY`**: ensures RLS applies even to the table owner.
   It does not affect superusers or `BYPASSRLS` roles, which always skip RLS;
-  system check `W005` warns when the default connection uses either.
+  system check `W005` (`E001` with `DEBUG = False`) reports a configured alias whose role
+  uses either.
 
 ## M2M Policy Generation
 

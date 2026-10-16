@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`E001`: an error for an RLS-bypassing connection role in production** (#108). When
+  `settings.DEBUG` is `False` and the connection role of an alias in
+  `RLS_TENANTS["DATABASES"]` is a superuser or has `BYPASSRLS`, the system checks report
+  the `django_rls_tenants.E001` error instead of the `W005` warning. See the first entry
+  under Changed for what this does to `check`, `migrate` and the test runner.
+- **`W013`: a database check that could not run no longer stays silent** (#108). When the
+  database is reachable but the catalogue query behind `W005`/`E001` or `W011` fails (for
+  example `permission denied for view pg_roles`, or a statement timeout), the checks now
+  report `W013` naming the error and the alias, so a clean `check` is not read as a pass.
+  It stays a warning with `DEBUG` off. When no connection can be opened (the database is
+  not provisioned yet, or a command runs without one), the checks are still skipped
+  quietly, with a `DEBUG` log line on the `django_rls_tenants` logger.
+
+### Changed
+
+- **`E001` can turn a passing `manage.py check` into a failing one, and it aborts `migrate`
+  and every other command that runs the system checks** (#108). It applies with
+  `DEBUG = False` and a connection role that is a superuser or has `BYPASSRLS`: `migrate`,
+  `createsuperuser`, `check_rls`, `setup_m2m_rls`, and `manage.py test` (Django's test
+  runner sets `DEBUG = False` before it runs the checks). Servers (gunicorn, uvicorn),
+  pytest-django and `call_command()` do not run the checks and are not affected. Connect
+  as a `NOSUPERUSER NOBYPASSRLS` role and run migrations as the table owner, which is an
+  ordinary role. If a settings module has to use such a role on purpose (a migration job
+  on a superuser, a superuser test database in CI), add
+  `SILENCED_SYSTEM_CHECKS = ["django_rls_tenants.E001"]` to that module only, never to the
+  settings the application serves requests with; `migrate --skip-checks` skips every check
+  for one run. This replaces the earlier advice that a superuser is fine for migrations.
+- **`W005` and `W011` check every alias in `RLS_TENANTS["DATABASES"]`** (#108), not only
+  `default`. The `W005` message now reads "The connection role 'x' of DATABASES['alias']
+  ...", and the `W011` message names the alias after the scope. An alias missing from
+  `settings.DATABASES` is skipped (`W006` reports it), as is one that is not PostgreSQL.
+- **`check_rls` fails cleanly when it cannot verify** (#108). If the `pg_class` or
+  `pg_policies` query fails, it prints "Could not determine the RLS status of the protected
+  tables on database 'x' ... Nothing was verified" to stderr and exits with status 1,
+  instead of a traceback.
+
 ## [1.4.0] - 2026-10-16
 
 ### Removed
