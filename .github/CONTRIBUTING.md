@@ -100,7 +100,8 @@ session itself holds reads it with a driver cursor (`tests/session_gucs.py`).
 CI runs Python 3.12-3.14 x Django 5.2-6.1 on PostgreSQL 16 with psycopg2, plus a psycopg 3
 leg, and PostgreSQL 15 and 18 legs with the oldest and newest supported Django. Those legs
 connect as a superuser, which bypasses RLS, so one more leg runs the suite as a plain role
-with `-m "not superuser_only"`: a test of RLS behaviour must pass there too. CI also
+with `-m "not superuser_only"`: a test of RLS behaviour must pass there too (under the
+superuser it requests `enforce_rls`, a fixture from the library's own pytest plugin). CI also
 installs the built wheel into a clean virtualenv and runs the example app against it, and
 the release workflow refuses a tag whose version has no `## [X.Y.Z]` heading in
 `CHANGELOG.md`. See the full
@@ -117,6 +118,7 @@ it blocks nothing, and a red run means a matrix review is due.
 ```
 tests/
 ├── conftest.py              # Shared fixtures
+├── test_pytest_plugin.py    # The shipped pytest plugin
 ├── test_rls/                # rls/ layer unit tests
 ├── test_tenants/            # tenants/ layer unit tests
 ├── test_integration/        # End-to-end tests

@@ -1,10 +1,13 @@
 """Test helpers for verifying RLS behavior.
 
 Provides context managers for test setup (``rls_bypass``, ``rls_as_tenant``)
-and assertion functions for verifying RLS policies are applied correctly,
-plus their counterparts for ``async def`` tests (``async_rls_bypass``,
-``async_rls_as_tenant``, ``aassert_rls_enabled``, ``aassert_rls_policy_exists``
-and ``aassert_rls_blocks_without_context``).
+and assertion functions for verifying RLS policies are applied correctly
+(``assert_rls_enforced`` checks the connection's role itself), plus their
+counterparts for ``async def`` tests (``async_rls_bypass``,
+``async_rls_as_tenant``, ``aassert_rls_enforced``, ``aassert_rls_enabled``,
+``aassert_rls_policy_exists`` and ``aassert_rls_blocks_without_context``).
+The ``enforce_rls`` fixture lives in the pytest plugin,
+``django_rls_tenants.pytest_plugin``.
 """
 
 from __future__ import annotations
@@ -63,6 +66,46 @@ def rls_as_tenant(tenant_id: int | str, *, using: str = "default") -> Iterator[N
     """
     with tenant_context(tenant_id, using=using):
         yield
+
+
+def assert_rls_enforced(*, using: str = "default") -> None:
+    """Assert that PostgreSQL applies RLS to the ``using`` connection's current role.
+
+    A superuser, or a role with ``BYPASSRLS``, bypasses every RLS policy, even
+    with ``FORCE ROW LEVEL SECURITY``, so every isolation test on such a
+    connection passes whether or not the policies work. The check reads
+    ``current_user``, the role ``SET ROLE`` switches to (the ``enforce_rls``
+    fixture), not the login role.
+
+    Args:
+        using: Database alias. Default: ``"default"``.
+
+    Raises:
+        AssertionError: If the connection's current role is a superuser or has
+            ``BYPASSRLS``.
+    """
+    conn = connections[using]
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT rolname, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user"
+        )
+        row = cursor.fetchone()
+    assert row is not None, f"The current role of the {using!r} connection is not in pg_roles"
+    role, is_superuser, bypasses_rls = row
+    reasons = [
+        reason
+        for reason, applies in (
+            ("is a PostgreSQL superuser", is_superuser),
+            ("has the BYPASSRLS attribute", bypasses_rls),
+        )
+        if applies
+    ]
+    assert not reasons, (
+        f"The {using!r} connection runs as role {role!r}, which {' and '.join(reasons)}, "
+        f"so it bypasses every RLS policy and tests on it prove nothing about tenant "
+        f"isolation. Connect as a role with NOSUPERUSER and NOBYPASSRLS, or request the "
+        f"enforce_rls pytest fixture, which switches to such a role with SET ROLE."
+    )
 
 
 def assert_rls_enabled(table_name: str, *, using: str = "default") -> None:
@@ -281,6 +324,23 @@ async def async_rls_as_tenant(
     """
     async with async_tenant_context(tenant_id, using=using):
         yield
+
+
+async def aassert_rls_enforced(*, using: str = "default") -> None:
+    """Async counterpart of :func:`assert_rls_enforced`.
+
+    Runs the sync assertion in one ``thread_sensitive`` ``sync_to_async`` hop,
+    so it checks the connection of the thread the hop lands on (see the testing
+    guide, "Async Tests").
+
+    Args:
+        using: Database alias. Default: ``"default"``.
+
+    Raises:
+        AssertionError: If the connection's current role is a superuser or has
+            ``BYPASSRLS``.
+    """
+    await sync_to_async(assert_rls_enforced, thread_sensitive=True)(using=using)
 
 
 async def aassert_rls_enabled(table_name: str, *, using: str = "default") -> None:

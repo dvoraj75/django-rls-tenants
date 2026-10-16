@@ -1,8 +1,8 @@
 """Tests demonstrating django-rls-tenants testing utilities.
 
-Shows how to use ``rls_bypass``, ``rls_as_tenant``, ``assert_rls_enabled``,
-``assert_rls_policy_exists``, and ``assert_rls_blocks_without_context``
-in a real project's test suite.
+Shows how to use ``rls_bypass``, ``rls_as_tenant``, ``assert_rls_enforced``,
+``assert_rls_enabled``, ``assert_rls_policy_exists``, and
+``assert_rls_blocks_without_context`` in a real project's test suite.
 
 Also demonstrates strict mode: when ``STRICT_MODE=True``, querying
 RLS-protected models without an active tenant context raises
@@ -15,12 +15,29 @@ from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.tenants.testing import (
     assert_rls_blocks_without_context,
     assert_rls_enabled,
+    assert_rls_enforced,
     assert_rls_policy_exists,
     rls_as_tenant,
     rls_bypass,
 )
 
 pytestmark = pytest.mark.django_db(transaction=True)
+
+
+# ── Connection role ────────────────────────────────────────────────
+
+
+class TestConnectionRole:
+    """Verify the tests run as a role PostgreSQL applies RLS to.
+
+    A superuser or ``BYPASSRLS`` role would make every test below pass
+    whether or not the policies work. CI connects as the plain role ``app``;
+    a run as a superuser is switched by the autouse ``enforce_rls`` fixture
+    in ``conftest.py``.
+    """
+
+    def test_rls_is_enforced_on_the_connection(self):
+        assert_rls_enforced()
 
 
 # ── Policy verification tests ──────────────────────────────────────
