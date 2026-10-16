@@ -21,14 +21,9 @@ from django.db import connections, transaction
 from django.utils.module_loading import import_string
 
 from django_rls_tenants.exceptions import RLSConfigurationError
-from django_rls_tenants.rls.guc import clear_guc, set_guc
-from django_rls_tenants.tenants.affinity import suspect_sessions, writing
+from django_rls_tenants.tenants.affinity import suspect_sessions, write_gucs
 from django_rls_tenants.tenants.conf import rls_tenants_config
-from django_rls_tenants.tenants.context import (
-    _context_gucs_of,
-    _resolve_user_guc_vars,
-    _writes_gucs,
-)
+from django_rls_tenants.tenants.context import _context_gucs_of, _resolve_user_guc_vars
 from django_rls_tenants.tenants.state import (
     _ContextGucsToken,
     _current_live,
@@ -256,11 +251,12 @@ def _is_authenticated(request: HttpRequest) -> bool:
     return hasattr(request, "user") and bool(request.user.is_authenticated)
 
 
-def _clear_alias_gucs(conf: RLSTenantsConfig, db_alias: str) -> None:
-    """Clear both GUCs on the thread's connection of ``db_alias``, and record it for the guard."""
-    with writing(db_alias, None):
-        clear_guc(conf.GUC_IS_ADMIN, using=db_alias)
-        clear_guc(conf.GUC_CURRENT_TENANT, using=db_alias)
+def _clear_alias_gucs(db_alias: str) -> None:
+    """Clear both GUCs on the thread's connection of ``db_alias`` in one statement.
+
+    ``write_gucs()`` records the clear for the GUC affinity guard.
+    """
+    write_gucs(connections[db_alias], None)
 
 
 def _clear_gucs_on_all_databases(conf: Any) -> None:
@@ -275,7 +271,7 @@ def _clear_gucs_on_all_databases(conf: Any) -> None:
     for db_alias in conf.DATABASES:
         # Best-effort cleanup: the connection may be dead.
         with suppress(Exception):
-            _clear_alias_gucs(conf, db_alias)
+            _clear_alias_gucs(db_alias)
 
 
 def _clear_gucs_on_open_databases(conf: RLSTenantsConfig) -> None:
@@ -292,7 +288,7 @@ def _clear_gucs_on_open_databases(conf: RLSTenantsConfig) -> None:
         if connections[db_alias].connection is None:
             continue
         with suppress(Exception):  # best-effort cleanup
-            _clear_alias_gucs(conf, db_alias)
+            _clear_alias_gucs(db_alias)
 
 
 def _clear_request_gucs(conf: RLSTenantsConfig) -> None:
@@ -311,7 +307,7 @@ def _clear_request_gucs(conf: RLSTenantsConfig) -> None:
         suspect_sessions()
         return
     for db_alias in conf.DATABASES:
-        _clear_alias_gucs(conf, db_alias)
+        _clear_alias_gucs(db_alias)
     logger.debug("Middleware cleared GUCs on databases=%s", conf.DATABASES)
 
 
@@ -740,35 +736,30 @@ class RLSTenantMiddleware(MiddlewareMixin):
     def _set_gucs_on_all_databases(guc_vars: dict[str, str], conf: Any) -> None:
         """Set GUC variables on all configured database aliases.
 
-        If setting GUCs on one database fails, clears all GUCs on
-        databases that were already set, then re-raises. With
-        ``USE_LOCAL_SET=True`` an alias whose connection is not inside
-        ``transaction.atomic()`` (any alias on the async path) is skipped: the GUC
-        affinity guard applies the request's values there, transaction-locally.
+        One ``set_config()`` statement per alias. If setting GUCs on one
+        database fails, clears all GUCs on databases that were already set,
+        then re-raises. With ``USE_LOCAL_SET=True`` nothing is written, in the
+        request transaction of the sync path too: the GUC affinity guard
+        applies the request's values transaction-locally before the first
+        statement that needs them (see ``context._writes_gucs()``).
 
         Args:
             guc_vars: Mapping of GUC names to values.
             conf: ``RLSTenantsConfig`` instance.
         """
+        if conf.USE_LOCAL_SET:
+            return
         completed_aliases: list[str] = []
         gucs = _context_gucs_of(guc_vars, conf)
-        is_local = conf.USE_LOCAL_SET
         try:
             for db_alias in conf.DATABASES:
-                if not _writes_gucs(db_alias, is_local=is_local):
-                    continue
-                with writing(db_alias, gucs, local=is_local):
-                    for guc_name, guc_value in guc_vars.items():
-                        if guc_value:
-                            set_guc(guc_name, guc_value, is_local=is_local, using=db_alias)
-                        else:
-                            clear_guc(guc_name, is_local=is_local, using=db_alias)
+                write_gucs(connections[db_alias], gucs)
                 completed_aliases.append(db_alias)
         except Exception:
             # Rollback GUCs on databases that were already set.
             for done_alias in completed_aliases:
                 with suppress(Exception):  # best-effort cleanup
-                    _clear_alias_gucs(conf, done_alias)
+                    _clear_alias_gucs(done_alias)
             raise
 
     @staticmethod

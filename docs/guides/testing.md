@@ -141,12 +141,13 @@ This function:
 1. Enters `admin_context()` to verify the table has at least one row (prevents
    vacuous passes on empty tables).
 2. Clears the admin and tenant GUCs on the `using` connection, counts the rows again and
-   restores the GUCs to their previous values (with `SET LOCAL` when
-   `USE_LOCAL_SET=True` inside `transaction.atomic()`). The restore happens before the
+   restores the GUCs to their previous values. The restore happens before the
    assertion, so the caller's context is intact even when the assertion fails. With
-   `USE_LOCAL_SET=True` outside `atomic()` (*1.4.0+*), the count runs with the
+   `USE_LOCAL_SET=True` on an alias in `RLS_TENANTS["DATABASES"]` (*1.4.0+* outside
+   `atomic()`, *1.5.0+* inside it), the count runs with the
    [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) seeing no context,
-   and the GUCs are cleared and restored on the session.
+   and the GUCs are cleared and restored on the session. On any other alias that mode uses
+   `SET LOCAL`, inside `transaction.atomic()`.
 3. Asserts that the second count is zero.
 
 Both counts are raw SQL on the model's table (`SELECT COUNT(*)`), not ORM queries. The

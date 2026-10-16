@@ -128,23 +128,20 @@ def _rls_state(tenant_id: int | str | None, gucs: ContextGucs) -> Iterator[None]
 def _writes_gucs(using: str, *, is_local: bool) -> bool:
     """Whether a context block entered on ``using`` writes the admin and tenant GUCs itself.
 
-    With session GUCs it always does. With ``USE_LOCAL_SET=True`` it does
-    inside ``transaction.atomic()``, where its ``SET LOCAL`` lasts as long as
-    the block needs it. Outside one there is no transaction to scope it to:
-    on an alias in ``RLS_TENANTS["DATABASES"]`` the block only sets the
-    ``ContextVar`` values, and the GUC affinity guard applies the context
-    transaction-locally to each statement (#96). On any other alias the write
-    is still attempted, and fails as before.
+    With session GUCs it always does. With ``USE_LOCAL_SET=True``, on an
+    alias in ``RLS_TENANTS["DATABASES"]``, it never does, inside
+    ``transaction.atomic()`` or not: the block only sets the ``ContextVar``
+    values, and the GUC affinity guard applies the context transaction-locally
+    before the first statement that needs it, in one ``set_config()``
+    statement, and again only when the context changes (#96, #137). On any
+    other alias the block writes ``SET LOCAL`` itself, which fails outside
+    ``transaction.atomic()``.
 
     Args:
         using: Database alias the block is entered on.
         is_local: Scope the block uses (``USE_LOCAL_SET``, read once).
     """
-    return (
-        not is_local
-        or connections[using].in_atomic_block
-        or using not in rls_tenants_config.DATABASES
-    )
+    return not is_local or using not in rls_tenants_config.DATABASES
 
 
 @contextmanager
@@ -155,16 +152,17 @@ def tenant_context(
 ) -> Iterator[None]:
     """Set RLS context to a specific tenant. Supports nesting.
 
-    The previous GUC values are saved on entry and restored on exit in both
-    GUC modes. With ``USE_LOCAL_SET=True`` the restore is issued with
-    ``SET LOCAL`` so an enclosing block keeps its database scope for the
-    rest of the transaction (see :func:`django_rls_tenants.rls.context.restore_gucs`
-    for the behaviour when the block exits with an aborted transaction).
-    Outside ``transaction.atomic()`` that mode writes nothing on entry or
-    exit: the GUC affinity guard sets the context's values
-    transaction-locally for each statement, giving a statement run in
-    autocommit a transaction of its own (see "GUC affinity guard" in the
-    architecture guide).
+    With session GUCs the previous values are saved on entry and restored on
+    exit (see :func:`django_rls_tenants.rls.context.restore_gucs` for the
+    behaviour when the block exits with an aborted transaction).
+    With ``USE_LOCAL_SET=True`` the block writes nothing on entry: the GUC
+    affinity guard sets the context's values transaction-locally before the
+    first statement that needs them, inside ``transaction.atomic()`` or not,
+    giving a statement run in autocommit a transaction of its own (see "GUC
+    affinity guard" in the architecture guide). On exit inside a transaction
+    the guard puts the enclosing context's values back, or clears them, right
+    away. On an alias outside ``RLS_TENANTS["DATABASES"]`` that mode writes and
+    restores with ``SET LOCAL``, so it needs ``transaction.atomic()``.
 
     Args:
         tenant_id: The tenant PK to scope queries to.
@@ -187,8 +185,9 @@ def tenant_context(
     is_local = conf.USE_LOCAL_SET
     writes = _writes_gucs(using, is_local=is_local)
 
-    # Save previous state for nesting support (both modes: a SET LOCAL made
-    # by an enclosing block is visible here and must be re-issued on exit).
+    # Save previous state for nesting support (a SET LOCAL made by an
+    # enclosing block on an unguarded alias is visible here and must be
+    # re-issued on exit).
     previous = _snapshot_gucs(conf, using=using) if writes else None
     session = _session_of(using)
     enclosing = _current_live()
@@ -230,10 +229,9 @@ def admin_context(
 ) -> Iterator[None]:
     """Set RLS context to admin mode. Supports nesting.
 
-    The previous GUC values are saved on entry and restored on exit in both
-    GUC modes, so an inner ``admin_context()`` never leaks the admin bypass
-    into the enclosing block (see :func:`tenant_context`, also for
-    ``USE_LOCAL_SET=True`` outside ``transaction.atomic()``).
+    The enclosing block's values come back on exit in both GUC modes, so an
+    inner ``admin_context()`` never leaks the admin bypass into the enclosing
+    block (see :func:`tenant_context`, also for ``USE_LOCAL_SET=True``).
 
     Args:
         using: Database alias the GUCs are written to on entry and restored on
@@ -250,7 +248,7 @@ def admin_context(
     is_local = conf.USE_LOCAL_SET
     writes = _writes_gucs(using, is_local=is_local)
 
-    # Save previous state for nesting support (both modes).
+    # Save previous state for nesting support.
     previous = _snapshot_gucs(conf, using=using) if writes else None
     session = _session_of(using)
     enclosing = _current_live()
@@ -333,11 +331,14 @@ def _restore_tenant_gucs(
     outlive the block there), and the values are left unknown, so the guard
     applies the current context before the next statement.
 
-    A block that wrote nothing on entry (``USE_LOCAL_SET=True`` outside
-    ``transaction.atomic()``, see :func:`_writes_gucs`) has nothing to restore:
-    the guard set its values transaction-locally, so they ended with their
-    transactions. Only a transaction still open (``AUTOCOMMIT=False``) may
-    hold them, and every configured alias is settled. With
+    A block that wrote nothing on entry (``USE_LOCAL_SET=True`` on an alias
+    in ``RLS_TENANTS["DATABASES"]``, see :func:`_writes_gucs`) has nothing to
+    restore: the guard set its values transaction-locally, so those set in
+    the block's own transactions have ended with them. A transaction still
+    open (``transaction.atomic()``, ``AUTOCOMMIT=False``) may hold them, so
+    every configured alias is settled: one ``set_config()`` statement each
+    where the block's values are still in force, which puts the enclosing
+    context's values back or clears them. With
     ``USE_LOCAL_SET=True`` the values the sessions hold for themselves then
     count as unknown (``affinity.suspect_sessions()``): code in the block may
     have written them for the session.
@@ -418,8 +419,8 @@ def _enter_tenant_gucs(
     connection to the enclosing context's values (the hop holds a copy of the
     coroutine's ``ContextVar`` values, which the block has not changed yet),
     so the snapshot holds those values, as in :func:`_snapshot_gucs`. With
-    ``USE_LOCAL_SET=True`` outside ``transaction.atomic()`` it writes nothing
-    (see :func:`_writes_gucs`).
+    ``USE_LOCAL_SET=True`` on an alias in ``RLS_TENANTS["DATABASES"]`` it
+    writes nothing (see :func:`_writes_gucs`).
 
     Args:
         variables: Mapping of GUC name to the value to set.
@@ -481,15 +482,15 @@ async def async_tenant_context(
     (with sync or async blocks) and the restore in both GUC modes behave as
     in :func:`tenant_context`.
 
-    **USE_LOCAL_SET.** A coroutine cannot open ``transaction.atomic()``, so
-    with ``USE_LOCAL_SET=True`` the hop thread is usually in autocommit: the
-    block then writes nothing, and the GUC affinity guard sets its values
-    transaction-locally for each statement, in a transaction of its own (see
-    :func:`tenant_context`). When the coroutine is driven by
-    ``async_to_sync`` from synchronous code inside ``atomic()``, the block
-    writes ``SET LOCAL`` values into that transaction, as the sync manager
-    does. On an alias outside ``RLS_TENANTS["DATABASES"]``, which the guard
-    leaves alone, it needs that transaction and raises
+    **USE_LOCAL_SET.** With ``USE_LOCAL_SET=True`` the block writes nothing:
+    the GUC affinity guard sets its values transaction-locally before the
+    statements that need them (see :func:`tenant_context`). A coroutine
+    cannot open ``transaction.atomic()``, so the hop thread is usually in
+    autocommit, and each statement gets a transaction of its own; when the
+    coroutine is driven by ``async_to_sync`` from synchronous code inside
+    ``atomic()``, the guard sets the values in that transaction. On an alias
+    outside ``RLS_TENANTS["DATABASES"]``, which the guard leaves alone, the
+    block writes ``SET LOCAL`` itself: it needs that transaction and raises
     :class:`RLSConfigurationError` without one.
 
     **Concurrent tasks.** Sibling tasks of one request (for example under

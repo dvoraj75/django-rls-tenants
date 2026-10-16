@@ -341,11 +341,12 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         and dropped, and the rollback undoes the change (see
         :func:`django_rls_tenants.rls.context.restore_gucs`).
 
-        With ``USE_LOCAL_SET=True`` outside ``transaction.atomic()``, steps 1,
-        2 and 4's restore are skipped on an alias in
-        ``RLS_TENANTS["DATABASES"]``: the GUC affinity guard sets the user's
-        values transaction-locally for each statement (see
-        ``context._writes_gucs()``).
+        With ``USE_LOCAL_SET=True``, steps 1, 2 and 4's restore are skipped on
+        an alias in ``RLS_TENANTS["DATABASES"]``, inside
+        ``transaction.atomic()`` or not: the GUC affinity guard sets the
+        user's values transaction-locally before the first statement that
+        needs them, and on exit inside a transaction it puts the enclosing
+        values back (see ``context._writes_gucs()``).
 
         The alias is resolved once and pinned on the queryset for the
         duration of the scope, so Django runs the SQL where the GUCs were
@@ -381,8 +382,8 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         if using is None:
             using = self._db_for_write() if for_write else self.db
         variables = _resolve_user_guc_vars(user, conf)
-        # Decided before the transaction below opens: on an alias the guard
-        # covers, it writes the values once, inside that transaction.
+        # False with USE_LOCAL_SET on an alias the guard covers: the guard writes
+        # the values (for own_transaction, once, inside the transaction below).
         writes = _writes_gucs(using, is_local=is_local)
         transaction_block = (
             transaction.atomic(using=using, savepoint=False)

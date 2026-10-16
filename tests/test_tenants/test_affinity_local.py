@@ -27,6 +27,7 @@ from django.db import (
     transaction,
 )
 from django.db.backends.postgresql.psycopg_any import sql as psycopg_sql
+from django.http import HttpResponse
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 
@@ -459,7 +460,8 @@ class TestAutocommit:
 
         In session mode the context's exit restores the GUCs; here the
         session's own values count as unknown once the context ends, and the
-        next statement outside a context clears them.
+        next statement outside a context clears them. In a transaction the
+        exit's settle clears them already, for the session (#137).
         """
 
         def inside():
@@ -475,7 +477,10 @@ class TestAutocommit:
                 inside()
         else:
             inside()
-        assert session_gucs() != _NO_GUCS  # control: the write outlived the context
+        if transaction_open:
+            assert session_gucs() == _NO_GUCS
+        else:
+            assert session_gucs() != _NO_GUCS  # control: the write outlived the context
         assert _products() == []
         assert session_gucs() == _NO_GUCS
 
@@ -615,10 +620,12 @@ class TestInATransaction:
             assert _guard_statements(queries) == []
 
     def test_block_entered_in_a_transaction_restores_on_exit(self, tenant_a, tenant_b):
+        """The block writes nothing; its exit puts the enclosing values back right away (#137)."""
         with tenant_context(tenant_a.pk), transaction.atomic():
             assert _gucs() == _read_as(tenant_a)
             with tenant_context(tenant_b.pk):
-                assert session_gucs() == _read_as(tenant_b)
+                assert session_gucs() == _read_as(tenant_a)  # nothing written on entry
+                assert _gucs() == _read_as(tenant_b)
             assert session_gucs() == _read_as(tenant_a)
 
     def test_autocommit_off_without_atomic(self, tenant_a):
@@ -714,6 +721,128 @@ class TestInATransaction:
             cursor.execute("COMMIT")
             assert session_gucs() == _NO_GUCS
         _assert_cleared_after_a_context()
+
+
+@pytest.mark.django_db(transaction=True)
+class TestBlocksInATransaction:
+    """Inside ``atomic()`` a block writes nothing: the guard sets its values when needed (#137).
+
+    Each test lists the statements a shape sends, ``BEGIN`` and ``COMMIT``
+    included, with ``SET`` for one ``set_config()`` pair. Before #137 the
+    blocks read both GUCs and wrote them on entry, and wrote them again on
+    exit: 13, 15, 23 and 24 statements for the first four shapes. A block's
+    exit still settles the values right away (the last ``SET``), so SQL that
+    bypasses Django's cursor never sees them after the block.
+    """
+
+    @staticmethod
+    def _shape(queries):
+        """Each captured statement as ``SET``, ``COUNT``, or its SQL (``BEGIN``, ``COMMIT``)."""
+        shape = []
+        for sql in _logged(queries):
+            if sql.count("SET_CONFIG(") > 1:
+                shape.append("SET")
+            elif sql.startswith("SELECT COUNT("):
+                shape.append("COUNT")
+            else:
+                shape.append(sql)
+        return shape
+
+    def _run_in_atomic(self, func):
+        """Run ``func`` in ``transaction.atomic()``; return its result and its statements."""
+        _gucs()  # settles the connection, so only the shape's statements are counted
+        with CaptureQueriesContext(connection) as queries, transaction.atomic():
+            result = func()
+        return result, self._shape(queries)
+
+    def test_one_block(self, sample_orders, tenant_a, enforce_rls):
+        def shape():
+            with tenant_context(tenant_a.pk):
+                return [Order.objects.count() for _ in range(5)]
+
+        assert self._run_in_atomic(shape) == (
+            [2] * 5,
+            ["BEGIN", "SET", *["COUNT"] * 5, "SET", "COMMIT"],
+        )
+
+    def test_nested_block_with_the_same_values(self, sample_orders, tenant_a, enforce_rls):
+        def shape():
+            with tenant_context(tenant_a.pk), tenant_context(tenant_a.pk):
+                return Order.objects.count()
+
+        assert self._run_in_atomic(shape) == (2, ["BEGIN", "SET", "COUNT", "SET", "COMMIT"])
+
+    def test_for_user(self, sample_orders, tenant_a_user, enforce_rls):
+        def shape():
+            return [Order.objects.for_user(tenant_a_user).count() for _ in range(3)]
+
+        assert self._run_in_atomic(shape) == (
+            [2] * 3,
+            ["BEGIN", *["SET", "COUNT", "SET"] * 3, "COMMIT"],
+        )
+
+    def test_nested_blocks(self, sample_orders, tenant_a, tenant_b, enforce_rls):
+        def shape():
+            with tenant_context(tenant_a.pk):
+                counts = [Order.objects.count()]
+                with tenant_context(tenant_b.pk):
+                    counts.append(Order.objects.count())
+                with admin_context():
+                    counts.append(Order.objects.count())
+                counts.append(Order.objects.count())
+                return counts
+
+        assert self._run_in_atomic(shape) == (
+            [2, 1, 3, 2],
+            [
+                "BEGIN",
+                *["SET", "COUNT"] * 2,  # A, then B
+                "SET",  # B's exit puts A back
+                *["SET", "COUNT"] * 2,  # admin, then A again
+                "SET",  # A's exit clears
+                "COMMIT",
+            ],
+        )
+
+    def test_for_user_inside_a_block_with_its_values(self, sample_orders, tenant_a_user, tenant_a):
+        def shape():
+            with tenant_context(tenant_a.pk):
+                return Order.objects.for_user(tenant_a_user).count()
+
+        _, shape_ = self._run_in_atomic(shape)
+        assert shape_ == ["BEGIN", "SET", "COUNT", "SET", "COMMIT"]
+
+    def test_middleware_request_transaction(self, sample_orders, tenant_a_user, enforce_rls):
+        """The sync path's request transaction gets the values once, before the view's query."""
+        middleware = RLSTenantMiddleware(
+            get_response=lambda request: HttpResponse(str(Order.objects.count())),
+        )
+        _gucs()
+
+        with CaptureQueriesContext(connection) as queries:
+            response = middleware(_request_for(tenant_a_user))
+
+        assert response.content == b"2"
+        assert self._shape(queries) == ["BEGIN", "SET", "COUNT", "COMMIT"]
+
+    def test_savepoint_rolled_back_inside_a_block(self, sample_orders, tenant_a, tenant_b):
+        """A block left by an exception in a savepoint: the enclosing values are back."""
+        seen = []
+
+        def read_as_b_then_fail():
+            with tenant_context(tenant_b.pk):
+                seen.append(_gucs())
+                raise _Failed
+
+        with tenant_context(tenant_a.pk), transaction.atomic():
+            assert _gucs() == _read_as(tenant_a)
+            with pytest.raises(_Failed), transaction.atomic():
+                read_as_b_then_fail()
+            assert seen == [_read_as(tenant_b)]
+            assert session_gucs() == _read_as(tenant_a)
+            with CaptureQueriesContext(connection) as queries:
+                assert _gucs() == _read_as(tenant_a)
+            assert _guard_statements(queries) == []
 
 
 @pytest.mark.django_db(transaction=True)

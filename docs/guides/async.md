@@ -267,9 +267,10 @@ async with async_tenant_context(tenant_id):     # writes nothing with USE_LOCAL_
 A few more consequences:
 
 - **Code driven by `async_to_sync` from inside `transaction.atomic()`** runs its hops on the
-  calling thread, in that transaction. The async managers then write `SET LOCAL` values
-  into it, as the sync ones do (see
-  [`USE_LOCAL_SET=True` in async code](context-managers.md#use_local_settrue-in-async-code)).
+  calling thread, in that transaction. The async managers write nothing there either (since
+  1.5.0; before, they wrote `SET LOCAL` values into it): the guard sets the values in that
+  transaction, as for the sync ones (see
+  [`USE_LOCAL_SET=True` in async code](context-managers.md#async-code)).
 - **`thread_sensitive=False` work is outside your transaction.** It runs on another
   connection, so it does not see the transaction's uncommitted rows. With
   `USE_LOCAL_SET=True` each of its statements gets a transaction of its own.

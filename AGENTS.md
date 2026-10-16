@@ -138,8 +138,9 @@ copied context to that thread's statements (#41). Code that sets the flag from a
 different thread than the one that set the GUCs must pass that thread's marker (the
 async path takes it from the enter hop); `_mark_gucs_set()` alone marks the current
 thread. The safety-net `request_finished` handler clears GUCs on all configured aliases,
-and ends the guard's context. The sync `__call__` also cleans up when a `BaseException`
-skips `process_response`.
+and ends the guard's context. In session mode the middleware sets and clears both GUCs
+with one `write_gucs()` statement per alias (#137), and so does the safety net. The sync
+`__call__` also cleans up when a `BaseException` skips `process_response`.
 
 On an alias with `OPTIONS["pool"]` (Django's psycopg pool, `_is_pooled()` in `apps.py`),
 Django sends `connection_created` on every checkout, and the handler first clears every
@@ -208,12 +209,22 @@ have written the GUCs for the session and nothing restores them. It runs from
 marks a connection's session the same way after a statement that ran under local values
 (in its own transaction, or in a transaction with `wrote_local`), which reaches
 connections of other threads that no block exit reaches. In a transaction the mark takes
-effect at the commit. The context managers, `_rls_scope()` and the
-middleware write nothing outside `transaction.atomic()` on a configured alias
-(`context._writes_gucs()`, which `_rls_scope()` decides before its own transaction opens;
-the restore then gets `previous=None` and only settles), and the middleware's async path
-opens no request transaction. `ready()` calls `_guard_open_connections()` so connections
-opened earlier get the guard (`guard_open_connection()`). The `ContextVar` holds a
+effect at the commit. With `USE_LOCAL_SET=True` the context managers, `_rls_scope()` and
+the middleware write nothing on a configured alias, inside `transaction.atomic()` or not
+(#137; `context._writes_gucs()` is `not is_local or alias not in conf.DATABASES`, and
+`_rls_scope()` decides it before its own transaction opens): the guard applies the values
+(one `set_config()`, both GUCs) before the first statement that needs them, and again
+only when the context changes. The restore then gets `previous=None` and only settles:
+`settle_other_aliases(None)` puts the enclosing context's values back (transaction-local),
+or clears for the session when there is none, with one `set_config()` on each configured
+alias whose session still holds the block's values, while a transaction is open. So SQL
+past Django's cursor never sees a block's values after the block, but inside a block,
+until its first cursor statement, it sees the enclosing values (or none); and a
+session-level write of the GUCs inside a block in `atomic()` does not survive a block
+with no enclosing context. The middleware's async path opens no request transaction; the
+sync path's (#95) holds no writes of the middleware's. `ready()` calls
+`_guard_open_connections()` so connections opened earlier get the guard
+(`guard_open_connection()`). The `ContextVar` holds a
 `_Live` holder that `_reset_context_gucs()` / `_clear_context_gucs()` end for every copy,
 so a hop or task inherits a context only while its block is live. `_reset_context_gucs()`
 also ends a newer holder left current in its place, and the current one for a token used
@@ -314,8 +325,10 @@ and never across a `yield`. A queryset with cached results must skip both the sc
 `own_transaction=True`, so their `SET LOCAL` lands in that transaction (on a configured
 alias with `USE_LOCAL_SET=True` the scope writes nothing in it and the guard sets the
 values there, one `set_config()`, and takes them off at the scope's exit). With
-`USE_LOCAL_SET=True` outside `transaction.atomic()` on a configured alias the scope only
-sets the `ContextVar`s, and the GUC affinity guard applies the user's values per statement.
+`USE_LOCAL_SET=True` on a configured alias, inside `transaction.atomic()` or not (#137),
+the scope only sets the `ContextVar`s, and the GUC affinity guard applies the user's values
+per statement (autocommit) or once per transaction and context change. Only an alias outside
+`conf.DATABASES` still snapshots, writes `SET LOCAL` and restores.
 
 ### Async Middleware Path
 

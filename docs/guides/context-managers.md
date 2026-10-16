@@ -91,12 +91,14 @@ with admin_context():
     assert Order.objects.count() == all_count
 ```
 
-Save and restore happen in **both** GUC modes. With `USE_LOCAL_SET=True` inside
-`transaction.atomic()`, the previous values are re-issued with `SET LOCAL` when the inner
-block exits, so the enclosing block keeps its own scope for the rest of the transaction;
-PostgreSQL then drops everything at `COMMIT` / `ROLLBACK` as usual. Outside `atomic()` the
-blocks write nothing and restore nothing (see
-[below](#use_local_settrue-outside-a-transaction)).
+The enclosing block's values come back in **both** GUC modes. With session GUCs the inner
+block snapshots the previous values and writes them back on exit. With `USE_LOCAL_SET=True`
+on an alias in `RLS_TENANTS["DATABASES"]` the blocks write nothing on entry, inside
+`transaction.atomic()` or not, and the GUC affinity guard applies whichever context is
+active (see [below](#use_local_settrue-and-transactions)); PostgreSQL drops the
+transaction-local values at `COMMIT` / `ROLLBACK` as usual. *Changed in 1.5.0:* before,
+inside `atomic()` this mode snapshotted, wrote with `SET LOCAL` on entry and re-issued the
+previous values with `SET LOCAL` on exit.
 
 !!! warning "Before 1.3.2"
     With `USE_LOCAL_SET=True`, versions up to 1.3.1 did not restore on block exit at all.
@@ -131,21 +133,19 @@ with transaction.atomic(), tenant_context(tenant_id=1):
     Order.objects.count()
 ```
 
-## `USE_LOCAL_SET=True` Outside a Transaction
+## `USE_LOCAL_SET=True` and Transactions
 
-*Changed in 1.4.0.* `SET LOCAL` needs a transaction. Inside `transaction.atomic()` the
-managers behave as described above: they snapshot, `SET LOCAL` on entry and restore on
-exit. Outside `atomic()`, on an alias in `RLS_TENANTS["DATABASES"]`, they no longer raise
-`RuntimeError`. They write nothing on entry or exit and only set the Python-side context
-(if a transaction is still open at exit, from `AUTOCOMMIT=False` or an SQL `BEGIN`, the
-exit may send one `set_config()` statement that puts the enclosing context's values back,
-or clears them for the session when there is none). The
+*Changed in 1.4.0 outside `atomic()`, in 1.5.0 inside it.* `SET LOCAL` needs a
+transaction. On an alias in `RLS_TENANTS["DATABASES"]` the managers do not use it: they
+write nothing on entry, inside `transaction.atomic()` or not, and only set the Python-side
+context. Before 1.4.0 they raised `RuntimeError` outside `atomic()`; before 1.5.0 they
+wrote `SET LOCAL` values inside it. The
 [GUC affinity guard](../advanced/architecture.md#guc-affinity-guard)
-applies the values to each statement, transaction-locally: in a transaction of its own for
-a statement run in autocommit (`BEGIN`, the `set_config()` statement, your statement,
-`COMMIT`: three extra round trips), and once per transaction for a transaction opened
-inside the block. Celery tasks, management commands and scripts therefore need no
-`transaction.atomic()`:
+applies the values transaction-locally, both GUCs in one `set_config()` statement: in a
+transaction of its own for a statement run in autocommit (`BEGIN`, the `set_config()`
+statement, your statement, `COMMIT`: three extra round trips), and once per transaction,
+before the first statement that needs them, in a transaction that is open already. Celery
+tasks, management commands and scripts therefore need no `transaction.atomic()`:
 
 ```python
 with tenant_context(tenant_id=42):  # no atomic() needed
@@ -154,12 +154,15 @@ with tenant_context(tenant_id=42):  # no atomic() needed
 
 Put a batch of statements in one `transaction.atomic()` when the round trips matter.
 Opened inside the block, it costs one `set_config()` per transaction. Opened around the
-block, the block writes its own GUCs: two `current_setting()` reads and two `SET LOCAL`
-statements on entry, two `SET LOCAL` statements on exit. The guard sends none for it while
-its tracker is clean (a test transaction, the first such block after a statement run
-outside any context); after an earlier context has ended on that connection it first
-clears the session's values, one more statement, and a loop that enters `atomic()` and a
-context on every iteration pays it every time. The same holds for `admin_context()`,
+block, the block costs one `set_config()` before its first statement and, when it exits
+with the transaction still open, one more: the guard puts the enclosing context's values
+back, or clears them for the session when there is none, so SQL that bypasses Django's
+cursor (a driver cursor, `callproc()`) never sees a block's values after it. Before 1.5.0
+this was about six small statements per block (two `current_setting()` reads and two
+`SET LOCAL` statements on entry, two on exit). After an earlier context has ended on that
+connection the guard first clears the session's values, one more statement, and a loop
+that enters `atomic()` and a context on every iteration pays it every time. The same
+holds for `admin_context()`,
 `@with_rls_context`, the `for_user()` scope and the testing helpers. When a block ends,
 what the session holds for itself counts as unknown, and the next statement run outside any
 context, in autocommit or in a transaction, clears it first (one statement), in case code
@@ -169,9 +172,19 @@ context in autocommit: the guard's values override it, so change the context wit
 Transaction](connection-pooling.md#code-outside-a-request-transaction) for the cost by
 placement, the query counts, and where the guard stops.
 
+One limit comes with writing nothing on entry (since 1.5.0 inside `atomic()` too): inside
+a block, until its first statement through Django's cursor, SQL that bypasses it (a
+driver cursor, `callproc()`, the `FETCH` of an already open server-side cursor) sees the
+enclosing context's values, or none, not the block's. Run one ORM query first if such SQL
+needs the block's values. Code in a block that
+writes the admin or tenant GUC for the session (`set_guc()`, `rls_context()` without
+`is_local=True`) inside `atomic()` also loses that write when the block exits with no
+enclosing context: the exit clears both GUCs for the session.
+
 On an alias outside `RLS_TENANTS["DATABASES"]`, which the guard leaves alone, nothing
-changes: a block entered outside `atomic()` still raises `RuntimeError` ("Cannot use SET
-LOCAL for ... outside a transaction"), and the async managers raise `RLSConfigurationError`.
+changes: the managers snapshot, write `SET LOCAL` on entry and restore on exit, so a block
+entered outside `atomic()` still raises `RuntimeError` ("Cannot use SET LOCAL for ...
+outside a transaction"), and the async managers raise `RLSConfigurationError`.
 
 ## Async Code
 
@@ -218,7 +231,7 @@ event-loop thread raises `SynchronousOnlyOperation`), so the thread that runs th
 calls is normally in autocommit. With `USE_LOCAL_SET=True` the async managers write
 nothing there: they set the Python-side context, and the GUC affinity guard gives each
 statement the context in a transaction of its own (see
-[`USE_LOCAL_SET=True` Outside a Transaction](#use_local_settrue-outside-a-transaction)).
+[`USE_LOCAL_SET=True` and Transactions](#use_local_settrue-and-transactions)).
 That works in an ASGI request, a bare event loop and a script run with `asyncio.run()`:
 
 ```python
@@ -227,15 +240,16 @@ async with async_tenant_context(tenant_id):  # no atomic() needed
 ```
 
 When the coroutine is driven by `async_to_sync` from synchronous code that is already
-inside `transaction.atomic()`, the managers write `SET LOCAL` values into that
-transaction, as the sync managers do:
+inside `transaction.atomic()`, the managers still write nothing: the guard sets the values
+in that transaction, as it does for the sync managers (*changed in 1.5.0*; before, the
+managers wrote `SET LOCAL` values there):
 
 ```python
 from asgiref.sync import async_to_sync
 from django.db import transaction
 
 with transaction.atomic():
-    async_to_sync(do_tenant_work)()   # async_tenant_context() inside sets SET LOCAL
+    async_to_sync(do_tenant_work)()   # the guard sets the values in this transaction
 ```
 
 On an alias outside `RLS_TENANTS["DATABASES"]`, which the guard leaves alone, the async
