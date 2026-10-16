@@ -18,7 +18,8 @@ places: a management command, a shell session, a Celery task, a test, or a reque
 an unauthenticated user.
 
 **Fix:** Establish a context around the code: `tenant_context(tenant_id)` or
-`admin_context()`, `.for_user(user)` on the queryset, or `RLSTenantMiddleware` for
+`admin_context()` (for an existing management command, run it through
+[`run_as_tenant` or `run_for_all_tenants`](guides/management-commands.md#run_as_tenant)), `.for_user(user)` on the queryset, or `RLSTenantMiddleware` for
 requests. While developing, set `STRICT_MODE=True` so this surfaces as a
 `NoTenantContextError` instead of an empty result. Before 1.4.0, `count()`, `exists()`,
 `iterator()` and the writes of a `.for_user()` queryset also returned nothing outside a

@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`run_as_tenant` and `run_for_all_tenants` management commands** (#111). Run any
+  management command (a nightly report, a re-index, a per-tenant data fix, a backfill)
+  inside the right RLS context without writing context handling into it.
+  `manage.py run_as_tenant --tenant acme --lookup slug my_report --since 2026-01-01`
+  looks the tenant up (by `pk`, or by any field or ORM lookup with `--lookup`) and calls
+  the command inside `tenant_context()`; `--admin` uses `admin_context()` instead.
+  `manage.py run_for_all_tenants my_report` runs it once per tenant, in primary key order,
+  each in its own context, narrowed with repeatable `--filter field=value` lookups. It
+  prints a header, the command's output and an `OK`/`FAILED` line with the time per
+  tenant, then a summary. A tenant that fails does not stop the others (`--fail-fast`
+  does), and the command exits with status 1 when any failed. `--json` prints one object
+  per tenant (status, error, traceback and the command's captured output) for a scheduler
+  to parse. `--parallel N` runs tenants in `N` spawned worker processes, each with its own
+  connections, so workers only see committed rows and a settings module is required.
+  `--database` picks the alias and is passed on to commands that declare the option.
+  Both work under `STRICT_MODE`. See the
+  [Management Commands guide](https://dvoraj75.github.io/django-rls-tenants/guides/management-commands/).
+  The example project gains a `note_report` command to run through them.
 - **Django REST Framework integration** (#43). A new optional `drf` extra
   (`pip install "django-rls-tenants[drf]"`, `djangorestframework>=3.16`) adds `django_rls_tenants.contrib.drf`
   (not re-exported from the top-level package). DRF authenticates inside the view,

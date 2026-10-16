@@ -37,6 +37,7 @@ the [Security Model](advanced/security.md) for what that does and does not cover
 - **Tenant-aware Django admin** -- `RLSTenantModelAdmin` scopes changelists, forms, and related dropdowns to the current tenant, with a tenant switcher for cross-tenant admins. See the [Admin guide](guides/admin.md).
 - **Native Celery integration** -- `@rls_task` carries the active tenant context from enqueue to the worker, across chains, groups, and chords. See the [Celery Tasks guide](guides/celery-tasks.md).
 - **Django REST Framework integration** -- `RLSTenantAPIViewMixin` opens the RLS context after DRF authenticates the user (token and JWT clients included, which the middleware cannot see), `RLSTenantPermission` refuses a view that runs outside it, and `RLSTenantModelSerializer` fills the tenant FK from it. See the [Django REST Framework guide](guides/drf.md).
+- **Per-tenant management commands** -- `run_as_tenant` runs any management command inside one tenant's context and `run_for_all_tenants` runs it once per tenant, with filters, `--parallel`, `--json` output and a failure summary. See the [Management Commands guide](guides/management-commands.md#run_as_tenant).
 - **Raw SQL helpers** -- `safe_tenant_sql()` builds a tenant-filter predicate; `current_tenant_value_sql()` returns the current tenant ID expression for inserts and projections. Both reuse the expressions used by RLS policies. See the [Raw SQL guide](guides/raw-sql.md).
 - **Clean internal layering** -- generic `rls/` primitives separate from `tenants/` conveniences.
 - **Configurable escape hatches** -- bypass flags for authentication, admin, migrations.
@@ -50,6 +51,7 @@ the [Security Model](advanced/security.md) for what that does and does not cover
 | Expose the tenant on my `User` model | [User Integration](guides/user-integration.md) |
 | Set the tenant context for every request | [Middleware](guides/middleware.md) |
 | Set the context in a script or management command | [Context Managers](guides/context-managers.md) |
+| Run a management command as one tenant, or for every tenant | [`run_as_tenant` / `run_for_all_tenants`](guides/management-commands.md#run_as_tenant) |
 | Run a Celery task under the right tenant | [Celery Tasks](guides/celery-tasks.md) |
 | Scope a DRF API to the user's tenant | [Django REST Framework](guides/drf.md) |
 | Use the tenant context in an async view or consumer | [Async Code](guides/context-managers.md#async-code) |
@@ -62,7 +64,7 @@ the [Security Model](advanced/security.md) for what that does and does not cover
 | Run behind PgBouncer, with Django's connection pool or with persistent connections | [Connection Pooling](guides/connection-pooling.md) |
 | Deploy on an ASGI server (Uvicorn, Daphne, Hypercorn) | [Async Deployment](guides/async.md) |
 | Index tables so RLS stays fast | [Performance & Indexing](guides/performance.md) |
-| Verify the policies are really in the database | [Management Commands](guides/management-commands.md) |
+| Verify the policies are really in the database | [`check_rls`](guides/management-commands.md#check_rls) |
 | Migrate an existing app or another multitenancy library | [Migration Guide](advanced/migration-guide.md) |
 | Understand what RLS does and does not guarantee | [Security Model](advanced/security.md) |
 | Fix something that is wrong right now | [Troubleshooting](troubleshooting.md) |
