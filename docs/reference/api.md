@@ -192,9 +192,15 @@ the tenant switcher, and the middleware interaction.
 
 ### Testing
 
+The `enforce_rls` pytest fixtures and the `rls_role` / `rls_role_aliases` ini options come
+from the pytest plugin the package registers; see
+[Enforcing RLS in Tests](../guides/testing.md#enforcing-rls-in-tests).
+
 ::: django_rls_tenants.tenants.testing.rls_bypass
 
 ::: django_rls_tenants.tenants.testing.rls_as_tenant
+
+::: django_rls_tenants.tenants.testing.assert_rls_enforced
 
 ::: django_rls_tenants.tenants.testing.assert_rls_enabled
 
@@ -210,6 +216,8 @@ coroutine; see [Async Tests](../guides/testing.md#async-tests).
 ::: django_rls_tenants.tenants.testing.async_rls_bypass
 
 ::: django_rls_tenants.tenants.testing.async_rls_as_tenant
+
+::: django_rls_tenants.tenants.testing.aassert_rls_enforced
 
 ::: django_rls_tenants.tenants.testing.aassert_rls_enabled
 

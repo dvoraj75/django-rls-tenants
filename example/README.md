@@ -249,7 +249,7 @@ example/
 │                        seed command, committed migrations (0001_initial.py
 │                        carries the RLS policy DDL)
 └── tests/               Example tests using django-rls-tenants testing utilities
-    ├── conftest.py      Fixtures using rls_bypass for test data setup
+    ├── conftest.py      Autouse enforce_rls fixture; rls_bypass test data setup
     ├── test_admin.py    RLSTenantModelAdmin scoping, FK hiding and switcher tests
     ├── test_rls.py      RLS policy verification and tenant isolation tests
     ├── test_seed_demo.py  Seeded staff account and idempotent re-seeding tests
@@ -271,6 +271,12 @@ cd example/
 pip install pytest pytest-django
 python -m pytest tests/ -v
 ```
+
+An autouse `enforce_rls` fixture (`tests/conftest.py`, from django-rls-tenants' pytest
+plugin, which installing the library registers) switches the test connection to a plain
+role with `SET ROLE` when it is a superuser, so the tests also pass as the Docker
+superuser `demo`. It changes only the tests: the app itself must still connect as a plain
+role (see "Database-level proof" in What to Try, and `W005`).
 
 ## Local Development (without Docker)
 

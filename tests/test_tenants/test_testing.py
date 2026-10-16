@@ -97,13 +97,13 @@ def strict_mode(request):
 
 
 @pytest.fixture
-def myco_admin_policy(request, _rls_role, db):
+def myco_admin_policy(request, rls_role, db):
     """Add a ``test_order`` policy that admits every row while ``myco.is_admin`` is ``'true'``.
 
     The policy is created inside the test transaction (the rollback drops it)
     as the connecting role, a superuser or the table owner. ``enforce_rls``
     is entered only afterwards, because the RLS test role may not create
-    policies; ``_rls_role`` comes first so that the role is created outside
+    policies; ``rls_role`` comes first so that the role is created outside
     the test transaction, where the rollback cannot drop it.
     """
     with connection.cursor() as cur:

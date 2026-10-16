@@ -61,9 +61,13 @@ environment: installing psycopg 3 switches Django's driver for the whole process
 **Plain-role rule.** CI's `test-plain-role` job runs the whole library suite as a
 non-superuser role (`-m "not superuser_only"`). A superuser bypasses RLS, so any test that
 asserts database-level filtering (including `for_user()` results) must request the
-`enforce_rls` fixture: it switches a superuser connection to a plain role and is a no-op
-on one. Rows a test needs must be created inside `admin_context()` / `tenant_context()`,
-since a plain role cannot insert them without a context.
+`enforce_rls` fixture: it switches a `SUPERUSER` / `BYPASSRLS` connection to a plain role
+with `SET ROLE` and is a no-op on a plain one. `enforce_rls`, `rls_role` and
+`enforce_rls_on_other_threads` come from the shipped plugin
+`django_rls_tenants/pytest_plugin.py` (#97; see Architecture), which the suite dogfoods:
+`tests/conftest.py` only adds `replica` and `pooled`, built on `rls_role`. Rows a test needs
+must be created inside `admin_context()` / `tenant_context()`, since a plain role cannot
+insert them without a context.
 
 ### Test Organization
 
@@ -71,6 +75,7 @@ since a plain role cannot insert them without a context.
 tests/
 ├── conftest.py              # shared fixtures
 ├── settings.py              # Django settings for test suite
+├── test_pytest_plugin.py    # the shipped pytest plugin (fixtures, ini options)
 ├── test_rls/                # unit tests for rls/ layer
 ├── test_tenants/            # unit tests for tenants/ layer
 ├── test_integration/        # end-to-end tests (marked @pytest.mark.integration)
@@ -91,6 +96,15 @@ The library has two internal layers with a strict import boundary:
   psycopg connection pool, and the single statement that clears every GUC the policies
   read (used by the `connection_created` handler too). `settings.py` imports it before
   Django is set up, so it must not import `tenants/` at module level.
+- **`django_rls_tenants/pytest_plugin.py`** — the shipped pytest plugin (#97): the
+  `rls_role`, `enforce_rls` and `enforce_rls_on_other_threads` fixtures and the `rls_role` /
+  `rls_role_aliases` ini options, registered through `[project.entry-points.pytest11]`
+  (`django_rls_tenants`) in `pyproject.toml`, so it loads in every pytest run where the
+  package is installed (`-p no:django_rls_tenants` opts out). pytest imports it at startup,
+  before Django settings exist, and `tenants/__init__.py` imports models, so it sits at the
+  package root and **must not import Django or the rest of the package at module level**
+  (imports go inside the fixtures). Its twin in `tenants/testing.py` is
+  `assert_rls_enforced()` / `aassert_rls_enforced()`.
 
 This boundary is enforced by `tests/test_layering.py`. Never import from `tenants/` in `rls/`.
 
@@ -527,7 +541,9 @@ does not ship, so `pyproject.toml` excludes it from the sdist.
 The `example-smoke` job tests the **built wheel**, not the source tree: `uv build`, an
 inline check that the wheel holds only `django_rls_tenants/` + `*.dist-info/` (every
 package dir has `__init__.py`; `py.typed`, the management commands and `contrib/celery.py`
-are present), then `uv pip install dist/*.whl` into a clean `.wheel-venv` with the locked
+are present, and `pytest_plugin.py` plus the `pytest11` entry point in
+`*.dist-info/entry_points.txt`, which the example suite's autouse `enforce_rls` fixture
+needs), then `uv pip install dist/*.whl` into a clean `.wheel-venv` with the locked
 Django/test deps (`uv export --group test --no-emit-project`). It runs
 `example/manage.py check` and `pytest --collect-only` with no database (so `example/` must
 keep importing cleanly), then `makemigrations --check --dry-run` and the example suite as

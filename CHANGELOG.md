@@ -46,6 +46,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pg_policies` query fails, it prints "Could not determine the RLS status of the protected
   tables on database 'x' ... Nothing was verified" to stderr and exits with status 1,
   instead of a traceback.
+- **pytest plugin and `assert_rls_enforced()` for running tests as a role RLS applies to**
+  (#97). A superuser or `BYPASSRLS` connection skips every policy, so isolation tests on
+  it pass whether or not the policies work. Installing the package now registers a pytest
+  plugin through the `pytest11` entry point `django_rls_tenants` (it needs pytest-django
+  for the fixtures; `-p no:django_rls_tenants` turns it off) with three fixtures:
+  `rls_role` (session; creates a `NOLOGIN` role if missing and grants it `USAGE` on the
+  `search_path` schemas, `ALL` on their tables and sequences and default privileges for
+  later ones), `enforce_rls` (switches each configured alias that bypasses RLS to that
+  role with `SET ROLE` for the test, a connection the test reopens included; a no-op on a
+  plain role) and
+  `enforce_rls_on_other_threads` (does the same for connections opened on other threads,
+  such as ASGI error pages). Two ini options configure it: `rls_role` (default
+  `rls_test_role`) and `rls_role_aliases` (default `default`). `assert_rls_enforced()` and
+  `aassert_rls_enforced()` in `django_rls_tenants.tenants.testing` fail when the
+  connection's current role is a superuser or has `BYPASSRLS`. The example project's tests
+  now run as its Docker superuser too. See "Enforcing RLS in Tests" in the testing guide.
 
 ## [1.4.0] - 2026-10-16
 
