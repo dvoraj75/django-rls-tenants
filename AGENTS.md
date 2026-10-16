@@ -159,7 +159,10 @@ installed models' constraints (`RLSConstraint` GUCs and `extra_bypass_flags`,
 connection (with a pool, Django has already returned it). System check `W010` asks for
 `reset_rls_gucs` as the pool's `reset`; `W011` warns about a database- or role-level
 default (`ALTER DATABASE/ROLE ... SET`) for a policy GUC, which every new session starts
-with and the guard (which assumes a new session holds none) never clears.
+with and the guard (which assumes a new session holds none) never clears. `W005` (the
+`E001` error with `DEBUG` off), `W011` and `W013` query every alias in `conf.DATABASES`; a
+check that could not run on a reachable database reports `W013` instead of staying silent
+(an unreachable one is skipped, logged at `DEBUG`).
 
 When modifying middleware or GUC-related code, ensure all database iteration
 uses `conf.DATABASES` rather than hardcoding `"default"`.

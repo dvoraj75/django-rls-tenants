@@ -92,14 +92,15 @@ Open **<http://localhost:8000>** and log in with any demo account:
    otherwise `tenant_id` must equal the session's `rls.current_tenant` GUC.
 
    Separately, plain `python manage.py check` runs the library's Django system
-   checks (`django_rls_tenants.W001`-`W010`) against your configuration, for
+   checks (`django_rls_tenants.W001`-`W013`, `E001`) against your configuration, for
    example `W008` when `RLS_TENANTS["TENANT_MODEL"]` does not resolve to an
    installed model, `W009` when a protected model has no tenant FK field, and
-   `W005` when the connection role is a superuser or has `BYPASSRLS`. See the
+   `W005` when the connection role is a superuser or has `BYPASSRLS` (it becomes
+   the `E001` error when `DEBUG` is off; the demo runs with `DEBUG = True`). See the
    last one fire by pointing the demo at its `demo` superuser:
    ```bash
    docker compose exec -e DATABASE_URL=postgres://demo:demo@db:5432/demo web python manage.py check
-   # -> WARNINGS: ?: (django_rls_tenants.W005) The default database connection role 'demo' is a PostgreSQL superuser ...
+   # -> WARNINGS: ?: (django_rls_tenants.W005) The connection role 'demo' of DATABASES['default'] is a PostgreSQL superuser ...
    ```
 
 7. **Strict mode** -- The demo has `STRICT_MODE=True` in `RLS_TENANTS`. Try
@@ -202,7 +203,7 @@ Open **<http://localhost:8000>** and log in with any demo account:
 | `admin_context()` | `seed_demo.py` -- bulk data creation bypassing RLS |
 | `tenant_context()` | `seed_demo.py` -- programmatic tenant scoping for verification |
 | `check_rls` command | `docker-compose.yml` -- runs after migrations; `--verbose` prints the live policy SQL (item 6) |
-| System checks (`manage.py check`) | W001-W010 configuration checks, e.g. W005 superuser role, W008/W009 tenant model and FK (item 6) |
+| System checks (`manage.py check`) | W001-W013 and E001 configuration checks, e.g. W005 superuser role (E001 with `DEBUG` off), W008/W009 tenant model and FK (item 6) |
 | `STRICT_MODE` | `demo/settings.py` -- raises `NoTenantContextError` on unscoped queries |
 | `NoTenantContextError` handling | `notes/views.py` -- graceful handling in view code |
 | Testing utilities | `tests/test_rls.py` -- `rls_bypass`, `rls_as_tenant`, assert helpers |

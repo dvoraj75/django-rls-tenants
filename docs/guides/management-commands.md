@@ -40,6 +40,19 @@ Found 2 issue(s):
   Document (myapp_document): no RLS policies found
 ```
 
+If a catalogue query fails (for example `permission denied for view pg_policies`) or the
+connection cannot be used, the command does not print a traceback and does not report
+success. It writes this to stderr and exits with status code 1:
+
+```
+Could not determine the RLS status of the protected tables on database 'default': the catalogue query failed with ProgrammingError: permission denied for view pg_policies. Nothing was verified; fix the cause and run check_rls again.
+```
+
+Like every management command, `check_rls` runs Django's system checks first, so with
+`DEBUG = False` and a superuser or `BYPASSRLS` connection role it stops at the
+[`E001`](../troubleshooting.md#e001-the-connection-role-bypasses-rls-with-debug-off) error
+before it checks anything.
+
 ### What It Checks
 
 The command performs two batched queries against PostgreSQL system catalogs for both

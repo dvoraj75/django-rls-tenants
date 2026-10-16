@@ -384,6 +384,22 @@ def test_rls_with_transactions(tenant_a):
     ...
 ```
 
+### Django's Test Runner
+
+pytest-django never runs the system checks. `manage.py test` does, and Django's test runner
+sets `settings.DEBUG = False` before it runs them. A test database that Django reaches as a
+superuser or a `BYPASSRLS` role (common in CI, where the service container's user is a
+superuser) therefore fails with the
+[`E001`](../troubleshooting.md#e001-the-connection-role-bypasses-rls-with-debug-off) error
+instead of the `W005` warning. Record the choice in the test settings:
+
+```python title="settings_test.py"
+SILENCED_SYSTEM_CHECKS = ["django_rls_tenants.E001"]
+```
+
+Silencing the error does not restore isolation: a superuser still sees every row, so
+tests that assert isolation need a plain role.
+
 ## Async Tests
 
 *Added in 1.4.0.* Every helper has an async counterpart for `async def` tests, in the same

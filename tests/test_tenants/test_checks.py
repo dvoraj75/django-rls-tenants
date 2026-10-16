@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from contextlib import ExitStack
+import logging
+from contextlib import ExitStack, contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
+from django.core.checks import Error as CheckError
 from django.core.checks import Warning as CheckWarning
-from django.db import connection
+from django.core.exceptions import ImproperlyConfigured
+from django.db import InterfaceError, OperationalError, ProgrammingError, connection
 from django.test import override_settings
 
 from django_rls_tenants.pool import _policy_guc_names, reset_rls_gucs
@@ -20,6 +23,7 @@ from django_rls_tenants.tenants.checks import (
     _check_superuser_connection,
     _check_tenant_fk_field_exists,
     _check_tenant_model_resolves,
+    _checked_aliases,
     check_rls_config,
 )
 from django_rls_tenants.tenants.conf import RLSTenantsConfig
@@ -36,9 +40,9 @@ class TestCheckRlsConfig:
     def test_no_warnings_with_default_config(self):
         """Default test config produces no warnings (excluding superuser check)."""
         warnings = check_rls_config()
-        # Filter out W005 since test DB may run as superuser
-        non_superuser_warnings = [w for w in warnings if w.id != "django_rls_tenants.W005"]
-        assert non_superuser_warnings == []
+        # Filter out W005 / E001 since the test DB may run as a superuser
+        bypass_ids = {"django_rls_tenants.W005", "django_rls_tenants.E001"}
+        assert [w for w in warnings if w.id not in bypass_ids] == []
 
     def test_use_local_set_without_atomic_emits_nothing(self):
         """USE_LOCAL_SET without ATOMIC_REQUESTS is a valid setup (W003/W007 retired).
@@ -452,17 +456,56 @@ class TestCheckPoolWithoutReset:
         assert warnings == []
 
 
-def _run_superuser_check_with_row(row):
+def _fake_connection(
+    rows=(),
+    *,
+    connect_error=None,
+    query_error=None,
+    vendor="postgresql",
+    savepoint=None,
+):
+    """Return a mocked connection whose catalogue query returns ``rows``, and its cursor.
+
+    ``connect_error`` is raised by ``cursor()`` (opening the connection),
+    ``query_error`` by ``execute()`` (the query itself). ``savepoint`` is what
+    ``connection.savepoint()`` returns: ``None`` outside a transaction (Django's
+    behaviour in autocommit), a savepoint id inside one.
+    """
+    cursor = MagicMock()
+    cursor.fetchall.return_value = list(rows)
+    cursor.__enter__ = lambda self: self
+    cursor.__exit__ = MagicMock(return_value=False)
+    cursor.execute.side_effect = query_error
+    conn = MagicMock()
+    conn.vendor = vendor
+    conn.savepoint.return_value = savepoint
+    conn.ops.quote_name.side_effect = connection.ops.quote_name
+    if connect_error is None:
+        conn.cursor.return_value = cursor
+    else:
+        conn.cursor.side_effect = connect_error
+    return conn, cursor
+
+
+@contextmanager
+def _fake_aliases(**conns):
+    """Make the database checks see ``conns`` (alias -> mocked connection) only."""
+    with (
+        patch("django_rls_tenants.tenants.checks.connections", conns),
+        patch(
+            "django_rls_tenants.tenants.checks._checked_aliases",
+            return_value=list(conns),
+        ),
+    ):
+        yield
+
+
+def _run_superuser_check_with_row(row, *, debug=True):
     """Run ``_check_superuser_connection`` against a mocked ``pg_roles`` row."""
-    mock_cursor = MagicMock()
-    mock_cursor.fetchone.return_value = row
-    mock_cursor.__enter__ = lambda self: self
-    mock_cursor.__exit__ = MagicMock(return_value=False)
-    with patch("django_rls_tenants.tenants.checks.connection") as mock_conn:
-        mock_conn.cursor.return_value = mock_cursor
-        mock_conn.ops.quote_name.side_effect = connection.ops.quote_name
+    conn, cursor = _fake_connection([] if row is None else [row])
+    with _fake_aliases(default=conn), override_settings(DEBUG=debug):
         warnings = _check_superuser_connection()
-    return warnings, mock_cursor
+    return warnings, cursor
 
 
 def _is_superuser():
@@ -472,8 +515,38 @@ def _is_superuser():
         return bool(cur.fetchone()[0])
 
 
+class TestCheckedAliases:
+    """Tests for _checked_aliases, the aliases W005, E001, W011 and W013 query."""
+
+    def test_default_only(self):
+        assert _checked_aliases() == ["default"]
+
+    def test_every_configured_alias_in_order(self):
+        databases = {"default": {}, "replica": {}, "other": {}}
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "DATABASES": ["replica", "default"],
+                },
+                DATABASES=databases,
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            assert _checked_aliases() == ["replica", "default"]
+
+    def test_unknown_alias_is_left_to_w006(self):
+        with (
+            override_settings(
+                RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant", "DATABASES": ["default", "nope"]}
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            assert _checked_aliases() == ["default"]
+
+
 class TestCheckSuperuserConnection:
-    """Tests for _check_superuser_connection (W005)."""
+    """Tests for _check_superuser_connection (W005, E001, W013)."""
 
     def test_queries_pg_roles_for_both_attributes(self):
         """The check reads rolsuper and rolbypassrls from pg_roles."""
@@ -491,6 +564,7 @@ class TestCheckSuperuserConnection:
         assert "is a PostgreSQL superuser" in warnings[0].msg
         assert "has the BYPASSRLS attribute" not in warnings[0].msg
         assert "'postgres'" in warnings[0].msg
+        assert "DATABASES['default']" in warnings[0].msg
 
     def test_w005_when_bypassrls(self):
         """W005 fires for a non-superuser role with BYPASSRLS."""
@@ -512,34 +586,165 @@ class TestCheckSuperuserConnection:
         assert len(warnings) == 1
         assert "is a PostgreSQL superuser and has the BYPASSRLS attribute" in warnings[0].msg
 
-    def test_no_warning_when_plain_role(self):
-        """No W005 when the role is neither superuser nor BYPASSRLS."""
-        warnings, _ = _run_superuser_check_with_row(("app", False, False))
+    @pytest.mark.parametrize("row", [("postgres", True, False), ("app", False, True)])
+    def test_e001_instead_of_w005_without_debug(self, row):
+        """With DEBUG off a bypassing role is the E001 error, not W005 (#108)."""
+        warnings, _ = _run_superuser_check_with_row(row, debug=False)
+        assert [w.id for w in warnings] == ["django_rls_tenants.E001"]
+        assert isinstance(warnings[0], CheckError)
+        assert warnings[0].is_serious()
+        assert f"{row[0]!r} of DATABASES['default']" in warnings[0].msg
+        assert "settings.DEBUG is False" in warnings[0].msg
+        assert "NOSUPERUSER NOBYPASSRLS" in warnings[0].hint
+        assert "SILENCED_SYSTEM_CHECKS = ['django_rls_tenants.E001']" in warnings[0].hint
+
+    @pytest.mark.parametrize("debug", [True, False])
+    def test_nothing_for_a_plain_role(self, debug):
+        """Neither W005 nor E001 when the role is neither superuser nor BYPASSRLS."""
+        warnings, _ = _run_superuser_check_with_row(("app", False, False), debug=debug)
         assert warnings == []
 
-    def test_no_warning_when_db_unavailable(self):
-        """No W005 when the database is unavailable (graceful fallback)."""
-        with patch(
-            "django_rls_tenants.tenants.checks.connection",
-        ) as mock_conn:
-            mock_conn.cursor.side_effect = Exception("connection refused")
-            warnings = _check_superuser_connection()
-        assert warnings == []
-
-    def test_no_warning_when_role_not_found(self):
+    def test_nothing_when_role_not_found(self):
         """No W005 when no pg_roles row comes back (defensive guard)."""
         warnings, _ = _run_superuser_check_with_row(None)
         assert warnings == []
 
+    def test_every_configured_alias(self):
+        """A replica connected as a superuser is reported under its own alias."""
+        default, _ = _fake_connection([("app", False, False)])
+        replica, _ = _fake_connection([("replica_admin", True, False)])
+        with _fake_aliases(default=default, replica=replica), override_settings(DEBUG=True):
+            warnings = _check_superuser_connection()
+        assert [w.id for w in warnings] == ["django_rls_tenants.W005"]
+        assert "'replica_admin' of DATABASES['replica']" in warnings[0].msg
+        assert "set it in DATABASES['replica']" in warnings[0].hint
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            OperationalError("connection refused"),
+            InterfaceError("connection already closed"),
+            ImproperlyConfigured("settings.DATABASES is improperly configured"),
+        ],
+        ids=["operational", "interface", "improperly-configured"],
+    )
+    def test_quiet_skip_when_no_connection_can_be_opened(self, error, caplog):
+        """A database that cannot be reached (not provisioned yet) is skipped quietly."""
+        conn, cursor = _fake_connection(connect_error=error)
+        with (
+            _fake_aliases(default=conn),
+            caplog.at_level(logging.DEBUG, logger="django_rls_tenants"),
+        ):
+            assert _check_superuser_connection() == []
+        cursor.execute.assert_not_called()
+        assert "Skipping W005 and E001 on DATABASES['default']: could not connect" in caplog.text
+
+    def test_w013_when_the_query_fails(self):
+        """A failing query on a reachable database is W013, not silence (#108)."""
+        error = ProgrammingError(
+            "permission denied for view pg_roles\nLINE 1: SELECT rolname FROM pg_roles"
+        )
+        conn, _ = _fake_connection(query_error=error)
+        with _fake_aliases(default=conn), override_settings(DEBUG=False):
+            warnings = _check_superuser_connection()
+        assert [w.id for w in warnings] == ["django_rls_tenants.W013"]
+        assert isinstance(warnings[0], CheckWarning)
+        assert (
+            "Could not determine whether the connection role bypasses RLS on "
+            "DATABASES['default']: the query failed with ProgrammingError: permission "
+            "denied for view pg_roles." in warnings[0].msg
+        )
+        assert "LINE 1" not in warnings[0].msg  # only the first line of the error
+        assert "absence of W005 and E001 as a pass" in warnings[0].msg
+
+    def test_w013_when_a_connection_hook_fails(self):
+        """A database error other than a failed connect, raised while connecting, is W013."""
+        conn, _ = _fake_connection(connect_error=ProgrammingError("clearing the GUCs failed"))
+        with _fake_aliases(default=conn):
+            warnings = _check_superuser_connection()
+        assert [w.id for w in warnings] == ["django_rls_tenants.W013"]
+        assert "ProgrammingError: clearing the GUCs failed" in warnings[0].msg
+
+    def test_query_runs_in_a_savepoint_inside_a_transaction(self):
+        """In a transaction the query runs in a savepoint, released on success."""
+        conn, _ = _fake_connection([("app", False, False)], savepoint="sp1")
+        with _fake_aliases(default=conn):
+            assert _check_superuser_connection() == []
+        conn.savepoint_commit.assert_called_once_with("sp1")
+        conn.savepoint_rollback.assert_not_called()
+
+    def test_failed_query_rolls_back_to_its_savepoint(self):
+        """A failure rolls back to the savepoint, so the caller's transaction survives."""
+        conn, _ = _fake_connection(query_error=ProgrammingError("denied"), savepoint="sp1")
+        with _fake_aliases(default=conn):
+            warnings = _check_superuser_connection()
+        assert [w.id for w in warnings] == ["django_rls_tenants.W013"]
+        conn.savepoint_rollback.assert_called_once_with("sp1")
+        conn.savepoint_commit.assert_not_called()
+
+    def test_no_savepoint_in_autocommit(self):
+        """Outside a transaction Django's ``savepoint()`` is ``None``: nothing to release."""
+        conn, _ = _fake_connection(query_error=ProgrammingError("denied"))
+        with _fake_aliases(default=conn):
+            _check_superuser_connection()
+        conn.savepoint_rollback.assert_not_called()
+        conn.savepoint_commit.assert_not_called()
+
+    def test_w013_when_the_savepoint_cannot_be_set(self):
+        """A transaction already aborted before the check is W013, not a traceback."""
+        conn, cursor = _fake_connection()
+        conn.savepoint.side_effect = ProgrammingError(
+            "current transaction is aborted, commands ignored until end of transaction block"
+        )
+        with _fake_aliases(default=conn):
+            warnings = _check_superuser_connection()
+        assert [w.id for w in warnings] == ["django_rls_tenants.W013"]
+        assert "current transaction is aborted" in warnings[0].msg
+        cursor.execute.assert_not_called()
+
+    def test_w013_on_one_alias_does_not_hide_another(self):
+        """Each alias is checked on its own: a failing replica still reports default."""
+        default, _ = _fake_connection([("postgres", True, False)])
+        replica, _ = _fake_connection(query_error=OperationalError("canceling statement"))
+        with _fake_aliases(default=default, replica=replica), override_settings(DEBUG=True):
+            warnings = _check_superuser_connection()
+        assert [w.id for w in warnings] == [
+            "django_rls_tenants.W005",
+            "django_rls_tenants.W013",
+        ]
+        assert "DATABASES['replica']" in warnings[1].msg
+
+    def test_non_postgresql_alias_is_skipped(self):
+        conn, _ = _fake_connection(vendor="sqlite")
+        with _fake_aliases(default=conn):
+            assert _check_superuser_connection() == []
+        conn.cursor.assert_not_called()
+
+    def test_an_error_that_is_not_a_database_error_propagates(self):
+        """Only database errors are turned into W013; a bug is not swallowed."""
+        conn, _ = _fake_connection(query_error=RuntimeError("bug"))
+        with _fake_aliases(default=conn), pytest.raises(RuntimeError, match="bug"):
+            _check_superuser_connection()
+
     @pytest.mark.integration
-    def test_no_w005_for_real_plain_role(self, enforce_rls):
-        """Against live PostgreSQL, a NOLOGIN role (NOBYPASSRLS default) passes."""
-        assert _check_superuser_connection() == []
+    @pytest.mark.parametrize("debug", [True, False])
+    def test_nothing_for_real_plain_role(self, enforce_rls, debug):
+        """Against live PostgreSQL, a role RLS applies to gets neither W005 nor E001.
+
+        On the plain-role CI leg this is the connection's own role, so the leg
+        asserts that E001 does not fire for the setup the docs recommend.
+        """
+        with override_settings(DEBUG=debug):
+            assert _check_superuser_connection() == []
 
     @pytest.mark.integration
     @pytest.mark.superuser_only
-    def test_w005_for_real_bypassrls_role(self):
-        """Against live PostgreSQL, a non-superuser BYPASSRLS role triggers W005.
+    @pytest.mark.parametrize(
+        ("debug", "check_id"),
+        [(True, "django_rls_tenants.W005"), (False, "django_rls_tenants.E001")],
+    )
+    def test_real_bypassrls_role(self, debug, check_id):
+        """Against live PostgreSQL, a non-superuser BYPASSRLS role triggers W005 / E001.
 
         ``CREATE ROLE`` is transactional, so the role disappears when the
         test transaction rolls back.
@@ -551,7 +756,7 @@ class TestCheckSuperuserConnection:
         """
         if not _is_superuser():
             pytest.fail(
-                "test_w005_for_real_bypassrls_role needs a PostgreSQL superuser connection "
+                "test_real_bypassrls_role needs a PostgreSQL superuser connection "
                 "to CREATE a BYPASSRLS role, but the test connection is a plain role. "
                 'Run as a superuser or deselect it with -m "not superuser_only".'
             )
@@ -560,29 +765,58 @@ class TestCheckSuperuserConnection:
             cur.execute(f"CREATE ROLE {role} NOLOGIN NOSUPERUSER BYPASSRLS")
             cur.execute(f"SET ROLE {role}")
         try:
-            warnings = _check_superuser_connection()
+            with override_settings(DEBUG=debug):
+                warnings = _check_superuser_connection()
         finally:
             with connection.cursor() as cur:
                 cur.execute("RESET ROLE")
-        assert [w.id for w in warnings] == ["django_rls_tenants.W005"]
-        assert f"'{role}' has the BYPASSRLS attribute" in warnings[0].msg
+        assert [w.id for w in warnings] == [check_id]
+        assert f"'{role}' of DATABASES['default'] has the BYPASSRLS attribute" in warnings[0].msg
         assert "superuser and" not in warnings[0].msg
+
+    @pytest.mark.integration
+    @pytest.mark.superuser_only
+    def test_real_w013_when_pg_roles_is_not_readable(self):
+        """Against live PostgreSQL, a role that cannot read ``pg_roles`` gets W013.
+
+        ``REVOKE`` on the catalogue view needs a superuser (see
+        ``test_real_bypassrls_role`` for why it fails instead of skipping). The
+        check runs its query in a savepoint of its own, so the failure does not
+        abort the test transaction: a statement still runs afterwards. The test's
+        own savepoint undoes the ``REVOKE``, the ``CREATE ROLE`` and the ``SET ROLE``.
+        """
+        if not _is_superuser():
+            pytest.fail(
+                "test_real_w013_when_pg_roles_is_not_readable needs a PostgreSQL superuser "
+                "connection to REVOKE SELECT on pg_roles, but the test connection is a plain "
+                'role. Run as a superuser or deselect it with -m "not superuser_only".'
+            )
+        with connection.cursor() as cur:
+            cur.execute("SAVEPOINT w013")
+            cur.execute("REVOKE SELECT ON pg_catalog.pg_roles FROM PUBLIC")
+            cur.execute("CREATE ROLE rls_w013_role NOLOGIN")
+            cur.execute("SET ROLE rls_w013_role")
+        try:
+            warnings = _check_superuser_connection()
+            with connection.cursor() as cur:
+                cur.execute("SELECT 1")  # the test transaction is not aborted
+                assert cur.fetchone() == (1,)
+        finally:
+            with connection.cursor() as cur:
+                cur.execute("ROLLBACK TO SAVEPOINT w013")
+        assert [w.id for w in warnings] == ["django_rls_tenants.W013"]
+        assert "permission denied for view pg_roles" in warnings[0].msg
 
 
 def _run_policy_default_check_with_rows(rows):
     """Run ``_check_policy_guc_defaults`` against mocked ``pg_db_role_setting`` rows."""
-    mock_cursor = MagicMock()
-    mock_cursor.fetchall.return_value = rows
-    mock_cursor.__enter__ = lambda self: self
-    mock_cursor.__exit__ = MagicMock(return_value=False)
-    with patch("django_rls_tenants.tenants.checks.connection") as mock_conn:
-        mock_conn.cursor.return_value = mock_cursor
-        mock_conn.ops.quote_name.side_effect = lambda name: f'"{name}"'
+    conn, _ = _fake_connection(rows)
+    with _fake_aliases(default=conn):
         return _check_policy_guc_defaults()
 
 
 class TestCheckPolicyGucDefaults:
-    """Tests for _check_policy_guc_defaults (W011).
+    """Tests for _check_policy_guc_defaults (W011, W013).
 
     A default set with ``ALTER DATABASE ... SET`` or ``ALTER ROLE ... SET`` is in
     force in every new session before any RLS context is set, and the library
@@ -599,7 +833,7 @@ class TestCheckPolicyGucDefaults:
 
         assert [w.id for w in warnings] == ["django_rls_tenants.W011"]
         assert "rls.is_admin = 'true'" in warnings[0].msg
-        assert "for database 'app_db'" in warnings[0].msg
+        assert "for database 'app_db' (DATABASES['default'])" in warnings[0].msg
         assert 'ALTER DATABASE "app_db" RESET rls.is_admin;' in str(warnings[0].hint)
 
     def test_w011_for_a_role_default(self):
@@ -632,10 +866,32 @@ class TestCheckPolicyGucDefaults:
         rows = [("app_db", None, ["work_mem=64MB", "rls.unrelated=1"]), (None, "app", None)]
         assert _run_policy_default_check_with_rows(rows) == []
 
-    def test_no_warning_when_db_unavailable(self):
-        with patch("django_rls_tenants.tenants.checks.connection") as mock_conn:
-            mock_conn.cursor.side_effect = Exception("no database")
+    def test_every_configured_alias(self):
+        """A replica has its own database and role defaults; each alias is read."""
+        default, _ = _fake_connection([])
+        replica, _ = _fake_connection([("replica_db", None, ["rls.is_admin=on"])])
+        with _fake_aliases(default=default, replica=replica):
+            warnings = _check_policy_guc_defaults()
+        assert [w.id for w in warnings] == ["django_rls_tenants.W011"]
+        assert "for database 'replica_db' (DATABASES['replica'])" in warnings[0].msg
+
+    def test_quiet_skip_when_no_connection_can_be_opened(self):
+        conn, _ = _fake_connection(connect_error=OperationalError("no database"))
+        with _fake_aliases(default=conn):
             assert _check_policy_guc_defaults() == []
+
+    def test_w013_when_the_query_fails(self):
+        conn, _ = _fake_connection(
+            query_error=ProgrammingError("permission denied for table pg_db_role_setting")
+        )
+        with _fake_aliases(default=conn):
+            warnings = _check_policy_guc_defaults()
+        assert [w.id for w in warnings] == ["django_rls_tenants.W013"]
+        assert (
+            "Could not determine whether PostgreSQL applies a default for a GUC the RLS "
+            "policies read on DATABASES['default']" in warnings[0].msg
+        )
+        assert "absence of W011 as a pass" in warnings[0].msg
 
     @pytest.mark.integration
     @pytest.mark.superuser_only
