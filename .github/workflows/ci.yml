@@ -123,7 +123,10 @@ jobs:
               f"{package}/py.typed",
               f"{package}/contrib/celery.py",
               f"{package}/contrib/drf.py",
+              f"{package}/management/_worker.py",
               f"{package}/management/commands/check_rls.py",
+              f"{package}/management/commands/run_as_tenant.py",
+              f"{package}/management/commands/run_for_all_tenants.py",
               f"{package}/management/commands/setup_m2m_rls.py",
               f"{package}/pytest_plugin.py",
           ]

@@ -57,6 +57,11 @@ returns zero rows, never leaked data.
   consumers and tasks; tenant state is set in the coroutine, so the async ORM is scoped.
   [Async context managers →](https://dvoraj75.github.io/django-rls-tenants/guides/context-managers/#async-code)
   · [Async deployment guide →](https://dvoraj75.github.io/django-rls-tenants/guides/async/)
+- **Per-tenant management commands** -- `run_as_tenant` runs any management command inside
+  one tenant's context and `run_for_all_tenants` runs it once per tenant (filters,
+  `--parallel`, `--json`, a failure summary and exit status), so reports, re-indexing and
+  backfills need no context code of their own.
+  [Management commands guide →](https://dvoraj75.github.io/django-rls-tenants/guides/management-commands/)
 - **Raw SQL helpers** -- `safe_tenant_sql()` builds a tenant-filter predicate;
   `current_tenant_value_sql()` returns the current tenant ID expression for inserts
   and projections. Both reuse the expressions used by RLS policies.

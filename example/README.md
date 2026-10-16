@@ -208,6 +208,30 @@ Open **<http://localhost:8000>** and log in with any demo account:
     tenant's notes. Without a token the API answers `401`.
     `tests/test_api.py` runs this under the non-superuser role.
 
+12. **Management commands per tenant** -- `notes/management/commands/note_report.py`
+    prints the current tenant's note count and notes per category, and contains no
+    context code. The library's `run_as_tenant` and `run_for_all_tenants` commands
+    supply it (the tenants are the seeded slugs `acme`, `globex` and `initech`):
+    ```bash
+    docker compose exec web python manage.py run_as_tenant --tenant acme --lookup slug note_report
+    docker compose exec web python manage.py run_for_all_tenants note_report
+    docker compose exec web python manage.py run_for_all_tenants --json note_report
+    docker compose exec web python manage.py run_for_all_tenants --parallel 2 note_report
+    ```
+    `run_for_all_tenants` prints a header, the report and an `OK in ...s` line per
+    tenant, then a summary; `--json` prints one object per tenant with the captured
+    output, and `--parallel 2` runs two tenants at a time in worker processes.
+    Options of the library's command go before `note_report`; everything after the
+    name is passed to it. Run on its own, the report has no context, and the demo's
+    `STRICT_MODE` stops it:
+    ```bash
+    docker compose exec web python manage.py note_report
+    # -> NoTenantContextError
+    ```
+    `tests/test_note_report.py` runs these under the non-superuser role. See the
+    [Management Commands](https://dvoraj75.github.io/django-rls-tenants/guides/management-commands/)
+    guide.
+
 ## Library Features Demonstrated
 
 | Feature | Where |
@@ -228,6 +252,7 @@ Open **<http://localhost:8000>** and log in with any demo account:
 | `RLSTenantModelSerializer` (DRF) | `notes/api.py` -- `NoteSerializer` hides and stamps the tenant FK |
 | `admin_context()` | `seed_demo.py` -- bulk data creation bypassing RLS |
 | `tenant_context()` | `seed_demo.py` -- programmatic tenant scoping for verification |
+| `run_as_tenant` / `run_for_all_tenants` commands | `notes/management/commands/note_report.py` -- a report with no context code, run per tenant or for all of them (item 12) |
 | `check_rls` command | `docker-compose.yml` -- runs after migrations; `--verbose` prints the live policy SQL (item 6) |
 | System checks (`manage.py check`) | W001-W013 and E001 configuration checks, e.g. W005 superuser role (E001 with `DEBUG` off), W008/W009 tenant model and FK (item 6) |
 | `STRICT_MODE` | `demo/settings.py` -- raises `NoTenantContextError` on unscoped queries |
@@ -238,6 +263,7 @@ Open **<http://localhost:8000>** and log in with any demo account:
 | Strict mode tests | `tests/test_rls.py` -- `TestStrictMode` class |
 | Celery task tests | `tests/test_tasks.py` -- eager-mode round-trips for `count_notes` and `export_notes` |
 | Raw SQL tests | `tests/test_services.py` -- raw figures equal the ORM's for a tenant user and for admin |
+| Management command tests | `tests/test_note_report.py` -- `note_report` through `run_as_tenant` / `run_for_all_tenants`, and refused without a context by `STRICT_MODE` |
 | REST API tests | `tests/test_api.py` -- token clients, isolation, tenant stamping and the admin view of `/api/notes/` |
 
 ## How It Works
@@ -274,12 +300,13 @@ example/
 ├── notes/               RLS-protected Note + Category models, views, services
 │                        (safe_tenant_sql), tasks (@rls_task), REST API (api.py),
 │                        templates, admin,
-│                        seed command, committed migrations (0001_initial.py
+│                        seed_demo and note_report commands, committed migrations (0001_initial.py
 │                        carries the RLS policy DDL)
 └── tests/               Example tests using django-rls-tenants testing utilities
     ├── conftest.py      Autouse enforce_rls fixture; rls_bypass test data setup
     ├── test_admin.py    RLSTenantModelAdmin scoping, FK hiding and switcher tests
     ├── test_api.py      REST API (/api/notes/) with token auth under the non-superuser role
+    ├── test_note_report.py  note_report via run_as_tenant / run_for_all_tenants
     ├── test_rls.py      RLS policy verification and tenant isolation tests
     ├── test_seed_demo.py  Seeded staff account and idempotent re-seeding tests
     ├── test_services.py   safe_tenant_sql() raw aggregate vs. the ORM

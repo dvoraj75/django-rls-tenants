@@ -79,6 +79,7 @@ tests/
 ├── test_rls/                # unit tests for rls/ layer
 ├── test_tenants/            # unit tests for tenants/ layer
 ├── test_integration/        # end-to-end tests (marked @pytest.mark.integration)
+├── test_app/management/     # probe commands (rls_probe, rls_echo) the run_as_tenant tests run
 └── test_layering.py         # enforces rls/ ← tenants/ import boundary
 ```
 
@@ -105,6 +106,18 @@ The library has two internal layers with a strict import boundary:
   package root and **must not import Django or the rest of the package at module level**
   (imports go inside the fixtures). Its twin in `tenants/testing.py` is
   `assert_rls_enforced()` / `aassert_rls_enforced()`.
+- **`django_rls_tenants/management/`** — `check_rls` and `setup_m2m_rls`, plus `run_as_tenant`
+  and `run_for_all_tenants` (#111), which run another command through `call_command()` inside
+  `tenant_context()` / `admin_context()`. `run_for_all_tenants` imports the shared helpers
+  (`_inner_args`, `_check_alias`, `_output_options`, `_tenant_model`) from `run_as_tenant`. Both
+  read the tenant model inside `admin_context()` and never open a transaction (so with
+  `USE_LOCAL_SET=True` an alias outside `conf.DATABASES` is refused). `--parallel` uses a
+  `ProcessPoolExecutor` with the `spawn` start method (a forked child would share the parent's
+  PostgreSQL sockets); `management/_worker.py` holds the worker entry points. A spawned worker
+  imports `_worker` before `django.setup()`, so it **must not import the tenants layer, or
+  anything that imports models, at module level** (same kind of rule as `pytest_plugin.py`:
+  imports go inside the functions). The workers' `django.setup()` uses the parent's
+  `settings.SETTINGS_MODULE` and database `NAME`s, so the parent's tenants must be committed.
 
 This boundary is enforced by `tests/test_layering.py`. Never import from `tenants/` in `rls/`.
 
@@ -529,7 +542,7 @@ example/
 ├── demo/                Project settings, urls, wsgi/asgi, Celery app (eager mode)
 ├── tenants/             Tenant model (shared, not RLS-protected)
 ├── accounts/            Custom User with TenantUser protocol
-├── notes/               RLS-protected Note model, views, services, tasks, DRF API (api.py), templates, seed command
+├── notes/               RLS-protected Note model, views, services, tasks, DRF API (api.py), templates, seed command, `note_report` (run through `run_as_tenant`)
 └── docker/              PostgreSQL init (creates non-superuser role for RLS)
 ```
 

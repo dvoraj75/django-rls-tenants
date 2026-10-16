@@ -4,6 +4,9 @@ Context managers provide explicit control over RLS context in code that runs out
 the request/response cycle -- management commands, Celery tasks, tests, scripts, and
 service-layer functions.
 
+To run an existing management command for one tenant or for every tenant without
+touching its code, use [`run_as_tenant` and `run_for_all_tenants`](management-commands.md#run_as_tenant).
+
 ## tenant_context
 
 Scopes all database queries within the block to a specific tenant:
