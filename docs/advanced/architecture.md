@@ -55,7 +55,7 @@ The upper layer builds Django multitenancy on top of `rls/`:
 | `tenants/types.py` | `TenantUser` protocol, and `MultiTenantUser` (adds `rls_tenant_ids`) |
 | `tenants/selection.py` | Tenant selection for a `MultiTenantUser`: `switch_tenant()`, `clear_tenant_selection()`, and the resolver (header, then session, then `rls_tenant_id`) that the middleware, the DRF mixin and the admin share (see [Users in Several Tenants](../guides/multi-tenant-users.md)) |
 | `tenants/state.py` | `get_current_tenant_id()`, `set_current_tenant_id()`, `reset_current_tenant_id()` -- `ContextVar`-based tenant state for auto-scoping. Also `get_rls_context_active()`, `set_rls_context_active()`, `reset_rls_context_active()` -- tracks whether any RLS context is active (used by strict mode). A private third `ContextVar` holds the GUC values the library applied for the active context, for the GUC affinity guard |
-| `tenants/checks.py` | Django system checks (W001--W018, E001) |
+| `tenants/checks.py` | Django system checks (W001--W019, E001) |
 | `pytest_plugin.py` | The `rls_role`, `enforce_rls` and `enforce_rls_on_other_threads` fixtures, registered through the `pytest11` entry point; imports nothing from Django at module level |
 | `management/` | `check_rls` (with `--generate`, backed by `_rls_migrations.py`), `setup_m2m_rls`, `run_as_tenant` and `run_for_all_tenants` (`_worker.py` holds the `--parallel` worker entry points) |
 | `contrib/drf.py`, `contrib/celery.py` | Optional integrations behind the `drf` and `celery` extras; never imported by the core layers |

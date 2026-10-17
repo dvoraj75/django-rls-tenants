@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: 2026-10-17
+> Last updated: 2026-10-18
 >
 > Priorities may shift based on community feedback.
 > Have a suggestion? [Open an issue](https://github.com/dvoraj75/django-rls-tenants/issues).
@@ -412,24 +412,66 @@ correct policy. See [1.5.0](changelog.md#150-2026-10-17).
 
 ## v1.6.0 — Multi-Tenant Users & Observability
 
-Common SaaS patterns and compliance tooling.
+Common SaaS patterns and compliance tooling, plus RLS for rows and tables the model
+inheritance design could not reach. See [1.6.0](changelog.md#160-2026-10-18).
 
-- [ ] **Multi-tenant user support** — Support for users belonging to multiple
-  tenants with a tenant-switching helper and session/header-based tenant
-  selection.
+- [x] **Multi-tenant user support** (#47, `tenants/selection.py`) — `MultiTenantUser`,
+  a `TenantUser` with `rls_tenant_ids`; a per-request selection with the
+  `RLS_TENANTS["TENANT_HEADER"]` header (`X-Tenant`) or a session selection made with
+  `switch_tenant()` / `clear_tenant_selection()`, honoured by the middleware, the DRF
+  mixin and the admin (whose switcher a member may use for their own tenants). A
+  selection that is not one of the user's is a 403, never a fallback; with no
+  selection the request runs in `rls_tenant_id`. `for_user()`, `@with_rls_context`
+  and Celery propagation are unchanged.
   *Why:* Many SaaS applications need users that operate across tenants
-  (consultants, support staff, partner accounts). The current `TenantUser`
-  protocol assumes a single `rls_tenant_id`.
+  (consultants, support staff, partner accounts). The `TenantUser` protocol
+  assumed a single `rls_tenant_id`.
 
-- [ ] **Audit logging** — Structured logging when tenant context is set, cleared,
-  or violated. Optional integration with Django's logging framework.
+- [x] **Audit logging** (#48, `tenants/audit.py`) — Structured records on the
+  `django_rls_tenants.audit` logger: `context.entered` / `context.exited` and
+  `tenant.switched` at `INFO`, `context.denied`, `fk.cross_tenant_rejected` and
+  `gucs.cleared` at `WARNING`, each with `rls_*` record attributes (event, source,
+  tenant, admin flag, user pk) for JSON formatters. No library setting: Django's
+  `LOGGING` turns it on.
   *Why:* Compliance requirements (SOC 2, GDPR) often mandate audit trails for
   data access boundaries.
 
-- [ ] **Connection pooling guide expansion** — Concrete PgBouncer and pgpool
-  configuration examples, GUC leak troubleshooting section.
+- [x] **Connection pooling guide expansion** (#49) — PgBouncer transaction and session
+  mode in detail (`server_reset_query`, prepared statements, `DISABLE_SERVER_SIDE_CURSORS`),
+  a pgpool-II section (connection cache, `reset_query_list`, load balancing), and a
+  "Troubleshooting GUC Leaks" section with the diagnosis queries.
   *Why:* Connection pooling with session-scoped GUCs is the most common
   operational footgun — better docs prevent production incidents.
+
+- [x] **Cross-tenant sharing through policy predicates** (#59, `rls/predicates.py`) —
+  `RLSConstraint(extra_predicates=[SharedWith(...), TenantField(...), RawPredicate(...)])`
+  adds a second, `FOR SELECT` policy that lets a tenant read rows other tenants share
+  with it; writes still go through the tenant policy alone.
+  `Model.objects.including_shared()` reads them through the ORM (reading only). System
+  checks `W017`, `W018` and `W019` report predicates that cannot work.
+  *Why:* Data shared between tenants (partner and consultant accounts, support staff)
+  had to be handled in the application layer, outside the database-level guarantee.
+
+- [x] **RLS for tables the project does not own** (#112, `operations.AddRLSPolicy`) —
+  A reversible migration operation with `app_label` targeting that creates the same
+  policy `RLSConstraint` does on a third-party app's table, and
+  `RLS_TENANTS["EXTERNAL_MODELS"]` so the runtime, `check_rls` and the checks (`W016`)
+  treat the table as protected. RLS-only: no auto-scope or strict mode for a model
+  with its own manager.
+  *Why:* The smallest step toward protecting tables the project cannot subclass, and the
+  prerequisite of the v2.0.0 adoption operation.
+
+- [x] **`RLSTenantPermission` accepts the context `get_rls_context()` entered** (#150) —
+  The DRF permission trusts the tenant context the view's own override validated for
+  the request, so per-request tenant selection works with the permission listed in
+  `DEFAULT_PERMISSION_CLASSES`.
+  *Why:* The documented hook and the permission contradicted each other for a
+  non-admin user.
+
+- [x] **CI: psycopg 3 on the oldest Django and PostgreSQL 17** (#151) — A psycopg 3
+  leg on Django 5.2 and one on PostgreSQL 17, and the support-matrix test requires a
+  leg for every supported PostgreSQL major.
+  *Why:* The supported-versions policy promised combinations no leg ran.
 
 ---
 
@@ -443,9 +485,11 @@ Architectural changes that may require migration effort.
   *Why:* Soft-delete is a common pattern; pushing it to RLS ensures deleted
   data cannot be accessed through any code path.
 
-- [ ] **Cross-tenant relationships** — `RLSSharedModel` or `shared=True` flag
-  for models that reference data across tenant boundaries (shared catalogs,
-  inter-tenant messaging).
+- [ ] **Cross-tenant relationships beyond read sharing** — 1.6.0's
+  `extra_predicates` (#59) let a tenant *read* rows another tenant shares with it.
+  Still open: rows two tenants may both *write* (inter-tenant messaging), and shared
+  catalogs with no tenant column at all (an `RLSSharedModel` or `shared=True` flag
+  that the auto-scope filter, strict mode and the checks understand).
   *Why:* Real-world multi-tenant systems often need shared reference data that
   does not belong to a single tenant.
 

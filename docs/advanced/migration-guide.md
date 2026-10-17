@@ -126,8 +126,25 @@ migration that assigns the correct tenant to each existing record.
 ### From 1.5.0 to 1.6.0
 
 Nothing needs to change for a project that does not set `RLS_TENANTS["EXTERNAL_MODELS"]` or
-use `extra_predicates`.
+use `extra_predicates`. Two things are visible without opting in:
 
+- **Refusals now reach stderr when `LOGGING` does not configure the audit logger** (#48).
+  The library logs an audit record for each context entered, exited or refused on the
+  `django_rls_tenants.audit` logger. The `INFO` records are silent by default, but a
+  refusal (`context.denied`, a cross-tenant foreign key, the safety-net clear) is a
+  `WARNING`, which Python's last-resort handler prints to stderr when no handler is
+  configured. Route or silence the logger in `LOGGING`; see
+  [Audit Logging](../guides/audit-logging.md#enabling-it).
+- **A user model with `rls_tenant_ids` is a `MultiTenantUser`** (#47). Such a user's
+  requests honour the `X-Tenant` header (`RLS_TENANTS["TENANT_HEADER"]`) and a session
+  selection made with `switch_tenant()`; a selection that is not one of the user's tenants
+  is a 403. A project whose user model already has a property of that name should rename
+  it or set `TENANT_HEADER` and `TENANT_SESSION_KEY` to `None`. Responses of such a user
+  carry the header in `Vary`. See [Users in Several Tenants](../guides/multi-tenant-users.md).
+- **`RLSTenantPermission` accepts the context the view's `get_rls_context()` override
+  entered** (#150), also for a non-admin user. An override is now the place that
+  authorizes the selection; see
+  [Choosing the context](../guides/drf.md#choosing-the-context-get_rls_context).
 - **`select_related()` and the `prefetch_related()` tenant filter use each joined model's
   own tenant field** (#112). They filtered every joined RLS-protected model on
   `{TENANT_FK_FIELD}_id`. They now filter on the field of the joined model's
@@ -144,9 +161,9 @@ use `extra_predicates`.
   those tables and the new system check `W016` reports an entry the library cannot use.
   See [Tables You Do Not Own](../guides/protecting-models.md#tables-you-do-not-own).
 - **New: `extra_predicates` and `including_shared()`** (#59) let a tenant read rows other
-  tenants share with it, through a second `FOR SELECT` policy; system checks `W017` and
-  `W018` report predicates that cannot work. A model without predicates produces the same
-  SQL and the same migrations as before. See
+  tenants share with it, through a second `FOR SELECT` policy; system checks `W017`,
+  `W018` and `W019` report predicates that cannot work. A model without predicates
+  produces the same SQL and the same migrations as before. See
   [Sharing Rows Across Tenants](../guides/protecting-models.md#sharing-rows-across-tenants).
 
 ### From 1.4.0 to 1.5.0
