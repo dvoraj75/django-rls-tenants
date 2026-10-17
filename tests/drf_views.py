@@ -12,7 +12,7 @@ from typing import Any
 from django.db import DEFAULT_DB_ALIAS, connections
 from rest_framework import viewsets
 from rest_framework.authentication import SessionAuthentication, TokenAuthentication
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -29,6 +29,10 @@ from tests.test_app.models import Invoice, Order, OrderItem
 
 _AUTHENTICATION = (TokenAuthentication, SessionAuthentication)
 _PERMISSIONS = (IsAuthenticated, RLSTenantPermission)
+
+# The tenants each username may select in ``MemberHeaderStateView``, standing in
+# for a membership table; the tests fill it.
+TENANT_MEMBERSHIPS: dict[str, set[int]] = {}
 
 
 def database_products() -> list[str]:
@@ -151,6 +155,34 @@ class TenantHeaderStateView(StateView):
         if selected and request.user.is_tenant_admin:
             return tenant_context(int(selected))
         return super().get_rls_context(request)
+
+
+class MemberHeaderMixin(RLSTenantAPIViewMixin):
+    """Lets any user pick one of their tenants with the ``X-Tenant`` header (#150)."""
+
+    permission_classes = _PERMISSIONS
+
+    def get_rls_context(self, request):
+        selected = request.headers.get("X-Tenant")
+        if selected is None or not request.user.is_authenticated:
+            return super().get_rls_context(request)
+        tenant_id = int(selected)
+        if tenant_id not in TENANT_MEMBERSHIPS.get(request.user.username, set()):
+            msg = "You are not a member of the selected tenant."
+            raise PermissionDenied(msg)
+        return tenant_context(tenant_id)
+
+
+class MemberHeaderStateView(MemberHeaderMixin, StateView):
+    """``StateView`` with the ``X-Tenant`` selection."""
+
+
+class MemberInvoiceViewSet(MemberHeaderMixin, InvoiceViewSet):
+    """``InvoiceViewSet`` with the ``X-Tenant`` selection: writes and object lookups."""
+
+
+class MemberOrderItemViewSet(MemberHeaderMixin, OrderItemViewSet):
+    """``OrderItemViewSet`` with the ``X-Tenant`` selection: the browsable API's form."""
 
 
 class TokenOnlyOpenView(RLSTenantAPIViewMixin, APIView):
