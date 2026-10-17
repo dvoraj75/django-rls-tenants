@@ -133,8 +133,8 @@ M2M through tables:
 
 Migrations for 'myapp':
   myapp/migrations/0004_m2m_rls_policies.py
-    - Add M2M RLS policy to myapp_project_members
-    - Add M2M RLS policy to myapp_project_tags
+    + Add M2M RLS policy to myapp_project_members
+    + Add M2M RLS policy to myapp_project_tags
 
 Found 2 issue(s):
   ...

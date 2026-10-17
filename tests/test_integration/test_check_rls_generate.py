@@ -18,12 +18,14 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from django.apps import apps
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import connection, migrations
 from django.db.migrations.autodetector import MigrationAutodetector
 from django.db.migrations.executor import MigrationExecutor
 from django.test import override_settings
+from django.test.utils import isolate_apps
 
 from django_rls_tenants.management._rls_migrations import (
     NO_POLICIES,
@@ -35,7 +37,10 @@ from django_rls_tenants.management._rls_migrations import (
     model_hint,
     plan_m2m_migrations,
 )
-from django_rls_tenants.management.commands.check_rls import _collect_m2m_tables
+from django_rls_tenants.management.commands.check_rls import (
+    _collect_m2m_tables,
+    _collect_rls_models,
+)
 from django_rls_tenants.operations import AddM2MRLSPolicy
 from django_rls_tenants.rls.constraints import RLSConstraint, _build_m2m_drop_sql
 from django_rls_tenants.tenants.conf import RLSTenantsConfig
@@ -118,7 +123,7 @@ class TestGenerate:
         assert "Migrations for 'test_app':" in out
         assert f"{_GENERATED}.py" in out
         for table in _M2M_TABLES:
-            assert f"- Add M2M RLS policy to {table}" in out
+            assert f"    + Add M2M RLS policy to {table}\n" in out
         assert err == ""
 
         package = migrations_without_m2m_policies.name
@@ -264,6 +269,20 @@ class TestHints:
             "applied on database 'default', so the policy or the table was dropped outside "
             "migrations. `sqlmigrate test_app 0001_initial` prints the DO block"
         ) in err
+
+    def test_a_proxy_does_not_stand_for_its_table(self):
+        """The concrete model gets the hint: a proxy's ``Meta`` holds no ``RLSConstraint``."""
+        proxy_meta = type("Meta", (), {"app_label": "test_app", "proxy": True})
+        with isolate_apps("tests.test_app"):  # the proxy registers in a registry of its own
+            proxy = type("OrderProxy", (Order,), {"__module__": __name__, "Meta": proxy_meta})
+        _execute('DROP POLICY "test_order_tenant_isolation_policy" ON "test_order"')
+        with patch.object(apps, "get_models", return_value=[Order, proxy]):
+            assert _collect_rls_models()["test_order"] is Order
+            _, _, err = _check_rls()
+        assert "  Order (test_order): no RLS policies found" in err
+        assert "OrderProxy" not in err
+        assert "W014" not in err
+        assert "  Order (test_order): migration test_app.0001_initial created its policy" in err
 
     def test_constraint_migration_not_applied(self):
         _execute(

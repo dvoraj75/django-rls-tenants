@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from django.db import migrations
+from django.db.migrations.operations.base import OperationCategory
 
 from django_rls_tenants.rls.constraints import (
     _build_m2m_conditions,
@@ -56,6 +57,8 @@ class AddM2MRLSPolicy(migrations.operations.base.Operation):
 
     reduces_to_sql = True
     reversible = True
+    # The "+" prefix in the makemigrations-style listing (formatted_description()).
+    category = OperationCategory.ADDITION
 
     def __init__(
         self,

@@ -145,6 +145,13 @@ class TestAddM2MRLSPolicyDeconstruct:
         assert reconstructed.to_tenant_fk is None
         assert reconstructed.tenant_pk_type == "uuid"
 
+    def test_formatted_description_is_an_addition(self):
+        """``check_rls --generate`` lists it as makemigrations lists an addition (``+``)."""
+        op = AddM2MRLSPolicy(
+            m2m_table="t", from_model="a.B", to_model="c.D", from_fk="b_id", to_fk="d_id"
+        )
+        assert op.formatted_description() == "+ Add M2M RLS policy to t"
+
     def test_migration_writer_names_the_class_once(self):
         """``MigrationWriter`` writes ``<module>.AddM2MRLSPolicy(``.
 

@@ -606,6 +606,8 @@ def _check_protected_models_have_constraint() -> list[CheckWarning]:
         and not model._meta.proxy  # noqa: SLF001
         and _get_tenant_fk_field(model) is None
     ]
+
+
 def _check_strict_mode_exclude() -> list[CheckWarning]:
     """Warn about ``STRICT_MODE_EXCLUDE`` labels that exempt nothing (``W015``).
 

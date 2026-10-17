@@ -265,6 +265,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `django_rls_tenants.operations.django_rls_tenants.operations.AddM2MRLSPolicy(` and
   failed to import. It now returns the bare class name, like Django's own operations.
   Hand-written migrations are unaffected.
+- **`check_rls` listed a proxy model in place of its concrete model** (#46). A proxy of an
+  RLS-protected model shares its table, and `check_rls` reported that table under the
+  proxy's name. It now reports the concrete model, so the `How to fix:` line reads that
+  model's `Meta` and migrations (a proxy's `Meta` holds no `RLSConstraint`).
 
 ## [1.4.0] - 2026-10-16
 

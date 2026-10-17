@@ -52,14 +52,19 @@ class _Issue(NamedTuple):
 
 
 def _collect_rls_models() -> dict[str, type[Model]]:
-    """Return ``{db_table: model}`` for all concrete ``RLSProtectedModel`` subclasses."""
+    """Return ``{db_table: model}`` for all concrete ``RLSProtectedModel`` subclasses.
+
+    A proxy model shares its concrete model's table (and holds no constraints of
+    its own), so the concrete model stands for the table.
+    """
     from django.apps import apps  # noqa: PLC0415
 
     from django_rls_tenants.tenants.models import RLSProtectedModel  # noqa: PLC0415
 
     table_to_model: dict[str, type[Model]] = {}
     for model in apps.get_models():
-        if not issubclass(model, RLSProtectedModel) or model._meta.abstract:  # noqa: SLF001
+        meta = model._meta  # noqa: SLF001
+        if not issubclass(model, RLSProtectedModel) or meta.abstract or meta.proxy:
             continue
         table_to_model[model._meta.db_table] = model  # noqa: SLF001
     return table_to_model
@@ -453,7 +458,7 @@ class Command(BaseCommand):
         self.stdout.write(self.style.MIGRATE_HEADING(f"\nMigrations for {migration.app_label!r}:"))
         self.stdout.write(f"  {self.style.MIGRATE_LABEL(path)}")
         for operation in writer.migration.operations:
-            self.stdout.write(f"    - {operation.describe()}")
+            self.stdout.write(f"    {operation.formatted_description()}")
         if dry_run:
             self.stdout.write(writer.as_string())
             return []
