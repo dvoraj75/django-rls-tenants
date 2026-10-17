@@ -1062,6 +1062,15 @@ class TestMemberSwitcherFilter:
             tenant_b.pk
         )
 
+    def test_all_shows_the_default(self, tenant_a, tenant_b):
+        # ``?rls_tenant=__all__`` cleared the selection before the filter was
+        # built: the request runs in the default, which the dropdown shows.
+        user = _member(tenant_a.pk, [tenant_b.pk])
+        flt = TenantSwitchListFilter(
+            _member_request(user), _filter_params(rls_tenant="__all__"), Order, _order_admin()
+        )
+        assert flt.value() == str(tenant_a.pk)
+
     def test_no_all_entry(self, tenant_a, tenant_b):
         user = _member(tenant_a.pk, [tenant_b.pk])
         flt = TenantSwitchListFilter(_member_request(user), {}, Order, _order_admin())

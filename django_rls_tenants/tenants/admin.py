@@ -200,9 +200,13 @@ class TenantSwitchListFilter(admin.SimpleListFilter):
         The query parameter wins; otherwise fall back to the session-persisted
         selection so the dropdown still shows the active tenant on add/change
         pages that carry no query string (for a ``MultiTenantUser`` without
-        one, their default tenant).
+        one, their default tenant; ``__all__``, which clears their selection,
+        shows the default too, since they have no "All" entry).
         """
-        return super().value() or self._session_value
+        selected = super().value()
+        if self._member and selected == _ALL_TENANTS:
+            selected = None
+        return selected or self._session_value
 
     def queryset(self, request: HttpRequest, queryset: Any) -> Any:  # noqa: ARG002
         """No-op: scoping is done by the owning admin's context, not here."""
