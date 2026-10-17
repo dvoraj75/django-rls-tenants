@@ -164,11 +164,13 @@ class TestMigrateBackwards:
         with connection.cursor() as cursor:
             cursor.execute("RESET ROLE")
         executor = MigrationExecutor(connection)
+        # Back to the latest migration: those after 0010 are unapplied too.
+        leaves = executor.loader.graph.leaf_nodes("test_app")
         try:
             executor.migrate([("test_app", "0009_assignment")])
             assert _rls_status() == (False, False, [])
         finally:
-            MigrationExecutor(connection).migrate([_MIGRATION])
+            MigrationExecutor(connection).migrate(leaves)
         assert _rls_status() == (True, True, [_POLICY])
 
 

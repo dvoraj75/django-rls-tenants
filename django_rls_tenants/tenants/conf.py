@@ -6,12 +6,16 @@ Provides ``RLSTenantsConfig`` which reads and validates
 
 from __future__ import annotations
 
+import re
 import warnings
 from typing import Any
 
 from django.conf import settings
 
 from django_rls_tenants.exceptions import RLSConfigurationError
+
+# A TENANT_HEADER value: a header name as a client sends it.
+_HEADER_NAME = re.compile(r"[A-Za-z0-9-]+")
 
 # All recognized keys in the RLS_TENANTS configuration dict.
 _KNOWN_KEYS = frozenset(
@@ -22,8 +26,10 @@ _KNOWN_KEYS = frozenset(
         "STRICT_MODE",
         "STRICT_MODE_EXCLUDE",
         "TENANT_FK_FIELD",
+        "TENANT_HEADER",
         "TENANT_MODEL",
         "TENANT_PK_TYPE",
+        "TENANT_SESSION_KEY",
         "UNIQUE_ACROSS_TENANTS",
         "USE_LOCAL_SET",
         "USER_PARAM_NAME",
@@ -48,6 +54,8 @@ class RLSTenantsConfig:
             "USE_LOCAL_SET": False,                 # Default: False
             "UNIQUE_ACROSS_TENANTS": {},           # Default: {}
             "EXTERNAL_MODELS": {},                 # Default: {}
+            "TENANT_HEADER": "X-Tenant",           # Default: "X-Tenant"
+            "TENANT_SESSION_KEY": "rls_tenant",    # Default: "rls_tenant"
         }
     """
 
@@ -240,6 +248,43 @@ class RLSTenantsConfig:
             raise RLSConfigurationError(msg)
         return dict(value)
 
+    @property
+    def TENANT_HEADER(self) -> str | None:
+        """Request header a ``MultiTenantUser`` selects a tenant with. Default: ``"X-Tenant"``.
+
+        Read by ``RLSTenantMiddleware``, ``RLSTenantAPIViewMixin`` and
+        ``RLSTenantModelAdmin`` for a user who is a ``MultiTenantUser`` and
+        not a tenant admin; it takes precedence over the session's selection.
+        ``None`` turns header selection off.
+
+        Raises:
+            RLSConfigurationError: If the value is neither a header name
+                (letters, digits and hyphens) nor ``None``.
+        """
+        header = self._get_name_or_none("TENANT_HEADER", "X-Tenant", example="'X-Tenant'")
+        if header is not None and not _HEADER_NAME.fullmatch(header):
+            # Django reads "X_Tenant" from no header: it maps HTTP_X_TENANT to "X-Tenant".
+            msg = (
+                f"RLS_TENANTS['TENANT_HEADER'] must be a header name made of letters, digits "
+                f"and hyphens, as clients send it, got {header!r}. Example: 'X-Tenant'."
+            )
+            raise RLSConfigurationError(msg)
+        return header
+
+    @property
+    def TENANT_SESSION_KEY(self) -> str | None:
+        """Session key holding a ``MultiTenantUser``'s selection. Default: ``"rls_tenant"``.
+
+        Written by ``switch_tenant()`` (and the admin's tenant switcher for
+        such a user), cleared by ``clear_tenant_selection()``. ``None`` turns
+        session selection off, and with it the admin switcher for these users.
+
+        Raises:
+            RLSConfigurationError: If the value is neither a non-empty string
+                nor ``None``.
+        """
+        return self._get_name_or_none("TENANT_SESSION_KEY", "rls_tenant", example="'rls_tenant'")
+
     def __repr__(self) -> str:
         try:
             model = self.TENANT_MODEL
@@ -280,12 +325,7 @@ class RLSTenantsConfig:
         Raises:
             RLSConfigurationError: If ``key`` is required (no default) and missing.
         """
-        cached = self._config_cache
-        if cached is None:
-            cached = dict(getattr(settings, "RLS_TENANTS", {}))
-            self._config_cache = cached
-        self._warn_unknown_keys(cached)
-        value = cached.get(key, default)
+        value = self._config().get(key, default)
         if value is None:
             msg = (
                 f"RLS_TENANTS['{key}'] is required. "
@@ -294,6 +334,32 @@ class RLSTenantsConfig:
             )
             raise RLSConfigurationError(msg)
         return value
+
+    def _config(self) -> dict[str, Any]:
+        """Return the cached ``RLS_TENANTS`` dict; read (and its keys checked) on first use."""
+        cached = self._config_cache
+        if cached is None:
+            cached = dict(getattr(settings, "RLS_TENANTS", {}))
+            self._config_cache = cached
+        self._warn_unknown_keys(cached)
+        return cached
+
+    def _get_name_or_none(self, key: str, default: str, *, example: str) -> str | None:
+        """Read a key whose value is a non-empty string, or ``None`` to turn the feature off.
+
+        Unlike :meth:`_get`, an explicit ``None`` is a value, not a missing key.
+
+        Raises:
+            RLSConfigurationError: If the value is neither a non-empty string nor ``None``.
+        """
+        value = self._config().get(key, default)
+        if value is None or (isinstance(value, str) and value.strip()):
+            return value
+        msg = (
+            f"RLS_TENANTS['{key}'] must be a non-empty string or None (to turn it off), "
+            f"got {value!r}. Example: {example}."
+        )
+        raise RLSConfigurationError(msg)
 
     def _warn_unknown_keys(self, config: dict[str, Any]) -> None:
         """Emit a warning for any unrecognized keys in ``RLS_TENANTS``.

@@ -84,6 +84,7 @@ nav:
       - Tenant Model: guides/tenant-model.md
       - Protecting Models: guides/protecting-models.md
       - User Integration: guides/user-integration.md
+      - Users in Several Tenants: guides/multi-tenant-users.md
       - Middleware: guides/middleware.md
       - Context Managers: guides/context-managers.md
       - Raw SQL: guides/raw-sql.md

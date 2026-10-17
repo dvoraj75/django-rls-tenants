@@ -125,6 +125,10 @@ The `TenantUser` protocol is used in three places:
 - **Tenant users**: sets `rls.current_tenant = str(rls_tenant_id)` and `rls.is_admin = 'false'`
 - **Unauthenticated users**: no GUCs set (fail-closed)
 
+A user who also implements `rls_tenant_ids` (below) may select another of their tenants
+for a request; the middleware then uses the tenant they selected instead of
+`rls_tenant_id`.
+
 ### 2. QuerySet.for_user()
 
 ```python
@@ -150,6 +154,30 @@ def process_order(request, as_user):
 
 It works on `async def` functions too (in an async view, pass `await request.auser()`,
 not `request.user`); see [Async Functions](context-managers.md#async-functions).
+
+## Users in Several Tenants
+
+*1.6.0+.* `TenantUser` gives a user one tenant. A user who belongs to several (a
+consultant, a support agent) implements the `MultiTenantUser` protocol, which adds
+`rls_tenant_ids`, the tenants they may select:
+
+```python
+from functools import cached_property
+
+
+class User(AbstractUser):
+    # ... tenant, is_tenant_admin and rls_tenant_id as above; rls_tenant_id
+    # is the default tenant, used when a request selects none.
+
+    @cached_property
+    def rls_tenant_ids(self) -> frozenset[int]:
+        return frozenset(self.memberships.values_list("tenant_id", flat=True))
+```
+
+A request then selects its tenant with a header (`X-Tenant`) or, in a browser, with
+`switch_tenant()`; the library checks the choice against `rls_tenant_ids` and
+`rls_tenant_id` and refuses any other with a 403. Users that implement only `TenantUser`
+are unaffected. See [Users in Several Tenants](multi-tenant-users.md).
 
 ## Non-User Objects
 
@@ -205,3 +233,6 @@ def set_context(user: object) -> None:
         raise TypeError(f"{type(user).__name__} does not implement TenantUser protocol")
     # ...
 ```
+
+`MultiTenantUser` is `@runtime_checkable` too (import it from `django_rls_tenants`).
+`isinstance()` checks that the attributes exist and does not evaluate `rls_tenant_ids`.

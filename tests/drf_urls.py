@@ -14,6 +14,7 @@ from tests.drf_views import (
     MemberInvoiceViewSet,
     MemberOrderItemViewSet,
     OrderItemViewSet,
+    ProtectedStateView,
     StateView,
     TenantHeaderStateView,
     TokenOnlyOpenView,
@@ -30,6 +31,7 @@ router.register("member-order-items", MemberOrderItemViewSet, basename="member-o
 urlpatterns = [
     path("api/", include(router.urls)),
     path("api/state/", StateView.as_view()),
+    path("api/protected-state/", ProtectedStateView.as_view()),
     path("api/lazy/", LazyProductsView.as_view()),
     path("api/unmixed/", UnmixedStateView.as_view()),
     path("api/boom/", BoomView.as_view()),

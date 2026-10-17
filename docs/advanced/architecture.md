@@ -52,7 +52,8 @@ The upper layer builds Django multitenancy on top of `rls/`:
 | `tenants/bypass.py` | `set_bypass_flag()`, `clear_bypass_flag()`, `bypass_flag()`, `async_bypass_flag()` |
 | `tenants/audit.py` | Audit records on the `django_rls_tenants.audit` logger: context entered, exited and refused, attributed to the code path that set it (see [Audit Logging](../guides/audit-logging.md)) |
 | `tenants/testing.py` | Test helpers: `rls_bypass`, `rls_as_tenant`, assertion functions, and their async counterparts (`async_rls_bypass`, `async_rls_as_tenant`, `aassert_*`) |
-| `tenants/types.py` | `TenantUser` protocol |
+| `tenants/types.py` | `TenantUser` protocol, and `MultiTenantUser` (adds `rls_tenant_ids`) |
+| `tenants/selection.py` | Tenant selection for a `MultiTenantUser`: `switch_tenant()`, `clear_tenant_selection()`, and the resolver (header, then session, then `rls_tenant_id`) that the middleware, the DRF mixin and the admin share (see [Users in Several Tenants](../guides/multi-tenant-users.md)) |
 | `tenants/state.py` | `get_current_tenant_id()`, `set_current_tenant_id()`, `reset_current_tenant_id()` -- `ContextVar`-based tenant state for auto-scoping. Also `get_rls_context_active()`, `set_rls_context_active()`, `reset_rls_context_active()` -- tracks whether any RLS context is active (used by strict mode). A private third `ContextVar` holds the GUC values the library applied for the active context, for the GUC affinity guard |
 | `tenants/checks.py` | Django system checks (W001--W018, E001) |
 | `pytest_plugin.py` | The `rls_role`, `enforce_rls` and `enforce_rls_on_other_threads` fixtures, registered through the `pytest11` entry point; imports nothing from Django at module level |
@@ -102,6 +103,13 @@ ORM query executes  ──────▶  SELECT * FROM orders
 Middleware cleanup  ──────▶  set_config('rls.current_tenant', '')
                              set_config('rls.is_admin', '')
 ```
+
+The tenant in that flow is `request.user.rls_tenant_id`, unless the user implements
+`MultiTenantUser` and is not a tenant admin: then the request's tenant comes from
+`tenants/selection.py`, which reads the `TENANT_HEADER` header, then the session selection,
+then `rls_tenant_id`, and checks it against the user's tenants before anything is set. The
+middleware, `RLSTenantAPIViewMixin` and `RLSTenantModelAdmin` share that resolver (see
+[Users in Several Tenants](../guides/multi-tenant-users.md)).
 
 ## GUC Affinity Guard
 

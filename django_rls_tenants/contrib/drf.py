@@ -56,6 +56,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 
 from django.apps import apps
 from django.core.exceptions import FieldDoesNotExist
+from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import connections
 from django.db.models import Model
@@ -67,6 +68,12 @@ from django_rls_tenants.tenants import audit
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import admin_context, tenant_context
 from django_rls_tenants.tenants.errors import HINT_NO_CONTEXT, HINT_USER_NO_TENANT
+from django_rls_tenants.tenants.selection import (
+    _may_select,
+    _request_tenant_id,
+    _selects_tenants,
+    _vary_on_tenant_header,
+)
 from django_rls_tenants.tenants.state import (
     ADMIN_GUCS,
     ContextGucs,
@@ -109,15 +116,18 @@ logger = logging.getLogger("django_rls_tenants")
 _NO_TENANT_DETAIL = "Your account is not assigned to a tenant."
 
 
-def _context_gucs_for(user: Any) -> ContextGucs | None:
+def _context_gucs_for(user: Any, tenant_id: Any = None) -> ContextGucs | None:
     """Return the GUC values of the context ``user`` implies; ``None`` for a tenantless non-admin.
 
     Args:
         user: An authenticated user satisfying the ``TenantUser`` protocol.
+        tenant_id: The tenant a non-admin user's request selected, used
+            instead of ``user.rls_tenant_id``; ``None`` for that default.
     """
     if user.is_tenant_admin:
         return ADMIN_GUCS
-    tenant_id: int | str | None = user.rls_tenant_id
+    if tenant_id is None:
+        tenant_id = user.rls_tenant_id
     return None if tenant_id is None else ContextGucs.for_tenant(tenant_id)
 
 
@@ -156,7 +166,9 @@ class RLSTenantAPIViewMixin(_APIViewBase):
     before the permission and throttle checks), the mixin enters
     ``admin_context()`` for a user with ``is_tenant_admin`` and
     ``tenant_context(user.rls_tenant_id)`` for any other user (the
-    :class:`~django_rls_tenants.tenants.types.TenantUser` protocol). The
+    :class:`~django_rls_tenants.tenants.types.TenantUser` protocol), or, for
+    a :class:`~django_rls_tenants.tenants.types.MultiTenantUser`, the tenant
+    the request selects among the user's (see :meth:`get_rls_context`). The
     context stays active for the permission checks, the handler, DRF's
     exception handler and the rendering of the response, and is exited before
     ``dispatch()`` returns, also when the view raises. A non-admin user
@@ -173,9 +185,10 @@ class RLSTenantAPIViewMixin(_APIViewBase):
     leaves the response to Django to render, inside that context.
 
     Override :meth:`get_rls_context` to choose the context differently, for
-    example to let an admin pick a tenant, or a user one of the tenants they
-    belong to. :class:`RLSTenantPermission` accepts the tenant context it
-    entered for the request.
+    example to let an admin pick a tenant, or a user select a tenant another
+    way than the library's header and session selection.
+    :class:`RLSTenantPermission` accepts the tenant context it entered for
+    the request.
     """
 
     # Set by dispatch() for the request: where the context is entered, whether
@@ -210,6 +223,11 @@ class RLSTenantAPIViewMixin(_APIViewBase):
         ``None`` for an unauthenticated request and when the active context is
         already the one ``request.user`` implies, ``admin_context()`` for a
         tenant admin and ``tenant_context(user.rls_tenant_id)`` otherwise.
+        For a :class:`~django_rls_tenants.tenants.types.MultiTenantUser` who is
+        not a tenant admin, the tenant is the one the request selects (the
+        ``RLS_TENANTS["TENANT_HEADER"]`` header, then the session's
+        :func:`~django_rls_tenants.tenants.selection.switch_tenant` selection),
+        once it is checked to be one of the user's, else ``rls_tenant_id``.
 
         An override is where a selected tenant is validated:
         :class:`RLSTenantPermission` accepts the tenant context it returns for
@@ -221,12 +239,20 @@ class RLSTenantAPIViewMixin(_APIViewBase):
 
         Raises:
             PermissionDenied: If a non-admin user has no tenant (fail-closed,
-                like ``RLSTenantModelAdmin``).
+                like ``RLSTenantModelAdmin``), or a ``MultiTenantUser``'s
+                request selects a tenant that is not one of theirs.
         """
         user: Any = request.user
         if not _is_authenticated(user):
             return None
-        wanted = _context_gucs_for(user)
+        if _selects_tenants(user):
+            try:
+                tenant_id = _request_tenant_id(request, user, source="drf")
+            except DjangoPermissionDenied as exc:
+                raise PermissionDenied(str(exc)) from exc
+        else:
+            tenant_id = user.rls_tenant_id
+        wanted = _context_gucs_for(user, tenant_id)
         if wanted is None:
             logger.warning(
                 "RLSTenantAPIViewMixin: %s %s is not a tenant admin and has no tenant; "
@@ -241,7 +267,7 @@ class RLSTenantAPIViewMixin(_APIViewBase):
             return None
         if wanted == ADMIN_GUCS:
             return admin_context()
-        return tenant_context(user.rls_tenant_id)
+        return tenant_context(tenant_id)
 
     def perform_authentication(self, request: Request) -> None:
         """Authenticate the request, then enter its RLS context."""
@@ -275,6 +301,8 @@ class RLSTenantAPIViewMixin(_APIViewBase):
             self._rls_exit_stack = stack
             try:
                 response = super().dispatch(request, *args, **kwargs)
+                # Also without RLSTenantMiddleware (a token client's header).
+                _vary_on_tenant_header(request, response)
                 # Only a context the mixin entered ends here; otherwise Django
                 # renders the response inside the enclosing one.
                 if (
@@ -298,8 +326,10 @@ class RLSTenantPermission(BasePermission):
     (never the admin bypass) that is either the one
     :class:`RLSTenantAPIViewMixin` entered for this request (what
     :meth:`~RLSTenantAPIViewMixin.get_rls_context` returned, such as a tenant
-    the user selected and the override validated) or the user's own
-    (``rls_tenant_id``). A tenant admin passes in any context. A view that
+    the user selected and the override validated), the user's own
+    (``rls_tenant_id``), or, for a
+    :class:`~django_rls_tenants.tenants.types.MultiTenantUser`, one of
+    ``rls_tenant_ids``. A tenant admin passes in any context. A view that
     forgot the mixin, served to a token client the middleware saw as
     anonymous, so answers 401/403 instead of an empty result.
 
@@ -325,7 +355,9 @@ class RLSTenantPermission(BasePermission):
         """Return whether the active RLS context is the view's or the one ``request.user`` implies.
 
         The view's is the tenant context :class:`RLSTenantAPIViewMixin`
-        entered for this request, while it is the active one. A refusal of an
+        entered for this request, while it is the active one. A
+        ``MultiTenantUser`` also passes in the tenant context of any tenant it
+        may select (``rls_tenant_ids``). A refusal of an
         authenticated user is logged as a ``context.denied`` audit record; an
         unauthenticated request is not (DRF answers it 401).
         """
@@ -339,9 +371,12 @@ class RLSTenantPermission(BasePermission):
         if user.is_tenant_admin or active == _context_gucs_for(user):
             return True
         # The admin bypass is a tenant admin's only.
-        if active != ADMIN_GUCS and isinstance(view, RLSTenantAPIViewMixin):
-            entered = view._rls_entered_context  # noqa: SLF001  -- the mixin's per-request state
-            if entered is not None and entered is _current_live():
+        if active != ADMIN_GUCS:
+            if isinstance(view, RLSTenantAPIViewMixin):
+                entered = view._rls_entered_context  # noqa: SLF001  -- the mixin's per-request state
+                if entered is not None and entered is _current_live():
+                    return True
+            if _selects_tenants(user) and _may_select(user, active.current_tenant) is not None:
                 return True
         audit.denied(
             "drf",

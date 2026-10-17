@@ -27,6 +27,7 @@ from django_rls_tenants.tenants.context import (
 )
 from django_rls_tenants.tenants.managers import RLSManager, TenantQuerySet
 from django_rls_tenants.tenants.models import RLSProtectedModel, validate_cross_tenant_fks
+from django_rls_tenants.tenants.selection import clear_tenant_selection, switch_tenant
 from django_rls_tenants.tenants.state import (
     get_current_tenant_id,
     get_rls_context_active,
@@ -35,9 +36,10 @@ from django_rls_tenants.tenants.state import (
     set_current_tenant_id,
     set_rls_context_active,
 )
-from django_rls_tenants.tenants.types import TenantUser
+from django_rls_tenants.tenants.types import MultiTenantUser, TenantUser
 
 __all__ = [
+    "MultiTenantUser",
     "NoTenantContextError",
     "RLSConfigurationError",
     "RLSManager",
@@ -51,6 +53,7 @@ __all__ = [
     "async_tenant_context",
     "bypass_flag",
     "clear_bypass_flag",
+    "clear_tenant_selection",
     "get_current_tenant_id",
     "get_rls_context_active",
     "reset_current_tenant_id",
@@ -59,6 +62,7 @@ __all__ = [
     "set_bypass_flag",
     "set_current_tenant_id",
     "set_rls_context_active",
+    "switch_tenant",
     "tenant_context",
     "validate_cross_tenant_fks",
     "with_rls_context",

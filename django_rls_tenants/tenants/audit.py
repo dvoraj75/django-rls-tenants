@@ -6,16 +6,18 @@ routes it; there is no library setting. Each record carries its fields as
 ``LogRecord`` attributes (``extra=``) prefixed with ``rls_``, which JSON
 formatters emit without parsing the message:
 
-- ``rls_event``: ``context.entered`` / ``context.exited`` (``INFO``), and
-  ``context.denied``, ``fk.cross_tenant_rejected``, ``gucs.cleared``
-  (``WARNING``).
+- ``rls_event``: ``context.entered`` / ``context.exited`` and
+  ``tenant.switched`` (``INFO``), and ``context.denied``,
+  ``fk.cross_tenant_rejected``, ``gucs.cleared`` (``WARNING``).
 - ``rls_source``: the code path that set, ended or refused the context
   (:data:`Source`).
 - ``rls_tenant_id``, ``rls_admin``, ``rls_user_id``: the context and the
   user's primary key, ``None`` where unknown. No other user data is logged.
 - Per event: ``rls_using`` (the alias a context block was entered on),
   ``rls_reason`` (:data:`Reason`), ``rls_model`` (a model label),
-  ``rls_fields`` (foreign key names), ``rls_databases`` (aliases).
+  ``rls_fields`` (foreign key names), ``rls_databases`` (aliases),
+  ``rls_selected`` and ``rls_via`` (a tenant selection a ``MultiTenantUser``
+  made, and where), ``rls_previous`` (the selection ``tenant.switched`` replaced).
 
 ``for_user()`` scopes emit nothing (they run once per SQL statement); nor do
 the context blocks the library enters for its own lookups (the tenant of a
@@ -44,6 +46,7 @@ CONTEXT_EXITED = "context.exited"
 CONTEXT_DENIED = "context.denied"
 FK_CROSS_TENANT_REJECTED = "fk.cross_tenant_rejected"
 GUCS_CLEARED = "gucs.cleared"
+TENANT_SWITCHED = "tenant.switched"
 
 Source = Literal[
     "admin",
@@ -56,16 +59,19 @@ Source = Literal[
     "middleware",
     "queryset",
     "safety_net",
+    "selection",
     "validation",
 ]
 """Where a record comes from: an integration, a context manager, or a check."""
 
 Reason = Literal[
     "context_mismatch",
+    "cross_site_selection",
     "no_context",
     "object_of_other_tenant",
     "strict_mode",
     "tenant_id_none",
+    "tenant_not_selectable",
     "user_without_tenant",
 ]
 """Why a ``context.denied`` record refused the context."""

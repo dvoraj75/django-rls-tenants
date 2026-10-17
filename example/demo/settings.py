@@ -71,6 +71,10 @@ RLS_TENANTS = {
     "STRICT_MODE": True,
     # "DATABASES": ["default"],     # Database aliases for GUC setup (default: ["default"])
     # "USE_LOCAL_SET": False,       # Use SET LOCAL instead of set_config (default: False)
+    # A user in several tenants (accounts/models.py: rls_tenant_ids) selects one with
+    # this request header or with switch_tenant() (stored under this session key):
+    # "TENANT_HEADER": "X-Tenant",       # None turns header selection off
+    # "TENANT_SESSION_KEY": "rls_tenant",  # None turns session selection off
 }
 
 # Celery -- broker-free demo. Tasks run inline in the calling process (eager
@@ -108,6 +112,7 @@ TEMPLATES = [
                 "django.template.context_processors.request",
                 "django.contrib.auth.context_processors.auth",
                 "django.contrib.messages.context_processors.messages",
+                "notes.context_processors.tenant_switcher",
             ],
         },
     },

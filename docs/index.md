@@ -42,6 +42,7 @@ the [Security Model](advanced/security.md) for what that does and does not cover
 - **Django REST Framework integration** -- `RLSTenantAPIViewMixin` opens the RLS context after DRF authenticates the user (token and JWT clients included, which the middleware cannot see), `RLSTenantPermission` refuses a view that runs outside it, and `RLSTenantModelSerializer` fills the tenant FK from it. See the [Django REST Framework guide](guides/drf.md).
 - **Per-tenant management commands** -- `run_as_tenant` runs any management command inside one tenant's context and `run_for_all_tenants` runs it once per tenant, with filters, `--parallel`, `--json` output and a failure summary. See the [Management Commands guide](guides/management-commands.md#run_as_tenant).
 - **Audit logging** -- structured records on the `django_rls_tenants.audit` logger each time a tenant or admin context is entered, exited or refused, routed with Django's `LOGGING`. See the [Audit Logging guide](guides/audit-logging.md).
+- **Users in several tenants** -- a user model that adds `rls_tenant_ids` (`MultiTenantUser`) selects the tenant a request runs in with an `X-Tenant` header or `switch_tenant()`; the middleware, the DRF mixin and the admin check every selection against the user's tenants and refuse any other with a 403. See the [Users in Several Tenants guide](guides/multi-tenant-users.md).
 - **Raw SQL helpers** -- `safe_tenant_sql()` builds a tenant-filter predicate; `current_tenant_value_sql()` returns the current tenant ID expression for inserts and projections. Both reuse the expressions used by RLS policies. See the [Raw SQL guide](guides/raw-sql.md).
 - **Clean internal layering** -- generic `rls/` primitives separate from `tenants/` conveniences.
 - **Configurable escape hatches** -- bypass flags for authentication, admin, migrations.
@@ -54,6 +55,7 @@ the [Security Model](advanced/security.md) for what that does and does not cover
 | Install and protect my first model | [Quick Start](getting-started/quickstart.md), then [Protecting Models](guides/protecting-models.md) |
 | Expose the tenant on my `User` model | [User Integration](guides/user-integration.md) |
 | Set the tenant context for every request | [Middleware](guides/middleware.md) |
+| Let one user work in several tenants | [Users in Several Tenants](guides/multi-tenant-users.md) |
 | Set the context in a script or management command | [Context Managers](guides/context-managers.md) |
 | Run a management command as one tenant, or for every tenant | [`run_as_tenant` / `run_for_all_tenants`](guides/management-commands.md#run_as_tenant) |
 | Run a Celery task under the right tenant | [Celery Tasks](guides/celery-tasks.md) |

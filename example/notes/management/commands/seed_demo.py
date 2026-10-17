@@ -52,6 +52,19 @@ USERS = [
         "is_staff": True,
         "is_superuser": False,
     },
+    # Consultant in two tenants (a MultiTenantUser, see accounts/models.py):
+    # works in Acme unless they pick Globex with the switcher in the page header
+    # (switch_tenant()) or the X-Tenant header of an API request.
+    {
+        "username": "dave",
+        "email": "dave@consultants.example",
+        "password": "demo1234",
+        "tenant_slug": "acme",
+        "member_of": ["globex"],
+        "is_tenant_admin": False,
+        "is_staff": False,
+        "is_superuser": False,
+    },
     # Cross-tenant admin: sees every tenant and gets the admin tenant switcher.
     {
         "username": "admin",
@@ -103,8 +116,8 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument("--no-input", action="store_true")
 
-    def _create_user(self, user_data, tenant):
-        from accounts.models import User
+    def _create_user(self, user_data, tenant, tenants):
+        from accounts.models import Membership, User
 
         user = User.objects.create_user(
             username=user_data["username"],
@@ -119,6 +132,8 @@ class Command(BaseCommand):
             # Only grant access to the RLS-protected app. User and Tenant admins
             # are global and must not be accessible to tenant-scoped staff.
             user.user_permissions.set(Permission.objects.filter(content_type__app_label="notes"))
+        for slug in user_data.get("member_of", ()):
+            Membership.objects.create(user=user, tenant=tenants[slug])
         self.stdout.write(f"  Created user: {user_data['email']}")
 
     def handle(self, **options):
@@ -127,11 +142,18 @@ class Command(BaseCommand):
         from tenants.models import Tenant
 
         if User.objects.filter(email="admin@example.com").exists():
-            # Upgrade older demo volumes without deleting or replacing their data.
-            staff_data = next(user for user in USERS if user["username"] == "staff")
-            tenant = Tenant.objects.filter(slug=staff_data["tenant_slug"]).first()
-            if tenant is not None and not User.objects.filter(username="staff").exists():
-                self._create_user(staff_data, tenant)
+            # Upgrade older demo volumes without deleting or replacing their data:
+            # add the accounts introduced since (staff, dave) if they are missing.
+            tenants = {tenant.slug: tenant for tenant in Tenant.objects.all()}
+            for user_data in USERS:
+                if user_data["username"] not in ("staff", "dave"):
+                    continue
+                slugs = [user_data["tenant_slug"], *user_data.get("member_of", ())]
+                if (
+                    all(slug in tenants for slug in slugs)
+                    and not User.objects.filter(username=user_data["username"]).exists()
+                ):
+                    self._create_user(user_data, tenants[user_data["tenant_slug"]], tenants)
             self.stdout.write("Demo data already exists, preserving existing accounts and notes.")
             return
 
@@ -144,7 +166,7 @@ class Command(BaseCommand):
 
             # Create users
             for u in USERS:
-                self._create_user(u, tenants.get(u["tenant_slug"]))
+                self._create_user(u, tenants.get(u["tenant_slug"]), tenants)
 
             # Create categories (per-tenant, RLS-protected)
             cat_objects = {}  # (slug, cat_name) -> Category instance
@@ -195,4 +217,5 @@ class Command(BaseCommand):
         self.stdout.write("  bob   / demo1234   (Globex Inc)")
         self.stdout.write("  carol / demo1234   (Initech)")
         self.stdout.write("  staff / staff1234  (Acme Corp staff -- /admin/ scoped to Acme)")
+        self.stdout.write("  dave  / demo1234   (Acme Corp, also Globex Inc -- tenant switcher)")
         self.stdout.write("  admin / admin1234  (Admin -- sees all, /admin/ tenant switcher)")

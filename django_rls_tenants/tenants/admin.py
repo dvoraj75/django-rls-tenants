@@ -20,7 +20,9 @@ respects tenant isolation with no per-view boilerplate:
   admin with no selection keeps the field visible so they can assign a tenant.
 - **Tenant switcher.** Cross-tenant admins get a session-backed switcher rendered
   as a changelist filter; picking a tenant scopes every subsequent view, and the
-  "All" entry clears it back to ``admin_context()``.
+  "All" entry clears it back to ``admin_context()``. A user who belongs to several
+  tenants (``MultiTenantUser``) gets it too, listing only their tenants and without
+  "All"; their choice is the site's tenant selection (``switch_tenant()``).
 - **Fail-closed.** A non-admin user with no tenant raises ``PermissionDenied``
   (with the shared #34 hint) rather than silently falling back to admin access.
 
@@ -36,6 +38,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import urlsplit
 
 from django.apps import apps
 from django.contrib import admin
@@ -46,6 +49,15 @@ from django_rls_tenants.tenants import audit
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import admin_context, tenant_context
 from django_rls_tenants.tenants.errors import HINT_USER_NO_TENANT
+from django_rls_tenants.tenants.selection import (
+    _clear,
+    _other_tenants,
+    _request_tenant_id,
+    _selectable,
+    _selects_tenants,
+    _shown,
+    _switch,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -65,6 +77,9 @@ if TYPE_CHECKING:
 # "show all" apart from ordinary paramless navigation (add/change/delete pages),
 # which must keep the current selection.
 _ALL_TENANTS = "__all__"
+
+# The 403 of a member's switcher choice that a link on another site made.
+_CROSS_SITE_MESSAGE = "The tenant switcher only accepts a choice made on this site."
 
 # Default session key; mirrors RLSTenantModelAdmin.rls_session_key so the filter
 # can read the persisted selection without a hard dependency on the admin class.
@@ -98,11 +113,32 @@ def _fieldsets_without(
     return cleaned
 
 
+def _same_origin_navigation(request: HttpRequest) -> bool:
+    """Return whether the browser reports that the request comes from this site.
+
+    ``Sec-Fetch-Site`` is ``same-origin`` for a link on this site and ``none``
+    for an address the user typed or bookmarked; a browser that does not send
+    it is judged by ``Referer``, which must have this request's scheme and
+    host. Neither header: ``False``. A ``GET`` link from another site is sent
+    with the session cookie (``SameSite=Lax``), and Django's CSRF protection
+    does not cover ``GET``.
+    """
+    fetch_site = request.headers.get("Sec-Fetch-Site")
+    if fetch_site is not None:
+        return fetch_site in ("same-origin", "none")
+    referer = request.headers.get("Referer")
+    if not referer:
+        return False
+    parsed = urlsplit(referer)
+    return parsed.scheme == request.scheme and parsed.netloc == request.get_host()
+
+
 class TenantSwitchListFilter(admin.SimpleListFilter):
     """Changelist filter that renders the cross-tenant admin's tenant switcher.
 
     The dropdown lists every tenant from ``RLS_TENANTS["TENANT_MODEL"]`` plus an
-    "All" entry. Selecting an option reloads the changelist with
+    "All" entry (for a ``MultiTenantUser``, only the tenants they may select).
+    Selecting an option reloads the changelist with
     ``?<param>=<tenant-pk>`` (or ``?<param>=__all__``); the owning
     :class:`RLSTenantModelAdmin` persists that choice to the session and applies
     the actual scoping by activating the matching context. The filter's own
@@ -125,33 +161,46 @@ class TenantSwitchListFilter(admin.SimpleListFilter):
     ) -> None:
         # Remember the persisted selection so the dropdown reflects the tenant
         # currently in effect even on a paramless changelist load (the owning
-        # admin syncs the session before the filter is built).
-        session_key: str = getattr(model_admin, "rls_session_key", _DEFAULT_SESSION_KEY)
-        self._session_value: str | None = request.session.get(session_key)
+        # admin syncs the session before the filter is built). A
+        # MultiTenantUser's selection is the site's; with none, the request
+        # runs in their default tenant.
+        user: Any = request.user
+        self._member = _selects_tenants(user)
+        self._session_value: str | None
+        if self._member:
+            session_key = rls_tenants_config.TENANT_SESSION_KEY
+            selected = None if session_key is None else request.session.get(session_key)
+            default = user.rls_tenant_id
+            self._session_value = selected or (None if default is None else str(default))
+        else:
+            session_key = getattr(model_admin, "rls_session_key", _DEFAULT_SESSION_KEY)
+            self._session_value = request.session.get(session_key)
         super().__init__(request, params, model, model_admin)
 
     def lookups(
         self,
-        request: HttpRequest,  # noqa: ARG002  -- required by the base signature
+        request: HttpRequest,
         model_admin: admin.ModelAdmin[Any],  # noqa: ARG002  -- required by the base signature
     ) -> list[tuple[str, str]]:
-        """Return ``(pk, label)`` pairs for every tenant.
+        """Return ``(pk, label)`` pairs for every tenant the user may switch to.
 
-        The tenant model is global (not RLS-protected), so this is unaffected by
-        the active context and always lists all tenants.
+        Every tenant for a tenant admin; for a ``MultiTenantUser``, their
+        ``rls_tenant_id`` and ``rls_tenant_ids``. The tenant model is global
+        (not RLS-protected), so this is unaffected by the active context.
         """
         tenant_model = apps.get_model(rls_tenants_config.TENANT_MODEL)
-        return [
-            (str(tenant.pk), str(tenant))
-            for tenant in tenant_model._default_manager.all()  # noqa: SLF001
-        ]
+        tenants = tenant_model._default_manager.all()  # noqa: SLF001
+        if self._member:
+            tenants = tenants.filter(pk__in=_selectable(cast("Any", request.user)))
+        return [(str(tenant.pk), str(tenant)) for tenant in tenants]
 
     def value(self) -> str | None:
         """Return the selected tenant id.
 
         The query parameter wins; otherwise fall back to the session-persisted
         selection so the dropdown still shows the active tenant on add/change
-        pages that carry no query string.
+        pages that carry no query string (for a ``MultiTenantUser`` without
+        one, their default tenant).
         """
         return super().value() or self._session_value
 
@@ -160,13 +209,18 @@ class TenantSwitchListFilter(admin.SimpleListFilter):
         return queryset
 
     def choices(self, changelist: ChangeList) -> Iterator[_ListFilterChoices]:
-        """Yield the "All" entry (clearing the selection) followed by each tenant."""
+        """Yield the "All" entry (clearing the selection) followed by each tenant.
+
+        A ``MultiTenantUser`` gets no "All" entry: they always work in one
+        tenant.
+        """
         current = self.value()
-        yield {
-            "selected": current is None or current == _ALL_TENANTS,
-            "query_string": changelist.get_query_string({self.parameter_name: _ALL_TENANTS}),
-            "display": "All",
-        }
+        if not self._member:
+            yield {
+                "selected": current is None or current == _ALL_TENANTS,
+                "query_string": changelist.get_query_string({self.parameter_name: _ALL_TENANTS}),
+                "display": "All",
+            }
         for lookup, title in self.lookup_choices:
             yield {
                 "selected": current == str(lookup),
@@ -232,11 +286,14 @@ class RLSTenantModelAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
     and ``for_user()`` rely on.
 
     Attributes:
-        rls_allow_tenant_switch: Give cross-tenant admins the tenant switcher.
-            When ``False``, such admins always operate in ``admin_context()``
-            (all tenants). Defaults to ``True``.
-        rls_session_key: Session key holding the switcher selection. Defaults to
-            ``"rls_admin_tenant"``.
+        rls_allow_tenant_switch: Give cross-tenant admins, and users who may
+            select one of several tenants (``MultiTenantUser``), the tenant
+            switcher. When ``False``, such admins always operate in
+            ``admin_context()`` (all tenants), and such users in the tenant
+            their request selects elsewhere. Defaults to ``True``.
+        rls_session_key: Session key holding a tenant admin's switcher selection.
+            Defaults to ``"rls_admin_tenant"``. A ``MultiTenantUser``'s is the
+            site's, under ``RLS_TENANTS["TENANT_SESSION_KEY"]``.
         rls_tenant_query_param: Query parameter the switcher uses. Defaults to
             ``"rls_tenant"`` (matches :class:`TenantSwitchListFilter`).
         rls_deny_without_tenant: When ``True`` (default), a non-admin user with no
@@ -254,10 +311,18 @@ class RLSTenantModelAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
         """Return the tenant the current request should be scoped to.
 
         - Cross-tenant admin: the switcher selection (``None`` means "all").
+        - :class:`~django_rls_tenants.tenants.types.MultiTenantUser`: the
+          tenant the request selects (the ``RLS_TENANTS["TENANT_HEADER"]``
+          header, then the session's selection, which the switcher writes),
+          else their ``rls_tenant_id``.
         - Scoped user: their own ``rls_tenant_id``.
 
         ``None`` means "no specific tenant"; :meth:`_rls_context` decides whether
         that is admin access, a denial, or an unscoped fall-through.
+
+        Raises:
+            PermissionDenied: If a ``MultiTenantUser``'s request selects a
+                tenant that is not one of theirs.
         """
         user: Any = request.user
         if user.is_tenant_admin:
@@ -265,6 +330,9 @@ class RLSTenantModelAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
                 return None
             selected: int | str | None = request.session.get(self.rls_session_key)
             return selected
+        if _selects_tenants(user):
+            member_tenant: int | str | None = _request_tenant_id(request, user, source="admin")
+            return member_tenant
         tenant_id: int | str | None = user.rls_tenant_id
         return tenant_id
 
@@ -295,9 +363,24 @@ class RLSTenantModelAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
         return audit.attributed(self._rls_context(request), source="admin", user=request.user)
 
     def _user_can_switch_tenant(self, request: HttpRequest) -> bool:
-        """Return whether the switcher should be offered to this user."""
+        """Return whether the switcher should be offered to this user.
+
+        To a tenant admin, and to a
+        :class:`~django_rls_tenants.tenants.types.MultiTenantUser` who may
+        select a tenant other than their ``rls_tenant_id`` (while
+        ``RLS_TENANTS["TENANT_SESSION_KEY"]`` is set, where the switcher
+        stores the selection).
+        """
         user: Any = request.user
-        return bool(self.rls_allow_tenant_switch and user.is_tenant_admin)
+        if not self.rls_allow_tenant_switch:
+            return False
+        if user.is_tenant_admin:
+            return True
+        return (
+            _selects_tenants(user)
+            and rls_tenants_config.TENANT_SESSION_KEY is not None
+            and bool(_other_tenants(user))
+        )
 
     def _sync_tenant_selection(self, request: HttpRequest) -> None:
         """Persist a switcher choice from the query string into the session.
@@ -309,11 +392,39 @@ class RLSTenantModelAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
         every later admin page. A selection whose tenant is *later* deleted is not
         re-validated here (no query param to act on); it simply scopes to an empty
         result set (fail-closed) until the admin picks another tenant or "All".
+
+        A :class:`~django_rls_tenants.tenants.types.MultiTenantUser`'s choice
+        is the site's selection (``switch_tenant()``): a tenant that is not
+        one of theirs is a 403 and leaves the selection as it was, and
+        ``__all__`` (or empty) clears it, back to their ``rls_tenant_id``.
+        Because that selection steers the whole site and the switcher is a
+        ``GET`` link, the choice is applied only to a same-origin navigation
+        (:func:`_same_origin_navigation`); a link from another site is a 403.
+
+        Raises:
+            PermissionDenied: If a ``MultiTenantUser`` picks a tenant that is
+                not one of theirs, or the choice comes from another site.
         """
         if not self._user_can_switch_tenant(request):
             return
         raw = request.GET.get(self.rls_tenant_query_param)
         if raw is None:
+            return
+        user: Any = request.user
+        if not user.is_tenant_admin:
+            if not _same_origin_navigation(request):
+                audit.denied(
+                    "admin",
+                    "cross_site_selection",
+                    user_id=audit.user_id_of(user),
+                    selected=_shown(raw),
+                    via="query",
+                )
+                raise PermissionDenied(_CROSS_SITE_MESSAGE)
+            if raw in ("", _ALL_TENANTS):
+                _clear(request, source="admin")
+            else:
+                _switch(request, raw, source="admin", via="query")
             return
         if raw in ("", _ALL_TENANTS):
             request.session.pop(self.rls_session_key, None)

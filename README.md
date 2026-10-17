@@ -71,6 +71,11 @@ returns zero rows, never leaked data.
   time a tenant or admin context is entered, exited or refused (who, which tenant, which
   code path), ready for a JSON formatter and routed with Django's `LOGGING`.
   [Audit logging guide →](https://dvoraj75.github.io/django-rls-tenants/guides/audit-logging/)
+- **Users in several tenants** -- a user model that adds `rls_tenant_ids`
+  (`MultiTenantUser`) selects the tenant a request runs in with an `X-Tenant` header or
+  `switch_tenant()`; the middleware, the DRF mixin and the admin check every selection
+  against the user's tenants and refuse any other with a 403.
+  [Guide →](https://dvoraj75.github.io/django-rls-tenants/guides/multi-tenant-users/)
 - **Raw SQL helpers** -- `safe_tenant_sql()` builds a tenant-filter predicate;
   `current_tenant_value_sql()` returns the current tenant ID expression for inserts
   and projections. Both reuse the expressions used by RLS policies.

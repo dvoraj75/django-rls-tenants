@@ -73,3 +73,33 @@ def test_seed_backfills_staff_without_resetting_existing_data(client):
     assert alice.email == "custom@example.com"
     with rls_bypass():
         assert set(Note.objects.values_list("pk", "title")) == original_notes
+
+
+def test_seeded_consultant_switches_between_their_tenants(client):
+    from accounts.models import User
+    from tenants.models import Tenant
+
+    call_command("seed_demo", stdout=StringIO())
+    dave = User.objects.get(username="dave")
+    globex = Tenant.objects.get(slug="globex")
+    assert dave.tenant.slug == "acme"
+    assert dave.rls_tenant_ids == frozenset({globex.pk})
+    assert not dave.is_tenant_admin
+    assert client.login(username="dave", password="demo1234")  # noqa: S106 -- demo login
+    assert "Q3 Planning" in client.get("/").content.decode()
+    client.post("/select-tenant/", {"tenant": globex.pk})
+    body = client.get("/").content.decode()
+    assert "Product Launch" in body
+    assert "Q3 Planning" not in body
+
+
+def test_seed_backfills_the_consultant(client):
+    from accounts.models import User
+
+    call_command("seed_demo", stdout=StringIO())
+    # Simulate a volume from before the consultant was introduced.
+    User.objects.get(username="dave").delete()
+
+    call_command("seed_demo", stdout=StringIO())
+    dave = User.objects.get(username="dave")
+    assert {membership.tenant.slug for membership in dave.memberships.all()} == {"globex"}

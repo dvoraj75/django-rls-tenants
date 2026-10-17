@@ -59,6 +59,30 @@ class AdminUser(AbstractUser):
         """Tenant PK for RLS filtering, or ``None`` for admins / unassigned users."""
         return self.tenant_id  # type: ignore[return-value]
 
+    @property
+    def rls_tenant_ids(self) -> frozenset[int]:
+        """The tenants this user may select (``MultiTenantUser``, #47): their memberships.
+
+        Not cached: a test adds memberships to a user object it already holds.
+        """
+        return frozenset(self.memberships.values_list("tenant_id", flat=True))
+
+
+class Membership(models.Model):
+    """A user's membership of a tenant (#47); a plain table, readable without a context."""
+
+    user = models.ForeignKey(AdminUser, on_delete=models.CASCADE, related_name="memberships")
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="memberships")
+
+    class Meta:
+        db_table = "test_membership"
+        constraints = [  # noqa: RUF012  -- Django Meta convention
+            models.UniqueConstraint(fields=["user", "tenant"], name="test_membership_unique"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.user_id} in {self.tenant_id}"
+
 
 class TenantUser(models.Model):
     """Test user implementing the ``TenantUser`` protocol."""

@@ -25,8 +25,9 @@ HINT_NO_CONTEXT = (
 
 HINT_USER_NO_TENANT = (
     "Assign the user to a tenant (set rls_tenant_id) or mark them as a "
-    "cross-tenant admin (is_tenant_admin=True). A non-admin TenantUser must "
-    "belong to exactly one tenant."
+    "cross-tenant admin (is_tenant_admin=True). A non-admin TenantUser needs a "
+    "tenant; in a request, a MultiTenantUser may select one of rls_tenant_ids "
+    "instead (the RLS_TENANTS['TENANT_HEADER'] header or switch_tenant())."
 )
 """A non-admin ``TenantUser`` has ``rls_tenant_id=None``."""
 

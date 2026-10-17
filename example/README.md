@@ -28,6 +28,7 @@ Open **<http://localhost:8000>** and log in with any demo account:
 | `bob`    | `demo1234`  | Globex Inc | Only Globex notes |
 | `carol`  | `demo1234`  | Initech    | Only Initech notes|
 | `staff`  | `staff1234` | Acme Corp  | Only Acme notes, also in `/admin/` |
+| `dave`   | `demo1234`  | Acme Corp, also Globex Inc | Acme notes, or Globex notes after switching with the tenant switcher |
 | `admin`  | `admin1234` | _(admin)_  | **All notes**, with a tenant switcher in `/admin/` |
 
 ## What to Try
@@ -232,6 +233,30 @@ Open **<http://localhost:8000>** and log in with any demo account:
     [Management Commands](https://dvoraj75.github.io/django-rls-tenants/guides/management-commands/)
     guide.
 
+13. **A user in several tenants** -- `dave` is a consultant: his default tenant is Acme
+    Corp (`User.tenant`), and an `accounts.Membership` row makes him a member of
+    Globex Inc too. `User.rls_tenant_ids` (a `cached_property` over the memberships, on a
+    plain table) makes the user model a `MultiTenantUser`. Log in as `dave` / `demo1234`:
+    the page header shows a tenant switcher next to the tenant badge. Pick *Globex Inc*
+    and the notes, the stats page, the Celery task's count and "New Note" all follow it.
+    The select posts to `notes.views.select_tenant`, which calls `switch_tenant()` (a
+    tenant that is not Dave's is a `403`); the empty choice calls
+    `clear_tenant_selection()`. The switch applies from the next request. The API takes the
+    same choice per request with the `X-Tenant` header:
+    ```bash
+    docker compose exec web python manage.py drf_create_token dave
+    curl -H "Authorization: Token <key>" http://localhost:8000/api/notes/
+    # -> Acme's notes (the default tenant)
+    curl -H "Authorization: Token <key>" -H "X-Tenant: <globex id>" http://localhost:8000/api/notes/
+    # -> Globex's notes
+    ```
+    Look the Globex id up with `docker compose exec web python manage.py shell -c "from
+    tenants.models import Tenant; print(Tenant.objects.get(slug='globex').pk)"`. A tenant
+    Dave is not a member of (Initech's id) answers `403`.
+    `tests/test_multi_tenant_users.py` runs all of this under the non-superuser role. See the
+    [Users in Several Tenants](https://dvoraj75.github.io/django-rls-tenants/guides/multi-tenant-users/)
+    guide.
+
 ## Library Features Demonstrated
 
 | Feature | Where |
@@ -240,6 +265,9 @@ Open **<http://localhost:8000>** and log in with any demo account:
 | `RLSConstraint` migration | `notes/migrations/0001_initial.py` -- committed `AddConstraint` ops that emit the RLS DDL |
 | `RLSTenantMiddleware` | `demo/settings.py` -- automatic per-request RLS context |
 | `TenantUser` protocol | `accounts/models.py` -- `rls_tenant_id` + `is_tenant_admin` |
+| `MultiTenantUser` protocol | `accounts/models.py` -- `rls_tenant_ids` over the plain `Membership` table; `dave` belongs to Acme and Globex (item 13) |
+| `switch_tenant()` / `clear_tenant_selection()` | `notes/views.py` -- `select_tenant`, behind the tenant switcher of `notes/context_processors.py` and `base.html` (item 13) |
+| `X-Tenant` request header | `notes/api.py` -- the unchanged notes API: the default `RLSTenantAPIViewMixin` honours the header (item 13); the two settings are commented out in `demo/settings.py` |
 | `RLSTenantModelAdmin` | `notes/admin.py` -- auto-scoped changelists, hidden + auto-assigned tenant FK, tenant switcher |
 | Auto-scoping (zero `.filter()`) | `notes/views.py` -- `Note.objects.all()` returns only tenant data |
 | `select_related()` propagation | `notes/views.py` -- tenant filter auto-propagates to joined `Category` |
@@ -259,7 +287,8 @@ Open **<http://localhost:8000>** and log in with any demo account:
 | `NoTenantContextError` handling | `notes/views.py` -- graceful handling in view code |
 | Testing utilities | `tests/test_rls.py` -- `rls_bypass`, `rls_as_tenant`, assert helpers |
 | Admin tests | `tests/test_admin.py` -- the tenant-aware admin driven through the test client |
-| Seed command tests | `tests/test_seed_demo.py` -- `staff` account permissions and idempotent re-seeding |
+| Seed command tests | `tests/test_seed_demo.py` -- `staff` account permissions, the seeded `dave` switching tenants, and idempotent re-seeding that backfills `staff` and `dave` |
+| Multi-tenant user tests | `tests/test_multi_tenant_users.py` -- the switcher, the `X-Tenant` header, refusals and a member without a default tenant |
 | Strict mode tests | `tests/test_rls.py` -- `TestStrictMode` class |
 | Celery task tests | `tests/test_tasks.py` -- eager-mode round-trips for `count_notes` and `export_notes` |
 | Raw SQL tests | `tests/test_services.py` -- raw figures equal the ORM's for a tenant user and for admin |
@@ -296,19 +325,21 @@ example/
 ├── manage.py            Django management script
 ├── demo/                Django project: settings (incl. REST_FRAMEWORK), urls, wsgi/asgi, Celery app (eager mode)
 ├── tenants/             Tenant model (shared, not RLS-protected)
-├── accounts/            Custom User model with tenant FK + TenantUser protocol
+├── accounts/            Custom User model with tenant FK + TenantUser protocol,
+│                        Membership + rls_tenant_ids (MultiTenantUser)
 ├── notes/               RLS-protected Note + Category models, views, services
 │                        (safe_tenant_sql), tasks (@rls_task), REST API (api.py),
-│                        templates, admin,
+│                        templates, admin, context_processors.py (tenant switcher),
 │                        seed_demo and note_report commands, committed migrations (0001_initial.py
 │                        carries the RLS policy DDL)
 └── tests/               Example tests using django-rls-tenants testing utilities
     ├── conftest.py      Autouse enforce_rls fixture; rls_bypass test data setup
     ├── test_admin.py    RLSTenantModelAdmin scoping, FK hiding and switcher tests
     ├── test_api.py      REST API (/api/notes/) with token auth under the non-superuser role
+    ├── test_multi_tenant_users.py  Tenant switcher and X-Tenant header for a user in two tenants
     ├── test_note_report.py  note_report via run_as_tenant / run_for_all_tenants
     ├── test_rls.py      RLS policy verification and tenant isolation tests
-    ├── test_seed_demo.py  Seeded staff account and idempotent re-seeding tests
+    ├── test_seed_demo.py  Seeded staff and dave accounts and idempotent re-seeding tests
     ├── test_services.py   safe_tenant_sql() raw aggregate vs. the ORM
     └── test_tasks.py    @rls_task context propagation in eager mode
 ```

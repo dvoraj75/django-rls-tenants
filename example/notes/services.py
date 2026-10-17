@@ -30,7 +30,7 @@ def get_raw_note_stats():
     ``safe_tenant_sql(include_admin=False)`` -- a bare ``tenant_id = ...``
     match -- as described in the Performance & Indexing guide.
 
-    Must be called inside an RLS context (``get_note_stats`` provides one).
+    Must be called inside an RLS context (``note_stats_in_context`` runs in one).
     """
     sql = (
         "SELECT count(*), coalesce(round(avg(length(content))), 0)::int "
@@ -42,16 +42,14 @@ def get_raw_note_stats():
     return total, avg_content_length
 
 
-@with_rls_context
-def get_note_stats(as_user):
-    """Return per-category note counts for the current tenant.
-
-    The ``@with_rls_context`` decorator reads ``as_user`` and sets the
-    appropriate RLS context before the function body runs. No manual
-    ``tenant_context()`` or ``admin_context()`` call needed.
+def note_stats_in_context():
+    """Return per-category note counts for the tenant of the active RLS context.
 
     ``raw_total`` and ``avg_content_length`` come from the raw SQL statement
     in :func:`get_raw_note_stats`; ``raw_total`` always equals ``total``.
+
+    Must be called inside an RLS context: a request's (``RLSTenantMiddleware``
+    follows the tenant a user selected), or ``get_note_stats``'s.
     """
     total = Note.objects.count()
     by_category = (
@@ -69,3 +67,16 @@ def get_note_stats(as_user):
         "raw_total": raw_total,
         "avg_content_length": avg_content_length,
     }
+
+
+@with_rls_context
+def get_note_stats(as_user):
+    """Return :func:`note_stats_in_context` in the context of ``as_user``.
+
+    The ``@with_rls_context`` decorator reads ``as_user`` and sets the
+    appropriate RLS context before the function body runs. No manual
+    ``tenant_context()`` or ``admin_context()`` call needed. It uses the
+    user's own tenant (``rls_tenant_id``), not one the user selected for a
+    request, so code outside a request (a script, a task) calls it.
+    """
+    return note_stats_in_context()
