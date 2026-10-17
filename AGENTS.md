@@ -369,6 +369,24 @@ the scope only sets the `ContextVar`s, and the GUC affinity guard applies the us
 per statement (autocommit) or once per transaction and context change. Only an alias outside
 `conf.DATABASES` still snapshots, writes `SET LOCAL` and restores.
 
+### `prefetch_related()` Tenant Filter
+
+Django prefetches forward foreign keys, forward one-to-one fields and reverse one-to-one
+relations through the related model's `_base_manager`, which has no tenant filter (#44).
+`TenantQuerySet._tenant_prefetch_lookups()` rewrites the lookups at evaluation, when a
+tenant is active (the `for_user()` user's, else the context's; none for an admin):
+each such hop onto an RLS-protected model becomes `Prefetch(path, queryset=<base
+manager>.filter(tenant_id=X))` (`_scoped_prefetch_lookups()`, `_prefetch_hop()`,
+`_tenant_rows()`). The queryset's own `_prefetch_related_lookups` stay untouched.
+`_prefetch_related_objects()` uses the rewrite for `_fetch_all()`; `iterator()` and
+`aiterator()` run Django's implementation on a clone from `_with_tenant_prefetches()`,
+because it calls `prefetch_related_objects()` itself. A new override that evaluates a
+queryset by another route must do the same. A `Prefetch` with a caller-supplied queryset
+is left as given (its inner lookups are rewritten). On Django 6.1 the filtered queryset
+gets the fetch mode Django's own prefetch would give the hop's objects (that of the
+instances the hop starts from; `targets` tracks it per path, since a reverse foreign-key
+or many-to-many hop starts the related manager's fresh queryset in the default mode).
+
 ### Async Middleware Path
 
 Under ASGI, `RLSTenantMiddleware.__acall__` (not `MiddlewareMixin.__acall__`) serves the
