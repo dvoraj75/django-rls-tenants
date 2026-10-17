@@ -381,7 +381,32 @@ after it ends.
     continue to enforce fail-closed isolation regardless. Strict mode is an
     additional application-level safety net that surfaces mistakes earlier.
 
-See [Configuration](../getting-started/configuration.md#strict_mode) for setup.
+### Excluding models
+
+Some code legitimately reads an RLS-protected model with no context. The usual case is an
+authentication backend that reads the user model under `bypass_flag()`: the flag is a
+GUC, not an RLS context, so strict mode raises there. List such models in
+`STRICT_MODE_EXCLUDE`:
+
+```python title="settings.py"
+RLS_TENANTS = {
+    "TENANT_MODEL": "myapp.Tenant",
+    "STRICT_MODE": True,
+    "STRICT_MODE_EXCLUDE": ["accounts.User"],
+}
+```
+
+The exclusion removes the application-level guard for that model (and its proxies) and
+nothing else. Without a context the database still fails closed: the query returns only
+the rows the policy lets through, none unless a bypass flag from the constraint's
+`extra_bypass_flags` is set or the connection role bypasses RLS. Do not use it to make an
+"empty result" error go away: a query that should see a tenant's rows needs a context, and
+the exclusion only turns the loud failure back into a silent one for that model. It
+applies to every query on the model, not to one call. System check `W015` reports entries
+that name no installed RLS-protected model.
+
+See [Configuration](../getting-started/configuration.md#strict_mode) for setup, and
+[`STRICT_MODE_EXCLUDE`](../getting-started/configuration.md#strict_mode_exclude).
 
 ## Recommendations
 

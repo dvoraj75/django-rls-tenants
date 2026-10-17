@@ -195,7 +195,9 @@ with an `RLSConstraint` that omits the constraint's tenant field (PostgreSQL che
 indexes outside the policies, so the `IntegrityError` is a cross-tenant existence oracle).
 `RLS_TENANTS["UNIQUE_ACROSS_TENANTS"]` (`{"app.Model": [name | tuple of fields]}`, validated
 in `conf.py`) allowlists intended ones; a stale entry is a `W012` too. `W014` is reserved
-for #46.
+for #46. `W015` (#45, `_check_strict_mode_exclude()` in `tenants/checks.py`) warns about a
+`RLS_TENANTS["STRICT_MODE_EXCLUDE"]` label that does not resolve to an installed model or
+names one without an `RLSConstraint`; it runs whether or not `STRICT_MODE` is on.
 
 When modifying middleware or GUC-related code, ensure all database iteration
 uses `conf.DATABASES` rather than hardcoding `"default"`.
@@ -347,6 +349,18 @@ context. This distinguishes "no context" (should raise) from "admin context"
 `TenantQuerySet._rls_scope()`) set the flag to `True` on entry and restore via token on
 exit. The guard is in `TenantQuerySet._check_strict_mode()`. A third, private `ContextVar`
 (`_context_gucs`) drives the GUC affinity guard (see above).
+
+`RLS_TENANTS["STRICT_MODE_EXCLUDE"]` (#45, a list of `"app_label.ModelName"` labels,
+validated in `conf.py`) exempts models from that check only: `_is_strict_mode_excluded()`
+is consulted just before `_check_strict_mode()` raises, so it costs nothing when a
+context is active. It compares `Options.label_lower` of the model and of its concrete
+model (a proxy follows its concrete model, not the other way round) with the labels
+normalized like `apps.get_model()` (app label as given, model name lower-cased) by
+`_strict_mode_excluded_labels()`, an `lru_cache` keyed on the label tuple. The auto-scope
+filter, `for_user()`, the context managers and the RLS policies are unchanged, so an
+excluded model with no context still fails closed at the database. It is not the per-query
+`rls_skip_strict()` of the roadmap. Models without an `RLSConstraint` are never guarded
+and need no entry.
 
 ### `for_user()` Scope
 

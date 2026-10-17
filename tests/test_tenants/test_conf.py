@@ -124,6 +124,45 @@ class TestRLSTenantsConfig:
             conf = RLSTenantsConfig()
             assert conf.STRICT_MODE is True
 
+    def test_strict_mode_exclude_default(self):
+        """STRICT_MODE_EXCLUDE defaults to an empty tuple."""
+        with override_settings(RLS_TENANTS={"TENANT_MODEL": "x.Y"}):
+            conf = RLSTenantsConfig()
+            assert conf.STRICT_MODE_EXCLUDE == ()
+
+    @pytest.mark.parametrize(
+        "value",
+        [["a.B", "c.D"], ("a.B", "c.D")],
+        ids=["list", "tuple"],
+    )
+    def test_strict_mode_exclude_returns_a_tuple(self, value):
+        """A list or tuple of labels is returned as a tuple, in order."""
+        with override_settings(RLS_TENANTS={"TENANT_MODEL": "x.Y", "STRICT_MODE_EXCLUDE": value}):
+            conf = RLSTenantsConfig()
+            with w.catch_warnings():
+                w.simplefilter("error")  # a known key: no unknown-key warning
+                assert conf.STRICT_MODE_EXCLUDE == ("a.B", "c.D")
+
+    def test_strict_mode_exclude_accepts_a_set(self):
+        """A set of labels is accepted too."""
+        with override_settings(
+            RLS_TENANTS={"TENANT_MODEL": "x.Y", "STRICT_MODE_EXCLUDE": {"a.B", "c.D"}},
+        ):
+            conf = RLSTenantsConfig()
+            assert sorted(conf.STRICT_MODE_EXCLUDE) == ["a.B", "c.D"]
+
+    @pytest.mark.parametrize(
+        "value",
+        ["accounts.User", ["accounts.User", 1], {"accounts.User": True}],
+        ids=["bare_string", "non_string_label", "dict"],
+    )
+    def test_strict_mode_exclude_rejects_malformed_values(self, value):
+        """Anything but a list of strings raises RLSConfigurationError naming the fix."""
+        with override_settings(RLS_TENANTS={"TENANT_MODEL": "x.Y", "STRICT_MODE_EXCLUDE": value}):
+            conf = RLSTenantsConfig()
+            with pytest.raises(RLSConfigurationError, match=r"must be a list of model labels"):
+                _ = conf.STRICT_MODE_EXCLUDE
+
     def test_unique_across_tenants_default(self):
         """UNIQUE_ACROSS_TENANTS defaults to an empty dict."""
         with override_settings(RLS_TENANTS={"TENANT_MODEL": "x.Y"}):

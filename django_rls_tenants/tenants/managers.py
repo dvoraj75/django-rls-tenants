@@ -138,6 +138,31 @@ def _rls_model_cache() -> frozenset[type[models.Model]]:
     return frozenset(protected)
 
 
+def _is_strict_mode_excluded(model: type[models.Model]) -> bool:
+    """Whether ``RLS_TENANTS["STRICT_MODE_EXCLUDE"]`` lists ``model`` or its concrete model."""
+    excluded = _strict_mode_excluded_labels(rls_tenants_config.STRICT_MODE_EXCLUDE)
+    if not excluded:
+        return False
+    meta = model._meta  # noqa: SLF001
+    concrete = meta.concrete_model or model  # None only on an abstract model
+    return meta.label_lower in excluded or concrete._meta.label_lower in excluded  # noqa: SLF001
+
+
+@lru_cache(maxsize=1)
+def _strict_mode_excluded_labels(labels: tuple[str, ...]) -> frozenset[str]:
+    """Normalize ``STRICT_MODE_EXCLUDE`` labels to ``Options.label_lower``.
+
+    The app label stays as given and the model name is lower-cased, as
+    ``apps.get_model()`` resolves them; a label without a dot matches nothing
+    (check ``W015`` reports it).
+    """
+    normalized: set[str] = set()
+    for label in labels:
+        app_label, _, model_name = label.partition(".")
+        normalized.add(f"{app_label}.{model_name.lower()}")
+    return frozenset(normalized)
+
+
 # Type ignore explanation: Django's QuerySet is generic at runtime but
 # unparameterised in django-stubs; suppressed to avoid false positives. The
 # overrides below return Any for rows and instances for the same reason.
@@ -363,7 +388,10 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
 
         Only applies to RLS-protected models (those with an
         ``RLSConstraint``). Non-protected models that happen to use
-        ``TenantQuerySet`` (e.g., via inheritance) are not guarded.
+        ``TenantQuerySet`` (e.g., via inheritance) are not guarded, and
+        neither are the models listed in ``STRICT_MODE_EXCLUDE`` (or their
+        proxies). The exclusion is read only on the way to raising, so it
+        costs nothing when a context is active.
 
         The check reads two ``ContextVar`` values -- negligible cost.
 
@@ -380,9 +408,16 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
             return  # tenant_context / admin_context / middleware active
         if self._rls_user is not None:
             return  # for_user() was called
+        if _is_strict_mode_excluded(self.model):
+            return  # listed in STRICT_MODE_EXCLUDE; RLS still filters at the database
         model_name = self.model.__name__
+        label = self.model._meta.label  # noqa: SLF001
         msg = f"RLS strict mode: query on {model_name} attempted without an active RLS context."
-        hint = f"{HINT_NO_CONTEXT} To disable this guard, set STRICT_MODE=False in RLS_TENANTS."
+        hint = (
+            f"{HINT_NO_CONTEXT} If {model_name} is meant to be read without a context, list "
+            f"{label!r} in RLS_TENANTS['STRICT_MODE_EXCLUDE']; to disable "
+            f"this guard for every model, set STRICT_MODE=False in RLS_TENANTS."
+        )
         raise NoTenantContextError(msg, hint=hint)
 
     # ---- for_user() RLS scope ----

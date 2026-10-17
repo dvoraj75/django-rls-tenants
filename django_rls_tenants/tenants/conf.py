@@ -19,6 +19,7 @@ _KNOWN_KEYS = frozenset(
         "DATABASES",
         "GUC_PREFIX",
         "STRICT_MODE",
+        "STRICT_MODE_EXCLUDE",
         "TENANT_FK_FIELD",
         "TENANT_MODEL",
         "TENANT_PK_TYPE",
@@ -39,6 +40,7 @@ class RLSTenantsConfig:
             "DATABASES": ["default"],              # Default: ["default"]
             "GUC_PREFIX": "rls",                   # Default: "rls"
             "STRICT_MODE": False,                  # Default: False
+            "STRICT_MODE_EXCLUDE": [],             # Default: []
             "TENANT_FK_FIELD": "tenant",           # Default: "tenant"
             "USER_PARAM_NAME": "as_user",          # Default: "as_user"
             "TENANT_PK_TYPE": "int",               # Default: "int"
@@ -102,6 +104,39 @@ class RLSTenantsConfig:
         or ``RLSTenantMiddleware``).
         """
         return self._get("STRICT_MODE", default=False)  # type: ignore[no-any-return]
+
+    @property
+    def STRICT_MODE_EXCLUDE(self) -> tuple[str, ...]:
+        """Models ``STRICT_MODE`` does not guard. Default: ``()``.
+
+        A list of model labels (``"app_label.ModelName"``, the model name
+        case-insensitive). A query on a listed model, or on a proxy of one,
+        runs without an active RLS context instead of raising
+        ``NoTenantContextError``; the auto-scope filter, ``for_user()`` and
+        the RLS policies are unchanged, so with no context it reads only the
+        rows the policy lets through (none, unless a bypass flag is set)::
+
+            RLS_TENANTS = {
+                "STRICT_MODE": True,
+                "STRICT_MODE_EXCLUDE": ["accounts.User"],
+            }
+
+        A label that names no installed RLS-protected model is reported by
+        check ``W015``.
+
+        Raises:
+            RLSConfigurationError: If the value is not a list of strings.
+        """
+        value = self._get("STRICT_MODE_EXCLUDE", ())
+        if not isinstance(value, (list, tuple, set, frozenset)) or not all(
+            isinstance(label, str) for label in value
+        ):
+            msg = (
+                f"RLS_TENANTS['STRICT_MODE_EXCLUDE'] must be a list of model labels "
+                f"('app_label.ModelName'), got {value!r}. Example: ['accounts.User']."
+            )
+            raise RLSConfigurationError(msg)
+        return tuple(value)
 
     @property
     def DATABASES(self) -> list[str]:

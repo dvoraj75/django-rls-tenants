@@ -247,7 +247,8 @@ What this means in practice:
    section) and set the flag in both `authenticate()` and `get_user()`, as shown in
    [Use Case: Authentication](bypass-mode.md#use-case-authentication). Auth writes such
    as `last_login` updates also need a tenant or admin context; a read bypass does not
-   allow them.
+   allow them. With `STRICT_MODE=True`, also list the user model in
+   [`STRICT_MODE_EXCLUDE`](../getting-started/configuration.md#strict_mode_exclude).
 2. **Group and permission lookups need a tenant or admin context.** `RLSM2MConstraint`
    has no `extra_bypass_flags` option; its policy only passes for the admin GUC or when
    the referenced user belongs to the current tenant. Fresh database queries for group
