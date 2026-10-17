@@ -67,6 +67,10 @@ returns zero rows, never leaked data.
   `--parallel`, `--json`, a failure summary and exit status), so reports, re-indexing and
   backfills need no context code of their own.
   [Management commands guide →](https://dvoraj75.github.io/django-rls-tenants/guides/management-commands/)
+- **Audit logging** -- structured records on the `django_rls_tenants.audit` logger each
+  time a tenant or admin context is entered, exited or refused (who, which tenant, which
+  code path), ready for a JSON formatter and routed with Django's `LOGGING`.
+  [Audit logging guide →](https://dvoraj75.github.io/django-rls-tenants/guides/audit-logging/)
 - **Raw SQL helpers** -- `safe_tenant_sql()` builds a tenant-filter predicate;
   `current_tenant_value_sql()` returns the current tenant ID expression for inserts
   and projections. Both reuse the expressions used by RLS policies.

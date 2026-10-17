@@ -52,6 +52,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
     raise ImportError(msg) from exc
 
 from django_rls_tenants.exceptions import NoTenantContextError
+from django_rls_tenants.tenants import audit
 from django_rls_tenants.tenants.context import admin_context, tenant_context
 from django_rls_tenants.tenants.errors import HINT_NO_CONTEXT
 from django_rls_tenants.tenants.state import (
@@ -212,12 +213,13 @@ class RLSTask(Task):
         """Restore the propagated RLS context around the task body."""
         tenant_id, is_admin = _request_context(self.request)
         if tenant_id is not None:
-            with tenant_context(tenant_id):
+            with audit.attributed(tenant_context(tenant_id), source="celery"):
                 return super().__call__(*args, **kwargs)
         if is_admin:
-            with admin_context():
+            with audit.attributed(admin_context(), source="celery"):
                 return super().__call__(*args, **kwargs)
         if self.rls_require_context:
+            audit.denied("celery", "no_context")
             msg = f"Task {self.name!r} ran without an RLS context."
             raise NoTenantContextError(msg, hint=HINT_NO_CONTEXT)
         return super().__call__(*args, **kwargs)
@@ -321,6 +323,7 @@ def _task_prerun(
         context = admin_context()
     else:
         return
+    context = audit.attributed(context, source="celery")
     try:
         context.__enter__()
     except Exception:

@@ -160,6 +160,11 @@ rls_tenant_id) or mark them as a cross-tenant admin (is_tenant_admin=True). ...
 Set `rls_deny_without_tenant = False` to fall through instead; with RLS enforced
 the queries simply return nothing.
 
+*1.6.0+.* With `rls_deny_without_tenant = True` the refusal is logged as a
+`context.denied` [audit record](audit-logging.md) (`user_without_tenant`, source `admin`),
+and each wrapped admin view logs a `context.entered` / `context.exited` pair with the
+user's primary key.
+
 ## Notes
 
 - **Middleware interaction.** If `RLSTenantMiddleware` already established a

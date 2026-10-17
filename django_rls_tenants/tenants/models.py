@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from typing import Any
 
 from django_rls_tenants.rls.constraints import RLSConstraint, RLSM2MConstraint
+from django_rls_tenants.tenants import audit
 from django_rls_tenants.tenants.context import admin_context
 from django_rls_tenants.tenants.managers import RLSManager
 
@@ -304,51 +305,116 @@ def _foreign_keys_of_other_tenants(
     tenant_id: Any,
     targets: Mapping[models.ForeignKey[Any, Any], Any],
     *,
+    model: type[models.Model],
     instance: models.Model | None = None,
+    source: audit.Source = "validation",
+    user_id: Any = None,
+    rejected: Mapping[models.ForeignKey[Any, Any], Any] | None = None,
 ) -> list[models.ForeignKey[Any, Any]]:
     """Return the foreign keys in ``targets`` whose target row is not of tenant ``tenant_id``.
 
     Each target's tenant is read with one ``values_list()`` query inside
-    ``admin_context()``, so the answer does not depend on the active context.
-    A target that does not exist, or whose tenant is ``NULL``, counts as
-    another tenant's: a row of tenant ``tenant_id`` cannot see it either.
+    ``admin_context()`` (a lookup the audit log leaves out), so the answer
+    does not depend on the active context. A target that does not exist, or
+    whose tenant is ``NULL``, counts as another tenant's: a row of tenant
+    ``tenant_id`` cannot see it either.
+
+    The foreign keys whose target exists but is not of tenant ``tenant_id``
+    are logged as one ``fk.cross_tenant_rejected`` audit record. That
+    includes those in ``rejected``: foreign keys the caller's validation has
+    already rejected as not found, which is what Django's and DRF's own
+    validation report for a row that RLS or the auto-scope filter hides. They
+    are looked up for the audit record only, and only when the audit logger
+    logs it.
 
     Args:
         tenant_id: The tenant of the row that holds the foreign keys.
         targets: Each foreign key and the value it holds (its ``attname``
             value, already converted with ``to_python()``).
+        model: The model of the row, for the audit record.
         instance: The row, passed to the router as Django's foreign key
             validation does.
+        source: Who validates, for the audit record.
+        user_id: The primary key of the user who sent the data, if known.
+        rejected: Foreign keys already rejected as not found, and their values.
+    """
+    lookups = dict(targets)
+    if rejected and audit.audit_logger.isEnabledFor(logging.WARNING):
+        lookups.update(rejected)
+    found = _target_tenants(lookups, instance=instance)
+    # Exists, in another tenant or in none.
+    cross_tenant = sorted(
+        (field for field, tenants in found.items() if tenants and tenants != [tenant_id]),
+        key=lambda field: field.creation_counter,
+    )
+    if cross_tenant:
+        audit.emit(
+            audit.FK_CROSS_TENANT_REJECTED,
+            source=source,
+            level=logging.WARNING,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            model=model._meta.label,  # noqa: SLF001
+            fields=[field.name for field in cross_tenant],
+        )
+    return [field for field in targets if found[field] != [tenant_id]]
+
+
+def _target_tenants(
+    targets: Mapping[models.ForeignKey[Any, Any], Any],
+    *,
+    instance: models.Model | None,
+) -> dict[models.ForeignKey[Any, Any], list[Any]]:
+    """Return each foreign key's target tenant: ``[tenant]``, or ``[]`` when there is no target.
+
+    One ``values_list()`` query per foreign key, inside ``admin_context()`` on
+    the router's read alias (see :func:`_foreign_keys_of_other_tenants`).
     """
     by_alias: dict[str, list[tuple[models.ForeignKey[Any, Any], Any]]] = {}
     for field, value in targets.items():
         alias = router.db_for_read(field.related_model, instance=instance)
         by_alias.setdefault(alias, []).append((field, value))
-    mismatched: list[models.ForeignKey[Any, Any]] = []
+    found: dict[models.ForeignKey[Any, Any], list[Any]] = {}
     for alias, pairs in by_alias.items():
         with ExitStack() as stack:
             if _needs_own_transaction(alias):
                 stack.enter_context(transaction.atomic(using=alias))
-            stack.enter_context(admin_context(using=alias))
+            stack.enter_context(audit.silenced(admin_context(using=alias)))
             for field, value in pairs:
                 target: type[models.Model] = field.related_model
                 target_tenant = _tenant_field(target)
                 assert target_tenant is not None  # noqa: S101  -- _checked_foreign_keys() keeps only such targets
-                tenants = list(
+                found[field] = list(
                     target._base_manager.using(alias)  # noqa: SLF001
                     .filter(**{field.target_field.name: value})
                     .values_list(target_tenant.attname, flat=True)[:1],
                 )
-                if tenants != [tenant_id]:
-                    mismatched.append(field)
-    return mismatched
+    return found
+
+
+def _not_found_value(
+    instance: models.Model,
+    field: models.ForeignKey[Any, Any],
+    errors: list[ValidationError],
+) -> Any:
+    """Return ``field``'s value if ``errors`` rejected its target as not found, else ``None``.
+
+    Django's foreign key validation reports a target that the active context
+    cannot see (RLS hides another tenant's rows) with the ``invalid`` code.
+    """
+    if not any(error.code == "invalid" for error in errors):
+        return None
+    try:
+        return field.to_python(getattr(instance, field.attname))
+    except ValidationError:
+        return None  # not a value of the target's type
 
 
 def _cross_tenant_errors(
     instance: models.Model,
     exclude: Collection[str],
     *,
-    failed: Collection[str] = (),
+    failed: Mapping[str, list[ValidationError]] | None = None,
 ) -> dict[str, list[ValidationError]]:
     """Return the errors of ``instance``'s foreign keys that point at another tenant's row.
 
@@ -356,9 +422,13 @@ def _cross_tenant_errors(
         instance: The row to check.
         exclude: Foreign key names not to check. The tenant field is read
             even when it is excluded.
-        failed: Fields that already failed validation: they are not checked,
-            and nothing is when the tenant field is one of them.
+        failed: Fields that already failed validation, and their errors: they
+            are not checked, and nothing is when the tenant field is one of
+            them. A foreign key that failed as not found (Django's ``invalid``
+            error, which is what it reports for a row RLS hides) is looked up
+            for the ``fk.cross_tenant_rejected`` audit record.
     """
+    failed = failed or {}
     checked = _checked_foreign_keys(type(instance))
     if checked is None:
         return {}
@@ -373,8 +443,15 @@ def _cross_tenant_errors(
         return {}  # no tenant yet (an admin form sets it after validation)
     errors: dict[str, list[ValidationError]] = {}
     targets: dict[models.ForeignKey[Any, Any], Any] = {}
+    # Rejected as not found already: looked up for the audit record only.
+    rejected: dict[models.ForeignKey[Any, Any], Any] = {}
     for field in foreign_keys:
-        if field.name in exclude or field.name in failed:
+        if field.name in exclude:
+            continue
+        if field.name in failed:
+            value = _not_found_value(instance, field, failed[field.name])
+            if value is not None:
+                rejected[field] = value
             continue
         try:
             value = field.to_python(getattr(instance, field.attname))
@@ -383,8 +460,14 @@ def _cross_tenant_errors(
             continue
         if value is not None:  # None: no target, or one that is not saved yet
             targets[field] = value
-    if targets:
-        for field in _foreign_keys_of_other_tenants(tenant_id, targets, instance=instance):
+    if targets or rejected:
+        for field in _foreign_keys_of_other_tenants(
+            tenant_id,
+            targets,
+            model=type(instance),
+            instance=instance,
+            rejected=rejected,
+        ):
             errors[field.name] = [_invalid_target(field, targets[field])]
     return errors
 

@@ -457,6 +457,48 @@ excluded model with no context still fails closed at the database. It is not the
 `rls_skip_strict()` of the roadmap. Models without an `RLSConstraint` are never guarded
 and need no entry.
 
+### Audit Logging
+
+`tenants/audit.py` (#48) logs structured records to the child logger
+`django_rls_tenants.audit` (`AUDIT_LOGGER_NAME`): `emit()` (guarded by `isEnabledFor()`;
+every field becomes an `rls_<name>` record attribute) and `denied()` (`context.denied`,
+`WARNING`). Events: `context.entered` / `context.exited` (`INFO`), `context.denied`,
+`fk.cross_tenant_rejected` and `gucs.cleared` (`WARNING`); the `Source` and `Reason`
+`Literal`s list the allowed values. Users are identified by `pk` only (`user_id_of()`).
+Rules:
+
+- The four context managers log their own entry and exit through `context_event()`, with
+  the `Origin` read from a private `ContextVar` on entry (`current_origin()`); the exit is
+  logged in a `finally` only when the entry was, so it pairs with it even when the restore
+  raises. The default origin is `context_manager`.
+- An integration that enters a context block wraps it in `audit.attributed(context,
+  source=..., user=...)` (`async_attributed()` for `async with`): the attribution is set
+  only while the block is entered, so blocks nested in it are the code's own. The admin
+  does it in `_rls_view_context()`, not in `_rls_context()`.
+- A block the library enters for its own lookup (FK validation's target tenant, the
+  commands' tenant resolution and listing) is wrapped in `audit.silenced()`.
+- `_rls_scope()` (`for_user()`) logs nothing but its `user_without_tenant` refusal: it runs
+  per statement. Every other refusal (`NoTenantContextError`, a DRF/admin
+  `PermissionDenied` or `False`) calls `audit.denied()` right before it refuses.
+- The middleware does not use the context managers: `_audit_request_entered()` stores an
+  `_AuditedContext` on the request after the context is set, and `_audit_request_exited()`
+  pops it, so the exit is logged once, wherever the request's context ends
+  (`_cleanup_rls_state()` and the end of the native async path).
+- `fk.cross_tenant_rejected` is logged by `_foreign_keys_of_other_tenants()` only for
+  targets that exist (a missing target is an ordinary invalid value), with the caller's
+  `model`, `source` and `user_id`. Its `rejected` argument takes the foreign keys the
+  caller's validation already failed as not found (Django's `invalid` code in
+  `clean_fields()`, via `_not_found_value()`; a `PrimaryKeyRelatedField`'s
+  `does_not_exist` in `RLSTenantSerializerMixin.to_internal_value()`, inside a tenant
+  context): in a tenant context RLS or the auto-scope filter hides another tenant's row, so
+  that validation rejects it before the #107 check. They are looked up (`_target_tenants()`)
+  only when the audit logger logs `WARNING`, and never change the errors.
+  `gucs.cleared` is logged by the safety net after its clear ran without raising.
+
+The existing `DEBUG` messages on `django_rls_tenants` are separate and pinned by
+`tests/test_debug_logging.py`. Tests: `tests/test_tenants/test_audit.py`, plus the
+`TestAuditRecords` classes in `tests/test_contrib/test_drf.py` and `test_celery.py`.
+
 ### `for_user()` Scope
 
 `for_user()` only stores the user. Every `TenantQuerySet` method that runs SQL does so

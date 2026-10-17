@@ -12,7 +12,7 @@ import functools
 import inspect
 import logging
 from contextlib import asynccontextmanager, contextmanager
-from typing import TYPE_CHECKING, Any, cast, overload
+from typing import TYPE_CHECKING, Any, NoReturn, cast, overload
 
 from asgiref.sync import sync_to_async
 from django.db import connections
@@ -20,6 +20,7 @@ from django.db import connections
 from django_rls_tenants.exceptions import NoTenantContextError, RLSConfigurationError
 from django_rls_tenants.rls.context import _enter_gucs, _run_enter_hop, restore_gucs
 from django_rls_tenants.rls.guc import clear_guc, get_guc, set_guc
+from django_rls_tenants.tenants import audit
 from django_rls_tenants.tenants.affinity import (
     UNKNOWN,
     _forget,
@@ -144,6 +145,18 @@ def _writes_gucs(using: str, *, is_local: bool) -> bool:
     return not is_local or using not in rls_tenants_config.DATABASES
 
 
+def _refuse_tenant_id_none(origin: audit.Origin) -> NoReturn:
+    """Refuse ``tenant_context(None)``: log ``context.denied``, raise ``NoTenantContextError``.
+
+    Args:
+        origin: The block's audit attribution (``audit.current_origin()``).
+    """
+    if origin.source is not None:
+        audit.denied(origin.source, "tenant_id_none", user_id=origin.user_id)
+    msg = "tenant_id cannot be None."
+    raise NoTenantContextError(msg, hint=HINT_TENANT_ID_NONE)
+
+
 @contextmanager
 def tenant_context(
     tenant_id: int | str,
@@ -177,9 +190,9 @@ def tenant_context(
             ``RLS_TENANTS["DATABASES"]`` and its connection is not inside
             ``transaction.atomic()``.
     """
+    origin = audit.current_origin()
     if tenant_id is None:
-        msg = "tenant_id cannot be None."
-        raise NoTenantContextError(msg, hint=HINT_TENANT_ID_NONE)
+        _refuse_tenant_id_none(origin)
 
     conf = rls_tenants_config
     is_local = conf.USE_LOCAL_SET
@@ -194,6 +207,7 @@ def tenant_context(
 
     gucs = ContextGucs.for_tenant(tenant_id)
     exc_pending = False
+    entered = False
     try:
         with _rls_state(tenant_id, gucs):
             if writes:
@@ -206,19 +220,25 @@ def tenant_context(
                         using=using,
                     )
             logger.debug("tenant_context entered: tenant_id=%s, using=%s", tenant_id, using)
+            audit.context_event(audit.CONTEXT_ENTERED, origin, tenant_id=tenant_id, using=using)
+            entered = True
             yield
     except BaseException:
         exc_pending = True
         raise
     finally:
-        _restore_tenant_gucs(
-            previous,
-            is_local=is_local,
-            using=using,
-            exc_pending=exc_pending,
-            enclosing=enclosing,
-            session=session,
-        )
+        try:
+            _restore_tenant_gucs(
+                previous,
+                is_local=is_local,
+                using=using,
+                exc_pending=exc_pending,
+                enclosing=enclosing,
+                session=session,
+            )
+        finally:
+            if entered:
+                audit.context_event(audit.CONTEXT_EXITED, origin, tenant_id=tenant_id, using=using)
         logger.debug("tenant_context exited: tenant_id=%s, using=%s", tenant_id, using)
 
 
@@ -244,6 +264,7 @@ def admin_context(
             ``RLS_TENANTS["DATABASES"]`` and its connection is not inside
             ``transaction.atomic()``.
     """
+    origin = audit.current_origin()
     conf = rls_tenants_config
     is_local = conf.USE_LOCAL_SET
     writes = _writes_gucs(using, is_local=is_local)
@@ -254,6 +275,7 @@ def admin_context(
     enclosing = _current_live()
 
     exc_pending = False
+    entered = False
     try:
         with _rls_state(None, ADMIN_GUCS):
             if writes:
@@ -269,19 +291,25 @@ def admin_context(
                     # sentinel which could collide with integer PKs or fail UUID casts.
                     clear_guc(conf.GUC_CURRENT_TENANT, is_local=is_local, using=using)
             logger.debug("admin_context entered: using=%s", using)
+            audit.context_event(audit.CONTEXT_ENTERED, origin, tenant_id=None, using=using)
+            entered = True
             yield
     except BaseException:
         exc_pending = True
         raise
     finally:
-        _restore_tenant_gucs(
-            previous,
-            is_local=is_local,
-            using=using,
-            exc_pending=exc_pending,
-            enclosing=enclosing,
-            session=session,
-        )
+        try:
+            _restore_tenant_gucs(
+                previous,
+                is_local=is_local,
+                using=using,
+                exc_pending=exc_pending,
+                enclosing=enclosing,
+                session=session,
+            )
+        finally:
+            if entered:
+                audit.context_event(audit.CONTEXT_EXITED, origin, tenant_id=None, using=using)
         logger.debug("admin_context exited: using=%s", using)
 
 
@@ -520,9 +548,9 @@ async def async_tenant_context(
             ``RLS_TENANTS["DATABASES"]`` and no transaction is open on the hop
             thread.
     """
+    origin = audit.current_origin()
     if tenant_id is None:
-        msg = "tenant_id cannot be None."
-        raise NoTenantContextError(msg, hint=HINT_TENANT_ID_NONE)
+        _refuse_tenant_id_none(origin)
 
     conf = rls_tenants_config
     # Read once so entry and exit agree even if settings change mid-block.
@@ -544,6 +572,7 @@ async def async_tenant_context(
         undo=functools.partial(_restore_tenant_gucs, enclosing=enclosing, session=None),
     )
     exc_pending = False
+    entered = False
     try:
         with _rls_state(tenant_id, gucs):
             logger.debug(
@@ -551,19 +580,25 @@ async def async_tenant_context(
                 tenant_id,
                 using,
             )
+            audit.context_event(audit.CONTEXT_ENTERED, origin, tenant_id=tenant_id, using=using)
+            entered = True
             yield
     except BaseException:
         exc_pending = True
         raise
     finally:
-        await sync_to_async(_restore_tenant_gucs, thread_sensitive=True)(
-            previous,
-            is_local=is_local,
-            using=using,
-            exc_pending=exc_pending,
-            enclosing=enclosing,
-            session=next(iter(entered_on), None),
-        )
+        try:
+            await sync_to_async(_restore_tenant_gucs, thread_sensitive=True)(
+                previous,
+                is_local=is_local,
+                using=using,
+                exc_pending=exc_pending,
+                enclosing=enclosing,
+                session=next(iter(entered_on), None),
+            )
+        finally:
+            if entered:
+                audit.context_event(audit.CONTEXT_EXITED, origin, tenant_id=tenant_id, using=using)
         logger.debug("async_tenant_context exited: tenant_id=%s, using=%s", tenant_id, using)
 
 
@@ -588,6 +623,7 @@ async def async_admin_context(
             ``RLS_TENANTS["DATABASES"]`` and no transaction is open on the hop
             thread.
     """
+    origin = audit.current_origin()
     conf = rls_tenants_config
     is_local = conf.USE_LOCAL_SET
 
@@ -603,22 +639,29 @@ async def async_admin_context(
         undo=functools.partial(_restore_tenant_gucs, enclosing=enclosing, session=None),
     )
     exc_pending = False
+    entered = False
     try:
         with _rls_state(None, ADMIN_GUCS):
             logger.debug("async_admin_context entered: using=%s", using)
+            audit.context_event(audit.CONTEXT_ENTERED, origin, tenant_id=None, using=using)
+            entered = True
             yield
     except BaseException:
         exc_pending = True
         raise
     finally:
-        await sync_to_async(_restore_tenant_gucs, thread_sensitive=True)(
-            previous,
-            is_local=is_local,
-            using=using,
-            exc_pending=exc_pending,
-            enclosing=enclosing,
-            session=next(iter(entered_on), None),
-        )
+        try:
+            await sync_to_async(_restore_tenant_gucs, thread_sensitive=True)(
+                previous,
+                is_local=is_local,
+                using=using,
+                exc_pending=exc_pending,
+                enclosing=enclosing,
+                session=next(iter(entered_on), None),
+            )
+        finally:
+            if entered:
+                audit.context_event(audit.CONTEXT_EXITED, origin, tenant_id=None, using=using)
         logger.debug("async_admin_context exited: using=%s", using)
 
 
@@ -661,6 +704,7 @@ def _decorated_call_tenant_id(as_user: TenantUser, qualname: str) -> int | str |
         return None
     tenant_id = as_user.rls_tenant_id
     if tenant_id is None:
+        audit.denied("decorator", "user_without_tenant", user_id=audit.user_id_of(as_user))
         msg = f"Non-admin user passed to {qualname} has rls_tenant_id=None."
         raise NoTenantContextError(msg, hint=HINT_USER_NO_TENANT)
     return tenant_id
@@ -815,7 +859,7 @@ def with_rls_context[**P, R](
                 ctx = (
                     async_admin_context() if tenant_id is None else async_tenant_context(tenant_id)
                 )
-                async with ctx:
+                async with audit.async_attributed(ctx, source="decorator", user=as_user):
                     return await fn(*args, **kwargs)
 
             # mypy cannot express "R is a coroutine" for the async branch.
@@ -828,7 +872,7 @@ def with_rls_context[**P, R](
                 return _reject_coroutine(fn(*args, **kwargs), qualname)
             tenant_id = _decorated_call_tenant_id(as_user, qualname)
             ctx = admin_context() if tenant_id is None else tenant_context(tenant_id)
-            with ctx:
+            with audit.attributed(ctx, source="decorator", user=as_user):
                 return _reject_coroutine(fn(*args, **kwargs), qualname)
 
         return wrapper

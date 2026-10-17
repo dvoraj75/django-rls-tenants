@@ -387,6 +387,11 @@ no business running tenant-blind.
 that tenant's own `tenant_context()`, and reports every tenant's outcome. It is the
 command to schedule for per-tenant reports, re-indexing and backfills.
 
+*1.6.0+.* Both commands log the context the inner command runs in as a
+`context.entered` / `context.exited` [audit record](audit-logging.md) pair with source
+`command` (one pair per tenant here, from the worker processes with `--parallel`); the
+tenant lookups they make in `admin_context()` are not logged.
+
 ### Usage
 
 ```bash

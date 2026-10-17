@@ -291,6 +291,13 @@ Listing it in the settings is safe: the module avoids importing
 `rest_framework.views` at import time, because DRF imports the default permission
 classes while it builds `APIView`.
 
+*1.6.0+.* Each refusal of an authenticated user is a `context.denied`
+[audit record](audit-logging.md) with source `drf` (`no_context`, `context_mismatch`,
+`object_of_other_tenant`), as is the mixin's 403 for a user without a tenant
+(`user_without_tenant`). The context the mixin enters logs a `context.entered` /
+`context.exited` pair with the user's primary key, and a serializer that rejects a foreign
+key to another tenant's row logs `fk.cross_tenant_rejected`.
+
 ## Serializers
 
 `RLSTenantModelSerializer` (or `RLSTenantSerializerMixin`, mixin first, for your own

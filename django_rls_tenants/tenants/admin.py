@@ -41,6 +41,7 @@ from django.apps import apps
 from django.contrib import admin
 from django.core.exceptions import PermissionDenied, ValidationError
 
+from django_rls_tenants.tenants import audit
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import admin_context, tenant_context
 from django_rls_tenants.tenants.errors import HINT_USER_NO_TENANT
@@ -242,12 +243,17 @@ class RLSTenantModelAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
         if user.is_tenant_admin:
             return admin_context()
         if self.rls_deny_without_tenant:
+            audit.denied("admin", "user_without_tenant", user_id=audit.user_id_of(user))
             msg = (
                 f"{type(user).__name__} is not a tenant admin and has no tenant assigned, "
                 f"so this admin cannot determine which tenant's data to show."
             )
             raise PermissionDenied(f"{msg} Hint: {HINT_USER_NO_TENANT}")
         return nullcontext()
+
+    def _rls_view_context(self, request: HttpRequest) -> AbstractContextManager[None]:
+        """Return :meth:`_rls_context`, its audit records attributed to the admin and the user."""
+        return audit.attributed(self._rls_context(request), source="admin", user=request.user)
 
     def _user_can_switch_tenant(self, request: HttpRequest) -> bool:
         """Return whether the switcher should be offered to this user."""
@@ -299,7 +305,7 @@ class RLSTenantModelAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
     ) -> HttpResponse:
         """Wrap the changelist in the request's RLS context."""
         self._sync_tenant_selection(request)
-        with self._rls_context(request):
+        with self._rls_view_context(request):
             return super().changelist_view(request, extra_context)
 
     def add_view(
@@ -310,7 +316,7 @@ class RLSTenantModelAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
     ) -> HttpResponse:
         """Wrap the add view in the request's RLS context."""
         self._sync_tenant_selection(request)
-        with self._rls_context(request):
+        with self._rls_view_context(request):
             return super().add_view(request, form_url, extra_context)
 
     def change_view(
@@ -322,7 +328,7 @@ class RLSTenantModelAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
     ) -> HttpResponse:
         """Wrap the change view in the request's RLS context."""
         self._sync_tenant_selection(request)
-        with self._rls_context(request):
+        with self._rls_view_context(request):
             return super().change_view(request, object_id, form_url, extra_context)
 
     def delete_view(
@@ -333,7 +339,7 @@ class RLSTenantModelAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
     ) -> HttpResponse:
         """Wrap the delete view in the request's RLS context."""
         self._sync_tenant_selection(request)
-        with self._rls_context(request):
+        with self._rls_view_context(request):
             return super().delete_view(request, object_id, extra_context)
 
     def history_view(
@@ -344,7 +350,7 @@ class RLSTenantModelAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
     ) -> HttpResponse:
         """Wrap the history view in the request's RLS context."""
         self._sync_tenant_selection(request)
-        with self._rls_context(request):
+        with self._rls_view_context(request):
             return super().history_view(request, object_id, extra_context)
 
     # ---- Form / save hooks --------------------------------------------------

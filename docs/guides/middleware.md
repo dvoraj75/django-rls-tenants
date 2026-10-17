@@ -458,6 +458,10 @@ DEBUG Middleware set GUCs on databases=['default'] for user=User (admin=False, t
 DEBUG Middleware cleared GUCs on databases=['default']
 ```
 
+For a trail of who entered which context, with fields a JSON formatter can write, use
+the `django_rls_tenants.audit` logger instead (*1.6.0+*): see
+[Audit Logging](audit-logging.md).
+
 ## Using Without Middleware
 
 For non-web contexts (management commands, Celery tasks, scripts), use context managers

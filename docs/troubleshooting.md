@@ -23,12 +23,16 @@ an unauthenticated user.
 requests. While developing, set `STRICT_MODE=True` so this surfaces as a
 `NoTenantContextError` instead of an empty result. Before 1.4.0, `count()`, `exists()`,
 `iterator()` and the writes of a `.for_user()` queryset also returned nothing outside a
-context (#131); upgrade, or wrap them in a context manager.
+context (#131); upgrade, or wrap them in a context manager. With the
+[audit log](guides/audit-logging.md) at `INFO` (*1.6.0+*), the code path shows no
+`context.entered` record before the query, or a `context.denied` one says why the context
+was refused.
 
 **See:** [Context Managers](guides/context-managers.md),
 [Middleware](guides/middleware.md#using-without-middleware),
 [`STRICT_MODE`](getting-started/configuration.md#strict_mode),
-[Fail-Closed Design](advanced/security.md#fail-closed-design).
+[Fail-Closed Design](advanced/security.md#fail-closed-design),
+[Audit Logging](guides/audit-logging.md).
 
 ### Queries made while streaming a response see no rows
 

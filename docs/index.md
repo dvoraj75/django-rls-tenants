@@ -40,6 +40,7 @@ the [Security Model](advanced/security.md) for what that does and does not cover
 - **Native Celery integration** -- `@rls_task` carries the active tenant context from enqueue to the worker, across chains, groups, and chords. See the [Celery Tasks guide](guides/celery-tasks.md).
 - **Django REST Framework integration** -- `RLSTenantAPIViewMixin` opens the RLS context after DRF authenticates the user (token and JWT clients included, which the middleware cannot see), `RLSTenantPermission` refuses a view that runs outside it, and `RLSTenantModelSerializer` fills the tenant FK from it. See the [Django REST Framework guide](guides/drf.md).
 - **Per-tenant management commands** -- `run_as_tenant` runs any management command inside one tenant's context and `run_for_all_tenants` runs it once per tenant, with filters, `--parallel`, `--json` output and a failure summary. See the [Management Commands guide](guides/management-commands.md#run_as_tenant).
+- **Audit logging** -- structured records on the `django_rls_tenants.audit` logger each time a tenant or admin context is entered, exited or refused, routed with Django's `LOGGING`. See the [Audit Logging guide](guides/audit-logging.md).
 - **Raw SQL helpers** -- `safe_tenant_sql()` builds a tenant-filter predicate; `current_tenant_value_sql()` returns the current tenant ID expression for inserts and projections. Both reuse the expressions used by RLS policies. See the [Raw SQL guide](guides/raw-sql.md).
 - **Clean internal layering** -- generic `rls/` primitives separate from `tenants/` conveniences.
 - **Configurable escape hatches** -- bypass flags for authentication, admin, migrations.
@@ -58,6 +59,7 @@ the [Security Model](advanced/security.md) for what that does and does not cover
 | Scope a DRF API to the user's tenant | [Django REST Framework](guides/drf.md) |
 | Use the tenant context in an async view or consumer | [Async Code](guides/context-managers.md#async-code) |
 | Use the Django admin across tenants | [Admin](guides/admin.md) |
+| Keep an audit trail of tenant context changes | [Audit Logging](guides/audit-logging.md) |
 | Write a test that proves isolation fails closed | [Testing](guides/testing.md) |
 | Run my tests as a role RLS applies to (not a superuser) | [Enforcing RLS in Tests](guides/testing.md#enforcing-rls-in-tests) |
 | Test async code under a tenant context | [Async Tests](guides/testing.md#async-tests) |

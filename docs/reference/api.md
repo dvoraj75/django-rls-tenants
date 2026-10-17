@@ -233,6 +233,18 @@ coroutine; see [Async Tests](../guides/testing.md#async-tests).
 
 ---
 
+### Audit Logging
+
+The audit records go to the `django_rls_tenants.audit` logger. Its fields, events and
+sources are described in the [Audit Logging guide](../guides/audit-logging.md); the module
+has no public functions to call.
+
+::: django_rls_tenants.tenants.audit.AUDIT_LOGGER_NAME
+
+::: django_rls_tenants.tenants.audit.Source
+
+::: django_rls_tenants.tenants.audit.Reason
+
 ## Connection Pool
 
 Hook for Django's psycopg connection pool (`OPTIONS["pool"]`, Django 5.1+). It is **not**
