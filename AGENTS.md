@@ -70,7 +70,7 @@ must be created inside `admin_context()` / `tenant_context()`, since a plain rol
 insert them without a context.
 
 The test `AUTH_USER_MODEL` `test_app.AdminUser` is a `MultiTenantUser` (#47): `rls_tenant_ids`
-reads the plain `test_app.Membership` table (migration `0011_membership`; not cached, tests
+reads the plain `test_app.Membership` table (migration `0012_membership`; not cached, tests
 add memberships to a user they hold). The `member_of` fixture in `tests/test_contrib/test_drf.py`
 replaces a user's memberships; `tests/drf_views.py` reads `Membership` in its override
 recipe.

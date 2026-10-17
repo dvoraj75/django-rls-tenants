@@ -9,7 +9,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("test_app", "0010_loan_book_rls_policy"),
+        ("test_app", "0011_shared_note"),
     ]
 
     operations = [
