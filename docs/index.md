@@ -33,7 +33,7 @@ the [Security Model](advanced/security.md) for what that does and does not cover
 - **Optional strict mode** -- `STRICT_MODE=True` raises `NoTenantContextError` on unscoped queries, turning silent empty results into loud errors during development.
 - **Single schema, single database** -- no schema-per-tenant overhead.
 - **API-agnostic** -- works with GraphQL, async views, management commands, and (through the DRF integration) Django REST Framework.
-- **M2M isolation** -- auto-detected subquery-based RLS policies on M2M through tables.
+- **M2M isolation** -- auto-detected subquery-based RLS policies on M2M through tables; `check_rls --generate` writes the migration that creates them.
 - **Tenant-aware Django admin** -- `RLSTenantModelAdmin` scopes changelists, forms, and related dropdowns to the current tenant, with a tenant switcher for cross-tenant admins. See the [Admin guide](guides/admin.md).
 - **Native Celery integration** -- `@rls_task` carries the active tenant context from enqueue to the worker, across chains, groups, and chords. See the [Celery Tasks guide](guides/celery-tasks.md).
 - **Django REST Framework integration** -- `RLSTenantAPIViewMixin` opens the RLS context after DRF authenticates the user (token and JWT clients included, which the middleware cannot see), `RLSTenantPermission` refuses a view that runs outside it, and `RLSTenantModelSerializer` fills the tenant FK from it. See the [Django REST Framework guide](guides/drf.md).

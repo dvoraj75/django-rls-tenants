@@ -1,33 +1,77 @@
 """Management command: check_rls.
 
 Verifies that all RLSProtectedModel subclasses have the expected
-RLS policies applied in the database. Reports missing or stale policies.
-Also discovers M2M through tables needing RLS coverage.
+RLS policies applied in the database. Reports missing or stale policies,
+with the fix for each one's cause. Also discovers M2M through tables needing
+RLS coverage, and with ``--generate`` writes the ``AddM2MRLSPolicy``
+migrations they lack (#46).
 Supports checking non-default database aliases via ``--database``.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import os
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, NamedTuple
 
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
+from django.core.management.utils import run_formatters
 from django.db import Error, connections
 
+from django_rls_tenants.management._rls_migrations import (
+    NO_POLICIES,
+    RLS_NOT_ENABLED,
+    RLS_NOT_FORCED,
+    TABLE_MISSING,
+    MigrationFacts,
+    m2m_hint,
+    model_hint,
+    plan_m2m_migrations,
+)
 from django_rls_tenants.tenants.checks import _describe_error
+from django_rls_tenants.tenants.conf import RLSTenantsConfig
+
+if TYPE_CHECKING:
+    from django.db.models import Model
+
+    from django_rls_tenants.management._rls_migrations import PlannedMigration
 
 
-def _collect_rls_tables() -> dict[str, str]:
-    """Return ``{db_table: ModelName}`` for all concrete ``RLSProtectedModel`` subclasses."""
+_DEFAULT_MIGRATION_NAME = "m2m_rls_policies"
+
+
+class _Issue(NamedTuple):
+    """A problem ``check_rls`` found on one table."""
+
+    table: str
+    label: str  # the model name, or the M2M field's description
+    problem: str  # TABLE_MISSING, RLS_NOT_ENABLED, RLS_NOT_FORCED or NO_POLICIES
+
+    def __str__(self) -> str:
+        return f"  {self.label} ({self.table}): {self.problem}"
+
+
+def _collect_rls_models() -> dict[str, type[Model]]:
+    """Return ``{db_table: model}`` for all concrete ``RLSProtectedModel`` subclasses."""
     from django.apps import apps  # noqa: PLC0415
 
     from django_rls_tenants.tenants.models import RLSProtectedModel  # noqa: PLC0415
 
-    table_to_model: dict[str, str] = {}
+    table_to_model: dict[str, type[Model]] = {}
     for model in apps.get_models():
         if not issubclass(model, RLSProtectedModel) or model._meta.abstract:  # noqa: SLF001
             continue
-        table_to_model[model._meta.db_table] = model.__name__  # noqa: SLF001
+        table_to_model[model._meta.db_table] = model  # noqa: SLF001
     return table_to_model
+
+
+def _relative_path(path: str) -> str:
+    """Return ``path`` relative to the working directory when it is below it (as Django does)."""
+    try:
+        relative = os.path.relpath(path)
+    except ValueError:  # another drive on Windows
+        return path
+    return path if relative.startswith("..") else relative
 
 
 def _collect_m2m_tables() -> dict[str, dict[str, Any]]:
@@ -35,6 +79,7 @@ def _collect_m2m_tables() -> dict[str, dict[str, Any]]:
 
     Returns a dict of ``{db_table: info_dict}`` where info_dict contains:
     - ``description``: Human-readable description
+    - ``field``: Name of the ``ManyToManyField`` on the from model
     - ``from_model``: The model defining the M2M field
     - ``to_model``: The related model
     - ``from_table``: db_table of the from model
@@ -82,6 +127,7 @@ def _collect_m2m_tables() -> dict[str, dict[str, Any]]:
             desc = f"{model.__name__}.{m2m_field.name} (auto M2M)"
             m2m_tables[table] = {
                 "description": desc,
+                "field": m2m_field.name,
                 "from_model": model,
                 "to_model": to_model_ref,
                 "from_table": model._meta.db_table,  # noqa: SLF001
@@ -100,7 +146,8 @@ class Command(BaseCommand):
 
     help = (
         "Verify that RLS policies exist and are enabled on all "
-        "RLS-protected tables and M2M through tables."
+        "RLS-protected tables and M2M through tables. With --generate, write the "
+        "AddM2MRLSPolicy migrations the M2M through tables lack."
     )
 
     def add_arguments(self, parser: Any) -> None:
@@ -122,13 +169,45 @@ class Command(BaseCommand):
             default=False,
             help="Show each policy's full definition (USING / WITH CHECK SQL).",
         )
+        parser.add_argument(
+            "--generate",
+            action="store_true",
+            default=False,
+            help=(
+                "Write a migration, in each app, with an AddM2MRLSPolicy operation for "
+                "every auto-created M2M through table no migration adds a policy to."
+            ),
+        )
+        parser.add_argument(
+            "--dry-run",
+            action="store_true",
+            default=False,
+            help="With --generate, print the migrations instead of writing them.",
+        )
+        parser.add_argument(
+            "--name",
+            help=(
+                "With --generate, the name of the migrations after their number. "
+                f"Default: {_DEFAULT_MIGRATION_NAME!r}."
+            ),
+        )
 
     def handle(self, *args: Any, **options: Any) -> None:  # noqa: ARG002
         """Check each RLSProtectedModel subclass and M2M through tables."""
         db_alias: str = options["database"]
         quiet: bool = options["quiet"]
         verbose: bool = options["verbose"]
-        table_to_model = _collect_rls_tables()
+        generate: bool = options["generate"]
+        dry_run: bool = options["dry_run"]
+        name: str | None = options["name"]
+        if not generate and (dry_run or name is not None):
+            raise CommandError("--dry-run and --name only apply with --generate.")
+        if name is not None and not name.isidentifier():
+            raise CommandError(
+                f"--name must be a valid Python identifier, as Django's migration names "
+                f"are; got {name!r}."
+            )
+        table_to_model = _collect_rls_models()
         m2m_tables = _collect_m2m_tables()
 
         if not table_to_model and not m2m_tables:
@@ -136,11 +215,16 @@ class Command(BaseCommand):
                 self.stdout.write("No RLS-protected models found.")
             return
 
-        errors: list[str] = []
+        issues: list[_Issue] = []
 
         try:
-            self._check_tables(
-                table_to_model, m2m_tables, errors, db_alias=db_alias, quiet=quiet, verbose=verbose
+            policy_names = self._check_tables(
+                {table: model.__name__ for table, model in table_to_model.items()},
+                m2m_tables,
+                issues,
+                db_alias=db_alias,
+                quiet=quiet,
+                verbose=verbose,
             )
         except Error as exc:
             # A check that could not run must not look like one that passed (#108).
@@ -154,10 +238,25 @@ class Command(BaseCommand):
             )
             raise SystemExit(1) from exc
 
-        if errors:
-            self.stderr.write(self.style.ERROR(f"\nFound {len(errors)} issue(s):"))
-            for error in errors:
-                self.stderr.write(self.style.ERROR(error))
+        facts: MigrationFacts | None = None
+        generated: dict[str, str] = {}
+        if generate:
+            facts = MigrationFacts(db_alias)
+            generated = self._generate(
+                facts,
+                m2m_tables,
+                policy_names,
+                name=name or _DEFAULT_MIGRATION_NAME,
+                dry_run=dry_run,
+                quiet=quiet,
+            )
+
+        if issues:
+            self.stderr.write(self.style.ERROR(f"\nFound {len(issues)} issue(s):"))
+            for issue in issues:
+                self.stderr.write(self.style.ERROR(str(issue)))
+            self._write_hints(issues, table_to_model, m2m_tables, db_alias, facts, generated)
+            # The database is still unprotected, whatever --generate wrote.
             raise SystemExit(1)
 
         if not quiet:
@@ -168,18 +267,23 @@ class Command(BaseCommand):
         self,
         table_to_model: dict[str, str],
         m2m_tables: dict[str, dict[str, Any]],
-        errors: list[str],
+        issues: list[_Issue],
         *,
         db_alias: str,
         quiet: bool,
         verbose: bool,
-    ) -> None:
-        """Check the RLS-protected tables, then the M2M through tables, on ``db_alias``."""
+    ) -> dict[str, list[str]]:
+        """Check the RLS-protected tables, then the M2M through tables, on ``db_alias``.
+
+        Returns:
+            ``{table: [policy name, ...]}`` for the tables that have policies.
+        """
+        policy_names: dict[str, list[str]] = {}
         if table_to_model:
             tables = list(table_to_model.keys())
-            self._check_rls_status(tables, table_to_model, errors, db_alias=db_alias)
-            self._check_policies(
-                tables, table_to_model, errors, db_alias=db_alias, quiet=quiet, verbose=verbose
+            self._check_rls_status(tables, table_to_model, issues, db_alias=db_alias)
+            policy_names |= self._check_policies(
+                tables, table_to_model, issues, db_alias=db_alias, quiet=quiet, verbose=verbose
             )
 
         if m2m_tables:
@@ -187,21 +291,22 @@ class Command(BaseCommand):
                 self.stdout.write("\nM2M through tables:")
             m2m_table_to_desc = {t: info["description"] for t, info in m2m_tables.items()}
             m2m_table_list = list(m2m_table_to_desc.keys())
-            self._check_rls_status(m2m_table_list, m2m_table_to_desc, errors, db_alias=db_alias)
-            self._check_policies(
+            self._check_rls_status(m2m_table_list, m2m_table_to_desc, issues, db_alias=db_alias)
+            policy_names |= self._check_policies(
                 m2m_table_list,
                 m2m_table_to_desc,
-                errors,
+                issues,
                 db_alias=db_alias,
                 quiet=quiet,
                 verbose=verbose,
             )
+        return policy_names
 
     def _check_rls_status(
         self,
         tables: list[str],
         table_to_model: dict[str, str],
-        errors: list[str],
+        issues: list[_Issue],
         *,
         db_alias: str = "default",
     ) -> None:
@@ -221,30 +326,33 @@ class Command(BaseCommand):
 
         for table, model_name in table_to_model.items():
             if table not in rls_status:
-                errors.append(f"  {model_name} ({table}): table does not exist")
+                issues.append(_Issue(table, model_name, TABLE_MISSING))
                 continue
             enabled, forced = rls_status[table]
             if not enabled:
-                errors.append(f"  {model_name} ({table}): RLS not enabled")
+                issues.append(_Issue(table, model_name, RLS_NOT_ENABLED))
             if not forced:
-                errors.append(f"  {model_name} ({table}): RLS not forced")
+                issues.append(_Issue(table, model_name, RLS_NOT_FORCED))
 
     def _check_policies(
         self,
         tables: list[str],
         table_to_model: dict[str, str],
-        errors: list[str],
+        issues: list[_Issue],
         *,
         db_alias: str = "default",
         quiet: bool = False,
         verbose: bool = False,
-    ) -> None:
+    ) -> dict[str, list[str]]:
         """Batch-check RLS policies via ``pg_policies``.
 
         With ``verbose`` (and not ``quiet``), additionally print each policy's
         live ``USING`` / ``WITH CHECK`` expressions indented under the
         policy-name line, taken from the ``pg_policies`` view's ``qual`` /
         ``with_check`` columns.
+
+        Returns:
+            ``{table: [policy name, ...]}`` for the tables that have policies.
         """
         conn = connections[db_alias]
         with conn.cursor() as cursor:
@@ -271,12 +379,125 @@ class Command(BaseCommand):
         for table, model_name in table_to_model.items():
             policies = policies_by_table.get(table, [])
             if not policies:
-                errors.append(f"  {model_name} ({table}): no RLS policies found")
+                issues.append(_Issue(table, model_name, NO_POLICIES))
             elif not quiet:
                 names = ", ".join(policy[0] for policy in policies)
                 self.stdout.write(f"  {model_name} ({table}): {names}")
                 if verbose:
                     self._write_policy_details(policies)
+        return {
+            table: [policy[0] for policy in policies]
+            for table, policies in policies_by_table.items()
+        }
+
+    def _generate(
+        self,
+        facts: MigrationFacts,
+        m2m_tables: dict[str, dict[str, Any]],
+        policy_names: dict[str, list[str]],
+        *,
+        name: str,
+        dry_run: bool,
+        quiet: bool,
+    ) -> dict[str, str]:
+        """Write (or print) the ``AddM2MRLSPolicy`` migrations the through tables lack.
+
+        Returns:
+            ``{table: hint}`` for each through table a migration was planned for,
+            naming the migration, for ``_write_hints()``.
+        """
+        try:
+            planned, skipped = plan_m2m_migrations(
+                facts, m2m_tables, policy_names, name=name, conf=RLSTenantsConfig()
+            )
+        except ValueError as exc:  # a GUC name or tenant PK type the operation refuses
+            raise CommandError(str(exc)) from exc
+
+        generated: dict[str, str] = {}
+        written: list[str] = []
+        for migration in planned:
+            written.extend(self._write_migration(migration, dry_run=dry_run))
+            label = f"{migration.app_label}.{migration.writer.migration.name}"
+            hint = (
+                f"check_rls --generate --dry-run printed migration {label}, which adds "
+                f"its policy: run check_rls --generate to write it, then migrate."
+                if dry_run
+                else f"check_rls --generate wrote migration {label}, which adds its "
+                f"policy: run migrate."
+            )
+            generated.update(dict.fromkeys(migration.tables, hint))
+        if written:
+            run_formatters(written, stderr=self.stderr)
+        for table, reason in skipped.items():
+            self.stderr.write(
+                self.style.WARNING(
+                    f"No migration generated for {m2m_tables[table]['description']} "
+                    f"({table}): {reason}"
+                )
+            )
+        if not planned and not skipped and not quiet:
+            self.stdout.write(
+                "\nNo migration to generate: a migration adds the policy of every "
+                "auto-created M2M through table."
+            )
+        return generated
+
+    def _write_migration(self, migration: PlannedMigration, *, dry_run: bool) -> list[str]:
+        """Describe ``migration`` and write it, or print it with ``dry_run``.
+
+        Returns:
+            The path written, or nothing with ``dry_run``.
+        """
+        writer = migration.writer
+        path = _relative_path(writer.path)
+        self.stdout.write(self.style.MIGRATE_HEADING(f"\nMigrations for {migration.app_label!r}:"))
+        self.stdout.write(f"  {self.style.MIGRATE_LABEL(path)}")
+        for operation in writer.migration.operations:
+            self.stdout.write(f"    - {operation.describe()}")
+        if dry_run:
+            self.stdout.write(writer.as_string())
+            return []
+        try:
+            with Path(writer.path).open("x", encoding="utf-8") as migration_file:
+                migration_file.write(writer.as_string())
+        except FileExistsError as exc:
+            raise CommandError(
+                f"{path} exists already and is not a migration Django loads. Move it "
+                f"away, or pass --name to write the migration under another name."
+            ) from exc
+        return [writer.path]
+
+    def _write_hints(
+        self,
+        issues: list[_Issue],
+        table_to_model: dict[str, type[Model]],
+        m2m_tables: dict[str, dict[str, Any]],
+        db_alias: str,
+        facts: MigrationFacts | None,
+        generated: dict[str, str],
+    ) -> None:
+        """Print the fix for the cause of each table's issues, read from the migrations."""
+        if facts is None:
+            try:
+                facts = MigrationFacts(db_alias)
+            except Exception as exc:  # the hints are advice; the issues stand without them
+                self.stderr.write(
+                    f"\nCould not read the migrations to tell how to fix these issues: "
+                    f"{_describe_error(exc)}."
+                )
+                return
+        problems_by_table: dict[str, set[str]] = {}
+        labels: dict[str, str] = {}
+        for issue in issues:
+            problems_by_table.setdefault(issue.table, set()).add(issue.problem)
+            labels.setdefault(issue.table, issue.label)
+        self.stderr.write("\nHow to fix:")
+        for table, problems in problems_by_table.items():
+            if table in m2m_tables:
+                hint = m2m_hint(facts, table, m2m_tables[table], problems, generated)
+            else:
+                hint = model_hint(facts, table_to_model[table], problems)
+            self.stderr.write(f"  {labels[table]} ({table}): {hint}")
 
     def _write_policy_details(
         self,

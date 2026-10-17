@@ -648,6 +648,39 @@ RLS_TENANTS = {
 **See:** [`UNIQUE_ACROSS_TENANTS`](getting-started/configuration.md#unique_across_tenants),
 [Cross-Tenant Unique Constraints](advanced/security.md#cross-tenant-unique-constraints).
 
+### W014: a protected model has no RLSConstraint
+
+**Symptom:** `shop.Invoice: (django_rls_tenants.W014) shop.Invoice inherits from
+RLSProtectedModel but has no RLSConstraint in Meta.constraints, so no migration creates
+an RLS policy for its table 'shop_invoice': the database does not isolate its rows by
+tenant.` Without the check, `makemigrations` writes no policy and `check_rls` reports
+`no RLS policies found` on a migrated database.
+
+**Cause:** The policy comes from the `RLSConstraint` in `RLSProtectedModel.Meta.constraints`.
+A `class Meta:` that does not inherit `RLSProtectedModel.Meta` drops it, and so does a
+`Meta` that inherits it but assigns its own `constraints = [...]`, which replaces the
+inherited list. The ORM still scopes queries by tenant, but the database does not, so a
+raw query or a missing filter reads every tenant's rows. Proxy models share their
+concrete model's table and are not reported. After an upgrade to 1.5.0 this check can
+report models that were already like this.
+
+**Fix:** Inherit the `Meta`, and keep the inherited constraints when you add your own:
+
+```python
+class Invoice(RLSProtectedModel):
+    number = models.CharField(max_length=50)
+
+    class Meta(RLSProtectedModel.Meta):
+        db_table = "shop_invoice"
+        constraints = [
+            *RLSProtectedModel.Meta.constraints,
+            models.CheckConstraint(condition=models.Q(number__gt=""), name="invoice_number"),
+        ]
+```
+
+Then run `makemigrations` and `migrate`; `check_rls` confirms the policy.
+
+**See:** [Meta Class Inheritance](guides/protecting-models.md#meta-class-inheritance).
 ### W015: a `STRICT_MODE_EXCLUDE` entry exempts nothing
 
 **Symptom:** `(django_rls_tenants.W015) RLS_TENANTS['STRICT_MODE_EXCLUDE'] lists
@@ -696,17 +729,41 @@ removed.
 ### `check_rls` reports `RLS not enabled` or `no RLS policies found`
 
 **Symptom:** `Found 1 issue(s): Invoice (myapp_invoice): no RLS policies found`, exit
-status 1.
+status 1, followed by a `How to fix:` block with a line for the table.
 
-**Cause:** Either the migration carrying the `RLSConstraint` has not been applied, or the
-model defines its own `Meta` without inheriting `RLSProtectedModel.Meta`, so the
-constraint was never part of the model and no policy was ever created.
+**Cause:** One of several, and the `How to fix:` line (added in 1.5.0) tells them apart
+from the migrations on disk and their record on the `--database` alias: the model defines
+its own `Meta` without inheriting `RLSProtectedModel.Meta` (system check `W014`), no
+migration adds the `RLSConstraint`, a migration that adds it is not applied on this
+database, RLS was turned off (`RLS not enabled`), or an applied migration's policy or
+table was dropped outside migrations.
 
-**Fix:** Run `migrate`; if that changes nothing, make the model's `Meta` inherit from
-`RLSProtectedModel.Meta` and run `makemigrations` again.
+**Fix:** Do what the line says: `makemigrations <app>` and `migrate`, or the `ALTER TABLE
+... ENABLE ROW LEVEL SECURITY` statement it prints, or run the `DO` block that
+`sqlmigrate <app> <migration>` prints. For a model without the constraint, make its `Meta`
+inherit from `RLSProtectedModel.Meta` first.
 
 **See:** [Meta Class Inheritance](guides/protecting-models.md#meta-class-inheritance),
+[W014](#w014-a-protected-model-has-no-rlsconstraint),
 [check_rls: Failure Output](guides/management-commands.md#failure-output).
+
+### `check_rls` reports an M2M through table with `no RLS policies found` after `migrate`
+
+**Symptom:** `Project.tags (auto M2M) (myapp_project_tags): no RLS policies found`, even
+though `migrate` ran cleanly and the `Project` table is protected.
+
+**Cause:** `migrate` never creates the policy of an auto-created M2M through table. The
+library adds its `RLSM2MConstraint` to the through model at startup, outside the migration
+state, so no migration holds it. The policy comes from an `AddM2MRLSPolicy` migration, or
+from `setup_m2m_rls` on one database.
+
+**Fix:** Run `python manage.py check_rls --generate`, review the migration it writes, then
+`migrate`. A table it skips (an app without migrations, a field no migration creates yet)
+gets a warning that names the reason. `setup_m2m_rls` applies the policies to the
+database directly, but a database built from the migrations has none.
+
+**See:** [Generating M2M policy migrations](guides/management-commands.md#generating-m2m-policy-migrations),
+[Many-to-Many Relationships](guides/protecting-models.md#many-to-many-relationships).
 
 ### `check_rls` lists `M2M through tables:` you did not create
 

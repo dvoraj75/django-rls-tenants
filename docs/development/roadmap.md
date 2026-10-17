@@ -353,10 +353,17 @@ First-class support for the most popular Django API framework.
   *Why:* Current strict mode is all-or-nothing, which forces workarounds for
   legitimately unscoped models.
 
-- [ ] **Migration helpers** — `check_rls --generate` flag that outputs a
-  migration file for any missing RLS policies.
-  *Why:* Reduces manual steps when adding new `RLSProtectedModel` subclasses
-  to an existing project.
+- [x] **Migration helpers** (#46) — `check_rls --generate` writes an
+  `AddM2MRLSPolicy` migration for every auto-created M2M through table that no
+  migration covers (`migrate` never creates those policies), with `--dry-run` and
+  `--name`. Models with an `RLSConstraint` already get their policy from
+  `makemigrations`, so the flag covers through tables only. A failing `check_rls`
+  now also prints a `How to fix:` line per table, and system check `W014` reports a
+  model whose `Meta` dropped the `RLSConstraint`. `AddM2MRLSPolicy.deconstruct()`
+  was fixed so a migration Django writes with it imports.
+  *Why:* The policy of an M2M through table came only from a hand-written
+  migration or from `setup_m2m_rls`, so a fresh database built from the migrations
+  had none, and a failing `check_rls` named the table without naming the cause.
 
 ---
 

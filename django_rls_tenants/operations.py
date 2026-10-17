@@ -147,7 +147,12 @@ class AddM2MRLSPolicy(migrations.operations.base.Operation):
         return f"Add M2M RLS policy to {self.m2m_table}"
 
     def deconstruct(self) -> tuple[str, list[Any], dict[str, Any]]:
-        """Return args for Django's migration serializer."""
+        """Return args for Django's migration serializer.
+
+        The name is the bare class name, as Django's own operations return it:
+        ``MigrationWriter`` writes ``<module>.<name>(`` and imports the module
+        itself, so a dotted path would be written twice (#46).
+        """
         kwargs: dict[str, Any] = {
             "m2m_table": self.m2m_table,
             "from_model": self.from_model,
@@ -165,8 +170,4 @@ class AddM2MRLSPolicy(migrations.operations.base.Operation):
             kwargs["guc_admin_var"] = self.guc_admin_var
         if self.tenant_pk_type != "int":
             kwargs["tenant_pk_type"] = self.tenant_pk_type
-        return (
-            f"{self.__class__.__module__}.{self.__class__.__qualname__}",
-            [],
-            kwargs,
-        )
+        return (self.__class__.__name__, [], kwargs)

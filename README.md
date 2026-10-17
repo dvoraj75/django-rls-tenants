@@ -66,7 +66,8 @@ returns zero rows, never leaked data.
   `current_tenant_value_sql()` returns the current tenant ID expression for inserts
   and projections. Both reuse the expressions used by RLS policies.
   [Raw SQL guide →](https://dvoraj75.github.io/django-rls-tenants/guides/raw-sql/)
-- **M2M isolation** -- auto-detected subquery-based RLS policies on M2M through tables.
+- **M2M isolation** -- auto-detected subquery-based RLS policies on M2M through tables;
+  `check_rls --generate` writes the migration that creates them.
 - **Single schema, single database** -- no schema-per-tenant overhead, no connection
   routing.
 

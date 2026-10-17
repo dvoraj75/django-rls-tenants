@@ -160,7 +160,8 @@ RLS-protected, the output also gains an `M2M through tables:` section for Django
 through tables, which need policies of their own, and the total rises to 4 (see
 [Protecting the User Model](../guides/protecting-models.md#protecting-the-user-model)).
 
-If any policies are missing, the command exits with a non-zero status and lists the issues.
+If any policies are missing, the command exits with a non-zero status, lists the issues and
+prints a `How to fix:` line for each table.
 
 ## What's Next?
 

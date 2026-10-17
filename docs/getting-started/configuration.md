@@ -403,12 +403,13 @@ django-rls-tenants registers Django system checks that warn about common misconf
 | `W011` | Warning | PostgreSQL applies a database- or role-level default (`ALTER DATABASE/ROLE ... SET`) for a GUC the RLS policies read, in force in every new session; checked on every alias in `RLS_TENANTS["DATABASES"]` |
 | `W012` | Warning | A unique field, `unique_together` entry or `UniqueConstraint` of an RLS-protected model does not include the tenant field, so its `IntegrityError` reveals values held by other tenants; also a stale `UNIQUE_ACROSS_TENANTS` entry. Listed in [`UNIQUE_ACROSS_TENANTS`](#unique_across_tenants) when intended |
 | `W013` | Warning | `W005`/`E001` or `W011` could not be determined: the database was reachable but the catalogue query failed (for example `permission denied for view pg_roles`). A clean `check` is not a pass |
+| `W014` | Warning | A concrete, non-proxy `RLSProtectedModel` subclass has no `RLSConstraint` in `Meta.constraints`: its `Meta` does not inherit `RLSProtectedModel.Meta`, or sets `constraints` of its own, so no migration creates a policy for its table. See [W014](../troubleshooting.md#w014-a-protected-model-has-no-rlsconstraint) |
 | `W015` | Warning | A `STRICT_MODE_EXCLUDE` label does not resolve to an installed model, or names a model without an `RLSConstraint` (strict mode never guards it, so the entry has no effect). Checked whether or not `STRICT_MODE` is on. See [`STRICT_MODE_EXCLUDE`](#strict_mode_exclude) |
 | `E001` | Error | The connection role of a `DATABASES` alias is a superuser or has `BYPASSRLS` and `settings.DEBUG` is `False` (a production deployment). Replaces `W005`; fails `manage.py check` and every command that runs the system checks, such as `migrate` |
 
 Run `python manage.py check` to see any warnings and errors.
 
-`W005`, `W011`, `W012`, `W013` and `W015` stay warnings. `E001` is an error, so it also aborts `migrate`,
+`W005`, `W011`, `W012`, `W013`, `W014` and `W015` stay warnings. `E001` is an error, so it also aborts `migrate`,
 `createsuperuser`, `check_rls`, `setup_m2m_rls` and Django's test runner (which sets
 `DEBUG = False` before it runs the checks). If a settings module has to connect as such a
 role on purpose (a migration job, a superuser test database), record that decision there

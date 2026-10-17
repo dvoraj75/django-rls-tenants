@@ -118,6 +118,13 @@ The library has two internal layers with a strict import boundary:
   anything that imports models, at module level** (same kind of rule as `pytest_plugin.py`:
   imports go inside the functions). The workers' `django.setup()` uses the parent's
   `settings.SETTINGS_MODULE` and database `NAME`s, so the parent's tenants must be committed.
+  `check_rls` prints a "How to fix:" block for a failing run and, with `--generate` (#46, with
+  `--dry-run` / `--name`), writes one `AddM2MRLSPolicy` migration per app. The migration-state
+  analysis lives in the private `management/_rls_migrations.py`: `MigrationFacts` reads the
+  migration loader and the applied record on the `--database` alias, `model_hint()` /
+  `m2m_hint()` word the fix for a table's cause, and `plan_m2m_migrations()` builds the
+  migrations, which are written with Django's `MigrationWriter` (so `AddM2MRLSPolicy.deconstruct()`
+  must return the bare class name).
 
 This boundary is enforced by `tests/test_layering.py`. Never import from `tenants/` in `rls/`.
 
@@ -140,6 +147,11 @@ cooperate:
 - `RLSM2MConstraint` (in `rls/constraints.py`) — constraint for `Meta.constraints`
 - `AddM2MRLSPolicy` (in `operations.py`) — reversible migration operation
 - `register_m2m_rls()` (in `tenants/models.py`) — auto-detection in `AppConfig.ready()`
+
+`register_m2m_rls()` adds the constraint to the runtime through model only, outside the
+migration state, so `migrate` never creates an auto-created through table's policy: it comes
+from an `AddM2MRLSPolicy` migration (`check_rls --generate` writes it) or from `setup_m2m_rls`
+(one database, outside migrations).
 
 All three share SQL builder functions (`_build_m2m_conditions`,
 `_build_m2m_create_sql`, `_build_m2m_drop_sql`) from `rls/constraints.py` to
@@ -194,10 +206,14 @@ each `unique=True` field, `unique_together` entry and `UniqueConstraint` of a co
 with an `RLSConstraint` that omits the constraint's tenant field (PostgreSQL checks unique
 indexes outside the policies, so the `IntegrityError` is a cross-tenant existence oracle).
 `RLS_TENANTS["UNIQUE_ACROSS_TENANTS"]` (`{"app.Model": [name | tuple of fields]}`, validated
-in `conf.py`) allowlists intended ones; a stale entry is a `W012` too. `W014` is reserved
-for #46. `W015` (#45, `_check_strict_mode_exclude()` in `tenants/checks.py`) warns about a
-`RLS_TENANTS["STRICT_MODE_EXCLUDE"]` label that does not resolve to an installed model or
-names one without an `RLSConstraint`; it runs whether or not `STRICT_MODE` is on.
+in `conf.py`) allowlists intended ones; a stale entry is a `W012` too.
+
+System check `W014` (#46, `_check_protected_models_have_constraint()` in `tenants/checks.py`)
+warns about a concrete, non-proxy `RLSProtectedModel` subclass with no `RLSConstraint` (its
+`Meta` does not inherit `RLSProtectedModel.Meta`, or sets its own `constraints`, which replaces
+the inherited list). `W015` (#45, `_check_strict_mode_exclude()` in `tenants/checks.py`)
+warns about a `RLS_TENANTS["STRICT_MODE_EXCLUDE"]` label that does not resolve to an installed
+model or names one without an `RLSConstraint`; it runs whether or not `STRICT_MODE` is on.
 
 When modifying middleware or GUC-related code, ensure all database iteration
 uses `conf.DATABASES` rather than hardcoding `"default"`.

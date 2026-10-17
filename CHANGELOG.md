@@ -26,6 +26,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (strict mode never guards it). The strict-mode error's hint now names the label to list.
   See
   [`STRICT_MODE_EXCLUDE`](https://dvoraj75.github.io/django-rls-tenants/getting-started/configuration/#strict_mode_exclude).
+- **`check_rls --generate` writes the migrations that protect M2M through tables** (#46).
+  `migrate` never creates the policy of an auto-created many-to-many through table:
+  `register_m2m_rls()` adds the `RLSM2MConstraint` to the runtime through model at
+  startup, outside the migration state, so the policy came only from a hand-written
+  `AddM2MRLSPolicy` migration or from `setup_m2m_rls` (one database, outside migrations).
+  `manage.py check_rls --generate` now writes, in each app that declares the
+  `ManyToManyField`, one migration (`NNNN_m2m_rls_policies.py`, numbered after the app's
+  latest migration, which it depends on) with an `AddM2MRLSPolicy` for every through table
+  that no migration on disk adds a policy to, in the format of `makemigrations`. A table
+  whose policy exists only in the database (from `setup_m2m_rls`) is included, so a fresh
+  database (CI, a test database, a new environment) gets its policy from `migrate`; on a
+  database that has it, the operation changes nothing. GUC names and the tenant primary
+  key type come from `RLS_TENANTS`, like `setup_m2m_rls`. `--dry-run` prints the files
+  instead of writing them and `--name` replaces `m2m_rls_policies`. A table is skipped with
+  a warning when its app has no migrations, when no migration creates the field yet, when
+  the table has a policy of another name, or when the app has conflicting migrations.
+  The exit status is unchanged (1 while the database check finds issues), so the workflow
+  is `check_rls --generate`, review the file, `migrate`, `check_rls`. See the
+  [Management Commands guide](https://dvoraj75.github.io/django-rls-tenants/guides/management-commands/#generating-m2m-policy-migrations).
+- **`check_rls` says how to fix each failing table** (#46). After the `Found N issue(s):`
+  list, a failing run prints a `How to fix:` block to stderr with one line per table. It
+  tells the cause apart from the migrations on disk and their record on the `--database`
+  alias: a model whose `Meta` has no `RLSConstraint`, a constraint no migration adds
+  (`makemigrations`), one that is not applied (`migrate`, naming the migration), a policy
+  or table dropped outside migrations (`sqlmigrate` prints the `DO` block that creates the
+  policy; for an M2M table `setup_m2m_rls --database`), RLS turned off (the exact
+  `ALTER TABLE ... ENABLE / FORCE ROW LEVEL SECURITY` statements) and an M2M table no
+  migration covers (`check_rls --generate`). If the migrations cannot be loaded it prints
+  one line saying so; the issues and the exit status are unaffected.
+- **`W014`: a system check for a model that inherits `RLSProtectedModel` but has no
+  `RLSConstraint`** (#46). A subclass whose `class Meta:` does not inherit
+  `RLSProtectedModel.Meta`, or inherits it but sets `constraints = [...]` of its own
+  (which replaces the inherited list), gets no policy from `makemigrations`, and nothing
+  said so until `check_rls` ran against a migrated database. `manage.py check` now reports
+  `django_rls_tenants.W014` for each such concrete, non-proxy model, with the fix:
+  `class Meta(RLSProtectedModel.Meta)` and
+  `constraints = [*RLSProtectedModel.Meta.constraints, ...]`. **An existing project can see
+  new `W014` warnings after upgrading**; each one is a table that is not protected. See
+  [W014](https://dvoraj75.github.io/django-rls-tenants/troubleshooting/#w014-a-protected-model-has-no-rlsconstraint).
 - **`run_as_tenant` and `run_for_all_tenants` management commands** (#111). Run any
   management command (a nightly report, a re-index, a per-tenant data fix, a backfill)
   inside the right RLS context without writing context handling into it.
@@ -216,6 +255,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   raises `RelatedObjectDoesNotExist` on access, where such a connection used to get the
   other tenant's row. See the
   [performance guide](https://dvoraj75.github.io/django-rls-tenants/guides/performance/#prefetch_related).
+
+### Fixed
+
+- **`AddM2MRLSPolicy` in a migration that Django writes** (#46). `deconstruct()` returned
+  the dotted path as the operation's name, and `MigrationWriter` writes
+  `<module>.<name>(` itself, so a migration containing the operation that Django wrote (a
+  squashed one from `squashmigrations`, or one from `check_rls --generate`) read
+  `django_rls_tenants.operations.django_rls_tenants.operations.AddM2MRLSPolicy(` and
+  failed to import. It now returns the bare class name, like Django's own operations.
+  Hand-written migrations are unaffected.
 
 ## [1.4.0] - 2026-10-16
 

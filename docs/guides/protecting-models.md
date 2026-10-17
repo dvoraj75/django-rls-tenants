@@ -208,7 +208,14 @@ class Order(RLSProtectedModel):
 ```
 
 If you do not inherit from `RLSProtectedModel.Meta`, the `RLSConstraint` will not
-be included and RLS will not be applied to the table.
+be included and RLS will not be applied to the table. A `Meta` that inherits it but sets
+`constraints = [...]` of its own has the same effect, because that list replaces the
+inherited one: write `constraints = [*RLSProtectedModel.Meta.constraints, ...]`.
+
+System check `django_rls_tenants.W014` (added in 1.5.0) reports each concrete model that
+inherits `RLSProtectedModel` and has no `RLSConstraint` in `Meta.constraints`, so
+`manage.py check` catches it before `makemigrations` writes a migration without a policy.
+See [W014](../troubleshooting.md#w014-a-protected-model-has-no-rlsconstraint).
 
 ## Protecting the User Model
 
@@ -236,8 +243,8 @@ This is an opt-in with consequences beyond the `User` table:
     policy on each of them. It lists them under an extra `M2M through tables:` section,
     counts them in the total (the Quick Start project reports
     `All 4 RLS-protected tables verified.` instead of `All 1 ...`), and exits non-zero
-    until you apply the policies with an `AddM2MRLSPolicy` migration or
-    `setup_m2m_rls`.
+    until you apply the policies with an `AddM2MRLSPolicy` migration (`check_rls
+    --generate` writes it) or `setup_m2m_rls`.
 
 What this means in practice:
 
@@ -296,9 +303,11 @@ See [Bypass Mode](bypass-mode.md) for more details.
 
 ## Many-to-Many Relationships
 
-M2M relationships between `RLSProtectedModel` subclasses are automatically detected
-and protected. When Django auto-generates a through table for an M2M field,
-`django-rls-tenants` registers an `RLSM2MConstraint` on it during `AppConfig.ready()`.
+M2M relationships between `RLSProtectedModel` subclasses are automatically detected.
+When Django auto-generates a through table for an M2M field, `django-rls-tenants`
+registers an `RLSM2MConstraint` on it during `AppConfig.ready()`. The policy itself still
+has to be created: see [Automatic Protection](#automatic-protection) and
+[Migration Operation](#migration-operation).
 
 ### Automatic Protection
 
@@ -321,12 +330,21 @@ class Project(RLSProtectedModel):
 ```
 
 The auto-generated through tables (`myapp_project_members`, `myapp_project_tags`)
-will get `EXISTS`-based subquery RLS policies that check each FK reference belongs
-to the current tenant.
+get an `RLSM2MConstraint` at startup. It describes the `EXISTS`-based subquery policy
+that checks each FK reference belongs to the current tenant, but it lives on the runtime
+through model only, outside the migration state, so **`migrate` does not create the
+policy**. In a project with migrations, create it with an `AddM2MRLSPolicy` migration
+(next section); `python manage.py check_rls --generate` writes it for you. For a single
+database, or an app without migrations, `setup_m2m_rls` applies the policies directly.
+`check_rls` reports a through table with no policy.
 
 ### Migration Operation
 
-For explicit control in migrations, use `AddM2MRLSPolicy`:
+`AddM2MRLSPolicy` creates the policy in a migration. `python manage.py check_rls
+--generate` (added in 1.5.0) writes one migration per app with an operation for every
+through table that no migration covers, which you review and `migrate`; see
+[Generating M2M policy migrations](management-commands.md#generating-m2m-policy-migrations).
+To write it by hand:
 
 ```python
 from django.db import migrations

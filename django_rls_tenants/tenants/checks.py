@@ -18,6 +18,9 @@ silent failures at runtime:
 - A unique field or constraint on an RLS-protected model that omits the tenant
   field (``W012``): unique indexes are checked outside the RLS policies, so the
   ``IntegrityError`` tells one tenant that a value exists in another.
+- An ``RLSProtectedModel`` subclass with no ``RLSConstraint`` (``W014``): its
+  ``Meta`` does not inherit ``RLSProtectedModel.Meta``, or replaced its
+  ``constraints``, so no migration creates a policy for its table.
 - A ``STRICT_MODE_EXCLUDE`` label that names no installed RLS-protected model
   (``W015``): the entry exempts nothing.
 
@@ -64,6 +67,7 @@ def check_rls_config(
     errors.extend(_check_tenant_model_resolves())
     errors.extend(_check_tenant_fk_field_exists())
     errors.extend(_check_unique_across_tenants())
+    errors.extend(_check_protected_models_have_constraint())
     errors.extend(_check_strict_mode_exclude())
     return errors
 
@@ -564,6 +568,44 @@ def _check_tenant_fk_field_exists() -> list[CheckWarning]:
     return warnings
 
 
+def _check_protected_models_have_constraint() -> list[CheckWarning]:
+    """Warn about an ``RLSProtectedModel`` subclass with no ``RLSConstraint`` (``W014``).
+
+    The policy of a protected model's table comes from the ``RLSConstraint`` in
+    ``RLSProtectedModel.Meta.constraints``. A subclass whose ``class Meta:`` does
+    not inherit ``RLSProtectedModel.Meta``, or does but sets ``constraints`` of its
+    own, has none: ``makemigrations`` writes no policy, the table is not
+    protected, and nothing else says so until ``check_rls`` runs against a
+    migrated database (#46). A proxy model shares its concrete model's table and
+    is skipped.
+    """
+    from django.apps import apps  # noqa: PLC0415
+
+    from django_rls_tenants.tenants.models import (  # noqa: PLC0415
+        RLSProtectedModel,
+        _get_tenant_fk_field,
+    )
+
+    return [
+        CheckWarning(
+            f"{model._meta.label} inherits from RLSProtectedModel but has no "  # noqa: SLF001
+            f"RLSConstraint in Meta.constraints, so no migration creates an RLS policy "
+            f"for its table {model._meta.db_table!r}: the database does not "  # noqa: SLF001
+            f"isolate its rows by tenant.",
+            hint=(
+                "Make its Meta inherit RLSProtectedModel.Meta (class "
+                "Meta(RLSProtectedModel.Meta): ...). A Meta that sets constraints of its "
+                "own replaces the inherited list: write constraints = "
+                "[*RLSProtectedModel.Meta.constraints, ...]. Then run makemigrations."
+            ),
+            id="django_rls_tenants.W014",
+            obj=model,
+        )
+        for model in apps.get_models()
+        if issubclass(model, RLSProtectedModel)
+        and not model._meta.proxy  # noqa: SLF001
+        and _get_tenant_fk_field(model) is None
+    ]
 def _check_strict_mode_exclude() -> list[CheckWarning]:
     """Warn about ``STRICT_MODE_EXCLUDE`` labels that exempt nothing (``W015``).
 
