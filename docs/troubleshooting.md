@@ -898,16 +898,44 @@ tenant, or an unauthenticated request sees rows.
 `set_config()`. In transaction pooling the server connection is handed to another client
 as soon as the transaction ends, carrying the GUCs with it.
 
+If `USE_LOCAL_SET=True` is already set, something else wrote a policy GUC for the session
+through the same pool (a bypass flag without `is_local=True`, `set_guc()`, another client
+with `USE_LOCAL_SET=False`, a `psql` session). That value stays on its server connection,
+and every client PgBouncer gives the connection to runs with it.
+
 **Fix:** Set `USE_LOCAL_SET=True`. The GUCs become transaction-local and die with their
 transaction: the per-request transaction the middleware opens under WSGI, your own
 `transaction.atomic()`, or, on the middleware's async path (ASGI) and for code outside a
 transaction, the transaction the GUC affinity guard opens for each statement (since 1.4.0;
 before that, this mode did not work under ASGI, and scripts had to open their own
-transaction before setting context).
+transaction before setting context). Set a `server_reset_query` that clears the policy GUCs,
+with `server_reset_query_always = 1`, so a session-level write by anyone ends with its
+transaction, and run `RECONNECT` on PgBouncer's admin console to drop the server
+connections that already hold one.
 
-**See:** [PgBouncer: Transaction Mode](guides/connection-pooling.md#transaction-mode-recommended),
+**See:** [Troubleshooting GUC Leaks](guides/connection-pooling.md#troubleshooting-guc-leaks),
+[PgBouncer: Transaction Mode](guides/connection-pooling.md#transaction-mode-recommended),
 [Connection-Level State](advanced/security.md#connection-level-state),
 [Async Deployment: Connections and pooling](guides/async.md#connections-and-pooling).
+
+### Zero rows, or `new row violates row-level security policy`, behind pgpool-II
+
+**Symptom:** Behind pgpool-II with `load_balance_mode = on`, reads return no rows (with
+`USE_LOCAL_SET=False`, or with `disable_load_balance_on_write = 'off'`), or writes fail
+with `new row violates row-level security policy` (with `set_config` listed in
+`read_only_function_list`). The same code works on a direct connection.
+
+**Cause:** pgpool sends each statement to the primary or to a standby, and each backend
+session has its own GUCs. It sends the library's `SELECT set_config(...)` to the primary
+only, since `set_config()` is a volatile function, and plain reads to the standby, so the
+query runs where the GUCs were never set (fail-closed).
+
+**Fix:** Set `load_balance_mode = off` for the application, and read from a standby through
+a Django alias of its own, routed with a database router and listed in
+`RLS_TENANTS["DATABASES"]`. With `USE_LOCAL_SET=True` and pgpool's defaults load balancing
+works without errors, but every statement run under a context stays on the primary.
+
+**See:** [pgpool-II: Load Balancing](guides/connection-pooling.md#load-balancing).
 
 ### An async view committed some of its writes
 

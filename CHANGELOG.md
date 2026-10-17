@@ -77,6 +77,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forge a field of the plain-text message is quoted. The `DEBUG` messages on the
   `django_rls_tenants` logger are unchanged. See
   [Audit Logging](https://dvoraj75.github.io/django-rls-tenants/guides/audit-logging/).
+- **Docs: PgBouncer and pgpool-II configuration, and GUC leak troubleshooting** (#49). The
+  Connection Pooling guide now has a complete `pgbouncer.ini` (SCRAM authentication through
+  `auth_file`) with `settings.py` for transaction mode, and says what each `pool_mode` does
+  in both GUC modes: statement mode is not supported. It explains why session GUCs leak in
+  transaction mode without a crash, and that `USE_LOCAL_SET=True` does not protect against
+  a session-level write made by anything else through the same pool (a bypass flag without
+  `is_local=True`, another client with `USE_LOCAL_SET=False`, a `psql` session): the value
+  stays on its server connection for every later client, and the guard's clear after a
+  context can run on another server connection. The fix it recommends is a
+  `server_reset_query` that clears the policy GUCs with `server_reset_query_always = 1`,
+  which also makes `USE_LOCAL_SET=False` fail closed there. It covers psycopg 3 prepared
+  statements (`max_prepared_statements`) and session mode with `CONN_MAX_AGE`. A new
+  pgpool-II section covers its per-session pooling, `connection_cache` and
+  `reset_query_list`, and load balancing, under which pgpool sends the library's
+  `set_config()` statement to the primary only: reads find no rows with
+  `USE_LOCAL_SET=False`, and with `USE_LOCAL_SET=True` every statement run under a context
+  stays on the primary, so the guide recommends `load_balance_mode = off` and a Django
+  alias for the standby. A new "Troubleshooting GUC Leaks" section gives the diagnosis
+  query, a two-client reset test, how to find the session-level write in the PostgreSQL
+  log, the defaults `W011` does not see, cleanup (`RECONNECT`) and a checklist. The
+  troubleshooting page, the Async Deployment guide and the security page link to it. Every
+  configuration was checked against PgBouncer 1.26 and pgpool-II 4.7. See
+  [Connection Pooling](https://dvoraj75.github.io/django-rls-tenants/guides/connection-pooling/).
 
 ### Changed
 

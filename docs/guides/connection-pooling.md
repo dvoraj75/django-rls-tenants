@@ -2,9 +2,11 @@
 
 When using a connection pooler like **PgBouncer** or **pgpool-II**, or Django's own
 connection pool, special care is needed to prevent GUC variables from leaking between
-requests through pooled connections. Django's pool has its own section,
-[Django's Connection Pool](#djangos-connection-pool). For which combinations are safe under
-ASGI, see [Async Deployment](async.md#connections-and-pooling).
+requests through pooled connections. Each pooler has its own section:
+[PgBouncer](#pgbouncer), [pgpool-II](#pgpool-ii) and
+[Django's Connection Pool](#djangos-connection-pool). If you suspect a leak, start with
+[Troubleshooting GUC Leaks](#troubleshooting-guc-leaks). For which combinations are safe
+under ASGI, see [Async Deployment](async.md#connections-and-pooling).
 
 ## The Problem
 
@@ -228,24 +230,77 @@ request's session lookup on a persistent connection. That clear is for the sessi
 once its transaction commits it sticks. Inside a transaction the mark itself takes effect
 at the commit; a rollback undoes such a write anyway.
 
-## PgBouncer Configuration
+## PgBouncer
+
+PgBouncer gives a client a server connection for its whole session, for one transaction or
+for one statement, depending on `pool_mode`:
+
+| `pool_mode` | `USE_LOCAL_SET=False` (default) | `USE_LOCAL_SET=True` |
+|---|---|---|
+| `transaction` | **Unsafe.** The GUCs stay on the server connection, which PgBouncer hands to another client after every transaction. | **Safe**, with the settings below. |
+| `session` | **Safe.** | **Safe.** |
+| `statement` | **Not supported.** PgBouncer refuses transaction blocks, so `transaction.atomic()` fails, and the GUCs leak as in transaction mode. | **Not supported.** A statement run under a context needs a transaction (see [Code Outside a Request Transaction](#code-outside-a-request-transaction)), and PgBouncer closes the connection: `transaction blocks not allowed in statement pooling mode`. |
+
+The library cannot tell that it is talking to PgBouncer: the checkout clear and `W010` cover
+Django's own pool only, and `W004` looks at `CONN_MAX_AGE`. No check warns about
+`USE_LOCAL_SET=False` behind transaction pooling.
+
+The configurations in this section and in [pgpool-II](#pgpool-ii) were checked against
+PgBouncer 1.26 and pgpool-II 4.7 with PostgreSQL 16, Django 6.1, psycopg2 and psycopg 3.
 
 ### Transaction Mode (recommended)
 
 ```ini title="pgbouncer.ini"
 [databases]
-myproject = host=localhost dbname=myproject
+myproject = host=db.internal port=5432 dbname=myproject
 
 [pgbouncer]
+listen_addr = 0.0.0.0
+listen_port = 6432
 pool_mode = transaction
+auth_type = scram-sha-256
+auth_file = /etc/pgbouncer/userlist.txt
 max_client_conn = 1000
 default_pool_size = 20
+
+; Clear the RLS GUCs on each server connection after every transaction
+; (see "Clearing the GUCs After Every Transaction" below).
+server_reset_query = SELECT set_config('rls.is_admin', '', false), set_config('rls.current_tenant', '', false)
+server_reset_query_always = 1
+```
+
+```text title="userlist.txt"
+"app" "SCRAM-SHA-256$4096:..."
+```
+
+`auth_file` lists each role PgBouncer accepts, with its password or, as here, its SCRAM
+secret: the `rolpassword` that `SELECT rolpassword FROM pg_authid WHERE rolname = 'app';`
+returns (a superuser query). Connect as the application's plain role, not as a superuser or
+a role with `BYPASSRLS` (see [W005](../troubleshooting.md#w005-the-connection-role-is-a-superuser-or-has-bypassrls)).
+For `auth_query` and the other ways to authenticate, see PgBouncer's
+[configuration reference](https://www.pgbouncer.org/config.html).
+
+```python title="settings.py"
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": "myproject",  # the name in PgBouncer's [databases] section
+        "USER": "app",
+        "PASSWORD": "...",
+        "HOST": "pgbouncer.internal",
+        "PORT": "6432",
+        "DISABLE_SERVER_SIDE_CURSORS": True,
+    }
+}
+
+RLS_TENANTS = {
+    "TENANT_MODEL": "myapp.Tenant",
+    "USE_LOCAL_SET": True,
+}
 ```
 
 With `pool_mode = transaction` and `USE_LOCAL_SET = True`:
 
-- Each transaction gets a clean connection from the pool.
-- `SET LOCAL` ensures GUCs are scoped to the transaction.
 - Every statement gets its GUCs inside the transaction it runs in: the middleware's request
   transaction under WSGI, your `transaction.atomic()`, or, for requests on the middleware's
   async path and code outside a transaction, a transaction of its own that the GUC affinity
@@ -253,19 +308,113 @@ With `pool_mode = transaction` and `USE_LOCAL_SET = True`:
   [Code Outside a Request Transaction](#code-outside-a-request-transaction)). That is what
   transaction pooling needs. *Changed in 1.4.0:* before, only WSGI requests and code
   inside `atomic()` worked in this mode.
-- No cleanup is needed after the transaction ends.
+- The library's values end with their transaction, so it leaves nothing on the server
+  connection for the next client. That does not make the server connection clean: see
+  [One Session-Level Write Reaches Every Later Client](#one-session-level-write-reaches-every-later-client).
 - Pass `is_local=True` to `bypass_flag()`, `set_bypass_flag()` and `rls_context()` (inside
   `transaction.atomic()`): they are session-scoped by default in either mode, and nothing
   clears a flag that PgBouncer hands to another client.
 - Set `DISABLE_SERVER_SIDE_CURSORS = True` on the alias. Django requires it for transaction
   pooling: a server-side cursor (`iterator()`) can outlive its transaction, and the next
   transaction may run on another server connection.
+- Django connects with PgBouncer's default (empty) `ignore_startup_parameters`, with either
+  driver.
+
+#### Why Session GUCs Leak Here
+
+With `USE_LOCAL_SET=False`, the middleware and the context managers write the GUCs for the
+session (`set_config(..., false)`). In transaction mode every statement Django runs in
+autocommit is a transaction of its own, so PgBouncer can give the server connection to
+another client right after the GUCs were written, and that client runs with them. No crash
+or skipped cleanup is needed: a client with no context sees the first client's tenant while
+the first client's context is still open, and a client inside `tenant_context(1)` whose
+query lands on a server connection where another client has just written tenant 2 reads
+tenant 2's rows. Under load it happens constantly; on a quiet system it looks
+intermittent.
+
+#### One Session-Level Write Reaches Every Later Client
+
+With `USE_LOCAL_SET=True` the library writes the tenant and admin GUCs only
+transaction-locally, and it assumes that a new connection's session holds none of them.
+Behind PgBouncer that is true only while nothing else writes them for the session through
+the same pool. A session-level write stays on its server connection until PgBouncer closes
+that connection (`server_lifetime`, one hour by default), and every client that gets the
+connection runs with the value whenever it has no context of its own. A leaked
+`extra_bypass_flags` entry applies even inside a tenant context, for the models that
+declare it. Typical sources:
+
+- `bypass_flag()`, `set_bypass_flag()` or `rls_context()` without `is_local=True`, and
+  `set_guc()`;
+- a client of the same PgBouncer database that runs with `USE_LOCAL_SET=False`: another
+  deployment, a Celery worker or a management command with other settings;
+- a `psql` session, migration or maintenance script run through PgBouncer that runs
+  `SET rls.is_admin = 'true'` (without `LOCAL`) or `set_config(..., false)`;
+- a function or `DO` block that calls `set_config(..., false)`;
+- a per-database `connect_query` in `pgbouncer.ini` that sets a policy GUC.
+
+The guard's clear after a context ends (see [After a context ends](#after-a-context-ends))
+does not help here: it runs before the client's next statement, and PgBouncer may send that
+statement to another server connection than the one that holds the value.
+
+#### Clearing the GUCs After Every Transaction
+
+`server_reset_query` is the query PgBouncer runs on a server connection when a client
+releases it, before another client gets it. By default (`DISCARD ALL`, with
+`server_reset_query_always = 0`) it runs only in session pools. With
+`server_reset_query_always = 1` it also runs in transaction pools, after every transaction.
+A reset query that clears the RLS GUCs, as in the example above, removes a session-level
+write as soon as the transaction that made it ends:
+
+- `USE_LOCAL_SET=True` works as before. The library's own values never outlive their
+  transaction, so the reset finds nothing of theirs to remove.
+- `USE_LOCAL_SET=False` stops working, fail-closed: the GUCs the middleware writes are gone
+  before the view's first query, so every query returns zero rows. A deployment with the
+  wrong setting shows at once instead of leaking.
+- A bypass flag set without `is_local=True` does not reach the next transaction. Set it with
+  `is_local=True` inside `transaction.atomic()`, as transaction mode requires anyway.
+- Each transaction costs one more statement between PgBouncer and PostgreSQL. With
+  `USE_LOCAL_SET=True` outside `transaction.atomic()`, each statement run under a context is
+  a transaction of its own, so that is one per statement.
+- List every GUC your policies read: the tenant and admin GUCs (`rls.current_tenant` and
+  `rls.is_admin` with the default `GUC_PREFIX`), each `extra_bypass_flags` entry, and the
+  GUC names of any constraint, `AddRLSPolicy` or hand-written policy that uses names of its
+  own (see [What the Library Does on Checkout](#what-the-library-does-on-checkout)).
+
+#### Prepared Statements (psycopg 3)
+
+Django's psycopg 3 backend binds parameters on the client and turns psycopg's automatic
+prepared statements off (`prepare_threshold=None`) unless you set `OPTIONS`, and psycopg2
+never prepares statements, so nothing needs configuring. With
+`OPTIONS = {"server_side_binding": True, "prepare_threshold": 5}` (or another threshold),
+psycopg 3 prepares a statement on its connection once it has run that often. Behind
+transaction pooling the next transaction can run on another server connection, so PgBouncer
+must track prepared statements: that needs PgBouncer 1.21 or later with
+`max_prepared_statements` above zero (the default is 200 since 1.24). With
+`max_prepared_statements = 0`, queries fail with errors such as
+`prepared statement "_pg3_0" already exists`. Server-side binding without a
+`prepare_threshold` prepares nothing and needs no PgBouncer setting.
 
 ### Session Mode
 
-With `pool_mode = session`, each client gets a dedicated connection for the duration of
-the session. The default `set_config()` behavior works correctly because the middleware
-clears GUCs in `process_response`.
+With `pool_mode = session`, a client keeps one server connection until it disconnects.
+PgBouncer then runs `server_reset_query` (`DISCARD ALL` by default) and hands the connection
+to the next client clean. Both GUC modes work:
+
+- With `CONN_MAX_AGE = 0` (Django's default), Django disconnects at the end of every
+  request, so every request starts on a reset server connection. With
+  `USE_LOCAL_SET=False` the middleware also clears the GUCs at the end of the request.
+- With `CONN_MAX_AGE > 0`, Django keeps its connection to PgBouncer, and with it the server
+  connection, from one request to the next, and PgBouncer resets nothing in between. That
+  is a persistent connection: the middleware clears the GUCs at the end of each request,
+  the `request_finished` safety net clears them when that cleanup did not run (and logs a
+  `gucs.cleared` [audit record](audit-logging.md)), and `W004` warns about it with
+  `USE_LOCAL_SET=False` (see
+  [Django's Persistent Connections](#djangos-persistent-connections-conn_max_age)).
+- `DISCARD ALL` resets every setting to the session's default. A default for a policy GUC
+  set with `ALTER ROLE ... SET` or `ALTER DATABASE ... SET` comes back instead of being
+  cleared (`W011`).
+- PgBouncer needs one server connection per connected client in this mode: it saves the
+  cost of opening connections, not connections.
 
 ```python title="settings.py"
 RLS_TENANTS = {
@@ -273,6 +422,79 @@ RLS_TENANTS = {
     "USE_LOCAL_SET": False,  # default, works with session mode
 }
 ```
+
+## pgpool-II
+
+pgpool-II pools per session. One pgpool child process serves a client for its whole session
+and holds the backend connections for it. When the client disconnects, the child runs
+`reset_query_list` on every backend and, with `connection_cache = on`, keeps the connections
+for its next client with the same user and database. There is no transaction pooling, so a
+server session is never handed to another client mid-session, and without load balancing
+both GUC modes work as they do on a direct connection.
+
+The settings that matter here (backends, authentication, health checks and failover are
+configured as usual; see the
+[pgpool-II documentation](https://www.pgpool.net/docs/latest/en/html/)):
+
+```ini title="pgpool.conf"
+backend_clustering_mode = 'streaming_replication'
+backend_hostname0 = 'db-primary'
+backend_port0 = 5432
+backend_hostname1 = 'db-standby'
+backend_port1 = 5432
+
+# Defaults, shown for reference.
+connection_cache = on
+reset_query_list = 'ABORT; DISCARD ALL'
+num_init_children = 32
+max_pool = 4
+
+# The default is on; see "Load Balancing" below.
+load_balance_mode = off
+```
+
+- Keep `DISCARD ALL` in `reset_query_list`: it is what clears the session GUCs between
+  clients. As in PgBouncer's session mode, it brings back a role or database default for a
+  policy GUC (`W011`).
+- With `CONN_MAX_AGE > 0`, Django does not disconnect between requests, and the session is
+  a persistent connection, as in [Session Mode](#session-mode): the middleware's cleanup,
+  the safety net and `W004` apply.
+- `num_init_children` is the number of clients pgpool serves at once. Every Django thread
+  with an open connection is one client; a client beyond the limit waits for a free child.
+
+### Load Balancing
+
+In streaming replication mode with `load_balance_mode = on`, pgpool sends a session's
+read-only queries to a load-balancing node, a standby here, and everything else to the
+primary. Each backend has its own session, with its own GUCs, and pgpool decides for each
+statement where it goes:
+
+- `SELECT set_config(...)`, the statement the library sets the GUCs with, calls a volatile
+  function. With neither `write_function_list` nor `read_only_function_list` set, pgpool
+  treats it as a write and sends it to the primary only.
+- A plain `SELECT` goes to the standby, unless it runs in an explicit transaction after a
+  write: `disable_load_balance_on_write = 'transaction'` (the default) keeps the rest of
+  that transaction on the primary.
+
+What that does to the two GUC modes:
+
+| pgpool settings | `USE_LOCAL_SET=False` | `USE_LOCAL_SET=True` |
+|---|---|---|
+| `load_balance_mode = off` | **Works.** | **Works.** |
+| `load_balance_mode = on` | **Broken, fail-closed.** Reads in autocommit, and reads in a transaction before its first write, run on the standby, which never got the GUCs: zero rows. Writes run on the primary, with the GUCs. | **Works, without load balancing.** The guard opens each transaction run under a context with its `set_config()` statement, which goes to the primary, and the rest of the transaction stays there. Only statements run outside any context reach the standby. |
+| `load_balance_mode = on` and `disable_load_balance_on_write = 'off'` | **Broken, fail-closed**, as above. | **Broken, fail-closed.** Reads run on the standby without the GUCs: zero rows. |
+
+Do not list `set_config` in `read_only_function_list`: pgpool then sends the `set_config()`
+statement to the standby, and writes on the primary fail with
+`new row violates row-level security policy`.
+
+Turn load balancing off for the Django application. To read from a standby, give Django a
+separate alias for it, route reads there with a
+[database router](https://docs.djangoproject.com/en/stable/topics/db/multi-db/#automatic-database-routing),
+and list the alias in `RLS_TENANTS["DATABASES"]`: the
+[GUC affinity guard](../advanced/architecture.md#guc-affinity-guard) then applies the
+active context on that alias's connection too (see
+[Multi-Database Support](context-managers.md#multi-database-support)).
 
 ## Django's Connection Pool
 
@@ -474,3 +696,113 @@ RLS_TENANTS = {
 Under ASGI, keep `CONN_MAX_AGE = 0`: each request runs on a thread of its own, so a
 persistent connection is never reused. Use Django's pool or PgBouncer instead (see
 [Async Deployment](async.md#connections-and-pooling)).
+
+## Troubleshooting GUC Leaks
+
+**Symptoms.** Only behind the pooler, and more often under load:
+
+- a request, task or command sees another tenant's rows, or every tenant's;
+- an anonymous request, or code that runs without a context, sees rows at all (it should
+  see none: [fail-closed](../advanced/security.md#fail-closed-design));
+- a model with `extra_bypass_flags` shows every tenant's rows inside a tenant context.
+
+The opposite, zero rows behind the pooler where the same code finds rows on a direct
+connection, is the fail-closed side of the same problem: the GUCs were written on one
+server connection and the query ran on another (pgpool-II's
+[load balancing](#load-balancing), or `USE_LOCAL_SET=False` with the
+[reset query](#clearing-the-gucs-after-every-transaction)).
+
+### 1. Look at What a Server Connection Holds
+
+Connect through the pooler, with the application's role and database, and run:
+
+```sql
+SELECT pg_backend_pid(),
+       current_setting('rls.is_admin', true) AS is_admin,
+       current_setting('rls.current_tenant', true) AS tenant;
+```
+
+Outside a context both columns must be empty (the GUC was set and cleared on this server
+connection) or `NULL` (it never was). Any other value is a leak, held by the backend with
+that process id. Add a column for each `extra_bypass_flags` entry, and use your own names
+if you changed `GUC_PREFIX`.
+
+PostgreSQL cannot show another session's settings (`pg_stat_activity` has no GUC values),
+so the query has to run on the server connection you want to look at. In transaction mode
+PgBouncer gives each transaction whichever server connection is free: run the query a few
+times, or check a staging pool with `default_pool_size = 1`, which has only one.
+PgBouncer's `SHOW SERVERS` (on its admin console) lists each server connection with its
+backend's process id (`remote_pid`) and the time it connected. Behind pgpool-II with load
+balancing on, the query can run on a standby; start it with the comment
+`/*NO LOAD BALANCE*/` to run it on the primary.
+
+### 2. Check That the Pool Resets
+
+In staging, with `default_pool_size = 1` (behind pgpool-II, `num_init_children = 1`) so
+that both clients get the same server connection, write a GUC for the session from one
+client and read it from another:
+
+```console
+$ psql "host=pgbouncer.internal port=6432 dbname=myproject user=app" \
+    -c "SELECT set_config('rls.current_tenant', '1', false)"
+$ psql "host=pgbouncer.internal port=6432 dbname=myproject user=app" \
+    -c "SELECT current_setting('rls.current_tenant', true)"
+```
+
+In transaction mode without the [reset query](#clearing-the-gucs-after-every-transaction),
+the second client prints `1`: the first client's write reached it. With the reset query, in
+session mode, and behind pgpool-II with load balancing off, it prints an empty value.
+Without the reset query, the test leaves the value on the server connection: run
+`RECONNECT` afterwards (step 5).
+
+### 3. Find the Session-Level Write
+
+With `USE_LOCAL_SET=True` the library writes the tenant and admin GUCs only
+transaction-locally (`set_config(..., true)`). The only session-level writes of them it
+makes are clears to an empty value. In the PostgreSQL log, a statement that sets a policy
+GUC to a non-empty value for the session, `set_config('rls....', '...', false)` or
+`SET rls.... = ...` without `LOCAL`, is the source; the
+[list of typical sources](#one-session-level-write-reaches-every-later-client) says where
+it usually comes from. To log every statement of the application's role in staging, run
+`ALTER ROLE app SET log_statement = 'all';` as a superuser. It applies to new sessions, so
+run `RECONNECT` on PgBouncer too, and `ALTER ROLE app RESET log_statement;` when you are
+done.
+
+With `USE_LOCAL_SET=False` (session pools, pgpool-II), a `gucs.cleared`
+[audit record](audit-logging.md) means a request's cleanup did not run and the
+`request_finished` safety net cleared its GUCs.
+
+### 4. Rule Out Defaults
+
+`python manage.py check` reports a default for a policy GUC set with `ALTER ROLE ... SET`
+or `ALTER DATABASE ... SET` as `W011` (see
+[W011](../troubleshooting.md#w011-postgresql-applies-a-default-for-a-policy-guc)).
+`DISCARD ALL` restores such a default instead of clearing it. The check reads
+`pg_db_role_setting` only, so it does not see a value that PgBouncer's per-database
+`connect_query` sets.
+
+### 5. Clean Up
+
+- **PgBouncer:** `RECONNECT` (every database) or `RECONNECT myproject` on the admin console
+  closes each server connection once its client releases it, and the new ones start without
+  the value. Restarting PgBouncer does the same. Unused server connections are closed after
+  `server_lifetime` anyway (one hour by default).
+- **pgpool-II:** the next disconnect of the client runs `reset_query_list`. A client that
+  keeps its connection (`CONN_MAX_AGE > 0`) keeps its session until Django closes it.
+- **Django's pool:** every checkout clears the policy GUCs (see
+  [What the Library Does on Checkout](#what-the-library-does-on-checkout)).
+
+### 6. Prevent It
+
+- [ ] PgBouncer in transaction mode only with `USE_LOCAL_SET=True`, for every client of that
+      database: every deployment, worker and management command.
+- [ ] A `server_reset_query` that clears every policy GUC, with
+      `server_reset_query_always = 1`.
+- [ ] Bypass flags with `is_local=True`, inside `transaction.atomic()`; no `set_guc()` or
+      `rls_context()` without `is_local=True`.
+- [ ] No PgBouncer statement mode.
+- [ ] pgpool-II with `load_balance_mode = off`; replicas through their own Django alias,
+      listed in `RLS_TENANTS["DATABASES"]`.
+- [ ] A maintenance session that needs the admin bypass connects to PostgreSQL directly, or
+      sets it with `SET LOCAL rls.is_admin = 'true'` inside `BEGIN` ... `COMMIT`.
+- [ ] `python manage.py check` reports no `W004`, `W005`, `W010` or `W011`.
