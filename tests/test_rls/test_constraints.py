@@ -5,8 +5,11 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
+from django.db.migrations.writer import MigrationWriter
 
 from django_rls_tenants.rls.constraints import RLSConstraint, RLSM2MConstraint
+from django_rls_tenants.rls.predicates import RawPredicate, SharedWith, TenantField
+from tests.test_app.models import Order, SharedNote
 
 
 def _make_mock_model(db_table: str = "test_order") -> MagicMock:
@@ -643,3 +646,114 @@ class TestM2MInitPlanWrapping:
         sql = _get_m2m_create_sql(c)
         assert "nullif(current_setting(" not in sql
         assert "current_setting('rls.is_admin', true) = 'true'" not in sql
+
+
+_SHARED = SharedWith(through="test_app.NoteShare", fk="note", tenant_fk="shared_with")
+_TENANT_VALUE = "nullif((SELECT current_setting('rls.current_tenant', true)), '')::int"
+
+
+def _shared_note_constraint(**options):
+    return RLSConstraint(
+        field="tenant",
+        name="c",
+        extra_predicates=[_SHARED, TenantField("partner")],
+        **options,
+    )
+
+
+class TestExtraPredicates:
+    """``extra_predicates`` add a ``FOR SELECT`` sharing policy (#59)."""
+
+    def test_without_predicates_the_statement_is_unchanged(self):
+        """The tenant policy alone, in the same one-part statement as before."""
+        statement = RLSConstraint(field="tenant", name="c").create_sql(SharedNote, None)
+        assert statement.template == "%(sql)s"
+        assert "sharing" not in str(statement)
+        removal = RLSConstraint(field="tenant", name="c").remove_sql(SharedNote, None)
+        assert removal.template == "%(sql)s"
+
+    def test_tenant_policy_is_the_one_without_predicates(self):
+        plain = str(RLSConstraint(field="tenant", name="c").create_sql(SharedNote, None))
+        sql = str(_shared_note_constraint().create_sql(SharedNote, None))
+        assert sql.startswith(plain)
+        assert sql.count('CREATE POLICY "test_shared_note_tenant_isolation_policy"') == 1
+
+    def test_sharing_policy(self):
+        sql = str(_shared_note_constraint().create_sql(SharedNote, None))
+        sharing = sql.split('CREATE POLICY "test_shared_note_tenant_sharing_policy"')[1]
+        assert sharing.split("$BODY$")[0].split() == [
+            "ON",
+            '"test_shared_note"',
+            "AS",
+            "PERMISSIVE",
+            "FOR",
+            "SELECT",
+            "USING",
+            "(",
+            *_SHARED.policy_sql(SharedNote, tenant_value=_TENANT_VALUE).split(),
+            "OR",
+            *TenantField("partner").policy_sql(SharedNote, tenant_value=_TENANT_VALUE).split(),
+            ");",
+        ]
+        assert "WHERE policyname = 'test_shared_note_tenant_sharing_policy'" in sql
+
+    def test_sharing_policy_reads_the_constraints_tenant_guc_and_type(self):
+        constraint = _shared_note_constraint(guc_tenant_var="app.tenant", tenant_pk_type="uuid")
+        sql = str(constraint.create_sql(SharedNote, None))
+        sharing = sql.rsplit("tenant_sharing_policy", maxsplit=1)[-1]
+        assert "nullif((SELECT current_setting('app.tenant', true)), '')::uuid" in sharing
+        assert "rls.current_tenant" not in sharing
+
+    def test_predicates_are_built_when_the_statement_is_rendered(self):
+        """Django renders a deferred statement at the end of the migration (see ``0011``)."""
+        missing = SharedWith(through="test_app.Missing", fk="note", tenant_fk="shared_with")
+        constraint = RLSConstraint(field="tenant", name="c", extra_predicates=[missing])
+        statement = constraint.create_sql(SharedNote, None)
+        with pytest.raises(ValueError, match=r"there is no model 'test_app\.Missing'"):
+            str(statement)
+
+    def test_remove_sql_drops_the_sharing_policy_first(self):
+        sql = str(_shared_note_constraint().remove_sql(SharedNote, None))
+        plain = str(RLSConstraint(field="tenant", name="c").remove_sql(SharedNote, None))
+        drop_sharing = 'DROP POLICY IF EXISTS "test_shared_note_tenant_sharing_policy" ON '
+        assert sql.split() == [*drop_sharing.split(), '"test_shared_note";', *plain.split()]
+
+    def test_an_item_that_is_not_a_predicate_is_refused(self):
+        with pytest.raises(TypeError, match="extra_predicates takes Predicate instances"):
+            RLSConstraint(field="tenant", name="c", extra_predicates=["partner_id = 1"])
+
+    def test_deconstruct_omits_no_predicates(self):
+        _, _, kwargs = RLSConstraint(field="tenant", name="c", extra_predicates=[]).deconstruct()
+        assert "extra_predicates" not in kwargs
+
+    def test_deconstruct_roundtrip(self):
+        constraint = _shared_note_constraint()
+        _, _, kwargs = constraint.deconstruct()
+        assert kwargs["extra_predicates"] == [_SHARED, TenantField("partner")]
+        assert RLSConstraint(**kwargs) == constraint
+
+    def test_migration_writer_serializes_the_predicates(self):
+        source, imports = MigrationWriter.serialize(_shared_note_constraint())
+        assert "extra_predicates=[django_rls_tenants.rls.predicates.SharedWith(" in source
+        assert "django_rls_tenants.rls.predicates.TenantField('partner')]" in source
+        assert "import django_rls_tenants.rls.predicates" in imports
+
+    def test_equality_and_hash_include_the_predicates(self):
+        constraint = _shared_note_constraint()
+        assert constraint == _shared_note_constraint()
+        assert hash(constraint) == hash(_shared_note_constraint())
+        other = RLSConstraint(field="tenant", name="c", extra_predicates=[RawPredicate("true")])
+        assert constraint != other
+        assert constraint != RLSConstraint(field="tenant", name="c")
+        assert hash(constraint) != hash(RLSConstraint(field="tenant", name="c"))
+
+    def test_repr(self):
+        constraint = RLSConstraint(field="tenant", name="c", extra_predicates=[TenantField("p")])
+        assert repr(constraint) == (
+            "RLSConstraint(name='c', field='tenant', extra_predicates=[TenantField('p')])"
+        )
+
+    def test_other_models_constraints_are_unaffected(self):
+        """``Order`` keeps the constraint ``RLSProtectedModel`` gives it."""
+        [constraint] = Order._meta.constraints
+        assert constraint.extra_predicates == []

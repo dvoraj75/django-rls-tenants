@@ -26,6 +26,10 @@ silent failures at runtime:
 - An ``EXTERNAL_MODELS`` entry the library cannot use (``W016``): its label names
   no installed, non-proxy model, the model already has an ``RLSConstraint``, or
   the field it names is not a foreign key to ``TENANT_MODEL``.
+- An ``extra_predicates`` item of an ``RLSConstraint`` that cannot be built
+  (``W017``): ``migrate`` would fail on it.
+- A ``SharedWith`` whose ``through`` model's own policy hides its rows from the
+  tenant they share with (``W018``): the predicate never matches.
 
 Check IDs are never renumbered. ``W003`` (retired in 1.3.1) and ``W007``
 (retired in 1.3.2) are no longer emitted: ``RLSTenantMiddleware`` opens its
@@ -73,6 +77,7 @@ def check_rls_config(
     errors.extend(_check_protected_models_have_constraint())
     errors.extend(_check_strict_mode_exclude())
     errors.extend(_check_external_models())
+    errors.extend(_check_extra_predicates())
     return errors
 
 
@@ -779,6 +784,86 @@ def _check_external_models() -> list[CheckWarning]:
                 f"Map {label!r} to the name of its foreign key to the tenant model: the "
                 f"policy compares that column with the current tenant.",
                 model,
+            )
+    return warnings
+
+
+def _check_extra_predicates() -> list[CheckWarning]:
+    """Warn about ``extra_predicates`` that cannot work (``W017``, ``W018``).
+
+    For each installed, non-proxy model with an ``RLSConstraint`` (the first
+    one, as the runtime reads it) that has ``extra_predicates``:
+
+    - ``W017``: a predicate that cannot be built for the model (a
+      ``SharedWith`` whose ``through`` model does not resolve or whose
+      foreign keys are wrong, a ``TenantField`` that names no foreign key).
+      ``migrate`` builds it from the migration state and would fail the same
+      way.
+    - ``W018``: a ``SharedWith`` whose ``through`` model has an
+      ``RLSConstraint`` on another field than ``tenant_fk`` and no
+      ``TenantField(tenant_fk)`` among its own ``extra_predicates``. Its
+      policy then hides the share rows from the tenant they share with, also
+      inside the sharing policy's subquery, so the predicate never matches.
+      A ``RawPredicate`` that makes them visible is not recognized: silence
+      the warning then.
+    """
+    from django.apps import apps  # noqa: PLC0415
+
+    from django_rls_tenants.rls.constraints import RLSConstraint  # noqa: PLC0415
+    from django_rls_tenants.rls.predicates import SharedWith, TenantField  # noqa: PLC0415
+
+    def first_constraint(model: type[models.Model]) -> RLSConstraint | None:
+        constraints = model._meta.constraints  # noqa: SLF001
+        return next((c for c in constraints if isinstance(c, RLSConstraint)), None)
+
+    warnings: list[CheckWarning] = []
+    for model in apps.get_models():
+        constraint = first_constraint(model)
+        if model._meta.proxy or constraint is None:  # noqa: SLF001
+            continue
+        label = model._meta.label  # noqa: SLF001
+        for predicate in constraint.extra_predicates:
+            try:
+                predicate.policy_sql(model, tenant_value="NULL")
+            except ValueError as exc:
+                warnings.append(
+                    CheckWarning(
+                        f"The extra predicate {predicate!r} of {label}'s RLSConstraint "
+                        f"cannot be built: {exc}",
+                        hint=(
+                            "Correct the predicate: migrate builds the sharing policy from "
+                            "it and would fail with the same error."
+                        ),
+                        id="django_rls_tenants.W017",
+                        obj=model,
+                    )
+                )
+                continue
+            if not isinstance(predicate, SharedWith):
+                continue
+            # Built above, so the model's registry resolves it. A proxy has no
+            # constraints of its own: its rows are its concrete model's.
+            through = model._meta.apps.get_model(predicate.through)  # noqa: SLF001
+            through = through._meta.concrete_model or through  # noqa: SLF001
+            through_constraint = first_constraint(through)
+            if through_constraint is None or through_constraint.field == predicate.tenant_fk:
+                continue
+            if TenantField(predicate.tenant_fk) in through_constraint.extra_predicates:
+                continue
+            through_label = through._meta.label  # noqa: SLF001
+            warnings.append(
+                CheckWarning(
+                    f"{predicate!r} on {label} never matches: the RLS policy of "
+                    f"{through_label} filters its rows on {through_constraint.field!r}, so "
+                    f"the tenant in {predicate.tenant_fk!r} cannot read the rows shared "
+                    f"with it, inside the sharing policy either.",
+                    hint=(
+                        f"Add TenantField({predicate.tenant_fk!r}) to the extra_predicates "
+                        f"of {through_label}'s RLSConstraint and run makemigrations."
+                    ),
+                    id="django_rls_tenants.W018",
+                    obj=model,
+                )
             )
     return warnings
 

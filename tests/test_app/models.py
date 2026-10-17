@@ -6,6 +6,7 @@ from django.contrib.auth.models import AbstractUser
 from django.db import models
 
 from django_rls_tenants.rls.constraints import RLSConstraint
+from django_rls_tenants.rls.predicates import SharedWith, TenantField
 from django_rls_tenants.tenants.models import RLSProtectedModel
 
 
@@ -320,3 +321,60 @@ class Loan(RLSProtectedModel):
 
     class Meta(RLSProtectedModel.Meta):
         db_table = "test_loan"
+
+
+class SharedNote(RLSProtectedModel):
+    """A protected model whose rows other tenants may read (#59).
+
+    Its ``RLSConstraint`` has two ``extra_predicates``: a ``NoteShare`` row
+    shares a note with a tenant, and ``partner`` names a tenant that may read
+    it. They make the ``test_shared_note_tenant_sharing_policy``.
+    """
+
+    title = models.CharField(max_length=100)
+    partner = models.ForeignKey(
+        Tenant,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="partner_notes",
+    )
+
+    class Meta(RLSProtectedModel.Meta):
+        db_table = "test_shared_note"
+        constraints = [  # noqa: RUF012  -- Django Meta convention
+            RLSConstraint(
+                field="tenant",
+                name="%(app_label)s_%(class)s_rls_constraint",
+                extra_predicates=[
+                    SharedWith(through="test_app.NoteShare", fk="note", tenant_fk="shared_with"),
+                    TenantField("partner"),
+                ],
+            ),
+        ]
+
+
+class NoteShare(RLSProtectedModel):
+    """Shares a ``SharedNote`` with the tenant in ``shared_with`` (#59).
+
+    ``tenant`` is the note's tenant, who owns the share. ``TenantField``
+    lets the ``shared_with`` tenant read the row too, which the
+    ``SharedWith`` predicate of ``SharedNote`` needs (system check ``W018``).
+    """
+
+    note = models.ForeignKey(SharedNote, on_delete=models.CASCADE, related_name="shares")
+    shared_with = models.ForeignKey(
+        Tenant,
+        on_delete=models.CASCADE,
+        related_name="received_shares",
+    )
+
+    class Meta(RLSProtectedModel.Meta):
+        db_table = "test_note_share"
+        constraints = [  # noqa: RUF012  -- Django Meta convention
+            RLSConstraint(
+                field="tenant",
+                name="%(app_label)s_%(class)s_rls_constraint",
+                extra_predicates=[TenantField("shared_with")],
+            ),
+        ]

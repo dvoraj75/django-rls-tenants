@@ -42,6 +42,7 @@ from django_rls_tenants.tenants.managers import (
     _resolve_related_path,
     _rls_model_cache,
     _scoped_prefetch_lookups,
+    _shares_rows,
     _tenant_attname,
 )
 from django_rls_tenants.tenants.middleware import RLSTenantMiddleware
@@ -64,6 +65,7 @@ from tests.test_app.models import (
     OrderShipment,
     Project,
     ProtectedUser,
+    SharedNote,
     Tenant,
     TenantUser,
 )
@@ -359,6 +361,22 @@ class TestIsRlsProtected:
             pass  # setting_changed fires on enter and exit
         assert _rls_model_cache() is not before
         assert _rls_model_cache() == before
+
+
+class TestSharesRows:
+    """``_shares_rows()``: whether ``including_shared()`` accepts a model (#59)."""
+
+    def test_model_with_extra_predicates(self):
+        assert _shares_rows(SharedNote) is True
+
+    def test_models_without_them(self):
+        """A constraint without predicates, a proxy of it, no constraint, an external model."""
+        assert [_shares_rows(model) for model in (Order, OrderProxy, Tenant, Book)] == [
+            False,
+            False,
+            False,
+            False,
+        ]
 
 
 class TestPrepareTenantInModelData:

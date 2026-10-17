@@ -454,11 +454,13 @@ django-rls-tenants registers Django system checks that warn about common misconf
 | `W014` | Warning | A concrete, non-proxy `RLSProtectedModel` subclass has no `RLSConstraint` in `Meta.constraints`: its `Meta` does not inherit `RLSProtectedModel.Meta`, or sets `constraints` of its own, so no migration creates a policy for its table. See [W014](../troubleshooting.md#w014-a-protected-model-has-no-rlsconstraint) |
 | `W015` | Warning | A `STRICT_MODE_EXCLUDE` label does not resolve to an installed model, or names a model without an `RLSConstraint` or `EXTERNAL_MODELS` entry (strict mode never guards it, so the entry has no effect). Checked whether or not `STRICT_MODE` is on. See [`STRICT_MODE_EXCLUDE`](#strict_mode_exclude) |
 | `W016` | Warning | An `EXTERNAL_MODELS` entry cannot be used: its label does not resolve to an installed model, it names a swapped-out model, a proxy, a model that already has an `RLSConstraint`, or a field that does not exist, is not a `ForeignKey` or does not point at `TENANT_MODEL`; or two labels name the same model. See [W016](../troubleshooting.md#w016-an-external_models-entry-cannot-be-used) and [`EXTERNAL_MODELS`](#external_models) |
+| `W017` | Warning | An `extra_predicates` item of an installed model's `RLSConstraint` cannot be built (a `SharedWith` whose `through` model does not resolve or whose foreign keys are wrong, a `TenantField` that names no foreign key); `migrate` would fail on it. See [W017](../troubleshooting.md#w017-an-extra-predicate-cannot-be-built) |
+| `W018` | Warning | A `SharedWith` predicate never matches: its `through` model has an `RLSConstraint` on another field than `tenant_fk` and no `TenantField(tenant_fk)` among its `extra_predicates`, so the tenant a row is shared with cannot read the share. See [W018](../troubleshooting.md#w018-a-sharedwith-predicate-never-matches) |
 | `E001` | Error | The connection role of a `DATABASES` alias is a superuser or has `BYPASSRLS` and `settings.DEBUG` is `False` (a production deployment). Replaces `W005`; fails `manage.py check` and every command that runs the system checks, such as `migrate` |
 
 Run `python manage.py check` to see any warnings and errors.
 
-`W005`, `W011`, `W012`, `W013`, `W014`, `W015` and `W016` stay warnings. `E001` is an error, so it also aborts `migrate`,
+`W005`, `W011`, `W012`, `W013`, `W014`, `W015`, `W016`, `W017` and `W018` stay warnings. `E001` is an error, so it also aborts `migrate`,
 `createsuperuser`, `check_rls`, `setup_m2m_rls` and Django's test runner (which sets
 `DEBUG = False` before it runs the checks). If a settings module has to connect as such a
 role on purpose (a migration job, a superuser test database), record that decision there

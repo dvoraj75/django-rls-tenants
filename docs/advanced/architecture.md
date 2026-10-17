@@ -29,6 +29,7 @@ tenants, users, or Django multitenancy concepts**:
 |--------|---------|
 | `rls/guc.py` | `set_guc()`, `get_guc()`, `clear_guc()`, `restore_guc()` and their `a`-prefixed async counterparts -- manage PostgreSQL GUC variables |
 | `rls/constraints.py` | `RLSConstraint` -- Django `BaseConstraint` that generates `CREATE POLICY` SQL. `RLSM2MConstraint` -- subquery-based policies for M2M join tables |
+| `rls/predicates.py` | `SharedWith`, `TenantField`, `RawPredicate` (and the `Predicate` base) -- the `extra_predicates` of `RLSConstraint` / `AddRLSPolicy`, which become a second, `FOR SELECT` policy |
 | `rls/context.py` | `rls_context()`, `bypass_flag()` and their `async with` counterparts `async_rls_context()`, `async_bypass_flag()` -- generic context managers for setting/restoring GUC variables |
 
 This layer is reusable outside the multitenancy use case. You could use `RLSConstraint`
@@ -53,7 +54,7 @@ The upper layer builds Django multitenancy on top of `rls/`:
 | `tenants/testing.py` | Test helpers: `rls_bypass`, `rls_as_tenant`, assertion functions, and their async counterparts (`async_rls_bypass`, `async_rls_as_tenant`, `aassert_*`) |
 | `tenants/types.py` | `TenantUser` protocol |
 | `tenants/state.py` | `get_current_tenant_id()`, `set_current_tenant_id()`, `reset_current_tenant_id()` -- `ContextVar`-based tenant state for auto-scoping. Also `get_rls_context_active()`, `set_rls_context_active()`, `reset_rls_context_active()` -- tracks whether any RLS context is active (used by strict mode). A private third `ContextVar` holds the GUC values the library applied for the active context, for the GUC affinity guard |
-| `tenants/checks.py` | Django system checks (W001--W016, E001) |
+| `tenants/checks.py` | Django system checks (W001--W018, E001) |
 | `pytest_plugin.py` | The `rls_role`, `enforce_rls` and `enforce_rls_on_other_threads` fixtures, registered through the `pytest11` entry point; imports nothing from Django at module level |
 | `management/` | `check_rls` (with `--generate`, backed by `_rls_migrations.py`), `setup_m2m_rls`, `run_as_tenant` and `run_for_all_tenants` (`_worker.py` holds the `--parallel` worker entry points) |
 | `contrib/drf.py`, `contrib/celery.py` | Optional integrations behind the `drf` and `celery` extras; never imported by the core layers |
@@ -420,6 +421,16 @@ WITH CHECK (
 constraint: both call `_build_policy_create_sql()` in `rls/constraints.py`, and the
 reverse SQL comes from `_build_policy_drop_sql()`. See
 [Tables You Do Not Own](../guides/protecting-models.md#tables-you-do-not-own).
+
+With `extra_predicates` (*1.6.0*), the same statement also creates a second policy,
+`myapp_order_tenant_sharing_policy`, `AS PERMISSIVE FOR SELECT USING (<predicate> OR ...)`,
+built by `_build_sharing_policy_create_sql()` from the SQL of each predicate in
+`rls/predicates.py`. The tenant policy above is unchanged. PostgreSQL ORs the permissive
+policies of a command, so the predicates widen `SELECT` only; `UPDATE`, `DELETE`, `INSERT`
+and `SELECT ... FOR UPDATE` use the tenant policy alone. `RLSConstraint` hands Django a
+statement whose sharing part is rendered late (`_SharingPolicySQL`), so a `SharedWith`
+finds a share model that the same migration creates after the protected model. See
+[Sharing Rows Across Tenants](../guides/protecting-models.md#sharing-rows-across-tenants).
 
 Key design decisions in the policy:
 

@@ -82,6 +82,11 @@ returns zero rows, never leaked data.
   foreign key check and the `select_related()` / `prefetch_related()` tenant filters treat
   the model as protected.
   [Guide →](https://dvoraj75.github.io/django-rls-tenants/guides/protecting-models/#tables-you-do-not-own)
+- **Sharing rows across tenants** -- `extra_predicates` (`SharedWith`, `TenantField`,
+  `RawPredicate`) let a tenant read rows another tenant shares with it, in a separate
+  `FOR SELECT` policy that never lets it update or delete them; `including_shared()`
+  queries them.
+  [Guide →](https://dvoraj75.github.io/django-rls-tenants/guides/protecting-models/#sharing-rows-across-tenants)
 - **Single schema, single database** -- no schema-per-tenant overhead, no connection
   routing.
 

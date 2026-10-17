@@ -125,7 +125,8 @@ migration that assigns the correct tenant to each existing record.
 
 ### From 1.5.0 to 1.6.0
 
-Nothing needs to change for a project that does not set `RLS_TENANTS["EXTERNAL_MODELS"]`.
+Nothing needs to change for a project that does not set `RLS_TENANTS["EXTERNAL_MODELS"]` or
+use `extra_predicates`.
 
 - **`select_related()` and the `prefetch_related()` tenant filter use each joined model's
   own tenant field** (#112). They filtered every joined RLS-protected model on
@@ -142,6 +143,11 @@ Nothing needs to change for a project that does not set `RLS_TENANTS["EXTERNAL_M
   same policy `RLSConstraint` creates. With the setting in use, `check_rls` also checks
   those tables and the new system check `W016` reports an entry the library cannot use.
   See [Tables You Do Not Own](../guides/protecting-models.md#tables-you-do-not-own).
+- **New: `extra_predicates` and `including_shared()`** (#59) let a tenant read rows other
+  tenants share with it, through a second `FOR SELECT` policy; system checks `W017` and
+  `W018` report predicates that cannot work. A model without predicates produces the same
+  SQL and the same migrations as before. See
+  [Sharing Rows Across Tenants](../guides/protecting-models.md#sharing-rows-across-tenants).
 
 ### From 1.4.0 to 1.5.0
 

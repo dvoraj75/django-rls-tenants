@@ -624,6 +624,219 @@ the database policy is the only isolation:
 See [Security](../advanced/security.md#models-you-do-not-own) for the same limits from the
 isolation point of view.
 
+## Sharing Rows Across Tenants
+
+*Added in 1.6.0.*
+
+By default a tenant reads its own rows and nothing else. `extra_predicates` on
+`RLSConstraint` lets a tenant **read** chosen rows of other tenants too: a document its
+owner shared with it, or a row that names it as a partner. It never lets the tenant change
+those rows.
+
+```python title="notes/models.py"
+from django.db import models
+
+from django_rls_tenants import (
+    RLSConstraint,
+    RLSProtectedModel,
+    SharedWith,
+    TenantField,
+)
+
+
+class Note(RLSProtectedModel):
+    title = models.CharField(max_length=255)
+    partner = models.ForeignKey(
+        "myapp.Tenant", null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="partner_notes",
+    )
+
+    class Meta(RLSProtectedModel.Meta):
+        # Replace the inherited constraint with one of the same name.
+        constraints = [
+            RLSConstraint(
+                field="tenant",
+                name="%(app_label)s_%(class)s_rls_constraint",
+                extra_predicates=[
+                    SharedWith(through="notes.NoteShare", fk="note", tenant_fk="shared_with"),
+                    TenantField("partner"),
+                ],
+            ),
+        ]
+
+
+class NoteShare(RLSProtectedModel):
+    """Shares `note` with the tenant in `shared_with`; `tenant` is the note's owner."""
+
+    note = models.ForeignKey(Note, on_delete=models.CASCADE, related_name="shares")
+    shared_with = models.ForeignKey(
+        "myapp.Tenant", on_delete=models.CASCADE, related_name="received_shares",
+    )
+
+    class Meta(RLSProtectedModel.Meta):
+        constraints = [
+            RLSConstraint(
+                field="tenant",
+                name="%(app_label)s_%(class)s_rls_constraint",
+                # The tenant a note is shared with must be able to read the share.
+                extra_predicates=[TenantField("shared_with")],
+            ),
+        ]
+        indexes = [models.Index(fields=["note", "shared_with"])]
+```
+
+Run `makemigrations`. Django writes a `RemoveConstraint` and an `AddConstraint` for a model
+whose constraint changes, which drops and recreates its policies. A new model carries the
+constraint in its `CreateModel`.
+
+### The predicates
+
+All three are importable from `django_rls_tenants` (and from `django_rls_tenants.rls`,
+with the `Predicate` base class). They are deconstructible, so migrations serialize them.
+Each is built from the model the policy is created on; an argument that cannot be
+interpolated safely, or a model or field that does not resolve, raises `ValueError`.
+
+| Predicate | Matches a row when |
+|-----------|--------------------|
+| `SharedWith(through="app.Model", fk="note", tenant_fk="shared_with")` | a row of `through` points at it with `fk` (a `ForeignKey` of `through` to this model, or a proxy of it) and at the current tenant with `tenant_fk` (a `ForeignKey` of `through`) |
+| `TenantField("partner")` | its foreign key `partner` is the current tenant: a second tenant column |
+| `RawPredicate("...")` | the SQL expression you write is true |
+
+`SharedWith` becomes this `EXISTS` subquery (the through table is aliased, so the
+protected table's own columns stay reachable by its name):
+
+```sql
+EXISTS (SELECT 1 FROM "notes_noteshare" AS "rls_shared"
+        WHERE "rls_shared"."note_id" = "notes_note"."id"
+        AND "rls_shared"."shared_with_id" = nullif(
+            (SELECT current_setting('rls.current_tenant', true)), '')::int)
+```
+
+`TenantField` becomes `"notes_note"."partner_id" = nullif((SELECT current_setting(...)), '')::int`.
+With no tenant context, the tenant value is `NULL`, so neither matches anything. The SQL
+text uses the constraint's `guc_tenant_var` and `tenant_pk_type`. Identifiers are double-quoted;
+a table or column name with a quote, a backslash, a dollar sign or a NUL is refused.
+
+`RawPredicate` is SQL you own. It is used as written, in parentheses, and only text that
+would break out of the policy statement is refused: an empty string, `;`, `--`, `/*`, `$` and
+a NUL. It must compare with the tenant itself, through the GUC the policies read:
+
+```python
+RawPredicate("region = 'eu' AND partner_id = nullif(current_setting('rls.current_tenant', true), '')::int")
+```
+
+!!! danger "A raw predicate that ignores the tenant opens rows to everyone"
+    `RawPredicate("is_public")` makes every public row readable by every tenant, and by a
+    session with no tenant context. The library does not inspect the expression.
+
+### What the policy changes
+
+The predicates do **not** change the tenant policy `<table>_tenant_isolation_policy`: its
+SQL is byte-identical to a model without predicates. They go into a second, permissive
+`FOR SELECT` policy, `<table>_tenant_sharing_policy`, whose `USING` is the predicates joined
+by `OR`. PostgreSQL ORs the permissive policies that apply to a command, so:
+
+| Command | Policies that apply | Result for a row shared with the tenant |
+|---------|--------------------|------------------------------------------|
+| `SELECT` | tenant policy OR sharing policy | readable |
+| `UPDATE`, `DELETE` | tenant policy | matches nothing: 0 rows affected |
+| `INSERT` | tenant policy | `WITH CHECK` rejects a row of another tenant |
+| `SELECT ... FOR UPDATE` / `FOR SHARE` | tenant policy | the shared row is not returned |
+
+A tenant therefore cannot update, delete, lock or take over a shared row (`UPDATE ... SET
+tenant_id = <me>` matches nothing). Putting the predicates into the existing policy's
+`USING` would not give this: `WITH CHECK` only inspects the new row, so the receiving
+tenant could delete the row or move it to itself.
+
+The migration operations drop the sharing policy first when reversed, and a model without
+predicates creates no second policy. `check_rls --verbose` lists the policy with its
+command (`notes_note_tenant_sharing_policy [SELECT]`) and its `USING` expression.
+
+### Reading shared rows: `including_shared()`
+
+The default manager adds `WHERE tenant_id = X` to every query inside a tenant context
+(and `for_user()` adds it too), which would hide the shared rows. `including_shared()`
+returns a queryset without those filters, so the policies alone decide:
+
+```python
+with tenant_context(tenant_b.pk):
+    Note.objects.all()                    # B's own notes
+    Note.objects.including_shared()       # B's own notes + notes shared with B
+    Note.objects.including_shared().for_user(user_b)
+    note.shares.including_shared()        # related manager: the relation filter stays
+```
+
+- It is a **manager** method. Call it first, then `filter()`, `for_user()` and the rest:
+  `including_shared()` is not a queryset method, and `for_user()` after it adds no tenant
+  filter.
+- The queryset adds no tenant filter of any kind: not the automatic one, not `for_user()`'s,
+  not the ones `select_related()` adds to joined RLS-protected tables, and not the
+  `prefetch_related()` rewrite (see the [Performance guide](performance.md#prefetch_related)).
+  Rows a related manager already prefetched were read with the tenant filter and are not
+  reused.
+- With no tenant context the policies match no rows of a tenant; in `admin_context()` it
+  reads everything; under `STRICT_MODE` it needs a context like any queryset.
+- On a model whose `RLSConstraint` has no `extra_predicates` (the concrete model's, for a
+  proxy), it raises `RLSConfigurationError` with a hint, so it is never a way to switch the
+  tenant filter off.
+- **It is read-only.** `update()`, `delete()`, `bulk_update()`, `update_or_create()` and
+  `select_for_update()` (and the async variants of those that have one) raise `TypeError`.
+  The database would skip shared rows in an `UPDATE` and `DELETE`, but Django's `delete()`
+  runs a collector first: it would fire the delete signals of shared rows and
+  `CASCADE`-delete the current tenant's own rows that point at them, while the shared row
+  itself survives. Call those methods on `Note.objects`, not on an `including_shared()` queryset.
+  A queryset combined with one (`qs | Note.objects.including_shared()`, `&`, `^`) is
+  read-only too.
+
+!!! warning "Methods on an instance are not blocked"
+    `instance.delete()` on a row of another tenant that you read through
+    `including_shared()` runs the same collector cascade on your own related rows, and
+    `instance.save()` fails at the database (the `UPDATE` affects no row, and the `INSERT`
+    Django then tries violates the policy). Do not call them on shared rows.
+
+Relations of a shared row are not shared. An auto-created many-to-many through table
+keeps its policy, which requires both sides in the tenant, and a reverse relation
+(`note.shares.all()`) goes through the related model's own manager and policy.
+
+### The share model must be readable by the tenant it shares with
+
+The `EXISTS` subquery reads the `through` table, and **that table's own RLS policy applies
+inside it**. If `NoteShare` is protected by the owner's tenant (the default `tenant` field),
+the tenant a note is shared with cannot see the share row, so `SharedWith` never matches.
+Give the share model `TenantField("shared_with")` in its own `extra_predicates`, as above,
+or make its tenant field the receiving tenant.
+
+System check [`W018`](../troubleshooting.md#w018-a-sharedwith-predicate-never-matches) reports
+this: a `SharedWith` whose `through` model has an `RLSConstraint` on another field than
+`tenant_fk` and no `TenantField(tenant_fk)` among its `extra_predicates`. It does not
+recognize a `RawPredicate` that makes the rows visible: silence the warning then.
+[`W017`](../troubleshooting.md#w017-an-extra-predicate-cannot-be-built) reports a predicate
+that cannot be built, which `migrate` would fail on too.
+
+### Migration notes
+
+- `extra_predicates` is also an argument of `AddRLSPolicy` (see
+  [Tables You Do Not Own](#tables-you-do-not-own)): the sharing policy is created after the
+  tenant policy, and the operation's `through` model must already be in the migration state
+  (a dependency, or an earlier operation). Unset GUC names and the tenant PK type are read
+  from `RLS_TENANTS` when the migration runs, like its other options.
+- With `RLSConstraint`, the sharing SQL is built when Django renders the statement. In a
+  migration that creates the protected model and its share model, Django defers the
+  constraint SQL of `CreateModel` to the end of the migration, so a share model created
+  later in the same migration is found. Elsewhere (an `AddConstraint`), the `through` model
+  must already exist in the migration state.
+- A model without predicates keeps serializing exactly as before: `deconstruct()` omits an
+  empty list.
+- An external model (`EXTERNAL_MODELS`) keeps its own manager and has no
+  `including_shared()`. Its manager adds no tenant filter, so a row its sharing policy
+  shares is already visible to its normal queries.
+
+!!! tip "Index the share table"
+    `including_shared()` leaves `tenant_id = X` out of the query, and the sharing policy
+    runs one `EXISTS` per candidate row. Index the `through` table on `(fk, tenant_fk)`
+    (`models.Index(fields=["note", "shared_with"])`). See the
+    [Performance guide](performance.md#sharing-rows).
+
 ## Multiple Protected Models
 
 You can have as many `RLSProtectedModel` subclasses as needed. Each gets its own

@@ -460,6 +460,31 @@ unique pair index Django creates, then measure any additional indexes against th
 queries you run. Explicit through models can instead inherit `RLSProtectedModel` and
 have their own tenant column and indexes.
 
+## Sharing rows
+
+*Added in 1.6.0.* A model whose `RLSConstraint` has `extra_predicates` (see
+[Sharing Rows Across Tenants](protecting-models.md#sharing-rows-across-tenants)) is read
+across tenants with `Model.objects.including_shared()`. That queryset leaves
+`WHERE tenant_id = X` out, since it would hide the shared rows, so the planner sees the
+policy alone: the post-scan filter of [What the planner sees](#what-the-planner-sees), with
+the sharing policy's predicates ORed in. The default manager keeps the tenant predicate and
+its index plans; use `including_shared()` only where shared rows must appear.
+
+A `SharedWith` predicate is an `EXISTS` subquery on the share table, evaluated per
+candidate row. Index the share table on the foreign key to the
+protected model and the receiving tenant, in that order:
+
+```python
+class NoteShare(RLSProtectedModel):
+    ...
+    class Meta(RLSProtectedModel.Meta):
+        indexes = [models.Index(fields=["note", "shared_with"])]
+```
+
+A `TenantField` or a `RawPredicate` compares columns of the row itself; index the column
+if the query is selective on it. As elsewhere, read the `EXPLAIN` plan on production-sized
+data.
+
 ## Raw SQL
 
 RLS protects raw SQL, but the policy alone leaves you with the policy-only plans above.
@@ -640,6 +665,8 @@ of three hundred extra round trips, and its writes commit together. See
       `tenant` index.
 - [ ] `Prefetch(queryset=...)` querysets are built from `Model.objects` inside the
       context; `TenantQuerySet` filters the other `prefetch_related()` hops itself.
+- [ ] A share table read by a `SharedWith` predicate is indexed on `(fk, tenant_fk)`, and
+      `including_shared()` is used only where shared rows must appear.
 - [ ] Raw SQL on a hot path uses `safe_tenant_sql(include_admin=False)` or a bind
       parameter for the tenant id, not the admin-inclusive fragment.
 - [ ] Tables created before v1.3.0 have had their policy recreated in the InitPlan form

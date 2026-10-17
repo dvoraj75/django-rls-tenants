@@ -238,6 +238,26 @@ takes precedence, so verbose detail only appears on a non-quiet run.
         END
 ```
 
+A model whose `RLSConstraint` has `extra_predicates` (*1.6.0*) lists its sharing policy
+beside the tenant policy, and `--verbose` prints it with its own command and `USING`
+expression (it has no `WITH CHECK`):
+
+```
+  NoteShare (test_note_share): test_note_share_tenant_isolation_policy, test_note_share_tenant_sharing_policy
+    test_note_share_tenant_isolation_policy [ALL]
+      USING:
+        ...
+      WITH CHECK:
+        ...
+    test_note_share_tenant_sharing_policy [SELECT]
+      USING:
+        (shared_with_id = (NULLIF(( SELECT current_setting('rls.current_tenant'::text, true) AS current_setting), ''::text))::integer)
+```
+
+With several predicates PostgreSQL prints them joined by `OR`.
+
+See [Sharing Rows Across Tenants](protecting-models.md#sharing-rows-across-tenants).
+
 ### Limitations
 
 - Does not verify the **content** of the RLS policy (e.g., correct GUC variable names).

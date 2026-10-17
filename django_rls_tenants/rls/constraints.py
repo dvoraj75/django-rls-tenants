@@ -5,7 +5,8 @@ Provides ``RLSConstraint`` for standard tenant-FK-based policies, and
 
 Both generate ``CREATE POLICY`` / ``DROP POLICY`` SQL during migrations,
 with idempotency checks, ``FORCE ROW LEVEL SECURITY``, and configurable
-bypass flags.
+bypass flags. ``RLSConstraint``'s ``extra_predicates`` (see
+:mod:`django_rls_tenants.rls.predicates`) add a second, ``FOR SELECT`` policy.
 """
 
 from __future__ import annotations
@@ -24,6 +25,8 @@ if TYPE_CHECKING:
 
     from django.db.backends.base.schema import BaseDatabaseSchemaEditor
     from django.db.models import Model
+
+    from django_rls_tenants.rls.predicates import Predicate
 
 # Allowed SQL cast types for tenant PK to prevent injection via tenant_pk_type.
 _ALLOWED_PK_TYPES = frozenset({"int", "bigint", "uuid"})
@@ -158,6 +161,96 @@ def _build_policy_drop_sql(*, table: str) -> str:
             """
 
 
+def _build_sharing_policy_create_sql(*, table: str, predicates: Sequence[str]) -> str:
+    """Build idempotent SQL that creates ``table``'s sharing policy.
+
+    The policy, ``<table>_tenant_sharing_policy``, is a permissive
+    ``FOR SELECT`` policy whose ``USING`` ORs ``predicates`` (the SQL of an
+    ``RLSConstraint``'s or ``AddRLSPolicy``'s ``extra_predicates``).
+    PostgreSQL ORs it with the tenant policy for ``SELECT`` only, so the
+    predicates widen what a tenant reads and nothing it writes or deletes.
+    It is created only when the table has no policy of that name; the tenant
+    policy's SQL enables and forces RLS on the table.
+
+    Safety: interpolation only. The predicates quote and check what they
+    interpolate (see :mod:`django_rls_tenants.rls.predicates`); ``table`` is a
+    model's ``db_table``.
+    """
+    policy_name = f"{table}_tenant_sharing_policy"
+    using = "\n                                OR ".join(predicates)
+    return f"""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_policies
+                        WHERE policyname = '{policy_name}'
+                        AND tablename = '{table}'
+                        AND schemaname = current_schema()
+                    ) THEN
+                        EXECUTE $BODY$
+                            CREATE POLICY "{policy_name}"
+                            ON "{table}"
+                            AS PERMISSIVE
+                            FOR SELECT
+                            USING (
+                                {using}
+                            );
+                        $BODY$;
+                    END IF;
+                END
+                $$;
+            """
+
+
+def _build_sharing_policy_drop_sql(*, table: str) -> str:
+    """Build SQL that drops ``table``'s sharing policy.
+
+    The reverse of :func:`_build_sharing_policy_create_sql`; it leaves RLS on.
+    """
+    policy_name = f"{table}_tenant_sharing_policy"
+    return f"""
+            DROP POLICY IF EXISTS "{policy_name}" ON "{table}";
+            """
+
+
+class _SharingPolicySQL:
+    """The SQL creating a model's sharing policy, built when it is rendered.
+
+    A part of the ``Statement`` ``RLSConstraint.create_sql()`` returns.
+    During ``CREATE TABLE`` Django defers the constraint's statement to the
+    end of the migration and renders it then, so a ``SharedWith`` predicate
+    finds a ``through`` model that the same migration creates after the
+    protected model (whose foreign key to it requires that order): ``model``
+    belongs to the migration state's registry, which the later operations
+    add to.
+    """
+
+    def __init__(
+        self,
+        model: type[Model],
+        predicates: Sequence[Predicate],
+        *,
+        guc_tenant_var: str,
+        tenant_pk_type: str,
+    ) -> None:
+        self.model = model
+        self.predicates = predicates
+        self.guc_tenant_var = guc_tenant_var
+        self.tenant_pk_type = tenant_pk_type
+
+    def __str__(self) -> str:
+        from django_rls_tenants.rls.predicates import _predicates_sql  # noqa: PLC0415
+
+        return _build_sharing_policy_create_sql(
+            table=self.model._meta.db_table,  # noqa: SLF001
+            predicates=_predicates_sql(
+                self.model,
+                self.predicates,
+                tenant_value=tenant_value_sql(self.guc_tenant_var, self.tenant_pk_type),
+            ),
+        )
+
+
 class RLSConstraint(BaseConstraint):
     """Django constraint that generates PostgreSQL RLS policies during migrations.
 
@@ -179,6 +272,17 @@ class RLSConstraint(BaseConstraint):
             Default: ``"int"``. Options: ``"int"``, ``"uuid"``, ``"bigint"``.
         extra_bypass_flags: Additional GUC variables that bypass the ``USING``
             clause (but NOT ``WITH CHECK``). Useful for auth edge cases.
+        extra_predicates: Rows of other tenants the current tenant may read
+            (``SharedWith``, ``TenantField``, ``RawPredicate`` from
+            :mod:`django_rls_tenants.rls.predicates`). They go into a second,
+            permissive ``FOR SELECT`` policy, ``<table>_tenant_sharing_policy``,
+            so they never let a tenant update or delete those rows. The tenant
+            policy is unchanged.
+
+    Raises:
+        ValueError: If an argument contains characters that cannot be
+            interpolated into the policy SQL safely.
+        TypeError: If an item of ``extra_predicates`` is not a predicate.
     """
 
     def __init__(
@@ -190,7 +294,11 @@ class RLSConstraint(BaseConstraint):
         guc_admin_var: str = "rls.is_admin",
         tenant_pk_type: str = "int",
         extra_bypass_flags: list[str] | None = None,
+        extra_predicates: Sequence[Predicate] | None = None,
     ) -> None:
+        # The predicates module imports this one.
+        from django_rls_tenants.rls.predicates import _validated_predicates  # noqa: PLC0415
+
         super().__init__(name=name)
         _validate_field_name(field)
         _validate_pk_type(tenant_pk_type)
@@ -203,6 +311,7 @@ class RLSConstraint(BaseConstraint):
         self.guc_admin_var = guc_admin_var
         self.tenant_pk_type = tenant_pk_type
         self.extra_bypass_flags = extra_bypass_flags or []
+        self.extra_predicates = _validated_predicates(extra_predicates)
 
     def constraint_sql(  # type: ignore[override]
         self,
@@ -224,28 +333,46 @@ class RLSConstraint(BaseConstraint):
         model: type[Model] | None,
         schema_editor: BaseDatabaseSchemaEditor | None,  # noqa: ARG002  -- required by BaseConstraint
     ) -> Statement:
-        """Generate SQL to enable RLS and create the isolation policy."""
+        """Generate SQL to enable RLS and create the isolation policy.
+
+        With ``extra_predicates``, the statement creates the sharing policy
+        too; its SQL is built when the statement is rendered (see
+        :class:`_SharingPolicySQL`).
+        """
         table = model._meta.db_table  # type: ignore[union-attr]  # noqa: SLF001  -- Django's standard public API
-        return Statement(
-            template="%(sql)s",
-            sql=_build_policy_create_sql(
-                table=table,
-                column=f"{self.field}_id",
-                guc_tenant_var=self.guc_tenant_var,
-                guc_admin_var=self.guc_admin_var,
-                tenant_pk_type=self.tenant_pk_type,
-                extra_bypass_flags=self.extra_bypass_flags,
-            ),
+        sql = _build_policy_create_sql(
+            table=table,
+            column=f"{self.field}_id",
+            guc_tenant_var=self.guc_tenant_var,
+            guc_admin_var=self.guc_admin_var,
+            tenant_pk_type=self.tenant_pk_type,
+            extra_bypass_flags=self.extra_bypass_flags,
         )
+        if not self.extra_predicates:
+            return Statement(template="%(sql)s", sql=sql)
+        sharing = _SharingPolicySQL(
+            model,  # type: ignore[arg-type]
+            self.extra_predicates,
+            guc_tenant_var=self.guc_tenant_var,
+            tenant_pk_type=self.tenant_pk_type,
+        )
+        return Statement(template="%(sql)s%(sharing)s", sql=sql, sharing=sharing)
 
     def remove_sql(  # type: ignore[override]
         self,
         model: type[Model] | None,
         schema_editor: BaseDatabaseSchemaEditor | None,  # noqa: ARG002  -- required by BaseConstraint
     ) -> Statement:
-        """Generate SQL to drop the policy and disable RLS."""
+        """Generate SQL to drop the policy (and the sharing policy) and disable RLS."""
         table = model._meta.db_table  # type: ignore[union-attr]  # noqa: SLF001  -- Django's standard public API
-        return Statement(template="%(sql)s", sql=_build_policy_drop_sql(table=table))
+        sql = _build_policy_drop_sql(table=table)
+        if not self.extra_predicates:
+            return Statement(template="%(sql)s", sql=sql)
+        return Statement(
+            template="%(sharing)s%(sql)s",
+            sharing=_build_sharing_policy_drop_sql(table=table),
+            sql=sql,
+        )
 
     def validate(
         self,
@@ -266,6 +393,8 @@ class RLSConstraint(BaseConstraint):
             parts.append(f"tenant_pk_type={self.tenant_pk_type!r}")
         if self.extra_bypass_flags:
             parts.append(f"extra_bypass_flags={self.extra_bypass_flags!r}")
+        if self.extra_predicates:
+            parts.append(f"extra_predicates={self.extra_predicates!r}")
         return f"RLSConstraint({', '.join(parts)})"
 
     def __eq__(self, other: object) -> bool:
@@ -277,6 +406,7 @@ class RLSConstraint(BaseConstraint):
                 and self.guc_admin_var == other.guc_admin_var
                 and self.tenant_pk_type == other.tenant_pk_type
                 and self.extra_bypass_flags == other.extra_bypass_flags
+                and self.extra_predicates == other.extra_predicates
             )
         return super().__eq__(other)
 
@@ -289,6 +419,7 @@ class RLSConstraint(BaseConstraint):
                 self.guc_admin_var,
                 self.tenant_pk_type,
                 tuple(self.extra_bypass_flags),
+                tuple(self.extra_predicates),
             )
         )
 
@@ -304,6 +435,8 @@ class RLSConstraint(BaseConstraint):
             kwargs["tenant_pk_type"] = self.tenant_pk_type
         if self.extra_bypass_flags:
             kwargs["extra_bypass_flags"] = self.extra_bypass_flags
+        if self.extra_predicates:
+            kwargs["extra_predicates"] = self.extra_predicates
         return (path, (), kwargs)
 
 

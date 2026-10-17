@@ -12,6 +12,7 @@ from django.db.migrations.writer import MigrationWriter
 
 from django_rls_tenants.operations import AddRLSPolicy
 from django_rls_tenants.rls.constraints import RLSConstraint
+from django_rls_tenants.rls.predicates import RawPredicate, SharedWith, TenantField
 from tests.test_external_app.models import Book
 
 
@@ -87,6 +88,83 @@ class TestSameSqlAsRLSConstraint:
         constraint = RLSConstraint(field="owner", name="c", **options)
         sql = _forwards_sql(self._op(**options), state)
         assert sql == str(constraint.create_sql(Book, None))
+
+
+_LOANED = SharedWith(through="test_app.Loan", fk="book", tenant_fk="tenant")
+
+
+class TestExtraPredicates:
+    """``extra_predicates`` add the sharing policy ``RLSConstraint`` adds (#59)."""
+
+    def test_create_sql_matches_the_constraint(self, state):
+        predicates = [_LOANED, RawPredicate("true")]
+        constraint = RLSConstraint(field="owner", name="c", extra_predicates=predicates)
+        sql = _forwards_sql(_book(extra_predicates=predicates), state)
+        assert sql == str(constraint.create_sql(Book, None))
+        assert 'CREATE POLICY "test_external_book_tenant_sharing_policy"' in sql
+
+    def test_drop_sql_matches_the_constraint(self, state):
+        constraint = RLSConstraint(field="owner", name="c", extra_predicates=[_LOANED])
+        sql = _backwards_sql(_book(extra_predicates=[_LOANED]), state)
+        assert sql == str(constraint.remove_sql(Book, None))
+        assert 'DROP POLICY IF EXISTS "test_external_book_tenant_sharing_policy"' in sql
+
+    def test_without_predicates_there_is_no_sharing_policy(self, state):
+        assert "sharing" not in _forwards_sql(_book(), state)
+        assert "sharing" not in _backwards_sql(_book(), state)
+
+    def test_sharing_policy_reads_the_settings_when_the_migration_runs(self, state, settings):
+        op = _book(extra_predicates=[_LOANED])
+        settings.RLS_TENANTS = {
+            **settings.RLS_TENANTS,
+            "GUC_PREFIX": "app",
+            "TENANT_PK_TYPE": "uuid",
+        }
+        sharing = _forwards_sql(op, state).split("tenant_sharing_policy")[-1]
+        assert "nullif((SELECT current_setting('app.current_tenant', true)), '')::uuid" in sharing
+
+    def test_through_model_is_read_from_the_migration_state(self, state):
+        """A model that only the migration state holds, as during ``migrate``."""
+        _with_model(
+            state,
+            "Share",
+            [
+                ("book", models.ForeignKey("test_external_app.Book", on_delete=models.CASCADE)),
+                ("reader", _tenant_fk()),
+            ],
+        )
+        op = _book(
+            extra_predicates=[SharedWith(through="ext.Share", fk="book", tenant_fk="reader")]
+        )
+        sql = _forwards_sql(op, state)
+        assert 'FROM "ext_share" AS "rls_shared"' in sql
+        assert '"rls_shared"."reader_id" = ' in sql
+
+    def test_predicate_that_cannot_be_built_runs_nothing(self, state):
+        op = _book(extra_predicates=[TenantField("title")])
+        editor = _editor()
+        with pytest.raises(ValueError, match=r"Book\.title is a CharField, not a ForeignKey"):
+            op.database_forwards("test_app", editor, state, state)
+        editor.execute.assert_not_called()
+
+    def test_an_item_that_is_not_a_predicate_is_refused(self):
+        with pytest.raises(TypeError, match="extra_predicates takes Predicate instances"):
+            AddRLSPolicy("Book", extra_predicates=["true"])
+
+    def test_deconstruct(self):
+        _, _, kwargs = AddRLSPolicy("Book", extra_predicates=[]).deconstruct()
+        assert kwargs == {"model_name": "Book"}
+        op = AddRLSPolicy("Book", extra_predicates=(_LOANED,))
+        _, _, kwargs = op.deconstruct()
+        assert kwargs == {"model_name": "Book", "extra_predicates": [_LOANED]}
+        assert AddRLSPolicy(**kwargs).deconstruct() == op.deconstruct()
+
+    def test_migration_writer_output(self):
+        migration = migrations.Migration("0002_book_policy", "consumer")
+        migration.operations = [AddRLSPolicy("Book", extra_predicates=[_LOANED])]
+        source = MigrationWriter(migration).as_string()
+        assert "import django_rls_tenants.rls.predicates\n" in source
+        assert "django_rls_tenants.rls.predicates.SharedWith(" in source
 
 
 class TestModelWithAnRLSConstraint:
