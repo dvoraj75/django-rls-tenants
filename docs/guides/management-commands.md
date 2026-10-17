@@ -12,6 +12,8 @@ python manage.py check_rls
 python manage.py check_rls --database replica  # check a specific database
 python manage.py check_rls --quiet            # only print output on failure (for CI)
 python manage.py check_rls --verbose          # show each policy's USING / WITH CHECK SQL
+python manage.py check_rls --generate         # write the migrations M2M through tables lack
+python manage.py check_rls --generate --dry-run  # print them instead
 ```
 
 ### Successful Output
@@ -30,15 +32,42 @@ All 5 RLS-protected tables verified.
 
 ### Failure Output
 
-If any issues are found, the command prints errors and exits with status code 1:
+If any issues are found, the command prints errors and exits with status code 1. After
+the list it prints, on stderr, a `How to fix:` block with one line per table:
 
 ```
-  Order (myapp_order): myapp_order_tenant_isolation_policy
+  Invoice (myapp_invoice): myapp_invoice_tenant_isolation_policy
 
-Found 2 issue(s):
-  Invoice (myapp_invoice): RLS not enabled
+Found 3 issue(s):
+  Order (myapp_order): RLS not enabled
   Document (myapp_document): no RLS policies found
+  Project.tags (auto M2M) (myapp_project_tags): no RLS policies found
+
+How to fix:
+  Order (myapp_order): the policy exists, but RLS was turned off outside migrations. Turn it back on: ALTER TABLE "myapp_order" ENABLE ROW LEVEL SECURITY;
+  Document (myapp_document): migration myapp.0001_initial created its policy and is applied on database 'default', so the policy or the table was dropped outside migrations. `sqlmigrate myapp 0001_initial` prints the DO block that creates the policy (it skips a policy that exists): run that block again.
+  Project.tags (auto M2M) (myapp_project_tags): no migration adds its policy (migrate never creates the policy of an auto-created through table): run check_rls --generate to write one, then migrate.
 ```
+
+*The `How to fix:` block was added in 1.5.0.* It reads the migrations on disk and their
+record in `django_migrations` on the `--database` alias, so it tells the possible causes
+apart:
+
+| Cause | Fix the line gives |
+|-------|--------------------|
+| The model's `Meta` has no `RLSConstraint` (it does not inherit `RLSProtectedModel.Meta`; system check [`W014`](../troubleshooting.md#w014-a-protected-model-has-no-rlsconstraint)) | Fix the model, then `makemigrations <app>` and `migrate`. |
+| No migration adds the `RLSConstraint` | `makemigrations <app>`, then `migrate`. |
+| A migration that adds it is not applied on this database | `migrate` (the line names the migration). |
+| The policy exists but RLS is turned off | The `ALTER TABLE ... ENABLE / FORCE ROW LEVEL SECURITY` statements. |
+| The migration is applied, but the policy or table was dropped outside migrations | `sqlmigrate <app> <migration>` prints the `DO` block that creates the policy; run it again. |
+| M2M table: a migration with `AddM2MRLSPolicy` is not applied | `migrate`. |
+| M2M table: that migration is applied, but the policy was dropped | `setup_m2m_rls --database <alias>`. |
+| M2M table: no migration adds the policy | `check_rls --generate`, then `migrate`. |
+| M2M table: no migration creates the field yet | `makemigrations`, `migrate`, then `check_rls --generate`. |
+
+If the migrations cannot be loaded, the block is replaced by one line, `Could not read the
+migrations to tell how to fix these issues: <error>.` The issues and the exit status are
+the same either way.
 
 If a catalogue query fails (for example `permission denied for view pg_policies`) or the
 connection cannot be used, the command does not print a traceback and does not report
@@ -66,6 +95,12 @@ standard RLS-protected tables and M2M through tables:
 M2M through tables are auto-discovered by scanning `RLSProtectedModel` subclasses for
 `ManyToManyField` definitions with auto-generated through tables.
 
+`migrate` creates the policy of a table whose model carries an `RLSConstraint`, but
+**never** that of an auto-created M2M through table: the library adds its constraint
+to the runtime through model at startup, outside the migration state. Those policies come
+from an `AddM2MRLSPolicy` migration, which [`--generate`](#generating-m2m-policy-migrations)
+writes, or from [`setup_m2m_rls`](#setup_m2m_rls).
+
 ### When to Run
 
 - **After migrations**: to verify that RLS policies were created correctly.
@@ -80,6 +115,71 @@ M2M through tables are auto-discovered by scanning `RLSProtectedModel` subclasse
   run: python manage.py check_rls --quiet
 ```
 
+### Generating M2M policy migrations
+
+*Added in 1.5.0.*
+
+An auto-created M2M through table gets its policy only from an `AddM2MRLSPolicy`
+operation in a migration. `check_rls --generate` writes it, in the format of
+`makemigrations`:
+
+```bash
+python manage.py check_rls --generate
+```
+
+```
+M2M through tables:
+  ...
+
+Migrations for 'myapp':
+  myapp/migrations/0004_m2m_rls_policies.py
+    + Add M2M RLS policy to myapp_project_members
+    + Add M2M RLS policy to myapp_project_tags
+
+Found 2 issue(s):
+  ...
+```
+
+In each app (the app of the model that declares the `ManyToManyField`) it writes one
+migration, `NNNN_m2m_rls_policies.py`, numbered after the app's latest migration, which it
+depends on. The migration holds one `AddM2MRLSPolicy` for each auto-created through table
+that **no migration on disk adds a policy to**, applied or not. If `black` is installed,
+it formats the files, as `makemigrations` does.
+
+- A table whose policy exists in the database only (from `setup_m2m_rls`) is included, so
+  a fresh database (CI, a test database, a new environment) gets the policy from
+  `migrate`. The operation creates a policy only when the table has none named
+  `<table>_m2m_rls_policy`, so on a database that already has it, it changes nothing.
+- GUC names and the tenant primary key type come from `RLS_TENANTS` (`GUC_PREFIX`,
+  `TENANT_PK_TYPE`), like `setup_m2m_rls`.
+- `--dry-run` prints the files instead of writing them. `--name NAME` replaces
+  `m2m_rls_policies`; it must be a Python identifier.
+- An existing file at the planned path is never overwritten: it is a `CommandError`.
+- When nothing is missing, it prints `No migration to generate: a migration adds the
+  policy of every auto-created M2M through table.` (`--quiet` hides this line; the
+  `Migrations for` lines and the warnings below are never hidden).
+
+A table is skipped, with `No migration generated for ...: <reason>` on stderr, when:
+
+- its app has no migrations (use `setup_m2m_rls`);
+- no migration creates the `ManyToManyField` yet (run `makemigrations` first);
+- the table has a policy of **another** name on the checked database, such as a
+  hand-written one (`AddM2MRLSPolicy` would add a second policy);
+- the app has conflicting migrations (run `makemigrations --merge` first).
+
+The exit status does not change: it is 1 whenever the database check found issues, because
+the database stays unprotected until `migrate` runs. The workflow is:
+
+```bash
+python manage.py check_rls --generate   # writes the migration (exits 1 until migrate runs)
+git diff                                # review it
+python manage.py migrate
+python manage.py check_rls              # exits 0
+```
+
+`--generate` writes files into your source tree, so it is a development command, not a CI
+step. CI keeps `check_rls --quiet` after `migrate`.
+
 ### Options
 
 | Flag | Default | Description |
@@ -87,6 +187,9 @@ M2M through tables are auto-discovered by scanning `RLSProtectedModel` subclasse
 | `--database` | `default` | Database alias to check RLS status on |
 | `--quiet` | off | Suppress success output; only print errors (exit 1 on failure). Ideal for CI. |
 | `--verbose` | off | Show each policy's full definition (USING / WITH CHECK SQL) from the `pg_policies` view. |
+| `--generate` | off | Write a migration with an `AddM2MRLSPolicy` for every auto-created M2M through table that no migration adds a policy to. See [Generating M2M policy migrations](#generating-m2m-policy-migrations). |
+| `--dry-run` | off | With `--generate`, print the migrations instead of writing them. An error without `--generate`. |
+| `--name` | `m2m_rls_policies` | With `--generate`, the migration name after its number. An error without `--generate`. |
 
 ### Quiet Mode
 
@@ -125,6 +228,11 @@ takes precedence, so verbose detail only appears on a non-quiet run.
   It only checks that a policy exists. Use `--verbose` to eyeball the policy body manually.
 - Does not check policies on non-`RLSProtectedModel` tables. If you manually manage
   RLS policies, use `assert_rls_policy_exists()` from the testing helpers.
+- `--generate` covers auto-created M2M through tables only. Models with an
+  `RLSConstraint` get their policy from `makemigrations`, and an explicit through model is
+  an ordinary model.
+- The `How to fix:` lines reflect the migrations as the loader sees them. A policy
+  created by hand (not by a migration) reads as "no migration adds it".
 
 ## setup_m2m_rls
 
@@ -162,10 +270,13 @@ python manage.py setup_m2m_rls --database replica
   don't have policies yet.
 - **After adding M2M fields** to existing `RLSProtectedModel` subclasses without
   creating a migration with `AddM2MRLSPolicy`.
+- **For an app without migrations.** `check_rls --generate` skips those.
 
 !!! tip
-    For new M2M fields, prefer using `AddM2MRLSPolicy` in a migration instead.
-    `setup_m2m_rls` is a convenience for retroactive application.
+    Prefer an `AddM2MRLSPolicy` migration, which `migrate` applies on every database,
+    including a fresh one. [`check_rls --generate`](#generating-m2m-policy-migrations)
+    writes it. `setup_m2m_rls` reaches one database and leaves no trace in the
+    migrations, so a database built from them has no policy.
 
 ### Verbose Mode
 

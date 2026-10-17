@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from django.db import migrations
+from django.db.migrations.writer import MigrationWriter
+
 from django_rls_tenants.operations import AddM2MRLSPolicy
 
 
@@ -133,14 +136,36 @@ class TestAddM2MRLSPolicyDeconstruct:
             guc_tenant_var="custom.tenant",
             tenant_pk_type="uuid",
         )
-        path, args, kwargs = op.deconstruct()
-        assert "AddM2MRLSPolicy" in path
+        name, args, kwargs = op.deconstruct()
+        assert name == "AddM2MRLSPolicy"
         assert args == []
         reconstructed = AddM2MRLSPolicy(**kwargs)
         assert reconstructed.m2m_table == op.m2m_table
         assert reconstructed.from_tenant_fk == "org"
         assert reconstructed.to_tenant_fk is None
         assert reconstructed.tenant_pk_type == "uuid"
+
+    def test_formatted_description_is_an_addition(self):
+        """``check_rls --generate`` lists it as makemigrations lists an addition (``+``)."""
+        op = AddM2MRLSPolicy(
+            m2m_table="t", from_model="a.B", to_model="c.D", from_fk="b_id", to_fk="d_id"
+        )
+        assert op.formatted_description() == "+ Add M2M RLS policy to t"
+
+    def test_migration_writer_names_the_class_once(self):
+        """``MigrationWriter`` writes ``<module>.AddM2MRLSPolicy(``.
+
+        A dotted name from ``deconstruct()`` was written after the module a second
+        time (``django_rls_tenants.operations.django_rls_tenants.operations.``),
+        so a generated or squashed migration failed to import (#46).
+        """
+        op = AddM2MRLSPolicy(
+            m2m_table="t", from_model="a.B", to_model="c.D", from_fk="b_id", to_fk="d_id"
+        )
+        migration = type("Migration", (migrations.Migration,), {"operations": [op]})("0002_x", "a")
+        source = MigrationWriter(migration).as_string()
+        assert "import django_rls_tenants.operations\n" in source
+        assert "        django_rls_tenants.operations.AddM2MRLSPolicy(\n" in source
 
     def test_defaults_omitted(self):
         op = AddM2MRLSPolicy(

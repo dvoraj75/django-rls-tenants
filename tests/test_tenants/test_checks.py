@@ -25,6 +25,7 @@ from django_rls_tenants.tenants.checks import (
     _check_guc_prefix_mismatch,
     _check_policy_guc_defaults,
     _check_pool_without_reset,
+    _check_protected_models_have_constraint,
     _check_strict_mode_exclude,
     _check_superuser_connection,
     _check_tenant_fk_field_exists,
@@ -98,6 +99,7 @@ class TestCheckRlsConfig:
         "_check_tenant_model_resolves",
         "_check_tenant_fk_field_exists",
         "_check_unique_across_tenants",
+        "_check_protected_models_have_constraint",
         "_check_strict_mode_exclude",
     )
 
@@ -1687,3 +1689,74 @@ class TestCheckUniqueAcrossTenants:
         assert len(warnings) == 1
         assert "('tenant', 'number')" in warnings[0].msg
         assert warnings[0].obj._meta.label == "test_app.Invoice"
+
+
+def _model(model_name, meta_bases, /, **meta_attrs):
+    """Build an ``RLSProtectedModel`` subclass whose ``Meta`` has ``meta_bases`` and attributes."""
+    meta = type("Meta", meta_bases, {"app_label": "test_app", **meta_attrs})
+    return type(model_name, (RLSProtectedModel,), {"__module__": __name__, "Meta": meta})
+
+
+def _w014(models_):
+    """Run the W014 check over ``models_`` only."""
+    with patch.object(apps, "get_models", return_value=list(models_)):
+        return _check_protected_models_have_constraint()
+
+
+@pytest.mark.usefixtures("isolated_apps")
+class TestCheckProtectedModelsHaveConstraint:
+    """Tests for _check_protected_models_have_constraint (W014, #46)."""
+
+    def test_no_warning_with_default_config(self):
+        """Every RLS-protected model of the test app keeps its RLSConstraint."""
+        assert _check_protected_models_have_constraint() == []
+
+    def test_inherited_meta_passes(self):
+        assert _w014([_model("Kept", (RLSProtectedModel.Meta,))]) == []
+
+    def test_extended_constraints_pass(self):
+        constraints = [
+            *RLSProtectedModel.Meta.constraints,
+            models.CheckConstraint(condition=Q(id__gt=0), name="kept_positive_id"),
+        ]
+        model = _model("Extended", (RLSProtectedModel.Meta,), constraints=constraints)
+        assert _w014([model]) == []
+
+    def test_meta_without_inheritance(self):
+        model = _model("Dropped", ())
+        [warning] = _w014([model])
+        assert warning.id == "django_rls_tenants.W014"
+        assert isinstance(warning, CheckWarning)
+        assert warning.obj is model
+        assert warning.msg == (
+            "test_app.Dropped inherits from RLSProtectedModel but has no RLSConstraint in "
+            "Meta.constraints, so no migration creates an RLS policy for its table "
+            "'test_app_dropped': the database does not isolate its rows by tenant."
+        )
+        assert "class Meta(RLSProtectedModel.Meta)" in warning.hint
+        assert "[*RLSProtectedModel.Meta.constraints, ...]" in warning.hint
+
+    def test_inherited_meta_with_replaced_constraints(self):
+        """``constraints = [...]`` in a Meta that inherits the base replaces its list."""
+        model = _model(
+            "Replaced",
+            (RLSProtectedModel.Meta,),
+            constraints=[models.CheckConstraint(condition=Q(id__gt=0), name="positive_id")],
+        )
+        assert [w.id for w in _w014([model])] == ["django_rls_tenants.W014"]
+
+    def test_proxy_is_skipped(self):
+        """A proxy shares its concrete model's table, which W014 reports if it must."""
+        concrete = _model("Concrete", (RLSProtectedModel.Meta,))
+        proxy_meta = type("Meta", (), {"app_label": "test_app", "proxy": True})
+        proxy = type("Proxy", (concrete,), {"__module__": __name__, "Meta": proxy_meta})
+        assert _w014([proxy]) == []
+
+    def test_unprotected_model_is_skipped(self):
+        """A model that is not an RLSProtectedModel subclass is none of W014's business."""
+        plain = type(
+            "Plain",
+            (models.Model,),
+            {"__module__": __name__, "Meta": type("Meta", (), {"app_label": "test_app"})},
+        )
+        assert _w014([plain]) == []

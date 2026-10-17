@@ -52,7 +52,7 @@ The upper layer builds Django multitenancy on top of `rls/`:
 | `tenants/testing.py` | Test helpers: `rls_bypass`, `rls_as_tenant`, assertion functions, and their async counterparts (`async_rls_bypass`, `async_rls_as_tenant`, `aassert_*`) |
 | `tenants/types.py` | `TenantUser` protocol |
 | `tenants/state.py` | `get_current_tenant_id()`, `set_current_tenant_id()`, `reset_current_tenant_id()` -- `ContextVar`-based tenant state for auto-scoping. Also `get_rls_context_active()`, `set_rls_context_active()`, `reset_rls_context_active()` -- tracks whether any RLS context is active (used by strict mode). A private third `ContextVar` holds the GUC values the library applied for the active context, for the GUC affinity guard |
-| `tenants/checks.py` | Django system checks (W001--W013, W015, E001) |
+| `tenants/checks.py` | Django system checks (W001--W015, E001) |
 
 ### Import Boundary
 

@@ -177,6 +177,23 @@ migration that assigns the correct tenant to each existing record.
   never did. A `Prefetch` with a queryset you supplied is used as given. If you added
   `Prefetch("order", queryset=Order.objects.all())` as a workaround, it can go. See
   [Performance](../guides/performance.md#prefetch_related).
+- **`check_rls` prints a `How to fix:` block and can write the M2M policy migrations**
+  (#46). A failing `check_rls` run now adds, on stderr after the `Found N issue(s):` list,
+  one line per table with the fix for its cause; the issues and the exit status are the
+  same. `check_rls --generate` writes an `AddM2MRLSPolicy` migration for every
+  auto-created M2M through table that no migration adds a policy to. `migrate` has never
+  created those policies (only `AddM2MRLSPolicy` or `setup_m2m_rls` does), so a project
+  that applied them with `setup_m2m_rls` has none in its migrations, and a database built
+  from them (CI, a test database, a new environment) has none either. Run
+  `check_rls --generate` once per project, review and commit the files, then `migrate`; on
+  a database that already has the policies it changes nothing. See
+  [Generating M2M policy migrations](../guides/management-commands.md#generating-m2m-policy-migrations).
+- **`AddM2MRLSPolicy` serializes correctly** (#46). Its `deconstruct()` returned the dotted
+  path as its name, so a migration containing the operation that Django wrote (from
+  `squashmigrations`, or from `check_rls --generate`) imported
+  `django_rls_tenants.operations.django_rls_tenants.operations.AddM2MRLSPolicy` and
+  failed. If you squashed migrations that contain it and fixed the file by hand, nothing
+  needs to change; hand-written migrations are unaffected.
 
 #### `E001`: a superuser or `BYPASSRLS` role now fails the system checks with `DEBUG` off
 
@@ -219,6 +236,19 @@ nothing fails and no behaviour changes. For each one either:
 
 See [W012](../troubleshooting.md#w012-a-unique-field-or-constraint-spans-all-tenants) and
 [`UNIQUE_ACROSS_TENANTS`](../getting-started/configuration.md#unique_across_tenants).
+
+#### `W014`: models without an `RLSConstraint` are reported
+
+`python manage.py check` now warns (`django_rls_tenants.W014`) about each concrete,
+non-proxy model that inherits `RLSProtectedModel` but has no `RLSConstraint` in
+`Meta.constraints`: its `class Meta:` does not inherit `RLSProtectedModel.Meta`, or sets
+`constraints = [...]` of its own, which replaces the inherited list. Such a table has no
+policy and the database does not isolate its rows. An existing project can see new
+warnings after the upgrade; nothing fails and no behaviour changes. For each one, make the
+`Meta` inherit `RLSProtectedModel.Meta` (keep `*RLSProtectedModel.Meta.constraints` in a
+`constraints` list of your own), run `makemigrations` and `migrate`, then `check_rls`.
+
+See [W014](../troubleshooting.md#w014-a-protected-model-has-no-rlsconstraint).
 
 ### From 1.3.4 to 1.4.0
 
