@@ -53,7 +53,7 @@ need a superuser connection carry `@pytest.mark.superuser_only` (registered in
 **psycopg 3 marker.** Tests that need Django's connection pool (psycopg 3 plus
 `psycopg_pool`) carry `@pytest.mark.psycopg3_only`. `pytest_collection_modifyitems` in
 `tests/conftest.py` deselects them when Django runs on psycopg2 (reported as "deselected",
-not skipped, so the zero-skipped rule holds); only the psycopg 3 CI leg runs them, and a
+not skipped, so the zero-skipped rule holds); only the psycopg 3 CI legs run them, and a
 missing `psycopg_pool` there fails them. They use the `pooled` fixture, a real pool of one
 connection. To run them locally, install `psycopg[binary,pool]` into a separate
 environment: installing psycopg 3 switches Django's driver for the whole process.
@@ -640,10 +640,12 @@ example/
 
 GitHub Actions runs lint + type-check, a strict mkdocs build (`mkdocs build --strict`),
 a test matrix across Python {3.12, 3.13, 3.14} × Django {5.2, 6.0, 6.1} on PostgreSQL 16
-(psycopg2, no `exclude` rows) plus one psycopg 3 leg on Python 3.12 / Django 6.1 (the only
-one that runs the `psycopg3_only` tests), and a
-`test-postgres` job on PostgreSQL 15 and 18 with the oldest and newest supported Django
-(5.2 on Python 3.12 / 6.1 on Python 3.14) on every push/PR. Those legs connect as the
+(psycopg2, no `exclude` rows) plus two psycopg 3 legs on Python 3.12 with Django 5.2 and
+6.1, and a `test-postgres` job on PostgreSQL 15 and 18 with the oldest and newest supported
+Django (5.2 on Python 3.12 / 6.1 on Python 3.14, psycopg2) plus one PostgreSQL 17 leg on
+psycopg 3 with Django 5.2 / Python 3.12 (#151), on every push/PR. The psycopg 3 legs are the
+only ones that run the `psycopg3_only` tests; both jobs install the driver by the `driver`
+key and assert it. Those legs connect as the
 `postgres` superuser; a `test-plain-role` job runs the suite once more as a plain role
 (PostgreSQL 16, Python 3.12, the locked Django, `-m "not superuser_only"`) after checking
 that the connection really is one (see the plain-role rule under Testing). Coverage is
@@ -666,7 +668,11 @@ support; an explicit list of PostgreSQL majors. The matrix is stated in `pyproje
 `.github/workflows/ci.yml`, `README.md`, `docs/index.md`, the installation guide,
 `docs/comparison.md`, this file, both contributing guides and `example/Dockerfile`.
 `tests/test_support_matrix.py` parses all of them: change the constants at the top of
-that file first, and the test lists every file that disagrees. It reads files the sdist
+that file first, and the test lists every file that disagrees. For `ci.yml` it also
+expands the `test` and `test-postgres` matrices with GitHub's `include` rules (`_expand()`)
+and checks the legs (#151): every supported PostgreSQL major has a leg on the oldest
+Django, psycopg 3 has legs on the oldest and newest Django and on a major other than
+`DEFAULT_POSTGRES`, and each leg names only supported versions. It reads files the sdist
 does not ship, so `pyproject.toml` excludes it from the sdist.
 
 The `example-smoke` job tests the **built wheel**, not the source tree: `uv build`, an

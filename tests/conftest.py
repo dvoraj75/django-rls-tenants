@@ -74,9 +74,9 @@ def pytest_collection_modifyitems(config, items):
 
     Django's connection pool needs psycopg 3 and ``psycopg_pool``, and Django
     switches to psycopg 3 whenever it is importable, so only the psycopg 3 CI
-    leg can run these tests. Deselected tests are not skipped, so the
-    zero-skipped rule still holds; that leg's driver check proves it really
-    runs psycopg 3, and a missing ``psycopg_pool`` there fails the tests.
+    legs can run these tests. Deselected tests are not skipped, so the
+    zero-skipped rule still holds; those legs' driver check proves they really
+    run psycopg 3, and a missing ``psycopg_pool`` there fails the tests.
     """
     from django.db.backends.postgresql.psycopg_any import (  # noqa: PLC0415  -- keep conftest import-light
         is_psycopg3,

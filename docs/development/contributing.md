@@ -158,7 +158,7 @@ Tests that need Django's connection pool (psycopg 3 and `psycopg_pool`) carry
 `@pytest.mark.psycopg3_only`. Django uses psycopg 3 whenever it is importable, so the
 default environment runs psycopg2 and `tests/conftest.py` **deselects** these tests there.
 They show up as "deselected", not skipped, so the zero-skipped rule holds. Only the
-psycopg 3 CI leg, which installs `psycopg[binary,pool]` and asserts the driver, runs them,
+psycopg 3 CI legs, which install `psycopg[binary,pool]` and assert the driver, run them,
 and a missing `psycopg_pool` there fails them. To run them locally, install
 `psycopg[binary,pool]` into a separate virtual environment: installing psycopg 3 switches
 Django's driver for the whole process.
@@ -197,11 +197,14 @@ Every push and pull request runs:
 - **Lint & Type Check** -- `uv lock --check`, Ruff (check + format) and mypy.
 - **Docs** -- `mkdocs build --strict`.
 - **Test matrix** -- Python 3.12-3.14 x Django 5.2-6.1 on PostgreSQL 16 with psycopg2,
-  plus a psycopg 3 leg on Python 3.12 / Django 6.1 that keeps the library driver-neutral
-  and runs the `psycopg3_only` connection-pool tests.
+  plus psycopg 3 legs on Python 3.12 with Django 5.2 and 6.1 that keep the library
+  driver-neutral and run the `psycopg3_only` connection-pool tests on the oldest and the
+  newest supported Django.
 - **PostgreSQL 15 and 18 legs** -- the oldest and newest supported Django (5.2 on
   Python 3.12, 6.1 on Python 3.14) on both, so the supported PostgreSQL range is
-  verified at each end rather than assumed.
+  verified at each end rather than assumed. A PostgreSQL 17 leg (Django 5.2 on
+  Python 3.12) runs psycopg 3, so every supported major has a leg and the
+  connection-pool tests also run on a server other than 16.
 - **Non-superuser leg** -- the legs above connect as the `postgres` superuser, which
   bypasses every RLS policy, so a test of RLS behaviour can pass there without the
   policies ever applying. This leg creates a plain role (`LOGIN CREATEDB`, no
@@ -217,10 +220,10 @@ Every push and pull request runs:
   A packaging defect fails here instead of at a user's `pip install`.
 
 Both test matrices explicitly select their Python interpreter, verify the active Python
-and Django versions (and, in the main matrix, the database driver), and run pytest with
-`uv run --no-sync` so the Django override is not replaced by the lockfile version. The
-psycopg 3 leg installs `psycopg` on top of the synced environment: Django prefers it
-whenever it is importable, so it is deliberately absent from every dependency group.
+and Django versions and the database driver, and run pytest with `uv run --no-sync` so the
+Django override is not replaced by the lockfile version. The psycopg 3 legs install
+`psycopg` on top of the synced environment: Django prefers it whenever it is importable,
+so it is deliberately absent from every dependency group.
 
 All PostgreSQL legs run with `RLS_FAIL_ON_SKIPPED=1` (see
 [Skipped tests](#skipped-tests-and-the-superuser_only-marker)). `tests/conftest.py` also
