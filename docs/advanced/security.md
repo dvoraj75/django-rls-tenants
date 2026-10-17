@@ -398,7 +398,9 @@ Properties of the DRF side worth knowing:
   tenant context that a `get_rls_context()` override entered for the request (a tenant
   the user selected, say). It does not check that the user may access that tenant:
   the override must (see
-  [A user who belongs to several tenants](../guides/drf.md#a-user-who-belongs-to-several-tenants)).
+  [A custom selection rule](../guides/drf.md#a-custom-selection-rule)). For a
+  `MultiTenantUser` it also passes a tenant context of any tenant the user may select
+  (see [Users in Several Tenants](#users-in-several-tenants)).
   The admin bypass still needs `is_tenant_admin`.
 - DRF's `ModelSerializer` does not call `Model.full_clean()`, so model-level
   validation does not run on API writes. The caveats in
@@ -409,6 +411,47 @@ Properties of the DRF side worth knowing:
   that `full_clean()` would, so a foreign key to another tenant's row is a `400` (see
   [Serializers](../guides/drf.md#serializers)). A serializer that overrides
   `validate()` must call `super().validate(attrs)`.
+
+### Users in Several Tenants
+
+A [`MultiTenantUser`](../guides/multi-tenant-users.md) selects the tenant a request runs
+in, with a header or a session selection. The selection is input from the client, so the
+library treats it as untrusted:
+
+- **Every selection is checked** against the user's own tenants (`rls_tenant_id` and
+  `rls_tenant_ids`), on every request, by the middleware, the DRF mixin and the admin
+  alike. A forged or stale selection can at worst switch the user to another tenant they
+  already belong to; revoking a membership takes effect on the user's next request.
+- **No fallback.** A selection that fails the check is a 403 (`PermissionDenied`); the
+  request never runs in another tenant instead. A stale session selection is also removed,
+  so the next request runs in `rls_tenant_id`.
+- **One message for every refusal**, "The selected tenant is not one you can access.", for
+  a tenant that exists but is not the user's, one that does not exist, and a malformed or
+  empty value, so a refusal is not an existence oracle. The audit record
+  (`tenant_not_selectable`) holds the raw value for the operator, cut to 64 characters.
+- **The header cannot be forged cross-site.** A custom request header cannot be set by a
+  cross-site form or image request, only by same-origin JavaScript or a CORS-allowed
+  origin. What an origin you allow can do with it is bounded by the check above: select a
+  tenant the user may select anyway.
+- **The session selection is a state change.** Call `switch_tenant()` from a CSRF-protected
+  `POST` view, never from a `GET`. The admin's tenant switcher, a `GET` link, applies a
+  member's choice only to a navigation from this site (`Sec-Fetch-Site`, else `Referer`),
+  so a link on another site cannot change which tenant the user works in.
+- **The session selection belongs to the session's user.** A request authenticated
+  otherwise (a DRF token sent with another user's session cookie) neither uses nor drops
+  it, and `switch_tenant()` refuses to store one for such a user.
+- **Shared caches.** A `MultiTenantUser`'s response carries `RLS_TENANTS["TENANT_HEADER"]`
+  in `Vary`, so a cache keyed on the URL and the cookie or token does not serve one
+  tenant's response for another tenant of the same user.
+- **The membership table is read before any context exists.** Keep it a plain table; if it
+  is RLS-protected, `rls_tenant_ids` must read it inside `admin_context()`.
+- **A tenant admin never selects.** The header and the session selection are ignored for
+  `is_tenant_admin=True`, who runs in `admin_context()` as before.
+- **With no selection and no default** the middleware sets no context (fail-closed), as for
+  an anonymous request.
+
+`for_user()` and `@with_rls_context` use the user's default tenant (`rls_tenant_id`), not
+the request's selection.
 
 ## Threat Model
 
@@ -425,6 +468,7 @@ Properties of the DRF side worth knowing:
 | Background job without tenant context | Fail-closed: zero rows returned |
 | INSERT/UPDATE to wrong tenant | `WITH CHECK` clause validates writes |
 | M2M link to wrong tenant's records | `EXISTS`-based subquery policies on M2M through tables |
+| A user selecting a tenant they do not belong to (header, session, admin switcher) | The selection is checked against the user's tenants on every request; a refusal is a 403 with a uniform message and never a fallback |
 | FK to another tenant's row in a form, the admin or a DRF serializer | `validate_cross_tenant_fks()` in `clean_fields()` and `RLSTenantSerializerMixin.validate()` |
 | A tenant changing or deleting a row shared with it | The sharing policy is `FOR SELECT`; writes and `FOR UPDATE` use the tenant policy alone |
 

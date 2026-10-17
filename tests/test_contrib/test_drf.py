@@ -61,13 +61,21 @@ from django_rls_tenants.tenants.state import (
     get_rls_context_active,
 )
 from tests.drf_views import (
-    TENANT_MEMBERSHIPS,
     InvoiceSerializer,
     OrderItemSerializer,
     StateView,
 )
 from tests.session_gucs import session_gucs
-from tests.test_app.models import AdminUser, Invoice, Order, OrderItem, OrderNote, Tag, Tenant
+from tests.test_app.models import (
+    AdminUser,
+    Invoice,
+    Membership,
+    Order,
+    OrderItem,
+    OrderNote,
+    Tag,
+    Tenant,
+)
 
 pytestmark = [pytest.mark.django_db, pytest.mark.urls("tests.drf_urls")]
 
@@ -119,11 +127,13 @@ def tenantless_user(db):
 
 
 @pytest.fixture
-def member_of(monkeypatch):
-    """Make a user a member of tenants in the ``MemberHeaderMixin`` views, for one test."""
+def member_of(db):
+    """Make ``tenants`` the ones a user is a member of (``Membership``, ``rls_tenant_ids``)."""
 
     def add(user, *tenants):
-        monkeypatch.setitem(TENANT_MEMBERSHIPS, user.username, {tenant.pk for tenant in tenants})
+        Membership.objects.filter(user=user).delete()
+        for tenant in tenants:
+            Membership.objects.create(user=user, tenant=tenant)
 
     return add
 
@@ -460,6 +470,84 @@ class TestRLSTenantPermission:
 # ---------------------------------------------------------------------------
 # CurrentTenantDefault and the serializer mixin: unit tests
 # ---------------------------------------------------------------------------
+
+
+def _member(default=3, tenants=(4,)):
+    """An authenticated ``MultiTenantUser`` stand-in, a member of ``tenants``."""
+    return SimpleNamespace(
+        pk=7,
+        is_authenticated=True,
+        is_tenant_admin=False,
+        rls_tenant_id=default,
+        rls_tenant_ids=frozenset(tenants),
+    )
+
+
+def _selecting_request(user, *, header=None, session=None):
+    """A DRF ``Request`` stand-in with an ``X-Tenant`` header and a session."""
+    headers = {} if header is None else {"X-Tenant": header}
+    return SimpleNamespace(user=user, headers=headers, session={} if session is None else session)
+
+
+class TestMultiTenantUserSelection:
+    """The default ``get_rls_context()`` and the permission for a ``MultiTenantUser`` (#47)."""
+
+    def _context(self, request):
+        return StateView().get_rls_context(request)
+
+    def test_no_selection_gets_the_default(self):
+        with patch.object(drf_mod, "tenant_context") as tenant_ctx:
+            self._context(_selecting_request(_member()))
+        tenant_ctx.assert_called_once_with(3)
+
+    def test_header_selects(self):
+        with patch.object(drf_mod, "tenant_context") as tenant_ctx:
+            self._context(_selecting_request(_member(), header="4"))
+        tenant_ctx.assert_called_once_with(4)
+
+    def test_session_selects(self):
+        with patch.object(drf_mod, "tenant_context") as tenant_ctx:
+            self._context(
+                _selecting_request(_member(), session={"_auth_user_id": "7", "rls_tenant": "4"})
+            )
+        tenant_ctx.assert_called_once_with(4)
+
+    def test_selected_active_context_enters_nothing(self):
+        with tenant_context(4):
+            assert self._context(_selecting_request(_member(), header="4")) is None
+
+    @pytest.mark.parametrize("header", ["5", "abc", ""])
+    def test_tenant_of_another_is_refused(self, header):
+        with pytest.raises(PermissionDenied) as excinfo:
+            self._context(_selecting_request(_member(), header=header))
+        assert str(excinfo.value.detail) == "The selected tenant is not one you can access."
+
+    def test_without_selection_or_default_is_refused(self):
+        with pytest.raises(PermissionDenied) as excinfo:
+            self._context(_selecting_request(_member(None)))
+        assert str(excinfo.value.detail) == "Your account is not assigned to a tenant."
+
+    def test_tenant_admin_does_not_select(self):
+        admin = SimpleNamespace(**{**vars(_admin()), "rls_tenant_ids": frozenset({4})})
+        with patch.object(drf_mod, "admin_context") as admin_ctx:
+            self._context(_selecting_request(admin, header="abc"))
+        admin_ctx.assert_called_once_with()
+
+    def test_permission_allows_a_tenant_of_the_member(self):
+        """Not entered by the view: the middleware set it for the session's selection."""
+        permission = RLSTenantPermission()
+        request = _drf_request(_member())
+        with tenant_context(4):
+            assert permission.has_permission(request, StateView())
+        with tenant_context(3):
+            assert permission.has_permission(request, StateView())
+
+    def test_permission_refuses_a_tenant_of_another(self):
+        permission = RLSTenantPermission()
+        with tenant_context(5):
+            assert not permission.has_permission(_drf_request(_member()), StateView())
+        with admin_context():
+            assert not permission.has_permission(_drf_request(_member()), StateView())
 
 
 class TestCurrentTenantDefault:
@@ -984,6 +1072,129 @@ class TestTenantSelection:
 
 
 @pytest.mark.integration
+class TestLibraryTenantSelection:
+    """The default ``get_rls_context()`` runs a ``MultiTenantUser`` in the selected tenant (#47).
+
+    ``ProtectedStateView`` and ``InvoiceViewSet`` keep the mixin's default and list
+    ``RLSTenantPermission``; the test ``AdminUser``'s ``rls_tenant_ids`` are its
+    ``Membership`` rows.
+    """
+
+    def test_token_member_selects_with_the_header(
+        self, enforce_rls, user_a, member_of, sample_orders, tenant_a, tenant_b
+    ):
+        member_of(user_a, tenant_b)
+        client = _token_client(user_a)
+
+        selected = client.get("/api/protected-state/", headers={"X-Tenant": str(tenant_b.pk)})
+        own = client.get("/api/protected-state/")
+
+        assert selected.status_code == 200, selected.content
+        body = selected.json()
+        assert body["database_products"] == ["Gadget B1"]
+        assert body["tenant_id"] == tenant_b.pk
+        assert body["tenant_guc"] == str(tenant_b.pk)
+        assert own.status_code == 200, own.content
+        assert own.json()["database_products"] == ["Widget A1", "Widget A2"]
+        _assert_context_closed()
+
+    def test_tenant_of_another_is_a_403(
+        self, enforce_rls, user_a, member_of, sample_orders, tenant_b, caplog
+    ):
+        caplog.set_level(logging.INFO, logger=AUDIT_LOGGER_NAME)
+        member_of(user_a)
+
+        response = _token_client(user_a).get(
+            "/api/protected-state/", headers={"X-Tenant": str(tenant_b.pk)}
+        )
+
+        assert response.status_code == 403
+        assert response.json() == {"detail": "The selected tenant is not one you can access."}
+        _assert_context_closed()
+        denied = [r for r in caplog.records if getattr(r, "rls_event", None) == "context.denied"]
+        assert [(r.rls_source, r.rls_reason, r.rls_via) for r in denied] == [
+            ("drf", "tenant_not_selectable", "header"),
+        ]
+
+    def test_response_varies_on_the_header(self, enforce_rls, user_a, member_of, sample_orders):
+        member_of(user_a)
+
+        response = _token_client(user_a).get("/api/protected-state/")
+
+        assert response.status_code == 200, response.content
+        assert "X-Tenant" in response["Vary"]
+
+    def test_session_selection_of_another_user_is_ignored(
+        self, enforce_rls, user_a, user_b, member_of, sample_orders, tenant_a, tenant_b
+    ):
+        """A's cookie, B's token: B runs in their own tenant, and A's selection stays."""
+        client = _token_client(user_b)
+        client.force_login(user_a)
+        session = client.session
+        session["rls_tenant"] = str(tenant_a.pk)  # A's selection
+        session.save()
+        member_of(user_b, tenant_a)  # B could select A too, but did not
+
+        response = client.get("/api/protected-state/")
+
+        assert response.status_code == 200, response.content
+        assert response.json()["database_products"] == ["Gadget B1"]  # B's default
+        assert client.session["rls_tenant"] == str(tenant_a.pk)
+        _assert_context_closed()
+
+    def test_member_without_default_must_select(
+        self, enforce_rls, tenantless_user, member_of, sample_orders, tenant_b
+    ):
+        member_of(tenantless_user, tenant_b)
+        client = _token_client(tenantless_user)
+
+        unselected = client.get("/api/protected-state/")
+        selected = client.get("/api/protected-state/", headers={"X-Tenant": str(tenant_b.pk)})
+
+        assert unselected.status_code == 403
+        assert unselected.json() == {"detail": "Your account is not assigned to a tenant."}
+        assert selected.status_code == 200, selected.content
+        assert selected.json()["database_products"] == ["Gadget B1"]
+        _assert_context_closed()
+
+    def test_write_lands_in_the_selected_tenant(
+        self, enforce_rls, user_a, member_of, tenant_a, tenant_b
+    ):
+        member_of(user_a, tenant_b)
+
+        response = _token_client(user_a).post(
+            "/api/invoices/",
+            {"number": "INV-7", "tenant": tenant_a.pk},
+            format="json",
+            headers={"X-Tenant": str(tenant_b.pk)},
+        )
+
+        assert response.status_code == 201, response.content
+        with admin_context():
+            assert Invoice.objects.get(number="INV-7").tenant_id == tenant_b.pk
+        _assert_context_closed()
+
+    def test_selection_under_asgi(self, enforce_rls, user_a, member_of, sample_orders, tenant_b):
+        member_of(user_a, tenant_b)
+        headers = {**_token_header(user_a), "X-Tenant": str(tenant_b.pk)}
+
+        response = async_to_sync(AsyncClient().get)("/api/protected-state/", headers=headers)
+
+        assert response.status_code == 200, response.content
+        assert response.json()["database_products"] == ["Gadget B1"]
+        _assert_context_closed()
+
+    def test_tenant_admin_header_is_ignored(self, enforce_rls, api_admin, sample_orders):
+        response = _token_client(api_admin).get(
+            "/api/protected-state/", headers={"X-Tenant": "abc"}
+        )
+
+        assert response.status_code == 200, response.content
+        assert response.json()["is_admin_guc"] == "true"
+        _assert_context_closed()
+
+
+@pytest.mark.integration
 class TestContextExit:
     """The context ends with the request on every path, and the next request starts clean."""
 
@@ -1286,6 +1497,25 @@ class TestWithMiddleware:
         assert refused.status_code == 403
         assert own.status_code == 200, own.content
         assert own.json()["database_products"] == ["Widget A1", "Widget A2"]
+        _assert_context_closed()
+
+    def test_session_selection_is_the_middlewares_context(
+        self, enforce_rls, user_a, member_of, sample_orders, tenant_b, rls_middleware
+    ):
+        """The middleware runs the request in the selection; the mixin enters nothing (#47)."""
+        member_of(user_a, tenant_b)
+        client = APIClient()
+        client.force_login(user_a)
+        session = client.session
+        session["rls_tenant"] = str(tenant_b.pk)
+        session.save()
+
+        with patch.object(drf_mod, "tenant_context", wraps=tenant_context) as tenant_ctx:
+            response = client.get("/api/protected-state/")
+
+        assert response.status_code == 200, response.content
+        assert response.json()["database_products"] == ["Gadget B1"]
+        tenant_ctx.assert_not_called()
         _assert_context_closed()
 
     def test_session_user_browsable_api(self, enforce_rls, user_a, sample_orders, rls_middleware):

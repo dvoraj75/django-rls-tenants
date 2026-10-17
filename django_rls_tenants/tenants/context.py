@@ -57,6 +57,8 @@ logger = logging.getLogger("django_rls_tenants")
 def _resolve_user_guc_vars(
     user: TenantUser,
     conf: RLSTenantsConfig | None = None,
+    *,
+    tenant_id: Any = None,
 ) -> dict[str, str]:
     """Map a ``TenantUser`` to GUC variable name-value pairs.
 
@@ -70,6 +72,9 @@ def _resolve_user_guc_vars(
     Args:
         user: User satisfying the ``TenantUser`` protocol.
         conf: Config instance. Defaults to the module-level singleton.
+        tenant_id: The tenant a non-admin user's request selected
+            (``selection._request_tenant_id()``), used instead of
+            ``user.rls_tenant_id``; ``None`` for that default.
 
     Returns:
         Dict mapping GUC variable names to their string values.
@@ -81,7 +86,8 @@ def _resolve_user_guc_vars(
             conf.GUC_IS_ADMIN: "true",
             conf.GUC_CURRENT_TENANT: "",
         }
-    tenant_id = user.rls_tenant_id
+    if tenant_id is None:
+        tenant_id = user.rls_tenant_id
     if tenant_id is None:
         msg = f"Non-admin user has rls_tenant_id=None (user type: {type(user).__name__})."
         raise NoTenantContextError(msg, hint=HINT_USER_NO_TENANT)

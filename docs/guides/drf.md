@@ -115,15 +115,18 @@ request
 
 Right after DRF authenticates the request, the mixin enters `admin_context()` for a
 user with `is_tenant_admin` and `tenant_context(user.rls_tenant_id)` for any other
-user (the [`TenantUser` protocol](user-integration.md)). The context exits before
-`dispatch()` returns, whether the view returns, raises a handled error (a 400, a
-404) or an unhandled one (a 500).
+user (the [`TenantUser` protocol](user-integration.md)); a user who belongs to several
+tenants gets the one the request selects (see
+[A user who belongs to several tenants](#a-user-who-belongs-to-several-tenants)). The
+context exits before `dispatch()` returns, whether the view returns, raises a handled
+error (a 400, a 404) or an unhandled one (a 500).
 
 | `request.user` | Context |
 |----------------|---------|
 | Unauthenticated | none entered: the view runs in the enclosing context, normally none (fail-closed: zero rows, or `NoTenantContextError` under `STRICT_MODE`); see the warning below |
 | `is_tenant_admin` | `admin_context()` |
 | Non-admin with a tenant | `tenant_context(user.rls_tenant_id)` |
+| `MultiTenantUser`, non-admin | `tenant_context(<the tenant the request selects, else rls_tenant_id>)`; a selection that is not one of the user's tenants is `403 Forbidden` |
 | Non-admin without a tenant | `403 Forbidden` |
 
 !!! warning "A request DRF did not authenticate keeps an enclosing context"
@@ -185,16 +188,43 @@ class TenantHeaderMixin(RLSTenantAPIViewMixin):
         return super().get_rls_context(request)
 ```
 
-The header counts only for a tenant admin, who may act on every tenant anyway; any
-other user gets their own tenant. Keep the `super()` fallback so that every other
-request gets its own context.
+The header counts only for a tenant admin here, who may act on every tenant anyway
+(the library ignores the header for a tenant admin); any other user gets the default
+context: their own tenant, or, for a user who belongs to several tenants, the one they
+select. Keep the `super()` fallback so that every other request gets its own context.
 
 #### A user who belongs to several tenants
 
-A non-admin user may also be given a context other than `tenant_context(user.rls_tenant_id)`:
-a user who belongs to several tenants through a membership table selects one per request
-(a header, a URL segment, a session key), and `user.rls_tenant_id` is another of their
-tenants, or `None`. The override checks the membership and enters the selected tenant:
+*1.6.0+.* A user who implements the
+[`MultiTenantUser`](multi-tenant-users.md) protocol (`rls_tenant_ids`, the tenants they
+may select) needs no override. The default `get_rls_context()` resolves the request's
+tenant for a non-admin `MultiTenantUser` in this order:
+
+1. the request header `RLS_TENANTS["TENANT_HEADER"]` (default `X-Tenant`);
+2. the session selection `switch_tenant()` stored under `RLS_TENANTS["TENANT_SESSION_KEY"]`;
+3. the user's `rls_tenant_id`.
+
+```bash
+curl -H "Authorization: Token <key>" -H "X-Tenant: 7" https://example.com/api/orders/
+```
+
+The selection is checked against `rls_tenant_id` and `rls_tenant_ids`. A tenant that is
+not one of the user's, a malformed value or an empty header is a `403` with
+`{"detail": "The selected tenant is not one you can access."}`, the same message whether
+the tenant exists or not, and never a fallback to another tenant. A stale session
+selection is a `403` too and is removed from the session. A member with no selection and
+no `rls_tenant_id` gets the `403` "Your account is not assigned to a tenant.". A tenant
+admin ignores the header and gets `admin_context()`. When `RLSTenantMiddleware` has
+already set the selected context (a session user), the mixin enters nothing. The session
+selection is used only when the session is logged in as the user DRF authenticated: a
+token client selects with the header. The response carries the header in `Vary`. See
+[Users in Several Tenants](multi-tenant-users.md).
+
+##### A custom selection rule
+
+Override `get_rls_context()` when the user selects the tenant another way than the
+library's header and session (a URL segment, say), or by a rule of your own. The override
+checks the rule and enters the selected tenant:
 
 ```python
 from rest_framework.exceptions import PermissionDenied
@@ -207,7 +237,7 @@ from .models import Membership
 
 class SelectedTenantMixin(RLSTenantAPIViewMixin):
     def get_rls_context(self, request):
-        selected = request.headers.get("X-Tenant")
+        selected = self.kwargs.get("tenant_id")
         if selected is None or not request.user.is_authenticated:
             return super().get_rls_context(request)
         # A plain model: an RLS-protected one needs admin_context() here, where
@@ -223,8 +253,8 @@ class SelectedTenantMixin(RLSTenantAPIViewMixin):
         return tenant_context(int(selected))
 ```
 
-The example parses an integer primary key; validate the header the way the tenant
-model's key requires (a `UUIDField`, say) before it reaches the query and `tenant_context()`.
+The example parses an integer primary key; validate the value the way the tenant model's
+key requires (a `UUIDField`, say) before it reaches the query and `tenant_context()`.
 
 [`RLSTenantPermission`](#rlstenantpermission) accepts the tenant context the override
 entered for the request (see what it checks there), so the view keeps it in its
@@ -261,6 +291,7 @@ context:
 | Unauthenticated | nothing |
 | `is_tenant_admin` | any context |
 | Any other user | the tenant context `RLSTenantAPIViewMixin` entered for this request (what [`get_rls_context()`](#choosing-the-context-get_rls_context) returned), or `tenant_context(user.rls_tenant_id)`; never the admin bypass |
+| A non-admin `MultiTenantUser` | also a tenant context of any tenant they may select (`rls_tenant_ids` or `rls_tenant_id`), even one the mixin did not enter, such as the middleware's; never the admin bypass |
 
 No context at all is refused for every user. A view that forgot the mixin, served to a
 token client, so answers `403` (an anonymous client gets `401`) instead of `200` with an
@@ -294,7 +325,7 @@ classes while it builds `APIView`.
 *1.6.0+.* Each refusal of an authenticated user is a `context.denied`
 [audit record](audit-logging.md) with source `drf` (`no_context`, `context_mismatch`,
 `object_of_other_tenant`), as is the mixin's 403 for a user without a tenant
-(`user_without_tenant`). The context the mixin enters logs a `context.entered` /
+(`user_without_tenant`) and for a refused tenant selection (`tenant_not_selectable`). The context the mixin enters logs a `context.entered` /
 `context.exited` pair with the user's primary key, and a serializer that rejects a foreign
 key to another tenant's row logs `fk.cross_tenant_rejected` (a `PrimaryKeyRelatedField`
 that reports the row as not found too, not a slug or hyperlink field). The permission logs
@@ -489,7 +520,7 @@ exactly the leak the library exists to prevent. The mixin owns both the entry
   middleware's for a session cookie (see the warning under [Lifecycle](#lifecycle)).
 - `RLSTenantPermission` trusts the tenant a `get_rls_context()` override enters; the
   override must check that the user may access it (see
-  [A user who belongs to several tenants](#a-user-who-belongs-to-several-tenants)).
+  [A custom selection rule](#a-custom-selection-rule)).
 - The tenant foreign key is the one named by `RLS_TENANTS["TENANT_FK_FIELD"]`, and
   `CurrentTenantDefault` expects it to reference the tenant's primary key.
 - DRF's `ModelSerializer` does not call `Model.full_clean()`, so model validators

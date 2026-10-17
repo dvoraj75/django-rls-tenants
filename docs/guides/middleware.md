@@ -50,6 +50,9 @@ work in its own async path; see
 3. If **authenticated**: reads the `TenantUser` protocol properties:
     - `is_tenant_admin`: if `True`, sets `rls.is_admin = 'true'` and clears `rls.current_tenant`.
     - `rls_tenant_id`: if not admin, sets `rls.current_tenant = str(tenant_id)` and `rls.is_admin = 'false'`.
+    - For a non-admin [`MultiTenantUser`](multi-tenant-users.md), the tenant is the one the
+      request selects instead of `rls_tenant_id`, resolved before anything is set (see
+      [Tenant selection](#tenant-selection)).
 4. Sets GUCs on **all database aliases** listed in `RLS_TENANTS["DATABASES"]` (default:
    `["default"]`), both GUCs in one `set_config()` statement per alias (*changed in
    1.5.0*; before, one statement per GUC). If setting GUCs on one alias fails, all
@@ -65,6 +68,35 @@ work in its own async path; see
    on any other connection the request's code uses (*added in 1.4.0*).
 8. Records in a `ContextVar` that GUCs were set, and on which thread (read by the
    safety-net and `connection_created` signal handlers).
+
+### Tenant selection
+
+*1.6.0+.* For a user who implements [`MultiTenantUser`](multi-tenant-users.md) and is not
+a tenant admin, the middleware resolves the request's tenant **before it sets anything**:
+
+1. the header `RLS_TENANTS["TENANT_HEADER"]` (default `X-Tenant`), if the request sends it;
+2. else the session selection stored by `switch_tenant()` under
+   `RLS_TENANTS["TENANT_SESSION_KEY"]` (default `rls_tenant`);
+3. else `rls_tenant_id`.
+
+A selection that is not `rls_tenant_id` or one of `rls_tenant_ids` (a malformed, empty or
+unknown value included) raises `PermissionDenied`: a plain 403 with nothing to undo, and
+never a silent fallback to another tenant. A stale session selection is removed from the
+session as it is refused, so the next request runs in `rls_tenant_id`. The header is read
+on the synchronous path, the native ASGI path and the hook path of subclasses alike, with
+or without `USE_LOCAL_SET`. `rls_tenant_ids` is read only when a request selects a tenant.
+The session selection counts only while the session is logged in as the request's user.
+The response of such a user's request carries the header in `Vary`, so that a cache keyed
+on the URL and the cookie does not serve one tenant's page for another.
+
+If the user has **neither a selection nor `rls_tenant_id`**, the middleware sets no context,
+as for an anonymous request (fail-closed): protected tables read nothing and `STRICT_MODE`
+raises `NoTenantContextError`. It is deliberately not a 403, so that a tenant-picker page,
+which reads only plain tables (the memberships, the tenant model), can render. A plain
+`TenantUser` with `rls_tenant_id=None` still raises `NoTenantContextError`, as before.
+
+Tenant admins ignore the header and the session selection and get the admin context. The
+`context.entered` [audit record](audit-logging.md) carries the selected tenant.
 
 ### Transaction Per Request (`USE_LOCAL_SET=True`)
 
@@ -423,7 +455,9 @@ that the user is resolved **before** the middleware runs.
 The middleware sets `_rls_context_active=True` for authenticated requests, which
 satisfies the strict mode check. Unauthenticated requests do **not** set this
 flag -- if strict mode is enabled, queries in unauthenticated views will raise
-`NoTenantContextError` rather than silently returning zero rows.
+`NoTenantContextError` rather than silently returning zero rows. The same holds for a
+`MultiTenantUser` who selected no tenant and has no `rls_tenant_id` (see
+[Tenant selection](#tenant-selection)).
 
 This is the intended behavior: strict mode surfaces missing context at the point
 of query execution, making it easier to identify views that should require

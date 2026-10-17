@@ -1,8 +1,9 @@
 # Audit Logging
 
 *1.6.0+.* The library logs an audit record each time an RLS context is entered or exited,
-each time it refuses one, when it rejects a foreign key to another tenant's row, and when
-its safety net has to clear a request's context. Compliance frameworks such as SOC 2 and
+each time it refuses one, when it rejects a foreign key to another tenant's row, when
+its safety net has to clear a request's context, and when a user who belongs to several
+tenants changes the tenant they work in. Compliance frameworks such as SOC 2 and
 GDPR ask for this kind of trail of data-access boundaries.
 
 The records go to the `django_rls_tenants.audit` logger, a child of `django_rls_tenants`.
@@ -108,6 +109,9 @@ And, depending on the event:
 | `rls_reason` | `context.denied` | Why the context was refused, see [Events](#events). |
 | `rls_model` | `context.denied` (`strict_mode`, `object_of_other_tenant`), `fk.cross_tenant_rejected` | The model label, `"app_label.ModelName"`. |
 | `rls_fields` | `fk.cross_tenant_rejected` | The names of the foreign keys whose target belongs to another tenant. |
+| `rls_selected` | `context.denied` (`tenant_not_selectable`, `cross_site_selection`) | The raw value the client sent as the tenant selection, cut to its first 64 characters (followed by `...`) when longer. A string with whitespace, `=` or a non-printable character is quoted in the message. |
+| `rls_via` | `context.denied` (`tenant_not_selectable`, `cross_site_selection`) | Where the selection came from: `header`, `session`, `query` (the admin switcher's query parameter) or `switch` (a `switch_tenant()` call). |
+| `rls_previous` | `tenant.switched` | The selection the session held before (a string), `None` if it held none. |
 | `rls_databases` | `gucs.cleared` | The aliases the safety net covered (`RLS_TENANTS["DATABASES"]`). It skips a closed connection, and with `USE_LOCAL_SET=True` it writes nothing: it marks the sessions for the GUC affinity guard, which clears them before their next statement. |
 
 The user is identified by primary key only. No username, email address or other personal
@@ -124,6 +128,7 @@ handler.
 | `context.entered` | `INFO` | A tenant or admin context is entered. |
 | `context.exited` | `INFO` | That context ends, also when its block raises. One per `context.entered`, same fields. For a request whose middleware cleanup never ran, none is logged and the safety net's `gucs.cleared` comes instead; if the middleware's clear itself failed, `context.exited` is logged and `gucs.cleared` follows. |
 | `context.denied` | `WARNING` | The library refuses to run without the right context (reasons below). |
+| `tenant.switched` | `INFO` | A user who belongs to several tenants changed the session's tenant selection with `switch_tenant()`, `clear_tenant_selection()` or the admin's tenant switcher (see [Users in Several Tenants](multi-tenant-users.md)). `rls_tenant_id` is the new selection, `None` when it was cleared, and `rls_admin` is `False`. `clear_tenant_selection()` logs nothing when there was no selection. |
 | `fk.cross_tenant_rejected` | `WARNING` | Validation rejects a foreign key whose target row exists but belongs to another tenant, or to none (see [Cross-tenant foreign keys](protecting-models.md#cross-tenant-foreign-keys)). That includes a target that validation already rejected as not found because RLS or the auto-scope filter hides it (a tenant user sending another tenant's id): Django's foreign key validation in `full_clean()`, a related-field dropdown of an `RLSTenantModelAdmin` form (`invalid_choice`, source `admin`), and a DRF `PrimaryKeyRelatedField` (`does_not_exist`). The library then reads the target's tenant once in `admin_context()` and leaves the error as it was. It does so only when the audit logger is enabled for `WARNING`, which it is when `LOGGING` does not configure it (the root logger's default level), and in a savepoint: if the lookup fails, the record is lost, never the error. A target that does not exist is an ordinary invalid value and is not logged. |
 | `gucs.cleared` | `WARNING` | The `request_finished` safety net found a request's context still set (the middleware's own cleanup did not run, or its clear failed) and ran its clear, which skips a connection that is already closed (see [Connection-Level State](../advanced/security.md#connection-level-state)). If the clear raises, a warning goes to the `django_rls_tenants` logger instead. |
 
@@ -136,6 +141,8 @@ handler.
 | `strict_mode` | `queryset` | `STRICT_MODE` refused a query with no context (`rls_model` names the model). |
 | `no_context` | `drf`, `celery` | `RLSTenantPermission` found no context for an authenticated user (a view without `RLSTenantAPIViewMixin`), an `RLSTask` with `rls_require_context = True` arrived without one, or `CurrentTenantDefault` was called outside a tenant context (`rls_admin=True` in the admin context, `None` with no context). |
 | `context_mismatch` | `drf` | `RLSTenantPermission.has_permission()`: the active context is not the user's (`rls_tenant_id` / `rls_admin` describe the active one). |
+| `tenant_not_selectable` | `middleware`, `drf`, `admin`, `selection` | A user who belongs to several tenants selected a tenant that is not one of theirs (a malformed or unknown value included), by header, session, the admin switcher's query parameter or a `switch_tenant()` call; also a `switch_tenant()` call by an anonymous user, a tenant admin or a user who is not a `MultiTenantUser`, or by a user the session is not logged in as (a DRF token client). The request is refused with a 403 (`PermissionDenied`); `rls_selected` and `rls_via` describe the selection. |
+| `cross_site_selection` | `admin` | The admin's tenant switcher refused the choice of a user who belongs to several tenants because the request did not come from this site (`Sec-Fetch-Site` other than `same-origin` or `none`, or, without it, a `Referer` of another scheme or host, or none): a link elsewhere cannot change the site's selection. A 403; `rls_selected` and `rls_via=query` describe the choice. |
 | `object_of_other_tenant` | `drf` | `RLSTenantPermission.has_object_permission()` refused an object of another tenant (`rls_model` names its model). |
 
 ## Sources
@@ -144,7 +151,8 @@ handler.
 |--------------|-----------|------------|
 | `middleware` | `RLSTenantMiddleware`, on every path (WSGI, ASGI, a subclass with its own hooks). The context ends with the request, before a streaming body is sent. | yes |
 | `drf` | `RLSTenantAPIViewMixin` (the context `get_rls_context()` returned, an override's too), `RLSTenantPermission`, `RLSTenantSerializerMixin`, `CurrentTenantDefault` | yes (the serializer: when its `context` has the `request`) |
-| `admin` | `RLSTenantModelAdmin`'s view wrappers, and its forms' dropdowns rejecting another tenant's row | yes |
+| `admin` | `RLSTenantModelAdmin`'s view wrappers, its forms' dropdowns rejecting another tenant's row, and the tenant switcher of a user who belongs to several tenants (`tenant.switched`, `tenant_not_selectable`, `cross_site_selection`) | yes |
+| `selection` | `switch_tenant()` and `clear_tenant_selection()` called by your code | yes (the request's user) |
 | `decorator` | `@with_rls_context`, sync and async | yes |
 | `celery` | `RLSTask` and the `install()` signal handlers, on the worker | no |
 | `command` | `run_as_tenant`, `run_for_all_tenants` (one entry per tenant; with `--parallel` the records come from the worker processes, so a file handler must be safe for several processes) | no |

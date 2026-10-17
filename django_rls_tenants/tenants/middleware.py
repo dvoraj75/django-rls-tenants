@@ -25,6 +25,11 @@ from django_rls_tenants.tenants import audit
 from django_rls_tenants.tenants.affinity import suspect_sessions, write_gucs
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import _context_gucs_of, _resolve_user_guc_vars
+from django_rls_tenants.tenants.selection import (
+    _request_tenant_id,
+    _selects_tenants,
+    _vary_on_tenant_header,
+)
 from django_rls_tenants.tenants.state import (
     _ContextGucsToken,
     _current_live,
@@ -312,17 +317,72 @@ def _clear_request_gucs(conf: RLSTenantsConfig) -> None:
     logger.debug("Middleware cleared GUCs on databases=%s", conf.DATABASES)
 
 
-def _resolve_request_user(user: Any, conf: RLSTenantsConfig) -> dict[str, str]:
+def _resolve_request_user(
+    user: Any,
+    conf: RLSTenantsConfig,
+    member: _Member | None,
+) -> dict[str, str]:
     """Return the GUC values of the request's user; log ``context.denied`` for a tenantless one.
+
+    Args:
+        user: The request's authenticated user.
+        conf: ``RLSTenantsConfig`` instance.
+        member: What ``_member_of()`` returned for the request.
 
     Raises:
         NoTenantContextError: If a non-admin user has ``rls_tenant_id=None``.
     """
     try:
-        return _resolve_user_guc_vars(user, conf)
+        return _resolve_user_guc_vars(
+            user,
+            conf,
+            tenant_id=None if member is None else member.tenant_id,
+        )
     except NoTenantContextError:
         audit.denied("middleware", "user_without_tenant", user_id=audit.user_id_of(user))
         raise
+
+
+class _Member(NamedTuple):
+    """The tenant the request of a user who selects tenants runs in (``None``: none)."""
+
+    tenant_id: Any
+
+
+def _member_of(request: HttpRequest, user: Any) -> _Member | None:
+    """Return the tenant of a ``MultiTenantUser``'s request; ``None`` for any other user.
+
+    Called before anything is set, so a refused selection is a 403 with
+    nothing to undo.
+
+    Raises:
+        PermissionDenied: If the request selects a tenant that is not one of
+            the user's (``selection._request_tenant_id()``).
+    """
+    if not _selects_tenants(user):
+        return None
+    return _Member(_request_tenant_id(request, user, source="middleware"))
+
+
+def _log_member_without_tenant(user: Any) -> None:
+    """Log that a ``MultiTenantUser`` without a selection or a default gets no context."""
+    logger.debug(
+        "Middleware set no RLS context for user=%s: it selected no tenant and has no "
+        "rls_tenant_id (fail-closed)",
+        type(user).__name__,
+    )
+
+
+def _scope_tenant_id(user: Any, member: _Member | None) -> Any:
+    """Return the auto-scope tenant of the request: ``None`` for an admin.
+
+    The tenant ID keeps its Python type (not the string GUC form; a selected
+    one has the tenant primary key's type), so that
+    ``get_current_tenant_id()`` returns a consistent type.
+    """
+    if member is not None:
+        return member.tenant_id
+    return None if user.is_tenant_admin else user.rls_tenant_id
 
 
 class _AuditedContext(NamedTuple):
@@ -530,7 +590,9 @@ class RLSTenantMiddleware(MiddlewareMixin):
         scope = await self._aenter_request(request, conf)
         if scope is None:
             with _holder_for_the_request(request):
-                return await self._aget_response(request)
+                response = await self._aget_response(request)
+            _vary_on_tenant_header(request, response)
+            return response
         setattr(request, "_rls_found_context", _FoundContext(_current_live()))  # noqa: B010  -- dynamic attr on HttpRequest
         tenant_token = set_current_tenant_id(scope.tenant_id)
         active_token = set_rls_context_active(True)
@@ -546,7 +608,9 @@ class RLSTenantMiddleware(MiddlewareMixin):
                 admin=scope.tenant_id is None,
                 user_id=scope.user_id,
             )
-            return await self._aget_response(request)
+            response = await self._aget_response(request)
+            _vary_on_tenant_header(request, response)
+            return response
         finally:
             try:
                 setattr(request, "_rls_context_gucs_token", None)  # noqa: B010  -- dynamic attr on HttpRequest
@@ -581,18 +645,28 @@ class RLSTenantMiddleware(MiddlewareMixin):
             conf: ``RLSTenantsConfig`` instance.
 
         Returns:
-            ``None`` for an unauthenticated request (nothing was set), otherwise
-            the auto-scope tenant ID (``None`` for an admin user), the GUC values
-            set (with ``USE_LOCAL_SET=True``, the values the GUC affinity guard
-            applies), and the marker of the thread that set them.
+            ``None`` for an unauthenticated request, and for a
+            ``MultiTenantUser`` with neither a selection nor a default tenant
+            (nothing was set), otherwise the auto-scope tenant ID (``None``
+            for an admin user), the GUC values set (with ``USE_LOCAL_SET=True``,
+            the values the GUC affinity guard applies), and the marker of the
+            thread that set them.
+
+        Raises:
+            PermissionDenied: If a ``MultiTenantUser``'s request selects a
+                tenant that is not one of theirs (nothing was set).
         """
         if not _is_authenticated(request):
             return None
         user: Any = request.user
+        member = _member_of(request, user)
+        if member is not None and member.tenant_id is None:
+            _log_member_without_tenant(user)
+            return None
         try:
-            guc_vars = _resolve_request_user(user, conf)
+            guc_vars = _resolve_request_user(user, conf, member)
             self._set_gucs_on_all_databases(guc_vars, conf)
-            tenant_id = None if user.is_tenant_admin else user.rls_tenant_id
+            tenant_id = _scope_tenant_id(user, member)
         except Exception:
             logger.exception("Failed to set RLS GUC variables, clearing to prevent leak")
             _clear_gucs_on_all_databases(conf)
@@ -602,7 +676,7 @@ class RLSTenantMiddleware(MiddlewareMixin):
             conf.DATABASES,
             type(user).__name__,
             user.is_tenant_admin,
-            getattr(user, "rls_tenant_id", None),
+            tenant_id,
         )
         return _RequestScope(
             tenant_id,
@@ -687,12 +761,24 @@ class RLSTenantMiddleware(MiddlewareMixin):
         alias. If setting GUCs on one database fails, clears all GUCs on
         databases that were already set, then re-raises. Used on the
         synchronous path only; ``__acall__`` uses ``_enter_request_gucs``.
+
+        For a ``MultiTenantUser`` who is not a tenant admin the tenant is the
+        one the request selects (``RLS_TENANTS["TENANT_HEADER"]``, then the
+        session), else ``rls_tenant_id``; with neither, no context is set.
+
+        Raises:
+            PermissionDenied: If a ``MultiTenantUser``'s request selects a
+                tenant that is not one of theirs (nothing was set).
         """
         if not _is_authenticated(request):
             return
 
         conf = rls_tenants_config
         user: Any = request.user
+        member = _member_of(request, user)
+        if member is not None and member.tenant_id is None:
+            _log_member_without_tenant(user)
+            return
 
         # Track tokens so the except branch can reset via token (not
         # push a new value) when the ContextVar was already set before
@@ -701,24 +787,19 @@ class RLSTenantMiddleware(MiddlewareMixin):
         active_token: Token[bool] | None = None
         gucs_token: _ContextGucsToken | None = None
         try:
-            guc_vars = _resolve_request_user(user, conf)
+            guc_vars = _resolve_request_user(user, conf, member)
             self._set_gucs_on_all_databases(guc_vars, conf)
+            tenant_id = _scope_tenant_id(user, member)
             logger.debug(
                 "Middleware set GUCs on databases=%s for user=%s (admin=%s, tenant=%s)",
                 conf.DATABASES,
                 type(user).__name__,
                 user.is_tenant_admin,
-                getattr(user, "rls_tenant_id", None),
+                tenant_id,
             )
 
             # Set auto-scope state for RLSManager.get_queryset().
-            # Use the original tenant ID from the user (preserving type)
-            # rather than the string GUC representation, so that
-            # get_current_tenant_id() returns a consistent type.
-            if not user.is_tenant_admin:
-                tenant_token = set_current_tenant_id(user.rls_tenant_id)
-            else:
-                tenant_token = set_current_tenant_id(None)
+            tenant_token = set_current_tenant_id(tenant_id)
             setattr(request, "_rls_tenant_token", tenant_token)  # noqa: B010  -- dynamic attr on HttpRequest
 
             # Mark RLS context as active for strict mode. This
@@ -734,7 +815,7 @@ class RLSTenantMiddleware(MiddlewareMixin):
             _mark_gucs_set()
             _audit_request_entered(
                 request,
-                None if user.is_tenant_admin else user.rls_tenant_id,
+                tenant_id,
                 admin=bool(user.is_tenant_admin),
                 user_id=audit.user_id_of(user),
             )
@@ -763,8 +844,12 @@ class RLSTenantMiddleware(MiddlewareMixin):
         request: HttpRequest,
         response: HttpResponse,
     ) -> HttpResponse:
-        """Clear GUC variables and auto-scope state to prevent cross-request leaks."""
+        """Clear GUC variables and auto-scope state to prevent cross-request leaks.
+
+        A ``MultiTenantUser``'s response also gets the tenant header in ``Vary``.
+        """
         self._cleanup_rls_state(request)
+        _vary_on_tenant_header(request, response)
         return response
 
     def process_exception(

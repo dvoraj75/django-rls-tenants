@@ -14,6 +14,7 @@ __version__: str = importlib.metadata.version("django-rls-tenants")
 __all__ = [
     "AddM2MRLSPolicy",
     "AddRLSPolicy",
+    "MultiTenantUser",
     "RLSConstraint",
     "RLSM2MConstraint",
     "RLSManager",
@@ -29,8 +30,10 @@ __all__ = [
     "admin_context",
     "async_admin_context",
     "async_tenant_context",
+    "clear_tenant_selection",
     "current_tenant_value_sql",
     "safe_tenant_sql",
+    "switch_tenant",
     "tenant_context",
     "validate_cross_tenant_fks",
     "with_rls_context",
@@ -39,6 +42,7 @@ __all__ = [
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "AddM2MRLSPolicy": ("django_rls_tenants.operations", "AddM2MRLSPolicy"),
     "AddRLSPolicy": ("django_rls_tenants.operations", "AddRLSPolicy"),
+    "MultiTenantUser": ("django_rls_tenants.tenants.types", "MultiTenantUser"),
     "RLSConstraint": ("django_rls_tenants.rls.constraints", "RLSConstraint"),
     "RLSM2MConstraint": ("django_rls_tenants.rls.constraints", "RLSM2MConstraint"),
     "RLSManager": ("django_rls_tenants.tenants.managers", "RLSManager"),
@@ -53,8 +57,13 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "admin_context": ("django_rls_tenants.tenants.context", "admin_context"),
     "async_admin_context": ("django_rls_tenants.tenants.context", "async_admin_context"),
     "async_tenant_context": ("django_rls_tenants.tenants.context", "async_tenant_context"),
+    "clear_tenant_selection": (
+        "django_rls_tenants.tenants.selection",
+        "clear_tenant_selection",
+    ),
     "current_tenant_value_sql": ("django_rls_tenants.tenants.sql", "current_tenant_value_sql"),
     "safe_tenant_sql": ("django_rls_tenants.tenants.sql", "safe_tenant_sql"),
+    "switch_tenant": ("django_rls_tenants.tenants.selection", "switch_tenant"),
     "tenant_context": ("django_rls_tenants.tenants.context", "tenant_context"),
     "validate_cross_tenant_fks": (
         "django_rls_tenants.tenants.models",

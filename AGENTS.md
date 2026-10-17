@@ -69,6 +69,12 @@ with `SET ROLE` and is a no-op on a plain one. `enforce_rls`, `rls_role` and
 must be created inside `admin_context()` / `tenant_context()`, since a plain role cannot
 insert them without a context.
 
+The test `AUTH_USER_MODEL` `test_app.AdminUser` is a `MultiTenantUser` (#47): `rls_tenant_ids`
+reads the plain `test_app.Membership` table (migration `0012_membership`; not cached, tests
+add memberships to a user they hold). The `member_of` fixture in `tests/test_contrib/test_drf.py`
+replaces a user's memberships; `tests/drf_views.py` reads `Membership` in its override
+recipe.
+
 ### Test Organization
 
 ```
@@ -126,6 +132,36 @@ The library has two internal layers with a strict import boundary:
   package root and **must not import Django or the rest of the package at module level**
   (imports go inside the fixtures). Its twin in `tenants/testing.py` is
   `assert_rls_enforced()` / `aassert_rls_enforced()`.
+- **`django_rls_tenants/tenants/selection.py`** — tenant selection for a `MultiTenantUser`
+  (#47; `tenants/types.py` adds `rls_tenant_ids` to `TenantUser`). `_request_tenant_id(request,
+  user, source=)` resolves a request's tenant: the `RLS_TENANTS["TENANT_HEADER"]` header, else
+  the `TENANT_SESSION_KEY` session value, else `rls_tenant_id` (`None` for a member with
+  neither); a selection outside `_selectable()` (`rls_tenant_ids` + the default, compared as
+  the tenant pk field's `to_python()`) is `PermissionDenied` with `NOT_SELECTABLE_MESSAGE`
+  (one message for every case: no existence oracle) and a `tenant_not_selectable` audit
+  record, and a refused session value is popped. The session value is read (and popped)
+  only while `_is_session_of()` (`SESSION_KEY` is the user's pk), so a DRF token user never
+  uses or drops another user's; `_switch()` refuses such a user (`NOT_SESSION_USER_MESSAGE`).
+  Reading the header records `_depends_on_header()`, and `_vary_on_tenant_header()` adds it
+  to `Vary` (the middleware's `process_response` and native path, the DRF mixin's
+  `dispatch()`). Its three consumers: `middleware._member_of()`
+  (called before anything is set, so a refusal is a plain 403; a member with no tenant gets no
+  context, like an anonymous request, and `_resolve_user_guc_vars(..., tenant_id=)` /
+  `_scope_tenant_id()` take the resolved tenant), `RLSTenantAPIViewMixin.get_rls_context()`
+  (turns `PermissionDenied` into DRF's) and `RLSTenantModelAdmin._effective_tenant_id()`. The
+  admin switcher for a member (`_user_can_switch_tenant()`: `_other_tenants()` non-empty and
+  `TENANT_SESSION_KEY` set) calls `_switch()` / `_clear()` with `source="admin"` and writes the
+  site's session key, not `rls_session_key` (a tenant admin's), only for a same-origin
+  navigation (`admin._same_origin_navigation()`: `Sec-Fetch-Site`, else `Referer`; else a 403
+  and `cross_site_selection`). Private helpers
+  `_selects_tenants()` (`isinstance(MultiTenantUser)` and not a tenant admin: tenant admins
+  never select), `_may_select()`, `_selectable()`, `_other_tenants()`, `_switch()`, `_clear()`;
+  public `switch_tenant()` / `clear_tenant_selection()`. `rls_tenant_ids` is read only when a
+  selection exists, by `RLSTenantPermission` and by the switcher (hence `cached_property` in
+  docs). `for_user()`, `@with_rls_context` and management commands keep `rls_tenant_id`.
+  Audit: `tenant.switched` and `Reason`s `tenant_not_selectable` / `cross_site_selection`
+  (`rls_selected`, cut to 64 characters by `_shown()`, and `rls_via`). `TENANT_HEADER` must
+  match `[A-Za-z0-9-]+` (Django never finds a header name with `_`).
 - **`django_rls_tenants/management/`** — `check_rls` and `setup_m2m_rls`, plus `run_as_tenant`
   and `run_for_all_tenants` (#111), which run another command through `call_command()` inside
   `tenant_context()` / `admin_context()`. `run_for_all_tenants` imports the shared helpers
@@ -163,8 +199,9 @@ owns both the entry (`perform_authentication()`) and the exit (`dispatch()`).
 only if entering it made a new holder current (a `nullcontext()` records nothing).
 `RLSTenantPermission.has_permission()` passes a non-admin user while that holder is the
 current one and is not `ADMIN_GUCS` (#150: a tenant the user selected, which the override
-validates), else only in `tenant_context(user.rls_tenant_id)`; the admin bypass always
-needs `is_tenant_admin`.
+validates), else only in `tenant_context(user.rls_tenant_id)` or, for a `MultiTenantUser`, in
+a tenant context `_may_select()` accepts (#47); the admin bypass always needs
+`is_tenant_admin`.
 
 ### M2M RLS Support
 
@@ -781,8 +818,8 @@ example/
 ├── manage.py            Django management script
 ├── demo/                Project settings, urls, wsgi/asgi, Celery app (eager mode)
 ├── tenants/             Tenant model (shared, not RLS-protected)
-├── accounts/            Custom User with TenantUser protocol
-├── notes/               RLS-protected Note model, views, services, tasks, DRF API (api.py), templates, seed command, `note_report` (run through `run_as_tenant`)
+├── accounts/            Custom User with TenantUser protocol, plus `rls_tenant_ids` + `Membership` (MultiTenantUser, #47)
+├── notes/               RLS-protected Note model, views, services, tasks, DRF API (api.py), templates, seed command, `note_report` (run through `run_as_tenant`), tenant switcher (`context_processors.py`, `select_tenant` view)
 └── docker/              PostgreSQL init (creates non-superuser role for RLS)
 ```
 

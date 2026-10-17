@@ -10,6 +10,7 @@ The most common symbols are available directly from `django_rls_tenants`:
 from django_rls_tenants import (
     AddM2MRLSPolicy,
     AddRLSPolicy,
+    MultiTenantUser,
     RLSConstraint,
     RLSM2MConstraint,
     RLSManager,
@@ -24,8 +25,10 @@ from django_rls_tenants import (
     admin_context,
     async_admin_context,
     async_tenant_context,
+    clear_tenant_selection,
     current_tenant_value_sql,
     safe_tenant_sql,
+    switch_tenant,
     tenant_context,
     validate_cross_tenant_fks,
     with_rls_context,
@@ -206,6 +209,18 @@ the tenant switcher, and the middleware interaction.
 ### Types
 
 ::: django_rls_tenants.tenants.types.TenantUser
+
+::: django_rls_tenants.tenants.types.MultiTenantUser
+
+### Tenant Selection
+
+For users who belong to several tenants. See the
+[Users in Several Tenants guide](../guides/multi-tenant-users.md). The module also holds
+`NOT_SELECTABLE_MESSAGE`, the message of every refused selection.
+
+::: django_rls_tenants.tenants.selection.switch_tenant
+
+::: django_rls_tenants.tenants.selection.clear_tenant_selection
 
 ### Bypass Helpers
 

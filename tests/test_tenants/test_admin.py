@@ -20,6 +20,7 @@ independently drive the RLS role the mixin reads.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -40,7 +41,7 @@ from django_rls_tenants.tenants.admin import (
 )
 from django_rls_tenants.tenants.context import admin_context, tenant_context
 from django_rls_tenants.tenants.errors import HINT_USER_NO_TENANT
-from tests.test_app.models import AdminUser, Order, OrderItem
+from tests.test_app.models import AdminUser, Membership, Order, OrderItem
 
 # ---------------------------------------------------------------------------
 # Unit-test helpers
@@ -875,3 +876,312 @@ class TestMiddlewareNesting:
         body = client.get("/admin/test_app/order/").content.decode()
         assert "Widget A1" in body
         assert "Gadget B1" not in body
+
+
+# ---------------------------------------------------------------------------
+# A user who belongs to several tenants (MultiTenantUser, #47)
+# ---------------------------------------------------------------------------
+
+
+def _member(default: int | None = 3, tenants: Any = (4,)) -> SimpleNamespace:
+    """A ``MultiTenantUser`` stand-in: default ``default``, a member of ``tenants``."""
+    return SimpleNamespace(
+        pk=7,
+        is_authenticated=True,
+        is_tenant_admin=False,
+        rls_tenant_id=default,
+        rls_tenant_ids=frozenset(tenants),
+    )
+
+
+_AUTH = {"_auth_user_id": "7"}  # a session logged in as ``_member()``
+
+
+def _member_request(
+    user: Any,
+    *,
+    session: dict[str, Any] | None = None,
+    get: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+):
+    """A member's request: a session logged in as them, a same-origin navigation."""
+    request = RequestFactory().get(
+        "/admin/test_app/order/",
+        get or {},
+        headers={"Sec-Fetch-Site": "same-origin"} if headers is None else headers,
+    )
+    request.user = user
+    request.session = {**_AUTH} if session is None else session  # type: ignore[attr-defined]
+    return request
+
+
+class TestMemberUnit:
+    """The admin's decisions for a ``MultiTenantUser``: the site's selection, no "All"."""
+
+    def test_effective_tenant_is_the_default_without_selection(self):
+        assert _order_admin()._effective_tenant_id(_member_request(_member())) == 3
+
+    def test_effective_tenant_is_the_sites_selection(self):
+        request = _member_request(
+            _member(), session={**_AUTH, "rls_tenant": "4", "rls_admin_tenant": "9"}
+        )
+        assert _order_admin()._effective_tenant_id(request) == 4
+
+    def test_stale_selection_is_a_403_and_dropped(self):
+        request = _member_request(_member(), session={**_AUTH, "rls_tenant": "9"})
+        with pytest.raises(PermissionDenied):
+            _order_admin()._rls_context(request)
+        assert request.session == _AUTH
+
+    def test_member_without_default_or_selection_is_denied(self):
+        with pytest.raises(PermissionDenied, match="has no tenant assigned"):
+            _order_admin()._rls_context(_member_request(_member(None)))
+
+    @pytest.mark.parametrize(
+        ("user", "expected"),
+        [
+            (_member(3, [4]), True),
+            (_member(None, [4]), True),
+            (_member(3, [3]), False),
+            (_member(3, []), False),
+        ],
+        ids=["other-tenant", "no-default", "only-the-default", "no-membership"],
+    )
+    def test_switcher_offered_when_there_is_another_tenant(self, user, expected):
+        filters = _order_admin().get_list_filter(_member_request(user))
+        assert (TenantSwitchListFilter in filters) is expected
+
+    def test_switcher_needs_the_session_key(self):
+        settings = {"TENANT_MODEL": "test_app.Tenant", "TENANT_SESSION_KEY": None}
+        with override_settings(RLS_TENANTS=settings):
+            assert TenantSwitchListFilter not in _order_admin().get_list_filter(
+                _member_request(_member())
+            )
+
+    def test_switch_disabled(self):
+        admin_obj = _order_admin(rls_allow_tenant_switch=False)
+        assert TenantSwitchListFilter not in admin_obj.get_list_filter(_member_request(_member()))
+
+    def test_choice_is_stored_as_the_sites_selection(self):
+        request = _member_request(_member(), get={"rls_tenant": "4"})
+        _order_admin()._sync_tenant_selection(request)
+        assert request.session == {**_AUTH, "rls_tenant": "4"}
+
+    @pytest.mark.parametrize("value", ["9", "abc"])
+    def test_choice_of_another_tenant_is_a_403(self, value):
+        request = _member_request(
+            _member(), session={**_AUTH, "rls_tenant": "4"}, get={"rls_tenant": value}
+        )
+        with pytest.raises(PermissionDenied):
+            _order_admin()._sync_tenant_selection(request)
+        assert request.session == {**_AUTH, "rls_tenant": "4"}
+
+    @pytest.mark.parametrize("value", ["", _ALL_TENANTS])
+    def test_all_clears_back_to_the_default(self, value):
+        request = _member_request(
+            _member(), session={**_AUTH, "rls_tenant": "4"}, get={"rls_tenant": value}
+        )
+        _order_admin()._sync_tenant_selection(request)
+        assert request.session == _AUTH
+        assert _order_admin()._effective_tenant_id(request) == 3
+
+
+class TestMemberSwitchIsSameOrigin:
+    """A member's choice changes the site's selection, so a link from another site cannot."""
+
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            {"Sec-Fetch-Site": "same-origin"},
+            {"Sec-Fetch-Site": "none"},  # typed or bookmarked
+            {"Referer": "http://testserver/admin/test_app/order/"},
+        ],
+        ids=["same-origin", "typed", "same-host-referer"],
+    )
+    def test_choice_from_this_site_is_applied(self, headers):
+        request = _member_request(_member(), get={"rls_tenant": "4"}, headers=headers)
+        _order_admin()._sync_tenant_selection(request)
+        assert request.session == {**_AUTH, "rls_tenant": "4"}
+
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            {"Sec-Fetch-Site": "cross-site"},
+            {"Sec-Fetch-Site": "same-site"},
+            {"Sec-Fetch-Site": "cross-site", "Referer": "http://testserver/"},
+            {"Referer": "http://evil.example/"},
+            {"Referer": "https://testserver/"},
+            {},
+        ],
+        ids=["cross-site", "same-site", "fetch-site-wins", "other-host", "other-scheme", "none"],
+    )
+    @pytest.mark.parametrize("value", ["4", _ALL_TENANTS])
+    def test_choice_from_elsewhere_is_a_403(self, headers, value, caplog):
+        caplog.set_level(logging.WARNING, logger="django_rls_tenants.audit")
+        session = {**_AUTH, "rls_tenant": "3"}
+        request = _member_request(
+            _member(3, [4, 5]), session=session, get={"rls_tenant": value}, headers=headers
+        )
+
+        with pytest.raises(PermissionDenied, match="made on this site"):
+            _order_admin()._sync_tenant_selection(request)
+
+        assert request.session == {**_AUTH, "rls_tenant": "3"}
+        (record,) = [r for r in caplog.records if r.name == "django_rls_tenants.audit"]
+        assert (record.rls_reason, record.rls_via, record.rls_selected) == (
+            "cross_site_selection",
+            "query",
+            value,
+        )
+
+    def test_tenant_admin_switcher_is_unchanged(self, tenant_a):
+        request = _request(_admin_user(), get={"rls_tenant": str(tenant_a.pk)})
+        _order_admin()._sync_tenant_selection(request)  # no same-origin header needed
+        assert request.session == {"rls_admin_tenant": str(tenant_a.pk)}
+
+
+@pytest.mark.django_db
+class TestMemberSwitcherFilter:
+    def test_lookups_list_only_the_members_tenants(self, tenant_a, tenant_b):
+        other = type(tenant_a).objects.create(name="Tenant C")
+        user = _member(tenant_a.pk, [tenant_b.pk])
+        flt = TenantSwitchListFilter(_member_request(user), {}, Order, _order_admin())
+        assert dict(flt.lookup_choices) == {
+            str(tenant_a.pk): "Tenant A",
+            str(tenant_b.pk): "Tenant B",
+        }
+        assert str(other.pk) not in dict(flt.lookup_choices)
+
+    def test_value_is_the_selection_else_the_default(self, tenant_a, tenant_b):
+        user = _member(tenant_a.pk, [tenant_b.pk])
+        selected = _member_request(user, session={**_AUTH, "rls_tenant": str(tenant_b.pk)})
+        assert TenantSwitchListFilter(
+            _member_request(user), {}, Order, _order_admin()
+        ).value() == str(tenant_a.pk)
+        assert TenantSwitchListFilter(selected, {}, Order, _order_admin()).value() == str(
+            tenant_b.pk
+        )
+
+    def test_all_shows_the_default(self, tenant_a, tenant_b):
+        # ``?rls_tenant=__all__`` cleared the selection before the filter was
+        # built: the request runs in the default, which the dropdown shows.
+        user = _member(tenant_a.pk, [tenant_b.pk])
+        flt = TenantSwitchListFilter(
+            _member_request(user), _filter_params(rls_tenant="__all__"), Order, _order_admin()
+        )
+        assert flt.value() == str(tenant_a.pk)
+
+    def test_no_all_entry(self, tenant_a, tenant_b):
+        user = _member(tenant_a.pk, [tenant_b.pk])
+        flt = TenantSwitchListFilter(_member_request(user), {}, Order, _order_admin())
+
+        class _ChangeList:
+            def get_query_string(self, new_params=None, remove=None):
+                return "?" + "&".join(f"{k}={v}" for k, v in (new_params or {}).items())
+
+        choices = list(flt.choices(_ChangeList()))
+        assert [choice["display"] for choice in choices] == ["Tenant A", "Tenant B"]
+        assert [choice["selected"] for choice in choices] == [True, False]
+
+
+_SAME_ORIGIN = {"Sec-Fetch-Site": "same-origin"}  # a click on the switcher
+
+
+@pytest.fixture
+def member_admin(db, tenant_a, tenant_b):
+    """Django superuser, RLS-scoped to tenant A by default, also a member of tenant B."""
+    user = AdminUser.objects.create_superuser(
+        username="member",
+        password="pw",  # noqa: S106
+        rls_admin=False,
+        tenant=tenant_a,
+    )
+    Membership.objects.create(user=user, tenant=tenant_b)
+    return user
+
+
+@pytest.mark.integration
+@pytest.mark.django_db
+class TestMemberAdmin:
+    """The live admin for a user who belongs to tenants A (default) and B."""
+
+    def test_default_tenant_and_switcher(
+        self, enforce_rls, client, member_admin, sample_orders, tenant_a, tenant_b
+    ):
+        other = type(tenant_a).objects.create(name="Tenant C")
+        client.force_login(member_admin)
+
+        body = client.get("/admin/test_app/order/").content.decode()
+
+        assert "Widget A1" in body
+        assert "Gadget B1" not in body
+        assert f"rls_tenant={tenant_b.pk}" in body
+        assert f"rls_tenant={other.pk}" not in body
+        assert f"rls_tenant={_ALL_TENANTS}" not in body
+
+    def test_switching_persists_and_assigns(
+        self, enforce_rls, client, member_admin, sample_orders, tenant_b
+    ):
+        client.force_login(member_admin)
+
+        switched = client.get(
+            "/admin/test_app/order/", {"rls_tenant": str(tenant_b.pk)}, headers=_SAME_ORIGIN
+        )
+        later = client.get("/admin/test_app/order/").content.decode()
+        added = client.post(
+            "/admin/test_app/order/add/",
+            {"product": "Switched B", "amount": "2.00", "_save": "Save"},
+        )
+
+        assert "Gadget B1" in switched.content.decode()
+        assert "Widget A1" not in switched.content.decode()
+        assert "Gadget B1" in later
+        assert added.status_code == 302
+        with admin_context():
+            assert Order.objects.get(product="Switched B").tenant_id == tenant_b.pk
+
+    def test_switching_to_a_tenant_of_another_is_a_403(
+        self, enforce_rls, client, member_admin, sample_orders, tenant_a
+    ):
+        other = type(tenant_a).objects.create(name="Tenant C")
+        client.force_login(member_admin)
+
+        response = client.get(
+            "/admin/test_app/order/", {"rls_tenant": str(other.pk)}, headers=_SAME_ORIGIN
+        )
+
+        assert response.status_code == 403
+
+    @override_settings(MIDDLEWARE=_MIDDLEWARE_WITH_RLS)
+    def test_the_selection_is_the_sites(
+        self, enforce_rls, client, member_admin, sample_orders, tenant_b
+    ):
+        """Picked in the admin, it is the middleware's tenant too (autocomplete included)."""
+        client.force_login(member_admin)
+        client.get(
+            "/admin/test_app/order/", {"rls_tenant": str(tenant_b.pk)}, headers=_SAME_ORIGIN
+        )
+
+        orders = client.get("/rls/orders/").json()
+        autocomplete = client.get("/admin/autocomplete/", _AUTOCOMPLETE_ORDER).json()
+
+        assert orders["database_products"] == ["Gadget B1"]
+        assert {row["id"] for row in autocomplete["results"]} == {str(sample_orders["b1"].pk)}
+
+    @override_settings(MIDDLEWARE=_MIDDLEWARE_WITH_RLS)
+    def test_a_link_from_another_site_cannot_switch(
+        self, enforce_rls, client, member_admin, sample_orders, tenant_b
+    ):
+        client.force_login(member_admin)
+
+        response = client.get(
+            "/admin/test_app/order/",
+            {"rls_tenant": str(tenant_b.pk)},
+            headers={"Sec-Fetch-Site": "cross-site"},
+        )
+
+        assert response.status_code == 403
+        assert client.get("/rls/orders/").json()["database_products"] == [
+            "Widget A1",
+            "Widget A2",
+        ]

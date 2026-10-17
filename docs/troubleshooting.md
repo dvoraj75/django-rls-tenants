@@ -96,7 +96,7 @@ keep it on the request's thread with `thread_sensitive=True` (the default for
 | Hint starts with | Cause | Fix |
 |---|---|---|
 | `Establish an RLS context before the query` | `STRICT_MODE=True` and a query ran with no context | Wrap the code in `tenant_context()` / `admin_context()`, use `.for_user()`, or run it under the middleware. If the model is meant to be read without a context (an auth backend under `bypass_flag()`), list it in [`STRICT_MODE_EXCLUDE`](getting-started/configuration.md#strict_mode_exclude), as the hint says |
-| `Assign the user to a tenant (set rls_tenant_id)` | A non-admin `TenantUser` has `rls_tenant_id=None`: a `createsuperuser` account, a user not yet attached to a tenant | Give the user a tenant, or set `is_tenant_admin=True` |
+| `Assign the user to a tenant (set rls_tenant_id)` | A non-admin `TenantUser` has `rls_tenant_id=None`: a `createsuperuser` account, a user not yet attached to a tenant | Give the user a tenant, or set `is_tenant_admin=True`. In a request, a user who belongs to several tenants (`MultiTenantUser`) may instead select one: see [Users in Several Tenants](guides/multi-tenant-users.md) |
 | `Pass a concrete tenant primary key` | `tenant_context(None)` was called | Pass a real tenant PK, or use `admin_context()` for cross-tenant access |
 
 For the first hint, the full text continues: `If Order is meant to be read without a
@@ -409,6 +409,22 @@ python manage.py shell -c \
 
 **See:** [Admin: Fail-closed](guides/admin.md#fail-closed),
 [example project README](https://github.com/dvoraj75/django-rls-tenants/tree/main/example).
+
+### A request answers 403 "The selected tenant is not one you can access."
+
+**Symptom:** A user who belongs to several tenants gets a 403 (under DRF a JSON `detail`)
+from a page or an API call that used to work.
+
+**Cause:** The request selected a tenant that is not `rls_tenant_id` or one of the user's
+`rls_tenant_ids`: the `X-Tenant` header (`RLS_TENANTS["TENANT_HEADER"]`) named a tenant the
+user may not select, a malformed or empty value, or a tenant that does not exist; or the
+session selection from `switch_tenant()` is stale because a membership was revoked. The
+message is the same for all of them on purpose. The `context.denied` audit record with the
+reason `tenant_not_selectable` holds the value (`rls_selected`) and its source (`rls_via`).
+
+**Fix:** Send a tenant from `rls_tenant_ids`, or none. A stale session selection is removed
+when it is refused, so the user's next request runs in `rls_tenant_id`. If the tenant should
+be selectable, check what `rls_tenant_ids` returns for the user. See [Users in Several Tenants](guides/multi-tenant-users.md).
 
 ### `RemovedInDjango2028Warning: Calling select_related() with no arguments is deprecated`
 

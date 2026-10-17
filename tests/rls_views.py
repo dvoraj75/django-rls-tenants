@@ -22,6 +22,7 @@ from django.http import (
 from django_rls_tenants.rls.guc import aget_guc, get_guc, set_guc
 from django_rls_tenants.tenants.context import async_admin_context, async_tenant_context
 from django_rls_tenants.tenants.middleware import RLSTenantMiddleware
+from django_rls_tenants.tenants.selection import clear_tenant_selection, switch_tenant
 from django_rls_tenants.tenants.state import get_current_tenant_id, get_rls_context_active
 from tests.test_app.models import Order, Tenant
 
@@ -118,6 +119,32 @@ async def async_stream_view(request: HttpRequest) -> StreamingHttpResponse:
             yield f"{await Order.objects.acount()}\n"
 
     return StreamingHttpResponse(body())
+
+
+def select_tenant_view(request: HttpRequest) -> JsonResponse:
+    """``POST tenant=<pk>`` selects that tenant for the session; an empty ``tenant`` clears it.
+
+    Answers with the context the request itself ran in, which the selection does not change.
+    """
+    selected = request.POST.get("tenant", "")
+    if selected:
+        switch_tenant(request, selected)
+    else:
+        clear_tenant_selection(request)
+    return JsonResponse(
+        {
+            "selection": request.session.get("rls_tenant"),
+            "tenant_id": get_current_tenant_id(),
+            "tenant_guc": get_guc("rls.current_tenant"),
+        }
+    )
+
+
+def task_headers_view(request: HttpRequest) -> JsonResponse:
+    """Return the RLS headers a Celery task enqueued by this request would carry."""
+    from django_rls_tenants.contrib.celery import _capture  # noqa: PLC0415  -- optional extra
+
+    return JsonResponse(_capture())
 
 
 def boom_view(request: HttpRequest) -> JsonResponse:

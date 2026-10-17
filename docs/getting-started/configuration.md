@@ -18,6 +18,8 @@ RLS_TENANTS = {
     "USE_LOCAL_SET": False,
     "UNIQUE_ACROSS_TENANTS": {},
     "EXTERNAL_MODELS": {},
+    "TENANT_HEADER": "X-Tenant",
+    "TENANT_SESSION_KEY": "rls_tenant",
 }
 ```
 
@@ -431,6 +433,49 @@ proxy is ignored. A value that is not a dict of strings raises `RLSConfiguration
 the setting is read. An entry that does not resolve to an installed, non-proxy model that is
 not swapped out, names a model that already has an `RLSConstraint`, or names a field that is
 not a foreign key to `TENANT_MODEL`, is reported as `W016`.
+
+### `TENANT_HEADER`
+
+| | |
+|---|---|
+| **Type** | `str` or `None` |
+| **Default** | `"X-Tenant"` |
+| **Example** | `"X-Organization"` |
+
+*Added in 1.6.0.* The request header with which a user who belongs to several tenants (a
+[`MultiTenantUser`](../guides/multi-tenant-users.md)) selects the tenant a request runs
+in. `RLSTenantMiddleware`, `RLSTenantAPIViewMixin` and `RLSTenantModelAdmin` read it for a
+non-admin `MultiTenantUser`; it wins over the session selection, and a value that is not
+one of the user's tenants is a 403. Tenant admins and plain `TenantUser`s are not
+affected. `None` turns header selection off. Header names are case-insensitive. The
+response to such a user's request carries the header in `Vary`, so a cache does not serve
+one tenant's page for another's.
+
+### `TENANT_SESSION_KEY`
+
+| | |
+|---|---|
+| **Type** | `str` or `None` |
+| **Default** | `"rls_tenant"` |
+| **Example** | `"current_tenant"` |
+
+*Added in 1.6.0.* The session key under which `switch_tenant()` stores a
+`MultiTenantUser`'s tenant selection and from which the next requests read it. `None`
+turns session selection off: `switch_tenant()` and `clear_tenant_selection()` then raise
+`RLSConfigurationError`, and `RLSTenantModelAdmin` offers such users no tenant switcher.
+
+```python
+RLS_TENANTS = {
+    "TENANT_MODEL": "myapp.Tenant",
+    "TENANT_HEADER": "X-Organization",
+    "TENANT_SESSION_KEY": None,        # API clients only: no session selection
+}
+```
+
+Each setting must be a non-empty string or `None`, and `TENANT_HEADER` a header name as
+clients send it (letters, digits and hyphens: `"X_Tenant"` would never match, since Django
+reads `HTTP_X_TENANT` as `X-Tenant`), else `RLSConfigurationError` is raised when it is
+read. See [Users in Several Tenants](../guides/multi-tenant-users.md).
 
 ## System Checks
 

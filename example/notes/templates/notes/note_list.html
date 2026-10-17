@@ -1,10 +1,12 @@
 {% extends "notes/base.html" %}
 {% block content %}
     <div style="display:flex;gap:1rem;margin-bottom:1.5rem">
-        {% if user.tenant %}
+        {% if current_tenant %}
             <a href="{% url 'note_create' %}" class="btn">+ New Note</a>
         {% endif %}
-        <a href="{% url 'note_stats' %}" class="btn" style="background:#1565c0">Stats</a>
+        {% if current_tenant or user.is_tenant_admin %}
+            <a href="{% url 'note_stats' %}" class="btn" style="background:#1565c0">Stats</a>
+        {% endif %}
     </div>
     {% for note in notes %}
         <div class="note">

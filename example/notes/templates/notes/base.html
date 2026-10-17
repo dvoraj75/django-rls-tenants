@@ -22,8 +22,21 @@
         <div>
             {% if user.is_authenticated %}
                 <span class="tenant-badge">
-                    {% if user.tenant %}{{ user.tenant.name }}{% else %}Admin{% endif %}
+                    {% if current_tenant %}{{ current_tenant.name }}{% elif user.is_tenant_admin %}Admin{% else %}No tenant selected{% endif %}
                 </span>
+                {% if selectable_tenants %}
+                    {# A user in several tenants (MultiTenantUser): switch_tenant() in notes/views.py. #}
+                    <form method="post" action="{% url 'select_tenant' %}" style="display:inline">
+                        {% csrf_token %}
+                        <select name="tenant" onchange="this.form.submit()" style="width:auto;margin:0" aria-label="Tenant">
+                            {% if not current_tenant %}<option value="" selected disabled>Select a tenant</option>{% endif %}
+                            {% for tenant in selectable_tenants %}
+                                <option value="{{ tenant.pk }}"{% if tenant == current_tenant %} selected{% endif %}>{{ tenant.name }}</option>
+                            {% endfor %}
+                        </select>
+                        <noscript><button type="submit" class="btn">Switch</button></noscript>
+                    </form>
+                {% endif %}
                 {{ user.email }}
                 {% if user.is_staff %}
                     <a href="{% url 'admin:index' %}" class="btn" style="background:#1565c0">Admin</a>

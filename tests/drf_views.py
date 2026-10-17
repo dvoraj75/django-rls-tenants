@@ -25,14 +25,10 @@ from django_rls_tenants.contrib.drf import (
 from django_rls_tenants.rls.guc import get_guc
 from django_rls_tenants.tenants.context import tenant_context
 from django_rls_tenants.tenants.state import get_current_tenant_id, get_rls_context_active
-from tests.test_app.models import Invoice, Order, OrderItem
+from tests.test_app.models import Invoice, Membership, Order, OrderItem
 
 _AUTHENTICATION = (TokenAuthentication, SessionAuthentication)
 _PERMISSIONS = (IsAuthenticated, RLSTenantPermission)
-
-# The tenants each username may select in ``MemberHeaderStateView``, standing in
-# for a membership table; the tests fill it.
-TENANT_MEMBERSHIPS: dict[str, set[int]] = {}
 
 
 def database_products() -> list[str]:
@@ -104,6 +100,16 @@ class StateView(RLSTenantAPIViewMixin, APIView):
         return Response(request_state())
 
 
+class ProtectedStateView(StateView):
+    """``StateView`` behind ``RLSTenantPermission``, with the default ``get_rls_context()``.
+
+    A ``MultiTenantUser`` (the test ``AdminUser``) selects a tenant with the library's
+    ``X-Tenant`` header and session selection (#47).
+    """
+
+    permission_classes = _PERMISSIONS
+
+
 class LazyProductsView(RLSTenantAPIViewMixin, APIView):
     """Return an unevaluated queryset: DRF's encoder evaluates it while rendering."""
 
@@ -167,7 +173,7 @@ class MemberHeaderMixin(RLSTenantAPIViewMixin):
         if selected is None or not request.user.is_authenticated:
             return super().get_rls_context(request)
         tenant_id = int(selected)
-        if tenant_id not in TENANT_MEMBERSHIPS.get(request.user.username, set()):
+        if not Membership.objects.filter(user=request.user, tenant_id=tenant_id).exists():
             msg = "You are not a member of the selected tenant."
             raise PermissionDenied(msg)
         return tenant_context(tenant_id)

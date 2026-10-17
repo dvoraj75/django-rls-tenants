@@ -24,7 +24,9 @@ That's the whole integration. Subclass `RLSTenantModelAdmin` instead of
 - **Changelists** show only the current tenant's rows.
 - **The tenant FK** is hidden on the add/change form and filled in on save.
 - **Related dropdowns** (and inline forms) list only the current tenant's rows.
-- **Cross-tenant admins** get a tenant switcher in the changelist filters.
+- **Cross-tenant admins** get a tenant switcher in the changelist filters, and so do
+  [users who belong to several tenants](#users-in-several-tenants), limited to their
+  own tenants.
 - **A user with no tenant** is denied (`PermissionDenied`) instead of seeing
   everything.
 
@@ -80,9 +82,11 @@ duplicate the filter the manager already applies.
 | User                                    | Effective tenant            | Context           |
 |-----------------------------------------|-----------------------------|-------------------|
 | Scoped user (`is_tenant_admin=False`)   | their `rls_tenant_id`       | `tenant_context`  |
+| `MultiTenantUser`, a tenant selected    | the selection (header, then the session) | `tenant_context` |
+| `MultiTenantUser`, none selected        | their `rls_tenant_id`       | `tenant_context`  |
 | Cross-tenant admin, a tenant selected   | the switcher selection      | `tenant_context`  |
 | Cross-tenant admin, no selection        | — (all tenants)             | `admin_context`   |
-| Scoped user with `rls_tenant_id=None`   | — (denied)                  | `PermissionDenied`|
+| Scoped user with `rls_tenant_id=None`   | — (denied; also a `MultiTenantUser` with no selection) | `PermissionDenied`|
 
 ## Hiding the tenant FK
 
@@ -125,6 +129,40 @@ Because the selection is session-backed, an admin can pick *Acme*, then add a
 handful of records that are all assigned to *Acme* without re-selecting it on
 every page.
 
+## Users in several tenants
+
+*1.6.0+.* A user who implements the
+[`MultiTenantUser`](multi-tenant-users.md) protocol (`rls_tenant_ids`) and is not a tenant
+admin works in the tenant their request **selects**: the `RLS_TENANTS["TENANT_HEADER"]`
+header, else the site's session selection (`RLS_TENANTS["TENANT_SESSION_KEY"]`), else their
+`rls_tenant_id`. A selection that is not one of their tenants is a 403, and a stale session
+selection (a membership revoked since) is dropped, so the next request runs in
+`rls_tenant_id`. A member with neither a selection nor a default gets the `PermissionDenied`
+described under [Fail-closed](#fail-closed).
+
+They get the **tenant switcher** too, when `rls_allow_tenant_switch` is `True`,
+`TENANT_SESSION_KEY` is not `None`, and they may select a tenant **other than** their
+`rls_tenant_id` (a member with no default and one membership gets it; a user whose only
+tenant is the default does not). It differs from a tenant admin's:
+
+- It lists only the tenants the user may select, and has no "All" entry.
+- Picking a tenant does what `switch_tenant()` does and writes **the site's selection**,
+  under `TENANT_SESSION_KEY`, not `rls_session_key`. The whole site follows it:
+  `RLSTenantMiddleware`, the autocomplete views and the next admin pages.
+- A tenant that is not theirs, put in the query parameter by hand, is a 403 and leaves the
+  selection as it was.
+- Because the choice steers the whole site and the switcher is a plain link (a `GET`, which
+  Django's CSRF protection does not cover), it is applied only to a navigation from this
+  site: the browser's `Sec-Fetch-Site` must be `same-origin` (a click on the switcher) or
+  `none` (a typed or bookmarked address), or, from a browser that does not send it, the
+  `Referer` must have this request's scheme and host. A link on another site is a 403
+  (`cross_site_selection` in the audit log) and leaves the selection as it was. A tenant
+  admin's switcher, which scopes only the admin, is not restricted this way.
+- `?rls_tenant=__all__`, or an empty value, clears the selection: back to `rls_tenant_id`.
+
+`rls_session_key` holds only a tenant admin's switcher selection. See
+[Users in Several Tenants](multi-tenant-users.md) for the rest.
+
 ## Configuration
 
 All behaviour is controlled with class attributes — there are **no** new
@@ -132,8 +170,8 @@ All behaviour is controlled with class attributes — there are **no** new
 
 | Attribute                  | Default             | Purpose |
 |----------------------------|---------------------|---------|
-| `rls_allow_tenant_switch`  | `True`              | Give cross-tenant admins the switcher. Set `False` to pin them to `admin_context()` (all tenants, no switcher). |
-| `rls_session_key`          | `"rls_admin_tenant"`| Session key the switcher selection is stored under. |
+| `rls_allow_tenant_switch`  | `True`              | Give cross-tenant admins, and users who belong to several tenants, the switcher. Set `False` to pin admins to `admin_context()` (all tenants, no switcher); such users then work in the tenant their request selects elsewhere. |
+| `rls_session_key`          | `"rls_admin_tenant"`| Session key a cross-tenant admin's switcher selection is stored under. A user who belongs to several tenants stores theirs under `RLS_TENANTS["TENANT_SESSION_KEY"]`. |
 | `rls_tenant_query_param`   | `"rls_tenant"`      | Query parameter the switcher uses (e.g. `?rls_tenant=42`). |
 | `rls_deny_without_tenant`  | `True`              | Raise `PermissionDenied` for a non-admin user with no tenant. Set `False` to fall through with no context (fail-closed: RLS returns nothing). |
 
@@ -146,7 +184,8 @@ class InvoiceAdmin(RLSTenantModelAdmin):
 
 ## Fail-closed
 
-A non-admin user whose `rls_tenant_id` is `None` has no tenant to scope to.
+A non-admin user whose `rls_tenant_id` is `None` has no tenant to scope to (nor has a
+`MultiTenantUser` with no default who selected none).
 Rather than silently granting `admin_context()` (which would expose every
 tenant), the mixin raises `PermissionDenied` — carrying the same actionable hint
 the rest of the library uses — so the misconfiguration surfaces as a clean 403:
@@ -164,7 +203,10 @@ the queries simply return nothing.
 `context.denied` [audit record](audit-logging.md) (`user_without_tenant`, source `admin`),
 and each wrapped admin view logs a `context.entered` / `context.exited` pair with the
 user's primary key. A form whose dropdown rejects another tenant's row as an invalid choice
-(a hand-edited request) logs `fk.cross_tenant_rejected` with source `admin`.
+(a hand-edited request) logs `fk.cross_tenant_rejected` with source `admin`. For a user who
+belongs to several tenants, a refused selection is a `context.denied` record with the reason
+`tenant_not_selectable` (`cross_site_selection` for a choice from another site), and a
+switcher choice is a `tenant.switched` record, all with source `admin`.
 
 ## Notes
 

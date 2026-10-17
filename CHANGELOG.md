@@ -9,6 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Users in several tenants: `MultiTenantUser`, a request header and a session selection**
+  (#47). `TenantUser` gives a user one tenant. A user model that also has
+  `rls_tenant_ids` (a `Collection` of the tenant primary keys the user may select; use
+  `functools.cached_property`, it can be read several times per request) satisfies the new
+  runtime-checkable protocol `MultiTenantUser`, and `rls_tenant_id` becomes the default
+  tenant, used when a request selects none (it may be `None`, and it is always selectable).
+  `RLSTenantMiddleware` (WSGI, native ASGI path, subclasses with their own hooks, with and
+  without `USE_LOCAL_SET`), `RLSTenantAPIViewMixin` and `RLSTenantModelAdmin` run the
+  request of a non-admin `MultiTenantUser` in the tenant it selects: the request header
+  `RLS_TENANTS["TENANT_HEADER"]` (default `"X-Tenant"`), else the session selection stored
+  under `RLS_TENANTS["TENANT_SESSION_KEY"]` (default `"rls_tenant"`), else `rls_tenant_id`.
+  Either setting is a non-empty string, or `None` to turn that source off, else
+  `RLSConfigurationError`. The values are compared with the tenant model's primary key
+  type (`"2"` matches `2`, a UUID string matches a `UUID`). A selection that is not
+  `rls_tenant_id` or one of `rls_tenant_ids` (not theirs, unknown, malformed, empty) raises
+  `PermissionDenied`, a 403 with the same message for every case ("The selected tenant is
+  not one you can access.", under DRF a JSON `detail`), never a fallback to another tenant;
+  a stale session selection is also removed, so the next request runs in `rls_tenant_id`,
+  and an invalid header leaves the session alone. The middleware resolves the tenant before
+  it sets anything, and a member with neither a selection nor a default gets no context
+  (fail-closed, like an anonymous request; not a 403, so a tenant-picker page can render).
+  Tenant admins still get `admin_context()` and ignore the header. New
+  `switch_tenant(request, tenant_id)` validates the choice against `request.user`, stores
+  it in the session and returns the tenant primary key; it takes effect from the next
+  request, so call it from a `POST` view and redirect, and `logout()` ends it. New
+  `clear_tenant_selection(request)` removes it. Both raise `RLSConfigurationError` when
+  `TENANT_SESSION_KEY` is `None` or the request has no session, and `switch_tenant()`
+  raises `PermissionDenied` for an anonymous user, a tenant admin, a user that is not a
+  `MultiTenantUser` or a tenant that is not selectable. `MultiTenantUser`, `switch_tenant`
+  and `clear_tenant_selection` are exported from `django_rls_tenants` and
+  `django_rls_tenants.tenants`. `RLSTenantModelAdmin` offers such a user the tenant switcher
+  (when `rls_allow_tenant_switch` is on, `TENANT_SESSION_KEY` is set and they may select a
+  tenant other than their `rls_tenant_id`), listing only their tenants with no "All" entry;
+  a choice writes the site's selection, a tenant that is not theirs is a 403, and
+  `?rls_tenant=__all__` clears it; because the switcher is a `GET` link, a member's choice is
+  applied only to a navigation from this site (`Sec-Fetch-Site` `same-origin` or `none`, else a
+  `Referer` with this scheme and host), and a link on another site is a 403. The session
+  selection belongs to the user the session is logged in as: a request authenticated
+  otherwise (a DRF token sent with another user's cookie) neither uses nor drops it, and
+  `switch_tenant()` refuses such a user. The response of a `MultiTenantUser`'s request carries
+  `TENANT_HEADER` in `Vary` (middleware and DRF mixin), so a shared cache does not mix their
+  tenants. `TENANT_HEADER` must be a header name of letters, digits and hyphens. `for_user()`, `@with_rls_context` and management
+  commands still use `rls_tenant_id`; Celery carries the request's effective tenant. The
+  membership table `rls_tenant_ids` reads should be a plain (not RLS-protected) table, as
+  it is read before any context exists. The example project gains a consultant, `dave`
+  (Acme Corp, also a member of Globex Inc, through `accounts.Membership`), a tenant
+  switcher in the page header and an `X-Tenant` header on the notes API. See
+  [Users in Several Tenants](https://dvoraj75.github.io/django-rls-tenants/guides/multi-tenant-users/).
+- **Audit records for tenant selection** (#47). New `INFO` event `tenant.switched`, from
+  `switch_tenant()` / `clear_tenant_selection()` (source `selection`) and from the admin's
+  tenant switcher (source `admin`), with `rls_tenant_id` (the new selection, `None` when
+  cleared), `rls_admin=False`, `rls_user_id` and `rls_previous` (the session's previous
+  selection, `None` if none). A refused selection is a `context.denied` record with the new
+  reason `tenant_not_selectable`, from `middleware`, `drf`, `admin` or `selection`, and the
+  new fields `rls_selected` (the raw value sent, cut to 64 characters) and `rls_via`
+  (`header`, `session`, `query` or `switch`); a member's admin-switcher choice from another
+  site is `context.denied` with the reason `cross_site_selection`. See
+  [Audit Logging](https://dvoraj75.github.io/django-rls-tenants/guides/audit-logging/).
+
 - **`AddRLSPolicy` and `RLS_TENANTS["EXTERNAL_MODELS"]`: RLS for tables you do not own**
   (#112). A model of a third-party app cannot inherit `RLSProtectedModel` or carry an
   `RLSConstraint`. `AddRLSPolicy("Book", app_label="library")` in a migration of your own
@@ -140,6 +199,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The default DRF context, `RLSTenantPermission` and the "no tenant" hint know users in
+  several tenants** (#47). For a non-admin `MultiTenantUser`, the default
+  `RLSTenantAPIViewMixin.get_rls_context()` now enters the tenant the request selects
+  (header, then session, then `rls_tenant_id`; see Added), so the membership-checking
+  override that the DRF guide showed is no longer needed for a user with `rls_tenant_ids`
+  (an override remains the place for a custom rule, such as a URL segment; it is still the
+  authorization point). `RLSTenantPermission.has_permission()` also passes such a user in a
+  tenant context of any tenant they may select, even one the mixin did not enter (the
+  middleware's, for a session user); never the admin bypass. A plain `TenantUser` is
+  unchanged. The `NoTenantContextError` hint for a non-admin user with `rls_tenant_id=None`
+  no longer says the user "must belong to exactly one tenant"; it now says that a request of
+  a `MultiTenantUser` may select one of `rls_tenant_ids` with the header or `switch_tenant()`.
 - **`select_related()` and the `prefetch_related()` tenant filter use each joined model's
   own tenant field** (#112). They filtered every joined RLS-protected model on
   `{TENANT_FK_FIELD}_id`. They now use the field of that model's `RLSConstraint(field=...)`

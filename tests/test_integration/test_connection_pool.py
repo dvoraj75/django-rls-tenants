@@ -16,7 +16,7 @@ from asgiref.sync import async_to_sync, sync_to_async
 from django.conf import settings as django_settings
 from django.core.signals import request_finished
 from django.db import DatabaseError, connections
-from django.http import HttpRequest
+from django.http import HttpRequest, HttpResponse
 from django.test import Client, override_settings
 
 from django_rls_tenants.contrib.celery import rls_task
@@ -444,11 +444,14 @@ class TestTransactionLocalMode:
         tenant_b,
     ):
         async def view(request):
-            return await sync_to_async(_pooled_state)()
+            # A real response: the middleware patches a member's ``Vary`` (#47).
+            response = HttpResponse()
+            response.state = await sync_to_async(_pooled_state)()
+            return response
 
         with _rls_on(pooled, use_local_set=True):
-            first = self._serve_async(web_user_a, view)
-            second = self._serve_async(web_user_b, view)
+            first = self._serve_async(web_user_a, view).state
+            second = self._serve_async(web_user_b, view).state
             after = _raw_state(pooled)
 
         assert first[0] == second[0] == after[0]
