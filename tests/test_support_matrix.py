@@ -326,6 +326,11 @@ def test_ci_driver_legs_install_and_verify_the_driver(job):
     assert re.search(r'^\s*assert driver == os\.environ\["DRIVER"\]', runs, re.MULTILINE), (
         f"{rel}: {job} must assert that the active driver is the leg's"
     )
+    # The asserted name must come from Django's own driver detection, or the
+    # assert compares the leg's name with itself.
+    assert re.search(
+        r'^\s*driver = "psycopg3" if is_psycopg3 else "psycopg2"', runs, re.MULTILINE
+    ), f"{rel}: {job} must derive the active driver from is_psycopg3"
 
 
 def test_ci_plain_role_leg():

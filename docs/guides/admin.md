@@ -156,7 +156,9 @@ tenant is the default does not). It differs from a tenant admin's:
   site: the browser's `Sec-Fetch-Site` must be `same-origin` (a click on the switcher) or
   `none` (a typed or bookmarked address), or, from a browser that does not send it, the
   `Referer` must have this request's scheme and host. A link on another site is a 403
-  (`cross_site_selection` in the audit log) and leaves the selection as it was. A tenant
+  (`cross_site_selection` in the audit log) and leaves the selection as it was. A link
+  opened from another application (a mail or chat client) is a typed address to the
+  browser (`none`) and is applied, to one of the user's own tenants only. A tenant
   admin's switcher, which scopes only the admin, is not restricted this way.
 - `?rls_tenant=__all__`, or an empty value, clears the selection: back to `rls_tenant_id`.
 

@@ -794,6 +794,12 @@ resolve, whose `fk` is not a `ForeignKey` to the model (or a proxy of it) or who
 builds the sharing policy from the same predicate and would fail with the same
 `ValueError`. Proxies are skipped; the concrete model is checked.
 
+The check also reports `The sharing policy of notes.Note cannot be created: the table name
+'...' is 55 characters long.` PostgreSQL cuts an identifier to 63 bytes, so from a table name
+of 55 bytes on, the sharing policy's name is cut to the tenant policy's, and the `CREATE
+POLICY` that is skipped when a policy of that name exists would never run. `migrate` refuses
+such a table with a `ValueError`; set a shorter `Meta.db_table`.
+
 **Fix:** Correct the predicate in the model's `Meta.constraints`, then `makemigrations`.
 
 **See:** [Sharing Rows Across Tenants](guides/protecting-models.md#sharing-rows-across-tenants).
@@ -818,6 +824,26 @@ makes the share rows visible to that tenant, silence the warning
 (`SILENCED_SYSTEM_CHECKS = ["django_rls_tenants.W018"]`): the check does not recognize it.
 
 **See:** [Sharing Rows Across Tenants](guides/protecting-models.md#the-share-model-must-be-readable-by-the-tenant-it-shares-with).
+
+### W019: a predicate's foreign key does not point at the tenant model
+
+*Added in 1.6.0.*
+
+**Symptom:** `(django_rls_tenants.W019) SharedWith(through='notes.NoteShare', fk='note',
+tenant_fk='note') on notes.Note compares notes.NoteShare.note with the current tenant, but it
+is a foreign key to notes.note, not to RLS_TENANTS['TENANT_MODEL'] (tenants.Tenant): rows
+would be shared with whichever tenant has the same key.`
+
+**Cause:** A `SharedWith`'s `tenant_fk`, or a `TenantField`'s `field`, names a foreign key to
+another model than the tenant model. The policy compares that column with the current
+tenant's key, so with sequential integer keys a row whose note, user or other id happens to
+equal a tenant's id is readable by that tenant. The library cannot tell the two apart at the
+database: only the check does. Skipped while `TENANT_MODEL` does not resolve (`W008`).
+
+**Fix:** Pass the foreign key to the tenant model (`tenant_fk="shared_with"`,
+`TenantField("partner")`) and run `makemigrations`.
+
+**See:** [Sharing Rows Across Tenants](guides/protecting-models.md#sharing-rows-across-tenants).
 
 ### W006 / W008 / W009: alias, tenant model or tenant field not found
 

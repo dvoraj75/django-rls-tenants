@@ -501,11 +501,12 @@ django-rls-tenants registers Django system checks that warn about common misconf
 | `W016` | Warning | An `EXTERNAL_MODELS` entry cannot be used: its label does not resolve to an installed model, it names a swapped-out model, a proxy, a model that already has an `RLSConstraint`, or a field that does not exist, is not a `ForeignKey` or does not point at `TENANT_MODEL`; or two labels name the same model. See [W016](../troubleshooting.md#w016-an-external_models-entry-cannot-be-used) and [`EXTERNAL_MODELS`](#external_models) |
 | `W017` | Warning | An `extra_predicates` item of an installed model's `RLSConstraint` cannot be built (a `SharedWith` whose `through` model does not resolve or whose foreign keys are wrong, a `TenantField` that names no foreign key); `migrate` would fail on it. See [W017](../troubleshooting.md#w017-an-extra-predicate-cannot-be-built) |
 | `W018` | Warning | A `SharedWith` predicate never matches: its `through` model has an `RLSConstraint` on another field than `tenant_fk` and no `TenantField(tenant_fk)` among its `extra_predicates`, so the tenant a row is shared with cannot read the share. See [W018](../troubleshooting.md#w018-a-sharedwith-predicate-never-matches) |
+| `W019` | Warning | A `SharedWith` predicate's `tenant_fk`, or a `TenantField`'s `field`, is a foreign key to another model than `TENANT_MODEL`: the sharing policy would compare that model's keys with the current tenant's, so rows would be shared with whichever tenant has the same key. Skipped while `TENANT_MODEL` does not resolve (`W008`). See [W019](../troubleshooting.md#w019-a-predicates-foreign-key-does-not-point-at-the-tenant-model) |
 | `E001` | Error | The connection role of a `DATABASES` alias is a superuser or has `BYPASSRLS` and `settings.DEBUG` is `False` (a production deployment). Replaces `W005`; fails `manage.py check` and every command that runs the system checks, such as `migrate` |
 
 Run `python manage.py check` to see any warnings and errors.
 
-`W005`, `W011`, `W012`, `W013`, `W014`, `W015`, `W016`, `W017` and `W018` stay warnings. `E001` is an error, so it also aborts `migrate`,
+`W005`, `W011`, `W012`, `W013`, `W014`, `W015`, `W016`, `W017`, `W018` and `W019` stay warnings. `E001` is an error, so it also aborts `migrate`,
 `createsuperuser`, `check_rls`, `setup_m2m_rls` and Django's test runner (which sets
 `DEBUG = False` before it runs the checks). If a settings module has to connect as such a
 role on purpose (a migration job, a superuser test database), record that decision there

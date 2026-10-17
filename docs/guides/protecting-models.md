@@ -554,8 +554,9 @@ that name, so applying the operation twice changes nothing.
 
 - **Dependencies.** The migration must list, in `dependencies`, the third-party migration
   that creates the model and its tenant foreign key. A model or field missing from the
-  migration state raises `ValueError` at migrate time, naming what to add. A proxy model
-  or a field that is not a `ForeignKey` raises `ValueError` too.
+  migration state raises `ValueError` at migrate time, naming what to add. A proxy model,
+  a field that is not a `ForeignKey`, or a foreign key to another model than
+  `TENANT_MODEL` raises `ValueError` too.
 - **Reversible.** Migrating backwards drops the policy and disables RLS on the table
   (`NO FORCE` and `DISABLE`).
 - **Database only.** `state_forwards()` changes nothing. `sqlmigrate` prints the SQL, and
@@ -715,11 +716,18 @@ EXISTS (SELECT 1 FROM "notes_noteshare" AS "rls_shared"
 `TenantField` becomes `"notes_note"."partner_id" = nullif((SELECT current_setting(...)), '')::int`.
 With no tenant context, the tenant value is `NULL`, so neither matches anything. The SQL
 text uses the constraint's `guc_tenant_var` and `tenant_pk_type`. Identifiers are double-quoted;
-a table or column name with a quote, a backslash, a dollar sign or a NUL is refused.
+a table or column name with a quote, a backslash, a dollar sign or a NUL is refused. So is a
+table name of 55 bytes or more: PostgreSQL cuts an identifier to 63 bytes, which would give
+the sharing policy the tenant policy's name, and it would never be created (`migrate` raises
+`ValueError`; system check `W017` reports it first).
 
 `RawPredicate` is SQL you own. It is used as written, in parentheses, and only text that
 would break out of the policy statement is refused: an empty string, `;`, `--`, `/*`, `$` and
-a NUL. It must compare with the tenant itself, through the GUC the policies read:
+a NUL. Write a `%` (a `LIKE` pattern) once, as in SQL: the library doubles it for Django's
+schema editor, which composes the policy DDL with its parameters. `SharedWith`'s `tenant_fk`
+and `TenantField`'s `field` must be foreign keys to the tenant model; system check `W019`
+reports one that points elsewhere, which would compare that model's keys with the tenant's.
+It must compare with the tenant itself, through the GUC the policies read:
 
 ```python
 RawPredicate("region = 'eu' AND partner_id = nullif(current_setting('rls.current_tenant', true), '')::int")

@@ -139,10 +139,15 @@ def _clear_finished_request_gucs() -> None:
         raise RuntimeError(msg)
 
 
-def _audit_safety_net_clear() -> None:
+def _audit_safety_net_clear(*, tenant_id: object, active: bool) -> None:
     """Log ``gucs.cleared``: the safety net ended a request context the middleware left set.
 
     ``WARNING``, because the middleware's own cleanup should have ended it.
+
+    Args:
+        tenant_id: The tenant the safety net found set (``get_current_tenant_id()``).
+        active: Whether a context was found active (``get_rls_context_active()``);
+            with no tenant, that is the admin context.
     """
     from django_rls_tenants.tenants import audit  # noqa: PLC0415
     from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
@@ -151,6 +156,8 @@ def _audit_safety_net_clear() -> None:
         audit.GUCS_CLEARED,
         source="safety_net",
         level=logging.WARNING,
+        tenant_id=tenant_id,
+        admin=(tenant_id is None) if active else None,
         databases=list(rls_tenants_config.DATABASES),
     )
 
@@ -263,17 +270,22 @@ class DjangoRlsTenantsConfig(AppConfig):
             try:
                 from django_rls_tenants.tenants.state import (  # noqa: PLC0415
                     _clear_context_gucs,
+                    get_current_tenant_id,
+                    get_rls_context_active,
                     set_current_tenant_id,
                     set_rls_context_active,
                 )
 
+                # Read before the clears: the audit record names the context found.
+                found_tenant_id = get_current_tenant_id()
+                found_active = get_rls_context_active()
                 set_current_tenant_id(None)
                 set_rls_context_active(False)
                 # Otherwise the affinity guard would apply the request's GUCs
                 # again before the next statement in this context.
                 _clear_context_gucs()
                 _clear_finished_request_gucs()
-                _audit_safety_net_clear()
+                _audit_safety_net_clear(tenant_id=found_tenant_id, active=found_active)
             except Exception:
                 logger.warning(
                     "Safety net: failed to clear RLS GUC variables on request_finished. "

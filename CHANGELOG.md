@@ -80,7 +80,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a database the router refuses for the model's app, for an unmanaged model, or (in either
   direction) while the model has an `RLSConstraint` of its own, whose policy has the same
   name, and raises `ValueError` at migrate time for a missing model, a proxy, a missing or
-  non-foreign key field, or a table name with a quote, a backslash or a dollar sign. Unset
+  non-foreign key field, a foreign key to another model than `TENANT_MODEL`, or a table
+  name with a quote, a backslash or a dollar sign. Unset
   `guc_tenant_var`, `guc_admin_var` and `tenant_pk_type` are read from `RLS_TENANTS` when
   the migration runs, not when it is written, so changing the settings later does not
   rewrite an applied policy. Listing the model as
@@ -135,11 +136,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`W017` and `W018`: system checks for `extra_predicates`** (#59). `W017` reports a
   predicate of an installed model's `RLSConstraint` that cannot be built (a `SharedWith`
   whose `through` model does not resolve or whose foreign keys are wrong, a `TenantField`
-  that names no foreign key): `migrate` would fail the same way. `W018` reports a
+  that names no foreign key), and a table name of 55 bytes or more, which PostgreSQL's
+  63-byte identifier limit would cut to the tenant policy's name (the sharing policy would
+  then never be created): `migrate` would fail the same way. `W018` reports a
   `SharedWith` that can never match, because its `through` model is RLS-protected on
   another field than `tenant_fk` and has no `TenantField(tenant_fk)` among its own
   `extra_predicates`. A `RawPredicate` that solves it is not recognized: silence the
-  warning then. See
+  warning then. `W019` reports a `SharedWith` whose `tenant_fk`, or a `TenantField` whose
+  `field`, is a foreign key to another model than `TENANT_MODEL`: the policy would compare
+  that model's keys with the current tenant's. See
   [W017](https://dvoraj75.github.io/django-rls-tenants/troubleshooting/#w017-an-extra-predicate-cannot-be-built)
   and
   [W018](https://dvoraj75.github.io/django-rls-tenants/troubleshooting/#w018-a-sharedwith-predicate-never-matches).
@@ -165,7 +170,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that lookup fails); and
   `gucs.cleared` (`WARNING`)
   when the `request_finished` safety net clears a context the middleware's cleanup left
-  set. `for_user()` scopes, which run per SQL statement, and the `admin_context()` blocks
+  set (`rls_tenant_id` and `rls_admin` name the context it found). `for_user()` scopes,
+  which run per SQL statement, and the `admin_context()` blocks
   the library enters for its own lookups are not logged. With no handler configured the
   `INFO` records are dropped and the `WARNING` ones reach Python's last-resort handler
   (`stderr`), like the library's other warnings. A record whose filter or handler raises is

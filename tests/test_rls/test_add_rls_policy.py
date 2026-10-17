@@ -239,6 +239,23 @@ class TestTenantField:
         with pytest.raises(ValueError, match=r"is a CharField, not a ForeignKey"):
             op.database_forwards("test_app", _editor(), state, state)
 
+    def test_foreign_key_to_another_model_is_refused(self, state):
+        """A policy on ``author_id`` would protect nothing and satisfy ``check_rls``."""
+        _with_model(
+            state,
+            "Post",
+            [("author", models.ForeignKey("test_app.TenantUser", on_delete=models.CASCADE))],
+        )
+        op = AddRLSPolicy("Post", field="author", app_label="ext")
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"ext\.Post\.author is a foreign key to test_app\.tenantuser, not to "
+                r"RLS_TENANTS\['TENANT_MODEL'\] \(test_app\.Tenant\)"
+            ),
+        ):
+            op.database_forwards("test_app", _editor(), state, state)
+
     def test_one_to_one_field_is_accepted(self, state):
         _with_model(
             state,

@@ -130,7 +130,7 @@ handler.
 | `context.denied` | `WARNING` | The library refuses to run without the right context (reasons below). |
 | `tenant.switched` | `INFO` | A user who belongs to several tenants changed the session's tenant selection with `switch_tenant()`, `clear_tenant_selection()` or the admin's tenant switcher (see [Users in Several Tenants](multi-tenant-users.md)). `rls_tenant_id` is the new selection, `None` when it was cleared, and `rls_admin` is `False`. `clear_tenant_selection()` logs nothing when there was no selection. |
 | `fk.cross_tenant_rejected` | `WARNING` | Validation rejects a foreign key whose target row exists but belongs to another tenant, or to none (see [Cross-tenant foreign keys](protecting-models.md#cross-tenant-foreign-keys)). That includes a target that validation already rejected as not found because RLS or the auto-scope filter hides it (a tenant user sending another tenant's id): Django's foreign key validation in `full_clean()`, a related-field dropdown of an `RLSTenantModelAdmin` form (`invalid_choice`, source `admin`), and a DRF `PrimaryKeyRelatedField` (`does_not_exist`). The library then reads the target's tenant once in `admin_context()` and leaves the error as it was. It does so only when the audit logger is enabled for `WARNING`, which it is when `LOGGING` does not configure it (the root logger's default level), and in a savepoint: if the lookup fails, the record is lost, never the error. A target that does not exist is an ordinary invalid value and is not logged. |
-| `gucs.cleared` | `WARNING` | The `request_finished` safety net found a request's context still set (the middleware's own cleanup did not run, or its clear failed) and ran its clear, which skips a connection that is already closed (see [Connection-Level State](../advanced/security.md#connection-level-state)). If the clear raises, a warning goes to the `django_rls_tenants` logger instead. |
+| `gucs.cleared` | `WARNING` | The `request_finished` safety net found a request's context still set (the middleware's own cleanup did not run, or its clear failed) and ran its clear, which skips a connection that is already closed (see [Connection-Level State](../advanced/security.md#connection-level-state)). `rls_tenant_id` and `rls_admin` describe the context it found (`None` for both when the signal fired where the request's values were not visible). If the clear raises, a warning goes to the `django_rls_tenants` logger instead. |
 
 `context.denied` reasons:
 
@@ -179,6 +179,16 @@ nothing.
   in is.
 - **Unauthenticated requests.** No context is set for them (fail-closed), and DRF answers
   an unauthenticated request 401 without a `context.denied` record.
+- **A user who belongs to several tenants with no selection and no default.** The
+  middleware sets no context for such a request and refuses nothing (a tenant-picker page
+  must be reachable; see [Users in Several
+  Tenants](multi-tenant-users.md#refusals-stale-selections-and-no-default)). The RLS
+  policies then return no tenant's rows. The admin and DRF refuse the request instead, and
+  log `user_without_tenant`.
+- **A connection opened on another thread during a request** (a `sync_to_async(...,
+  thread_sensitive=False)` hop). Its GUCs are cleared when it opens, which is not a leak:
+  the request's context is applied to that thread's statements by the GUC affinity guard,
+  and logged once, when it was entered.
 - **GUCs written outside the context managers**, by `set_guc()`, `rls_context()`,
   `bypass_flag()` / `set_bypass_flag()` or raw SQL. These are lower-level tools; review
   their use in code (see [Recommendations](../advanced/security.md#recommendations)).

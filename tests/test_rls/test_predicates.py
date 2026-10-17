@@ -138,6 +138,14 @@ class TestRawPredicate:
             "(is_public AND partner_id = 3)"
         )
 
+    def test_percent_is_doubled_for_the_schema_editor(self):
+        """Django composes DDL with its (empty) parameters: a lone ``%`` fails ``migrate``."""
+        sql = RawPredicate("title LIKE 'a%' AND title NOT LIKE '%z'").policy_sql(
+            SharedNote, tenant_value="NULL"
+        )
+        assert sql == "(title LIKE 'a%%' AND title NOT LIKE '%%z')"
+        assert sql % () == "(title LIKE 'a%' AND title NOT LIKE '%z')"
+
     def test_string_literals_are_allowed(self):
         predicate = RawPredicate("status = 'shared'")
         assert predicate.policy_sql(SharedNote, tenant_value="x") == "(status = 'shared')"

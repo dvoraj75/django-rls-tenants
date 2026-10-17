@@ -267,9 +267,12 @@ The predicates are not part of the tenant policy: they form a second permissive 
   readable: every column, and the foreign keys it holds. Relations of the row are not
   shared; each related table applies its own policy.
 - **`RawPredicate` is yours.** The library refuses only text that breaks out of the policy
-  statement (`;`, `--`, `/*`, `$`, NUL, empty). It does not check what the expression
-  means. One that does not depend on the current tenant opens its rows to every tenant, and
-  to sessions with no context. Review it like the policy it is part of.
+  statement (`;`, `--`, `/*`, `$`, NUL, empty) and doubles a `%` for the schema editor. It
+  does not check what the expression means. One that does not depend on the current tenant
+  opens its rows to every tenant, and to sessions with no context. Review it like the policy
+  it is part of. A `SharedWith` or `TenantField` whose foreign key points at another model
+  than the tenant model compares that model's keys with the tenant's; system check `W019`
+  reports it.
 - **The share model has a policy too.** It applies inside `SharedWith`'s subquery. A share
   model protected by the owner's tenant is invisible to the tenant it shares with, so the
   predicate matches nothing: it fails closed, not open. System check `W018` reports it.
@@ -436,7 +439,9 @@ library treats it as untrusted:
 - **The session selection is a state change.** Call `switch_tenant()` from a CSRF-protected
   `POST` view, never from a `GET`. The admin's tenant switcher, a `GET` link, applies a
   member's choice only to a navigation from this site (`Sec-Fetch-Site`, else `Referer`),
-  so a link on another site cannot change which tenant the user works in.
+  so a link on another site cannot change which tenant the user works in. A link opened
+  from another application counts as a typed address and is applied; it can only select
+  one of the user's own tenants.
 - **The session selection belongs to the session's user.** A request authenticated
   otherwise (a DRF token sent with another user's session cookie) neither uses nor drops
   it, and `switch_tenant()` refuses to store one for such a user.

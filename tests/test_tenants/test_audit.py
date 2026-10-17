@@ -796,9 +796,21 @@ class TestSafetyNet:
         request_finished.send(sender=self.__class__)
 
         cleared = [r for r in records() if r.rls_event == "gucs.cleared"]
-        assert [(r.levelno, r.rls_source, r.rls_databases) for r in cleared] == [
-            (logging.WARNING, "safety_net", ["default"]),
+        assert [
+            (r.levelno, r.rls_source, r.rls_databases, r.rls_tenant_id, r.rls_admin)
+            for r in cleared
+        ] == [
+            (logging.WARNING, "safety_net", ["default"], tenant_a_user.rls_tenant_id, False),
         ]
+
+    def test_clearing_an_admin_request_context_names_the_admin_context(self, records, admin_user):
+        mw = RLSTenantMiddleware(get_response=lambda request: MagicMock())
+        mw.process_request(_make_request(user=admin_user))
+
+        request_finished.send(sender=self.__class__)
+
+        [cleared] = [r for r in records() if r.rls_event == "gucs.cleared"]
+        assert (cleared.rls_tenant_id, cleared.rls_admin) == (None, True)
 
     def test_nothing_to_clear_logs_nothing(self, records):
         request_finished.send(sender=self.__class__)

@@ -268,7 +268,10 @@ class RawPredicate(Predicate):
     A predicate that does not depend on the current tenant (``is_public``)
     opens the rows it matches to every tenant, and to sessions with no tenant
     context too. Only text that would break out of the policy statement is
-    refused; the expression itself is not checked.
+    refused; the expression itself is not checked. Write a ``%`` (a ``LIKE``
+    pattern) as in SQL: the policy DDL goes through Django's schema editor,
+    which composes it with its (empty) parameters, so :meth:`policy_sql`
+    doubles each ``%`` for it.
 
     Args:
         sql: The SQL boolean expression.
@@ -301,8 +304,13 @@ class RawPredicate(Predicate):
         *,
         tenant_value: str,  # noqa: ARG002  -- the Predicate interface
     ) -> str:
-        """Return the expression in parentheses."""
-        return f"({self.sql})"
+        """Return the expression in parentheses, each ``%`` doubled for the schema editor.
+
+        Django's PostgreSQL schema editor composes every statement with its
+        parameters client-side (``%`` is a placeholder there, also with no
+        parameters), so a lone ``%`` would fail ``migrate``.
+        """
+        return f"({self.sql.replace('%', '%%')})"
 
 
 def _validated_predicates(predicates: Sequence[Any] | None) -> list[Predicate]:

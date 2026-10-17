@@ -772,9 +772,11 @@ it usually comes from. To log every statement of the application's role in stagi
 run `RECONNECT` on PgBouncer too, and `ALTER ROLE app RESET log_statement;` when you are
 done.
 
-With `USE_LOCAL_SET=False` (session pools, pgpool-II), a `gucs.cleared`
-[audit record](audit-logging.md) means a request's cleanup did not run and the
-`request_finished` safety net cleared its GUCs.
+A `gucs.cleared` [audit record](audit-logging.md) means a request's cleanup did not run and
+the `request_finished` safety net ended its context. With `USE_LOCAL_SET=False` (session
+pools, pgpool-II) the safety net cleared the GUCs on every configured alias; with
+`USE_LOCAL_SET=True` it wrote nothing and marked the sessions for the GUC affinity guard,
+which clears them before their next statement.
 
 ### 4. Rule Out Defaults
 
@@ -811,3 +813,7 @@ or `ALTER DATABASE ... SET` as `W011` (see
 - [ ] A maintenance session that needs the admin bypass connects to PostgreSQL directly, or
       sets it with `SET LOCAL rls.is_admin = 'true'` inside `BEGIN` ... `COMMIT`.
 - [ ] `python manage.py check` reports no `W004`, `W005`, `W010` or `W011`.
+- [ ] A test that asserts the database filters, not only the ORM: the `enforce_rls`
+      fixture or `assert_rls_enforced()` (see
+      [Enforcing RLS in Tests](testing.md#enforcing-rls-in-tests)), run in CI as the
+      role the application connects as.

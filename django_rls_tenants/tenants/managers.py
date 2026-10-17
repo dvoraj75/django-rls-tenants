@@ -388,11 +388,16 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         ``none()``, Django returns an operand itself instead: the flag then
         goes on a clone, never on the caller's queryset.
         """
-        if not getattr(other, "_rls_including_shared", False) or combined._rls_including_shared:
+        if not getattr(other, "_rls_including_shared", False) or getattr(
+            combined, "_rls_including_shared", False
+        ):
             return combined
         if combined is self:
             combined = self._chain()  # type: ignore[attr-defined]
-        combined._rls_including_shared = True  # noqa: SLF001  -- a TenantQuerySet of this class
+        if isinstance(combined, TenantQuerySet):
+            # A sliced left operand gives a plain QuerySet of the base manager
+            # (Django's own loss of the class), which has no shared rows to mark.
+            combined._rls_including_shared = True  # noqa: SLF001  -- a TenantQuerySet
         return combined
 
     def __and__(self, other: Any) -> TenantQuerySet:

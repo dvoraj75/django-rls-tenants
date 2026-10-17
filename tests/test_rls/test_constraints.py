@@ -7,7 +7,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 from django.db.migrations.writer import MigrationWriter
 
-from django_rls_tenants.rls.constraints import RLSConstraint, RLSM2MConstraint
+from django_rls_tenants.rls.constraints import (
+    RLSConstraint,
+    RLSM2MConstraint,
+    _build_sharing_policy_create_sql,
+    _sharing_policy_name_problem,
+)
 from django_rls_tenants.rls.predicates import RawPredicate, SharedWith, TenantField
 from tests.test_app.models import Order, SharedNote
 
@@ -696,6 +701,25 @@ class TestExtraPredicates:
             ");",
         ]
         assert "WHERE policyname = 'test_shared_note_tenant_sharing_policy'" in sql
+
+    @pytest.mark.parametrize("length", [55, 63])
+    def test_table_name_that_truncates_to_the_tenant_policys_name_is_refused(self, length):
+        """PostgreSQL cuts both names to ``<table>_tenant_``: no sharing policy is created."""
+        table = "t" * length
+        with pytest.raises(ValueError, match=rf"the table name '{table}' is {length} characters"):
+            _build_sharing_policy_create_sql(table=table, predicates=["true"])
+        assert _sharing_policy_name_problem(table) is not None
+
+    def test_table_name_of_54_bytes_keeps_both_policy_names_apart(self):
+        table = "t" * 54
+        assert _sharing_policy_name_problem(table) is None
+        assert f"'{table}_tenant_sharing_policy'" in _build_sharing_policy_create_sql(
+            table=table, predicates=["true"]
+        )
+
+    def test_table_name_length_is_counted_in_bytes(self):
+        assert _sharing_policy_name_problem("é" * 28) is not None  # 56 bytes
+        assert _sharing_policy_name_problem("é" * 27) is None  # 54 bytes
 
     def test_sharing_policy_reads_the_constraints_tenant_guc_and_type(self):
         constraint = _shared_note_constraint(guc_tenant_var="app.tenant", tenant_pk_type="uuid")

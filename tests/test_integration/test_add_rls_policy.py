@@ -227,6 +227,25 @@ class TestCheckRls:
             "migrate." in output
         )
 
+    def test_generate_writes_no_migration_for_a_listed_model(self, settings):
+        """``--generate`` covers M2M through tables only; an external table gets the hint."""
+        settings.RLS_TENANTS = {
+            **settings.RLS_TENANTS,
+            "EXTERNAL_MODELS": {
+                **settings.RLS_TENANTS["EXTERNAL_MODELS"],
+                "test_app.TenantUser": "tenant",
+            },
+        }
+        out, err = StringIO(), StringIO()
+        with pytest.raises(SystemExit):
+            call_command("check_rls", "--generate", "--dry-run", stdout=out, stderr=err)
+        assert "AddRLSPolicy(" not in out.getvalue()
+        assert "No migration to generate" in out.getvalue()
+        assert (
+            "Add AddRLSPolicy('TenantUser', app_label='test_app') to a migration of your own "
+            "app" in err.getvalue()
+        )
+
 
 class TestCheckRlsComparesWithTheSetting:
     """``check_rls`` compares the ``AddRLSPolicy`` operations on disk with EXTERNAL_MODELS."""

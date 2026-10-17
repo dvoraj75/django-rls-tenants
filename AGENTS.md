@@ -133,7 +133,8 @@ The library has two internal layers with a strict import boundary:
   (imports go inside the fixtures). Its twin in `tenants/testing.py` is
   `assert_rls_enforced()` / `aassert_rls_enforced()`.
 - **`django_rls_tenants/tenants/selection.py`** — tenant selection for a `MultiTenantUser`
-  (#47; `tenants/types.py` adds `rls_tenant_ids` to `TenantUser`). `_request_tenant_id(request,
+  (#47; `tenants/types.py` adds `MultiTenantUser`, a `TenantUser` with `rls_tenant_ids`;
+  `TenantUser` is unchanged). `_request_tenant_id(request,
   user, source=)` resolves a request's tenant: the `RLS_TENANTS["TENANT_HEADER"]` header, else
   the `TENANT_SESSION_KEY` session value, else `rls_tenant_id` (`None` for a member with
   neither); a selection outside `_selectable()` (`rls_tenant_ids` + the default, compared as
@@ -283,8 +284,9 @@ not `STRICT_MODE` is on. `W016` (#112, `_check_external_models()`) warns about a
 that already has an `RLSConstraint`, a missing or non-FK field, an FK not to `TENANT_MODEL` (skipped when that
 does not resolve: `W008`), or two labels for one model.
 
-`RLS_TENANTS["EXTERNAL_MODELS"]` (#112, `{"app.Model": "tenant_fk_name"}`, validated in
-`conf.py`) makes the runtime treat a model without an `RLSConstraint` as RLS-protected; its
+`RLS_TENANTS["EXTERNAL_MODELS"]` (#112, `{"app.Model": "tenant_fk_name"}`; `conf.py` checks
+the shape only, a dict of strings, and `W016` resolves the labels) makes the runtime treat a
+model without an `RLSConstraint` as RLS-protected; its
 policy comes from an `AddRLSPolicy` migration of the project (which shares
 `_build_policy_create_sql()` / `_build_policy_drop_sql()` in `rls/constraints.py` with
 `RLSConstraint`, so the SQL text is identical). It cannot be a runtime-injected `RLSConstraint`
@@ -326,7 +328,8 @@ the row or take it over with `UPDATE ... SET tenant_id`. Each predicate's `polic
 tenant_value=...)` builds from the model the policy is created on (`model._meta.apps` is the
 migration state's registry during `migrate`) and raises `ValueError`; identifiers are quoted
 and refused when they hold a quote, backslash, `$` or NUL (`_quoted()`); `RawPredicate`
-refuses empty text, `;`, `--`, `/*`, `$` and NUL, and is otherwise the developer's. `SharedWith`
+refuses empty text, `;`, `--`, `/*`, `$` and NUL, doubles each `%` in `policy_sql()` (the
+schema editor composes the DDL with its parameters), and is otherwise the developer's. `SharedWith`
 aliases the through table `"rls_shared"`. `RLSConstraint.create_sql()` returns a `Statement`
 whose sharing part is a `_SharingPolicySQL`, rendered by `__str__` when Django renders the
 statement: Django defers the constraint SQL of `CreateModel` to the end of the migration, so a
@@ -336,8 +339,15 @@ GUC name and pk type `_policy_options()` read; `database_backwards()` drops the 
 policy first. The through model's own policy applies inside the `EXISTS`: `W018` warns when
 it is protected by another field than `tenant_fk` without `TenantField(tenant_fk)` among
 its `extra_predicates` (a `RawPredicate` that solves it is not recognized), `W017` when a
-predicate cannot be built (`_check_extra_predicates()` in `tenants/checks.py`; proxies are
-skipped; the next free id is `W019`).
+predicate cannot be built or the table name is so long (55 bytes or more) that the sharing
+policy's name, cut to 63 bytes, is the tenant policy's (`_sharing_policy_name_problem()` in
+`rls/constraints.py`; the builder raises `ValueError` for it), and `W019` when a `SharedWith`'s
+`tenant_fk` or a `TenantField`'s `field` is a foreign key to another model than
+`TENANT_MODEL` (the policy would compare that model's keys with the tenant's; skipped when
+`TENANT_MODEL` does not resolve). All three in `_check_extra_predicates()` in
+`tenants/checks.py`; proxies are skipped; the next free id is `W020`. `RawPredicate.policy_sql()`
+doubles each `%`: the schema editor composes the DDL with its empty parameters, where a lone
+`%` fails `migrate`.
 
 `RLSManager.including_shared()` (#59, `tenants/managers.py`) reads shared rows: the default
 queryset's `WHERE tenant_id = X` would hide them. It copies the manager with
@@ -556,9 +566,12 @@ and need no entry.
 every field becomes an `rls_<name>` record attribute; `_plain()` quotes a string value that
 could forge a field of the message; a record whose filter or handler raises is dropped and
 the failure logged on `django_rls_tenants`, so the library never depends on its audit sink)
-and `denied()` (`context.denied`, `WARNING`). Events: `context.entered` / `context.exited` (`INFO`), `context.denied`,
-`fk.cross_tenant_rejected` and `gucs.cleared` (`WARNING`); the `Source` and `Reason`
-`Literal`s list the allowed values. Users are identified by `pk` only (`user_id_of()`).
+and `denied()` (`context.denied`, `WARNING`). Events: `context.entered` / `context.exited`
+and `tenant.switched` (`INFO`; the latter from `selection._switch()` / `_clear()`, source
+`selection` or `admin`), `context.denied`, `fk.cross_tenant_rejected` and `gucs.cleared`
+(`WARNING`); the `Source` and `Reason` `Literal`s list the allowed values. Users are
+identified by `pk` only (`user_id_of()`); `rls_selected` is the one field that echoes a
+value a client sent (cut to 64 characters, quoted by `_plain()`).
 Rules:
 
 - The four context managers log their own entry and exit through `context_event()`, with

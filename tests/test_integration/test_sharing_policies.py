@@ -21,7 +21,7 @@ from django.db.migrations.state import ProjectState
 
 from django_rls_tenants.exceptions import NoTenantContextError, RLSConfigurationError
 from django_rls_tenants.operations import AddRLSPolicy
-from django_rls_tenants.rls.predicates import SharedWith
+from django_rls_tenants.rls.predicates import RawPredicate, SharedWith
 from django_rls_tenants.tenants.context import admin_context, tenant_context
 from tests.test_app.models import Loan, NoteShare, Order, SharedNote, Tenant
 from tests.test_external_app.models import Book
@@ -394,3 +394,26 @@ class TestAddRLSPolicy:
         }
         with tenant_context(tenant_b.pk):
             assert list(Book.objects.all()) == []
+
+    def test_raw_predicate_with_a_like_pattern_migrates(self, loaned_book, tenant_b):
+        """The schema editor composes the DDL: a ``%`` must reach PostgreSQL as one ``%``."""
+        plain = AddRLSPolicy("Book", field="owner", app_label="test_external_app")
+        public = AddRLSPolicy(
+            "Book",
+            field="owner",
+            app_label="test_external_app",
+            extra_predicates=[RawPredicate("title LIKE '%other book'")],
+        )
+        self._replace_policy(plain, public)
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT qual FROM pg_policies WHERE policyname = %s",
+                    ["test_external_book_tenant_sharing_policy"],
+                )
+                [(qual,)] = cursor.fetchall()
+            assert "'%other book'" in qual
+            with tenant_context(tenant_b.pk):
+                assert list(Book.objects.values_list("title", flat=True)) == ["A's other book"]
+        finally:
+            self._replace_policy(public, plain)

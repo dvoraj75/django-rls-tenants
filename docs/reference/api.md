@@ -101,7 +101,11 @@ asynchronous database cursor, so these are not non-blocking calls; see
 
 The `extra_predicates` an `RLSConstraint` or `AddRLSPolicy` takes (*1.6.0*; see
 [Sharing Rows Across Tenants](../guides/protecting-models.md#sharing-rows-across-tenants)).
-`Predicate` is the base class and is not re-exported from the package root.
+`Predicate` is the base class and is not re-exported from the package root. A subclass of
+your own implements `policy_sql()` and `_key()` (the values two equal predicates share;
+the underscore keeps it off the public surface of the three predicates, but it is part of
+the subclass contract), and takes only serializable `__init__` arguments, which
+`@deconstructible` records for the migration.
 
 ::: django_rls_tenants.rls.predicates.Predicate
 

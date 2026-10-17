@@ -161,6 +161,32 @@ def _build_policy_drop_sql(*, table: str) -> str:
             """
 
 
+# PostgreSQL cuts an identifier to this many bytes (NAMEDATALEN - 1).
+_MAX_IDENTIFIER_BYTES = 63
+
+# The longest prefix the tenant policy's and the sharing policy's names share.
+_POLICY_NAME_COMMON_PREFIX = "_tenant_"
+
+
+def _sharing_policy_name_problem(table: str) -> str | None:
+    """Return why ``table``'s sharing policy could not be created, or ``None``.
+
+    PostgreSQL cuts an identifier to 63 bytes. The two policy names start
+    with ``<table>_tenant_``, so from a 55-byte table name on they are cut to
+    the same name, and the sharing policy's ``IF NOT EXISTS`` finds the tenant
+    policy: the sharing policy would never be created, without an error.
+    """
+    if len(f"{table}{_POLICY_NAME_COMMON_PREFIX}".encode()) < _MAX_IDENTIFIER_BYTES:
+        return None
+    longest = _MAX_IDENTIFIER_BYTES - len(_POLICY_NAME_COMMON_PREFIX) - 1
+    return (
+        f"the table name {table!r} is {len(table)} characters long. PostgreSQL cuts an "
+        f"identifier to {_MAX_IDENTIFIER_BYTES} bytes, so the sharing policy "
+        f"'{table}_tenant_sharing_policy' would get the same name as the tenant policy "
+        f"and would never be created. Give the model a db_table of at most {longest} bytes."
+    )
+
+
 def _build_sharing_policy_create_sql(*, table: str, predicates: Sequence[str]) -> str:
     """Build idempotent SQL that creates ``table``'s sharing policy.
 
@@ -175,7 +201,16 @@ def _build_sharing_policy_create_sql(*, table: str, predicates: Sequence[str]) -
     Safety: interpolation only. The predicates quote and check what they
     interpolate (see :mod:`django_rls_tenants.rls.predicates`); ``table`` is a
     model's ``db_table``.
+
+    Raises:
+        ValueError: If ``table`` is so long that the sharing policy's name,
+            cut to 63 bytes, would be the tenant policy's
+            (:func:`_sharing_policy_name_problem`).
     """
+    problem = _sharing_policy_name_problem(table)
+    if problem is not None:
+        msg = f"Cannot create the sharing policy of {table!r}: {problem}"
+        raise ValueError(msg)
     policy_name = f"{table}_tenant_sharing_policy"
     using = "\n                                OR ".join(predicates)
     return f"""

@@ -2110,6 +2110,58 @@ class TestCheckExtraPredicates:
         )
         assert "migrate builds the sharing policy from it" in warning.hint
 
+    def test_w019_shared_with_tenant_fk_to_another_model(self):
+        """``tenant_fk`` pointing at the note compares note ids with tenant ids."""
+        wrong = SharedWith(through="test_app.Share", fk="note", tenant_fk="note")
+        note, share = _sharing_models(
+            note_predicates=[wrong], share_predicates=[TenantField("shared_with")]
+        )
+        [warning] = _w017_w018([note, share])
+        assert warning.id == "django_rls_tenants.W019"
+        assert warning.obj is note
+        assert warning.msg == (
+            f"{wrong!r} on test_app.Note compares test_app.Share.note with the current "
+            "tenant, but it is a foreign key to test_app.note, not to "
+            "RLS_TENANTS['TENANT_MODEL'] (test_app.Tenant): rows would be shared with "
+            "whichever tenant has the same key."
+        )
+        assert warning.hint == (
+            "Pass the foreign key to the tenant model as tenant_fk= and run makemigrations."
+        )
+
+    def test_w019_tenant_field_to_another_model(self):
+        note, share = _sharing_models(share_predicates=[TenantField("note")])
+        warnings = _w017_w018([note, share])
+        assert [w.id for w in warnings] == [
+            "django_rls_tenants.W018",  # the share stays hidden from shared_with
+            "django_rls_tenants.W019",
+        ]
+        assert warnings[1].obj is share
+        assert warnings[1].msg.startswith(
+            "TenantField('note') on test_app.Share compares test_app.Share.note with the "
+            "current tenant, but it is a foreign key to test_app.note"
+        )
+        assert warnings[1].hint.startswith("Pass the foreign key to the tenant model as field=")
+
+    def test_w019_is_skipped_when_the_tenant_model_does_not_resolve(self, settings):
+        settings.RLS_TENANTS = {**settings.RLS_TENANTS, "TENANT_MODEL": "nope.Missing"}
+        note, share = _sharing_models(share_predicates=[TenantField("note")])
+        assert [w.id for w in _w017_w018([note, share])] == ["django_rls_tenants.W018"]
+
+    def test_w017_table_name_that_truncates_to_the_tenant_policys_name(self):
+        """PostgreSQL cuts both policy names to 63 bytes: the sharing policy is never created."""
+        note, share = _sharing_models(share_predicates=[TenantField("shared_with")])
+        table = "n" * 55
+        with patch.object(note._meta, "db_table", table):
+            [warning] = _w017_w018([note, share])
+        assert warning.id == "django_rls_tenants.W017"
+        assert warning.obj is note
+        assert warning.msg.startswith(
+            f"The sharing policy of test_app.Note cannot be created: the table name "
+            f"'{table}' is 55 characters long. PostgreSQL cuts an identifier to 63 bytes"
+        )
+        assert warning.hint.startswith("Set a shorter Meta.db_table")
+
     def test_proxy_and_models_without_predicates_are_skipped(self):
         note, share = _sharing_models(note_predicates=[TenantField("title")])
         proxy = type(

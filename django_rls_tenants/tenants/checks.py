@@ -55,6 +55,9 @@ if TYPE_CHECKING:
 
     from django.db import models
 
+    from django_rls_tenants.rls.constraints import RLSConstraint
+    from django_rls_tenants.rls.predicates import Predicate
+
 logger = logging.getLogger("django_rls_tenants")
 
 
@@ -788,6 +791,58 @@ def _check_external_models() -> list[CheckWarning]:
     return warnings
 
 
+def _related_label_lower(owner: type[models.Model], field_name: str) -> str:
+    """Return the lower-case label of the model ``owner.field_name`` points at.
+
+    A target that the registry has not resolved is a string: ``"app.Model"``,
+    or ``"Model"`` for one of ``owner``'s own app.
+    """
+    target = owner._meta.get_field(field_name).related_model  # noqa: SLF001
+    target_meta = getattr(target, "_meta", None)
+    if target_meta is not None:
+        concrete_meta = getattr(target_meta.concrete_model, "_meta", target_meta)
+        return str(concrete_meta.label_lower)
+    label = str(target)
+    if "." not in label:
+        label = f"{owner._meta.app_label}.{label}"  # noqa: SLF001
+    return label.lower()
+
+
+def _w019(
+    model: type[models.Model],
+    predicate: object,
+    owner: type[models.Model],
+    param: str,
+    tenant_model: type[models.Model] | None,
+) -> CheckWarning | None:
+    """Return ``W019`` if the foreign key ``param`` of ``owner`` misses the tenant model.
+
+    Args:
+        model: The model whose ``RLSConstraint`` holds ``predicate``.
+        predicate: A ``SharedWith`` (``param="tenant_fk"``, ``owner`` its
+            ``through`` model) or a ``TenantField`` (``param="field"``,
+            ``owner`` is ``model``).
+        owner: The model the foreign key belongs to.
+        param: The predicate argument naming the foreign key.
+        tenant_model: ``TENANT_MODEL``; ``None`` skips the check (``W008``).
+    """
+    if tenant_model is None:
+        return None
+    field_name: str = getattr(predicate, param)
+    target_label = _related_label_lower(owner, field_name)
+    if target_label == tenant_model._meta.label_lower:  # noqa: SLF001
+        return None
+    return CheckWarning(
+        f"{predicate!r} on {model._meta.label} compares {owner._meta.label}.{field_name} "  # noqa: SLF001
+        f"with the current tenant, but it is a foreign key to {target_label}, not to "
+        f"RLS_TENANTS['TENANT_MODEL'] ({tenant_model._meta.label}): rows would be shared "  # noqa: SLF001
+        f"with whichever tenant has the same key.",
+        hint=f"Pass the foreign key to the tenant model as {param}= and run makemigrations.",
+        id="django_rls_tenants.W019",
+        obj=model,
+    )
+
+
 def _check_extra_predicates() -> list[CheckWarning]:
     """Warn about ``extra_predicates`` that cannot work (``W017``, ``W018``).
 
@@ -796,9 +851,10 @@ def _check_extra_predicates() -> list[CheckWarning]:
 
     - ``W017``: a predicate that cannot be built for the model (a
       ``SharedWith`` whose ``through`` model does not resolve or whose
-      foreign keys are wrong, a ``TenantField`` that names no foreign key).
-      ``migrate`` builds it from the migration state and would fail the same
-      way.
+      foreign keys are wrong, a ``TenantField`` that names no foreign key),
+      or a table name so long that the sharing policy's name, cut to 63
+      bytes, would be the tenant policy's. ``migrate`` builds the policy from
+      the migration state and would fail the same way.
     - ``W018``: a ``SharedWith`` whose ``through`` model has an
       ``RLSConstraint`` on another field than ``tenant_fk`` and no
       ``TenantField(tenant_fk)`` among its own ``extra_predicates``. Its
@@ -806,66 +862,108 @@ def _check_extra_predicates() -> list[CheckWarning]:
       inside the sharing policy's subquery, so the predicate never matches.
       A ``RawPredicate`` that makes them visible is not recognized: silence
       the warning then.
+    - ``W019``: a ``SharedWith`` whose ``tenant_fk``, or a ``TenantField``
+      whose ``field``, is a foreign key to another model than
+      ``TENANT_MODEL``. The policy would compare that model's keys with the
+      current tenant's, so rows would be shared with whichever tenant has the
+      same key. Skipped when ``TENANT_MODEL`` does not resolve (``W008``).
     """
     from django.apps import apps  # noqa: PLC0415
 
-    from django_rls_tenants.rls.constraints import RLSConstraint  # noqa: PLC0415
-    from django_rls_tenants.rls.predicates import SharedWith, TenantField  # noqa: PLC0415
+    from django_rls_tenants.rls.constraints import (  # noqa: PLC0415
+        RLSConstraint,
+        _sharing_policy_name_problem,
+    )
 
     def first_constraint(model: type[models.Model]) -> RLSConstraint | None:
         constraints = model._meta.constraints  # noqa: SLF001
         return next((c for c in constraints if isinstance(c, RLSConstraint)), None)
 
+    from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
+
+    try:
+        tenant_model: type[models.Model] | None = apps.get_model(rls_tenants_config.TENANT_MODEL)
+    except (LookupError, ValueError):
+        tenant_model = None  # W008 reports it
+
     warnings: list[CheckWarning] = []
     for model in apps.get_models():
         constraint = first_constraint(model)
-        if model._meta.proxy or constraint is None:  # noqa: SLF001
+        if model._meta.proxy or constraint is None or not constraint.extra_predicates:  # noqa: SLF001
             continue
-        label = model._meta.label  # noqa: SLF001
-        for predicate in constraint.extra_predicates:
-            try:
-                predicate.policy_sql(model, tenant_value="NULL")
-            except ValueError as exc:
-                warnings.append(
-                    CheckWarning(
-                        f"The extra predicate {predicate!r} of {label}'s RLSConstraint "
-                        f"cannot be built: {exc}",
-                        hint=(
-                            "Correct the predicate: migrate builds the sharing policy from "
-                            "it and would fail with the same error."
-                        ),
-                        id="django_rls_tenants.W017",
-                        obj=model,
-                    )
-                )
-                continue
-            if not isinstance(predicate, SharedWith):
-                continue
-            # Built above, so the model's registry resolves it. A proxy has no
-            # constraints of its own: its rows are its concrete model's.
-            through = model._meta.apps.get_model(predicate.through)  # noqa: SLF001
-            through = through._meta.concrete_model or through  # noqa: SLF001
-            through_constraint = first_constraint(through)
-            if through_constraint is None or through_constraint.field == predicate.tenant_fk:
-                continue
-            if TenantField(predicate.tenant_fk) in through_constraint.extra_predicates:
-                continue
-            through_label = through._meta.label  # noqa: SLF001
+        problem = _sharing_policy_name_problem(model._meta.db_table)  # noqa: SLF001
+        if problem is not None:
             warnings.append(
                 CheckWarning(
-                    f"{predicate!r} on {label} never matches: the RLS policy of "
-                    f"{through_label} filters its rows on {through_constraint.field!r}, so "
-                    f"the tenant in {predicate.tenant_fk!r} cannot read the rows shared "
-                    f"with it, inside the sharing policy either.",
+                    f"The sharing policy of {model._meta.label} cannot be created: {problem}",  # noqa: SLF001
                     hint=(
-                        f"Add TenantField({predicate.tenant_fk!r}) to the extra_predicates "
-                        f"of {through_label}'s RLSConstraint and run makemigrations."
+                        "Set a shorter Meta.db_table: migrate would skip the sharing "
+                        "policy without an error, and the extra_predicates would share "
+                        "nothing."
                     ),
-                    id="django_rls_tenants.W018",
+                    id="django_rls_tenants.W017",
                     obj=model,
                 )
             )
+        for predicate in constraint.extra_predicates:
+            warning = _predicate_warning(model, predicate, tenant_model, first_constraint)
+            if warning is not None:
+                warnings.append(warning)
     return warnings
+
+
+def _predicate_warning(
+    model: type[models.Model],
+    predicate: Predicate,
+    tenant_model: type[models.Model] | None,
+    first_constraint: Callable[[type[models.Model]], RLSConstraint | None],
+) -> CheckWarning | None:
+    """Return the ``W017`` / ``W018`` / ``W019`` warning for one predicate, if any."""
+    from django_rls_tenants.rls.predicates import SharedWith, TenantField  # noqa: PLC0415
+
+    label = model._meta.label  # noqa: SLF001
+    try:
+        predicate.policy_sql(model, tenant_value="NULL")
+    except ValueError as exc:
+        return CheckWarning(
+            f"The extra predicate {predicate!r} of {label}'s RLSConstraint cannot be built: {exc}",
+            hint=(
+                "Correct the predicate: migrate builds the sharing policy from it and would "
+                "fail with the same error."
+            ),
+            id="django_rls_tenants.W017",
+            obj=model,
+        )
+    if isinstance(predicate, TenantField):
+        return _w019(model, predicate, model, "field", tenant_model)
+    if not isinstance(predicate, SharedWith):
+        return None
+    # Built above, so the model's registry resolves it. A proxy has no
+    # constraints of its own: its rows are its concrete model's.
+    through = model._meta.apps.get_model(predicate.through)  # noqa: SLF001
+    through = through._meta.concrete_model or through  # noqa: SLF001
+    wrong = _w019(model, predicate, through, "tenant_fk", tenant_model)
+    if wrong is not None:
+        return wrong
+    through_constraint = first_constraint(through)
+    if (
+        through_constraint is None
+        or through_constraint.field == predicate.tenant_fk
+        or TenantField(predicate.tenant_fk) in through_constraint.extra_predicates
+    ):
+        return None
+    through_label = through._meta.label  # noqa: SLF001
+    return CheckWarning(
+        f"{predicate!r} on {label} never matches: the RLS policy of {through_label} filters "
+        f"its rows on {through_constraint.field!r}, so the tenant in {predicate.tenant_fk!r} "
+        f"cannot read the rows shared with it, inside the sharing policy either.",
+        hint=(
+            f"Add TenantField({predicate.tenant_fk!r}) to the extra_predicates of "
+            f"{through_label}'s RLSConstraint and run makemigrations."
+        ),
+        id="django_rls_tenants.W018",
+        obj=model,
+    )
 
 
 class _UniqueSet(NamedTuple):

@@ -375,11 +375,38 @@ class AddRLSPolicy(migrations.operations.base.Operation):
                 f"ForeignKey. Pass the tenant foreign key's name as field=."
             )
             raise ValueError(msg)  # noqa: TRY004  -- a wrong field= argument, like the others
+        self._check_target(field, label)
         column: str = field.column
         _validate_field_name(column, f"the column of {label}.{self.field}")
         if column == f"{self.field}_id" and column == column.lower():
             return column
         return f'"{column}"'
+
+    def _check_target(self, field: models.ForeignKey[Any, Any], label: str) -> None:
+        """Refuse a tenant foreign key that does not point at ``TENANT_MODEL``.
+
+        The policy would compare another model's key with the tenant GUC and
+        ``check_rls`` would report the table as protected (the policy has the
+        expected name), as system check ``W016`` says of a listed model.
+
+        Raises:
+            ValueError: If ``field`` targets another model than
+                ``RLS_TENANTS["TENANT_MODEL"]``.
+        """
+        # Read only when the migration runs; see _policy_options().
+        from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
+
+        tenant_model = rls_tenants_config.TENANT_MODEL
+        target = field.related_model
+        target_meta = getattr(target, "_meta", None)
+        target_label = target_meta.label_lower if target_meta is not None else str(target)
+        if target_label.lower() != tenant_model.lower():
+            msg = (
+                f"AddRLSPolicy: {label}.{self.field} is a foreign key to {target_label}, "
+                f"not to RLS_TENANTS['TENANT_MODEL'] ({tenant_model}). Pass the foreign "
+                f"key to the tenant model as field=."
+            )
+            raise ValueError(msg)
 
     def _policy_options(self) -> tuple[str, str, str]:
         """Return ``(guc_tenant_var, guc_admin_var, tenant_pk_type)``, unset ones from settings.
