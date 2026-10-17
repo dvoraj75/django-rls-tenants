@@ -10,6 +10,7 @@ from tests.drf_views import (
     InvalidView,
     InvoiceViewSet,
     LazyProductsView,
+    MemberHeaderStateView,
     OrderItemViewSet,
     StateView,
     TenantHeaderStateView,
@@ -30,6 +31,7 @@ urlpatterns = [
     path("api/boom/", BoomView.as_view()),
     path("api/invalid/", InvalidView.as_view()),
     path("api/tenant-header/", TenantHeaderStateView.as_view()),
+    path("api/member-header/", MemberHeaderStateView.as_view()),
     path("api/token-only/open/", TokenOnlyOpenView.as_view()),
     path("api/token-only/protected/", TokenOnlyProtectedView.as_view()),
 ]

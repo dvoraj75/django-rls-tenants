@@ -9,11 +9,13 @@ so every context a token request runs in is the mixin's.
 The suite splits into:
 
 * unit tests for ``RLSTenantAPIViewMixin.get_rls_context()``, the MRO check,
+  the context the mixin records for the permission (#150),
   ``RLSTenantPermission``, ``CurrentTenantDefault`` and the serializer mixin;
 * ``@pytest.mark.integration`` request-cycle tests through ``APIClient`` under
-  ``enforce_rls``: row isolation, writes, the context's exit on every path
-  (handled error, 500), rendering inside the context, ``STRICT_MODE``, both
-  GUC modes, nesting inside the middleware's context, and ASGI.
+  ``enforce_rls``: row isolation, a tenant the user selects (#150), writes, the
+  context's exit on every path (handled error, 500), rendering inside the
+  context, ``STRICT_MODE``, both GUC modes, nesting inside the middleware's
+  context, and ASGI.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -34,6 +37,7 @@ from rest_framework import serializers
 from rest_framework.authtoken.models import Token
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
 from rest_framework.test import APIClient, APIRequestFactory, force_authenticate
 from rest_framework.validators import UniqueTogetherValidator
 from rest_framework.views import APIView
@@ -48,11 +52,17 @@ from django_rls_tenants.contrib.drf import (
 from django_rls_tenants.exceptions import NoTenantContextError, RLSConfigurationError
 from django_rls_tenants.tenants.context import admin_context, tenant_context
 from django_rls_tenants.tenants.state import (
+    _current_live,
     _get_context_gucs,
     get_current_tenant_id,
     get_rls_context_active,
 )
-from tests.drf_views import InvoiceSerializer, OrderItemSerializer, StateView
+from tests.drf_views import (
+    TENANT_MEMBERSHIPS,
+    InvoiceSerializer,
+    OrderItemSerializer,
+    StateView,
+)
 from tests.session_gucs import session_gucs
 from tests.test_app.models import AdminUser, Invoice, Order, OrderItem, OrderNote, Tag, Tenant
 
@@ -106,6 +116,16 @@ def tenantless_user(db):
 
 
 @pytest.fixture
+def member_of(monkeypatch):
+    """Make a user a member of tenants in ``MemberHeaderStateView``, for one test."""
+
+    def add(user, *tenants):
+        monkeypatch.setitem(TENANT_MEMBERSHIPS, user.username, {tenant.pk for tenant in tenants})
+
+    return add
+
+
+@pytest.fixture
 def sample_invoices(tenant_a, tenant_b):
     """One invoice per tenant, both numbered ``INV-1``."""
     with admin_context():
@@ -151,6 +171,28 @@ def _admin():
 def _drf_request(user):
     """A DRF ``Request`` whose ``user`` is already set."""
     return SimpleNamespace(user=user)
+
+
+class ChosenContextView(RLSTenantAPIViewMixin, APIView):
+    """Enters the context ``choose(request)`` returns; the handler records what it sees."""
+
+    permission_classes = (IsAuthenticated, RLSTenantPermission)
+    choose = None
+    seen = None
+
+    def get_rls_context(self, request):
+        return self.choose(request)
+
+    def get(self, request):
+        self.seen = {"entered": self._rls_entered_context, "current": _current_live()}
+        return Response({"tenant_id": get_current_tenant_id()})
+
+
+def _serve(view, user):
+    """Serve a GET by ``user`` on the view instance ``view`` (``as_view()`` makes a new one)."""
+    request = APIRequestFactory().get("/")
+    force_authenticate(request, user=user)
+    return view.dispatch(request)
 
 
 # ---------------------------------------------------------------------------
@@ -248,14 +290,66 @@ class TestGetRlsContext:
         assert get_rls_context_active() is False
 
 
+class TestEnteredContext:
+    """The context the mixin entered, which ``RLSTenantPermission`` accepts (#150)."""
+
+    def test_the_context_entered_is_recorded_for_the_request(self):
+        view = ChosenContextView(choose=lambda request: tenant_context(4))
+
+        response = _serve(view, _scoped(None))
+
+        assert response.status_code == 200, response.data
+        assert response.data == {"tenant_id": 4}
+        assert view.seen["entered"] is not None
+        assert view.seen["entered"] is view.seen["current"]
+        assert view._rls_entered_context is None
+        _assert_context_closed()
+
+    def test_an_earlier_requests_context_is_not_trusted(self):
+        """DRF makes a view instance per request; a reused one does not trust the last one's.
+
+        The second request enters nothing, in an enclosing context with the same values.
+        """
+        view = ChosenContextView(choose=lambda request: tenant_context(4))
+        assert _serve(view, _scoped(None)).status_code == 200
+        view.seen = None
+        view.choose = lambda request: None
+
+        with tenant_context(4):
+            response = _serve(view, _scoped(None))
+
+        assert response.status_code == 403
+        assert view.seen is None
+
+    def test_a_context_manager_that_sets_up_no_context_is_not_recorded(self):
+        """The enclosing context stays current: not the view's choice."""
+        view = ChosenContextView(choose=lambda request: nullcontext())
+
+        with tenant_context(4):
+            refused = _serve(view, _scoped(None))
+            own = _serve(view, _scoped(4))
+
+        assert refused.status_code == 403
+        assert own.status_code == 200, own.data
+        assert view.seen["entered"] is None
+
+    def test_an_admin_context_for_a_non_admin_is_refused(self):
+        view = ChosenContextView(choose=lambda request: admin_context())
+
+        assert _serve(view, _scoped(3)).status_code == 403
+        assert view.seen is None
+        assert _serve(view, _admin()).status_code == 200
+        _assert_context_closed()
+
+
 # ---------------------------------------------------------------------------
 # RLSTenantPermission: unit tests
 # ---------------------------------------------------------------------------
 
 
 class TestRLSTenantPermission:
-    def _has_permission(self, user):
-        return RLSTenantPermission().has_permission(_drf_request(user), None)
+    def _has_permission(self, user, view=None):
+        return RLSTenantPermission().has_permission(_drf_request(user), view)
 
     def _has_object_permission(self, obj):
         return RLSTenantPermission().has_object_permission(_drf_request(_admin()), None, obj)
@@ -290,6 +384,35 @@ class TestRLSTenantPermission:
             assert self._has_permission(_admin())
         with tenant_context(3):
             assert self._has_permission(_admin())
+
+    def test_tenant_context_the_view_entered_is_allowed(self):
+        view = StateView()
+        with tenant_context(4):
+            view._rls_entered_context = _current_live()
+            assert self._has_permission(_scoped(None), view)
+            assert self._has_permission(_scoped(3), view)
+
+    def test_entered_context_must_be_the_active_one(self):
+        view = StateView()
+        with tenant_context(4):
+            view._rls_entered_context = _current_live()
+            with tenant_context(4):  # the same values, another context
+                assert not self._has_permission(_scoped(None), view)
+        with tenant_context(4):  # the entered one has ended
+            assert not self._has_permission(_scoped(None), view)
+
+    def test_admin_context_the_view_entered_is_refused_for_a_non_admin(self):
+        view = StateView()
+        with admin_context():
+            view._rls_entered_context = _current_live()
+            assert not self._has_permission(_scoped(3), view)
+            assert not self._has_permission(_scoped(None), view)
+            assert self._has_permission(_admin(), view)
+
+    def test_entered_context_of_a_view_without_the_mixin_is_ignored(self):
+        with tenant_context(4):
+            view = SimpleNamespace(_rls_entered_context=_current_live())
+            assert not self._has_permission(_scoped(None), view)
 
     def test_object_of_the_active_tenant_is_allowed(self):
         with tenant_context(3):
@@ -698,6 +821,97 @@ class TestTokenRequests:
 
 
 @pytest.mark.integration
+class TestTenantSelection:
+    """``get_rls_context()`` enters a tenant the user selected; the permission accepts it (#150).
+
+    ``MemberHeaderStateView`` lists ``RLSTenantPermission`` and takes the tenant from
+    the ``X-Tenant`` header after a membership check.
+    """
+
+    def test_tenantless_member_selects_a_tenant(
+        self, enforce_rls, tenantless_user, member_of, sample_orders, tenant_a
+    ):
+        member_of(tenantless_user, tenant_a)
+
+        response = _token_client(tenantless_user).get(
+            "/api/member-header/", headers={"X-Tenant": str(tenant_a.pk)}
+        )
+
+        assert response.status_code == 200, response.content
+        body = response.json()
+        assert body["products"] == ["Widget A1", "Widget A2"]
+        assert body["database_products"] == ["Widget A1", "Widget A2"]
+        assert body["tenant_id"] == tenant_a.pk
+        assert body["tenant_guc"] == str(tenant_a.pk)
+        assert body["is_admin_guc"] == "false"
+        _assert_context_closed()
+
+    def test_user_selects_another_of_their_tenants(
+        self, enforce_rls, user_a, member_of, sample_orders, tenant_a, tenant_b
+    ):
+        member_of(user_a, tenant_a, tenant_b)
+
+        response = _token_client(user_a).get(
+            "/api/member-header/", headers={"X-Tenant": str(tenant_b.pk)}
+        )
+
+        assert response.status_code == 200, response.content
+        assert response.json()["database_products"] == ["Gadget B1"]
+        _assert_context_closed()
+
+    def test_selection_the_override_rejects_is_a_403(
+        self, enforce_rls, user_a, member_of, sample_orders, tenant_a, tenant_b
+    ):
+        member_of(user_a, tenant_a)
+
+        response = _token_client(user_a).get(
+            "/api/member-header/", headers={"X-Tenant": str(tenant_b.pk)}
+        )
+
+        assert response.status_code == 403
+        assert response.json() == {"detail": "You are not a member of the selected tenant."}
+        _assert_context_closed()
+
+    def test_without_a_selection_the_users_own_context_applies(
+        self, enforce_rls, user_a, tenantless_user, member_of, sample_orders, tenant_a
+    ):
+        member_of(tenantless_user, tenant_a)
+
+        own = _token_client(user_a).get("/api/member-header/")
+        tenantless = _token_client(tenantless_user).get("/api/member-header/")
+
+        assert own.status_code == 200, own.content
+        assert own.json()["database_products"] == ["Widget A1", "Widget A2"]
+        assert tenantless.status_code == 403
+        assert tenantless.json() == {"detail": "Your account is not assigned to a tenant."}
+        _assert_context_closed()
+
+    def test_view_without_the_mixin_is_still_refused(
+        self, enforce_rls, tenantless_user, member_of, sample_orders, tenant_a
+    ):
+        member_of(tenantless_user, tenant_a)
+
+        response = _token_client(tenantless_user).get(
+            "/api/unmixed/", headers={"X-Tenant": str(tenant_a.pk)}
+        )
+
+        assert response.status_code == 403
+        _assert_context_closed()
+
+    def test_selection_under_asgi(
+        self, enforce_rls, tenantless_user, member_of, sample_orders, tenant_b
+    ):
+        member_of(tenantless_user, tenant_b)
+        headers = {**_token_header(tenantless_user), "X-Tenant": str(tenant_b.pk)}
+
+        response = async_to_sync(AsyncClient().get)("/api/member-header/", headers=headers)
+
+        assert response.status_code == 200, response.content
+        assert response.json()["database_products"] == ["Gadget B1"]
+        _assert_context_closed()
+
+
+@pytest.mark.integration
 class TestContextExit:
     """The context ends with the request on every path, and the next request starts clean."""
 
@@ -860,6 +1074,26 @@ class TestLocalSetMode:
         assert body["products"] == ["Widget A1", "Widget A2"]
         assert body["database_products"] == ["Widget A1", "Widget A2"]
         assert body["tenant_guc"] == str(tenant_a.pk)
+        _assert_context_closed()
+
+    def test_selected_tenant(
+        self,
+        enforce_rls,
+        atomic_requests,
+        tenantless_user,
+        member_of,
+        sample_orders,
+        tenant_b,
+        local_set,
+    ):
+        member_of(tenantless_user, tenant_b)
+
+        response = _token_client(tenantless_user).get(
+            "/api/member-header/", headers={"X-Tenant": str(tenant_b.pk)}
+        )
+
+        assert response.status_code == 200, response.content
+        assert response.json()["database_products"] == ["Gadget B1"]
         _assert_context_closed()
 
     def test_write_lands_in_the_tenant(

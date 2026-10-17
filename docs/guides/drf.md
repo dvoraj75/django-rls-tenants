@@ -185,9 +185,55 @@ class TenantHeaderMixin(RLSTenantAPIViewMixin):
         return super().get_rls_context(request)
 ```
 
-Only a tenant admin may choose a tenant: any other user would be able to read
-another tenant's rows. Validate the value, and keep the `super()` fallback so that
-every other request gets its own context.
+The header counts only for a tenant admin, who may act on every tenant anyway; any
+other user gets their own tenant. Keep the `super()` fallback so that every other
+request gets its own context.
+
+#### A user who belongs to several tenants
+
+A non-admin user may also be given a context other than `tenant_context(user.rls_tenant_id)`:
+a user who belongs to several tenants through a membership table selects one per request
+(a header, a URL segment, a session key), and `user.rls_tenant_id` is another of their
+tenants, or `None`. The override checks the membership and enters the selected tenant:
+
+```python
+from rest_framework.exceptions import PermissionDenied
+
+from django_rls_tenants import tenant_context
+from django_rls_tenants.contrib.drf import RLSTenantAPIViewMixin
+
+from .models import Membership
+
+
+class SelectedTenantMixin(RLSTenantAPIViewMixin):
+    def get_rls_context(self, request):
+        selected = request.headers.get("X-Tenant")
+        if selected is None or not request.user.is_authenticated:
+            return super().get_rls_context(request)
+        # A plain model: an RLS-protected one needs admin_context() here, as no
+        # context is active yet.
+        member = selected.isdecimal() and Membership.objects.filter(
+            user=request.user, tenant_id=int(selected)
+        ).exists()
+        if not member:
+            raise PermissionDenied("You are not a member of the selected tenant.")
+        return tenant_context(int(selected))
+```
+
+[`RLSTenantPermission`](#rlstenantpermission) accepts the tenant context the override
+entered for the request (see what it checks there), so the view keeps it in its
+permission classes.
+
+!!! warning "`get_rls_context()` is the authorization point"
+    **The permission trusts the tenant the override enters: it does not check that the
+    user may access it.** Validate every selection in `get_rls_context()` against what
+    the user may access, and raise `PermissionDenied` for anything else: never fall back
+    silently to another tenant, and never enter a tenant taken from the request
+    unchecked, or any user can read any tenant's rows. A rejected selection is a `403`
+    with the override's message.
+
+`admin_context()` is accepted only for a tenant admin (`is_tenant_admin`): an override
+that enters it for any other user gets a `403` from `RLSTenantPermission`.
 
 ### A subclass that overrides `perform_authentication()`
 
@@ -202,10 +248,24 @@ A permission class that turns a misconfigured view into an error instead of an
 empty list.
 
 `has_permission()` passes only for an authenticated user inside an active RLS
-context that is exactly the user's own: a non-admin user needs their own tenant's
-context (never another tenant's, never the admin bypass); a tenant admin passes in
-any context. A view that forgot the mixin, served to a token client, so answers
-`403` (an anonymous client gets `401`) instead of `200` with an empty list.
+context:
+
+| `request.user` | Passes in |
+|----------------|-----------|
+| Unauthenticated | nothing |
+| `is_tenant_admin` | any context |
+| Any other user | the tenant context `RLSTenantAPIViewMixin` entered for this request (what [`get_rls_context()`](#choosing-the-context-get_rls_context) returned), or `tenant_context(user.rls_tenant_id)`; never the admin bypass |
+
+No context at all is refused for every user. A view that forgot the mixin, served to a
+token client, so answers `403` (an anonymous client gets `401`) instead of `200` with an
+empty list: the mixin entered nothing, and a user is let through only in their own
+tenant.
+
+The context the mixin entered counts only while it is the active one, and only for the
+request it was entered for. A context manager that sets up no RLS context of its own
+(`contextlib.nullcontext()`, say) counts as nothing entered, so the request needs the
+user's own tenant. When the default `get_rls_context()` enters nothing because the
+middleware already set the user's context, that is the user's own tenant too.
 
 `has_object_permission()` checks that the object's tenant foreign key
 (`RLS_TENANTS["TENANT_FK_FIELD"]`) equals the active tenant. Any object passes in
@@ -411,6 +471,9 @@ exactly the leak the library exists to prevent. The mixin owns both the entry
   outside the context (see [above](#the-response-is-rendered-inside-the-context)).
 - A request DRF did not authenticate keeps an enclosing context, such as the
   middleware's for a session cookie (see the warning under [Lifecycle](#lifecycle)).
+- `RLSTenantPermission` trusts the tenant a `get_rls_context()` override enters; the
+  override must check that the user may access it (see
+  [A user who belongs to several tenants](#a-user-who-belongs-to-several-tenants)).
 - The tenant foreign key is the one named by `RLS_TENANTS["TENANT_FK_FIELD"]`, and
   `CurrentTenantDefault` expects it to reference the tenant's primary key.
 - DRF's `ModelSerializer` does not call `Model.full_clean()`, so model validators

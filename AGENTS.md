@@ -138,6 +138,13 @@ can be listed in `DEFAULT_PERMISSION_CLASSES`, which DRF imports while it builds
 `APIView`. It has no authentication class on purpose: DRF never calls an authenticator
 back at the end of the request, so one could not exit the context it entered; the mixin
 owns both the entry (`perform_authentication()`) and the exit (`dispatch()`).
+`perform_authentication()` also records on the view (`_rls_entered_context`, reset in
+`dispatch()`'s `finally`) the `_Live` holder of the context `get_rls_context()` returned,
+only if entering it made a new holder current (a `nullcontext()` records nothing).
+`RLSTenantPermission.has_permission()` passes a non-admin user while that holder is the
+current one and is not `ADMIN_GUCS` (#150: a tenant the user selected, which the override
+validates), else only in `tenant_context(user.rls_tenant_id)`; the admin bypass always
+needs `is_tenant_admin`.
 
 ### M2M RLS Support
 
