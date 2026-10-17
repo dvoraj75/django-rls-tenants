@@ -306,7 +306,8 @@ class DjangoRlsTenantsConfig(AppConfig):
         # the rest of the process (#100). Django sends ``setting_changed`` on
         # both enter and exit of an override, so the cache is rebuilt both ways.
         # The set of RLS-protected models reads both settings
-        # (RLS_TENANTS["EXTERNAL_MODELS"] and the registry), so it is dropped on either.
+        # (RLS_TENANTS["EXTERNAL_MODELS"] and the registry), so it is dropped on
+        # either: reload() drops it with the config.
         def _reload_config_on_setting_changed(
             sender: object,  # noqa: ARG001  -- Django signal API
             setting: str,
@@ -314,7 +315,6 @@ class DjangoRlsTenantsConfig(AppConfig):
         ) -> None:
             if setting == "RLS_TENANTS":
                 rls_tenants_config.reload()
-                _rls_model_cache.cache_clear()
             elif setting == "INSTALLED_APPS":
                 # The registry changed, as when Django clears its own model caches.
                 _declared_policy_guc_names_cached.cache_clear()

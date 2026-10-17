@@ -317,16 +317,16 @@ class AddRLSPolicy(migrations.operations.base.Operation):
         """Return ``model``'s ``db_table``, refused if the policy SQL cannot hold it.
 
         Raises:
-            ValueError: If the name contains a quote or a dollar sign (the
-                ``'schema"."table'`` idiom among them), which would break the
-                quoting of the policy SQL.
+            ValueError: If the name contains a quote, a backslash or a dollar
+                sign (the ``'schema"."table'`` idiom among them), which would
+                break the quoting of the policy SQL.
         """
         table: str = model._meta.db_table  # noqa: SLF001
-        if any(char in table for char in "\"'$\x00"):
+        if any(char in table for char in "\"'\\$\x00"):
             msg = (
                 f"AddRLSPolicy: the table name {table!r} of {model._meta.label} contains a "  # noqa: SLF001
-                f"quote or a dollar sign, which the policy SQL cannot hold. A table in "
-                f"another schema ('schema\".\"table') is not supported."
+                f"quote, a backslash or a dollar sign, which the policy SQL cannot hold. A "
+                f"table in another schema ('schema\".\"table') is not supported."
             )
             raise ValueError(msg)
         return table
@@ -335,9 +335,10 @@ class AddRLSPolicy(migrations.operations.base.Operation):
         """Return the SQL reference to the tenant foreign key's column of ``model``.
 
         The column ``<field>_id`` that Django names a foreign key's column is
-        left unquoted, so the text is the same as ``RLSConstraint``'s; any other
-        column (a ``db_column``, which may be a reserved word or not lower case)
-        is quoted.
+        left unquoted when it is lower case, so the text is the same as
+        ``RLSConstraint``'s; any other column (a ``db_column``, which may be a
+        reserved word, or a name with an upper-case letter, which PostgreSQL
+        would fold) is quoted.
 
         Raises:
             ValueError: If ``model`` has no such foreign key, or its column
@@ -362,7 +363,9 @@ class AddRLSPolicy(migrations.operations.base.Operation):
             raise ValueError(msg)  # noqa: TRY004  -- a wrong field= argument, like the others
         column: str = field.column
         _validate_field_name(column, f"the column of {label}.{self.field}")
-        return column if column == f"{self.field}_id" else f'"{column}"'
+        if column == f"{self.field}_id" and column == column.lower():
+            return column
+        return f'"{column}"'
 
     def _policy_options(self) -> tuple[str, str, str]:
         """Return ``(guc_tenant_var, guc_admin_var, tenant_pk_type)``, unset ones from settings.

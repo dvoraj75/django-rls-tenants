@@ -106,7 +106,7 @@ The library has two internal layers with a strict import boundary:
   skips, in both directions, what `allow_migrate_model()` skips and a state model with an
   `RLSConstraint` (same policy name: backwards would drop the constraint's policy); the
   column `<field>_id` stays unquoted (same text as `RLSConstraint`), any other is quoted;
-  `_table()` refuses a `db_table` with a quote or `$`.
+  `_table()` refuses a `db_table` with a quote, a backslash or `$`.
 - **`django_rls_tenants/pool.py`** — `reset_rls_gucs()`, the `reset` callback for Django's
   psycopg connection pool, and the single statement that clears every GUC the policies
   read (used by the `connection_created` handler too). `settings.py` imports it before
@@ -229,8 +229,8 @@ the inherited list). `W015` (#45, `_check_strict_mode_exclude()` in `tenants/che
 warns about a `RLS_TENANTS["STRICT_MODE_EXCLUDE"]` label that does not resolve to an installed
 model or names one without an `RLSConstraint` or `EXTERNAL_MODELS` entry; it runs whether or
 not `STRICT_MODE` is on. `W016` (#112, `_check_external_models()`) warns about an
-`EXTERNAL_MODELS` entry that is unusable: unresolved label, proxy, a model that already has an
-`RLSConstraint`, a missing or non-FK field, an FK not to `TENANT_MODEL` (skipped when that
+`EXTERNAL_MODELS` entry that is unusable: unresolved label, swapped-out model, proxy, a model
+that already has an `RLSConstraint`, a missing or non-FK field, an FK not to `TENANT_MODEL` (skipped when that
 does not resolve: `W008`), or two labels for one model.
 
 `RLS_TENANTS["EXTERNAL_MODELS"]` (#112, `{"app.Model": "tenant_fk_name"}`, validated in
@@ -247,9 +247,13 @@ config's `setting_changed` receiver on `RLS_TENANTS` and `INSTALLED_APPS`);
 `_tenant_attname()` in `managers.py`, which `select_related()` and the #44 prefetch filter use
 for each joined model's own tenant column (no filter when it is `None`: `W009` / `W016`);
 `_tenant_field()` (cross-tenant FKs); `W012` / `W015` / `W016`; `check_rls._collect_rls_models()`;
-`check_rls._check_external_policies()` (an entry naming another field than the latest
-`AddRLSPolicy` is the `FIELD_MISMATCH` issue; an `AddRLSPolicy` whose model is not listed, a
-warning) and `_rls_migrations.MigrationFacts.rls_policy_migrations()` /
+`check_rls._check_external_policy_fields()` (an entry naming another field than the latest
+`AddRLSPolicy` is the `FIELD_MISMATCH` issue) and `_warn_about_unlisted_policies()` (an
+`AddRLSPolicy` whose model is not listed: a warning, printed before the "No RLS-protected
+models found" return too); `check_rls` reads `MigrationFacts` once per run
+(`_migration_facts()`, after the table checks, in a savepoint when optional), and `MigrationFacts` records migrations in dependency order
+(`_migration_order()`: the `forwards_plan()` of each leaf), so "latest" is `migrate`'s
+latest; `_rls_migrations.MigrationFacts.rls_policy_migrations()` /
 `rls_policy_field()` / `_external_model_hint()` for the
 `How to fix:` line. `--generate` writes no `AddRLSPolicy`. **Not given:** the auto-scope filter,
 `for_user()` and the strict-mode guard on queries of the external model itself (it keeps its

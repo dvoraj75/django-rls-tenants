@@ -1806,6 +1806,14 @@ class TestCheckExternalModels:
         assert f"lists {label!r}, which does not resolve to an installed model" in warnings[0].msg
         assert warnings[0].obj is None
 
+    def test_swapped_out_model_names_its_replacement(self):
+        """``auth.User`` is swapped out by ``AUTH_USER_MODEL``: no table, no policy."""
+        (warning,) = _w016({"auth.User": "tenant"})
+        assert warning.id == "django_rls_tenants.W016"
+        assert "names a swapped-out model (replaced by test_app.AdminUser)" in warning.msg
+        assert "'test_app.AdminUser'" in warning.hint
+        assert warning.obj.__name__ == "User"
+
     def test_proxy_model_names_its_concrete_model(self):
         """A proxy has no table of its own; the hint names the model to list."""
         (warning,) = _w016({"test_external_app.BookProxy": "owner"})
@@ -1839,6 +1847,34 @@ class TestCheckExternalModels:
     def test_target_is_not_checked_when_the_tenant_model_does_not_resolve(self):
         """An unresolvable TENANT_MODEL is W008's to report."""
         assert _w016({"admin.LogEntry": "user"}, tenant_model="nope.Tenant") == []
+
+    @pytest.mark.parametrize(
+        "rls", [{"TENANT_MODEL": "Tenant"}, {}], ids=["no_dot_value_error", "unset_config_error"]
+    )
+    def test_tenant_model_failures_other_than_lookup_error_are_tolerated(self, rls):
+        """A TENANT_MODEL without a dot (ValueError) or unset (RLSConfigurationError) is W008's."""
+        with (
+            override_settings(RLS_TENANTS={**rls, "EXTERNAL_MODELS": {"admin.LogEntry": "user"}}),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            assert _check_external_models() == []
+
+    def test_hints_name_the_fix(self):
+        """Each hint says what to change."""
+        (unresolved,) = _w016({"nope_app.Book": "owner"})
+        assert "Correct the label to '<app_label>.<ModelName>'" in unresolved.hint
+        (missing,) = _w016({"test_external_app.Book": "tenant"})
+        assert (
+            missing.hint == "Map 'test_external_app.Book' to the name of its tenant foreign key."
+        )
+        (not_fk,) = _w016({"test_external_app.Book": "title"})
+        assert "name of its foreign key to the tenant model" in not_fk.hint
+        (other_target,) = _w016({"admin.LogEntry": "user"})
+        assert "the policy compares that column with the current tenant" in other_target.hint
+        (duplicate,) = _w016(
+            {"test_external_app.Book": "owner", "test_external_app.book": "owner"}
+        )
+        assert duplicate.hint == "Keep one entry per model."
 
     def test_two_labels_for_one_model(self):
         """Two spellings of one label: only one of their fields would be used."""

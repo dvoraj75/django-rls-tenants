@@ -193,15 +193,23 @@ class TestTenantField:
         sql = _forwards_sql(AddRLSPolicy("Legacy", app_label="ext"), state)
         assert 'ELSE "OrgID" = ' in sql
 
+    def test_upper_case_django_named_column_is_quoted(self, state):
+        """Unquoted, PostgreSQL would fold ``Tenant_id`` to ``tenant_id``."""
+        _with_model(state, "Legacy", [("Tenant", _tenant_fk())])
+        sql = _forwards_sql(AddRLSPolicy("Legacy", field="Tenant", app_label="ext"), state)
+        assert 'ELSE "Tenant_id" = ' in sql
+
     @pytest.mark.parametrize(
-        "table", ['other"."legacy', "it's", "ext_$body$"], ids=["schema", "quote", "dollar"]
+        "table",
+        ['other"."legacy', "it's", "ext_$body$", "ext\\legacy"],
+        ids=["schema", "quote", "dollar", "backslash"],
     )
     def test_table_that_cannot_be_interpolated_is_refused(self, state, table):
         _with_model(state, "Legacy", [("tenant", _tenant_fk())], db_table=table)
         op = AddRLSPolicy("Legacy", app_label="ext")
-        with pytest.raises(ValueError, match=r"quote or a dollar sign"):
+        with pytest.raises(ValueError, match=r"quote, a backslash or a dollar sign"):
             op.database_forwards("x", _editor(), state, state)
-        with pytest.raises(ValueError, match=r"quote or a dollar sign"):
+        with pytest.raises(ValueError, match=r"quote, a backslash or a dollar sign"):
             op.database_backwards("x", _editor(), state, state)
 
     def test_column_that_cannot_be_interpolated_is_refused(self, state):

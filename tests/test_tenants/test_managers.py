@@ -8,7 +8,7 @@ import json
 import warnings
 from contextlib import contextmanager
 from decimal import Decimal
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import django
 import pytest
@@ -25,6 +25,7 @@ from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.guc import get_guc
 from django_rls_tenants.tenants import managers
 from django_rls_tenants.tenants.bypass import bypass_flag
+from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import (
     admin_context,
     async_tenant_context,
@@ -41,6 +42,7 @@ from django_rls_tenants.tenants.managers import (
     _resolve_related_path,
     _rls_model_cache,
     _scoped_prefetch_lookups,
+    _tenant_attname,
 )
 from django_rls_tenants.tenants.middleware import RLSTenantMiddleware
 from django_rls_tenants.tenants.state import (
@@ -320,6 +322,14 @@ class TestIsRlsProtected:
         assert _is_rls_protected(Book) is True
         assert _is_rls_protected(BookProxy) is True
 
+    def test_tenant_attname_is_each_models_own(self):
+        """The join filters read the constraint's or the entry's field, not TENANT_FK_FIELD."""
+        assert _tenant_attname(Order) == "tenant_id"
+        assert _tenant_attname(OrderProxy) == "tenant_id"
+        assert _tenant_attname(Book) == "owner_id"
+        assert _tenant_attname(BookProxy) == "owner_id"
+        assert _tenant_attname(Tenant) is None
+
     def test_cache_follows_an_rls_tenants_change(self, settings):
         """The app config drops the cache on ``setting_changed`` for RLS_TENANTS."""
         assert Book in _rls_model_cache()
@@ -329,6 +339,18 @@ class TestIsRlsProtected:
         assert Book not in _rls_model_cache()
         assert BookProxy not in _rls_model_cache()
         assert Order in _rls_model_cache()
+
+    def test_cache_is_dropped_by_a_direct_reload(self, settings):
+        """``rls_tenants_config.reload()`` is public: a caller who swaps the setting by hand."""
+        assert Book in _rls_model_cache()
+        with patch.dict(
+            settings.RLS_TENANTS,
+            {"EXTERNAL_MODELS": {}},
+        ):
+            rls_tenants_config.reload()  # no setting_changed signal
+            assert Book not in _rls_model_cache()
+        rls_tenants_config.reload()
+        assert Book in _rls_model_cache()
 
     def test_cache_is_dropped_on_an_installed_apps_change(self):
         """A registry change rebuilds the cache, as Django clears its own model caches."""

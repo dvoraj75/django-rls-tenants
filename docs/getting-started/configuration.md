@@ -427,9 +427,9 @@ The database policy filters those queries. See
 
 A proxy of a listed model is protected through its concrete model; an entry that names a
 proxy is ignored. A value that is not a dict of strings raises `RLSConfigurationError` when
-the setting is read. An entry that does not resolve to an installed, non-proxy model, names
-a model that already has an `RLSConstraint`, or names a field that is not a foreign key to
-`TENANT_MODEL`, is reported as `W016`.
+the setting is read. An entry that does not resolve to an installed, non-proxy model that is
+not swapped out, names a model that already has an `RLSConstraint`, or names a field that is
+not a foreign key to `TENANT_MODEL`, is reported as `W016`.
 
 ## System Checks
 
@@ -452,7 +452,7 @@ django-rls-tenants registers Django system checks that warn about common misconf
 | `W013` | Warning | `W005`/`E001` or `W011` could not be determined: the database was reachable but the catalogue query failed (for example `permission denied for view pg_roles`). A clean `check` is not a pass |
 | `W014` | Warning | A concrete, non-proxy `RLSProtectedModel` subclass has no `RLSConstraint` in `Meta.constraints`: its `Meta` does not inherit `RLSProtectedModel.Meta`, or sets `constraints` of its own, so no migration creates a policy for its table. See [W014](../troubleshooting.md#w014-a-protected-model-has-no-rlsconstraint) |
 | `W015` | Warning | A `STRICT_MODE_EXCLUDE` label does not resolve to an installed model, or names a model without an `RLSConstraint` or `EXTERNAL_MODELS` entry (strict mode never guards it, so the entry has no effect). Checked whether or not `STRICT_MODE` is on. See [`STRICT_MODE_EXCLUDE`](#strict_mode_exclude) |
-| `W016` | Warning | An `EXTERNAL_MODELS` entry cannot be used: its label does not resolve to an installed model, it names a proxy, a model that already has an `RLSConstraint`, or a field that does not exist, is not a `ForeignKey` or does not point at `TENANT_MODEL`; or two labels name the same model. See [W016](../troubleshooting.md#w016-an-external_models-entry-cannot-be-used) and [`EXTERNAL_MODELS`](#external_models) |
+| `W016` | Warning | An `EXTERNAL_MODELS` entry cannot be used: its label does not resolve to an installed model, it names a swapped-out model, a proxy, a model that already has an `RLSConstraint`, or a field that does not exist, is not a `ForeignKey` or does not point at `TENANT_MODEL`; or two labels name the same model. See [W016](../troubleshooting.md#w016-an-external_models-entry-cannot-be-used) and [`EXTERNAL_MODELS`](#external_models) |
 | `E001` | Error | The connection role of a `DATABASES` alias is a superuser or has `BYPASSRLS` and `settings.DEBUG` is `False` (a production deployment). Replaces `W005`; fails `manage.py check` and every command that runs the system checks, such as `migrate` |
 
 Run `python manage.py check` to see any warnings and errors.

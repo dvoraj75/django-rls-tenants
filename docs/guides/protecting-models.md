@@ -541,7 +541,7 @@ package root (`from django_rls_tenants import AddRLSPolicy`).
 | Argument | Meaning |
 |----------|---------|
 | `model_name` | The model's name, `"Book"`. |
-| `field` | The name of the model's tenant `ForeignKey` (a `OneToOneField` is accepted). Default `"tenant"`. The policy reads the field's real column from the migration state, so `db_column` is respected. A column other than the `<field>_id` Django names (a `db_column`, which may be a reserved word or not lower case) is quoted. |
+| `field` | The name of the model's tenant `ForeignKey` (a `OneToOneField` is accepted). Default `"tenant"`. The policy reads the field's real column from the migration state, so `db_column` is respected. A column other than the lower-case `<field>_id` Django names (a `db_column`, which may be a reserved word, or a name with an upper-case letter) is quoted. |
 | `app_label` | The model's app. Without it, the app of the migration the operation is in; for a third-party model, pass it. |
 | `tenant_pk_type`, `guc_tenant_var`, `guc_admin_var` | As on [`RLSConstraint`](../reference/api.md). When unset, they come from `RLS_TENANTS` (see below). |
 | `extra_bypass_flags` | Additional GUCs that bypass the `USING` clause but not `WITH CHECK`, as on `RLSConstraint` (see [Extra Bypass Flags](#extra-bypass-flags)). |
@@ -569,8 +569,8 @@ that name, so applying the operation twice changes nothing.
   direction: the constraint's policy has the same name, and migrating backwards must not
   drop it. If the operation ran first, the table keeps its policy, since the
   constraint's `DO` block skips a policy that exists.
-- **Table names.** A `db_table` with a quote or a dollar sign (the `'schema"."table'`
-  idiom among them) raises `ValueError`: the policy SQL cannot hold it.
+- **Table names.** A `db_table` with a quote, a backslash or a dollar sign (the
+  `'schema"."table'` idiom among them) raises `ValueError`: the policy SQL cannot hold it.
 
 !!! warning "GUC names and the tenant type are read when the migration runs"
     `guc_tenant_var`, `guc_admin_var` and `tenant_pk_type`, when you leave them out, are

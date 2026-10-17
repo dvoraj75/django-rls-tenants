@@ -15,6 +15,7 @@ import pytest
 from django.apps import apps
 from django.core.management import call_command
 from django.db import DatabaseError, connection, transaction
+from django.db.migrations.executor import MigrationExecutor
 from django.db.migrations.state import ProjectState
 
 from django_rls_tenants.management._rls_migrations import (
@@ -131,9 +132,54 @@ class TestReversible:
         state = ProjectState.from_apps(apps)
         with connection.cursor() as cursor:
             cursor.execute("RESET ROLE")
+            oid_before = _policy_oid(cursor)
         with connection.schema_editor() as editor:
             op.database_forwards("test_app", editor, state, state)
         assert _rls_status() == (True, True, [_POLICY])
+        with connection.cursor() as cursor:
+            assert _policy_oid(cursor) == oid_before  # the same row: not dropped and recreated
+
+    def test_sqlmigrate_prints_the_policy_in_both_directions(self):
+        """The ``How to fix:`` line tells the user to run ``sqlmigrate``: it shows the DO block."""
+        out = StringIO()
+        call_command("sqlmigrate", *_MIGRATION, stdout=out)
+        assert f'CREATE POLICY "{_POLICY}"' in out.getvalue()
+        assert "ELSE owner_id = " in out.getvalue()
+        out = StringIO()
+        call_command("sqlmigrate", *_MIGRATION, backwards=True, stdout=out)
+        assert f'DROP POLICY IF EXISTS "{_POLICY}" ON "{_TABLE}"' in out.getvalue()
+
+    def test_makemigrations_has_nothing_to_write(self):
+        """The policy is outside the third-party app's model state: no migration is due."""
+        out = StringIO()
+        call_command("makemigrations", "--check", "--dry-run", stdout=out)
+        assert "No changes detected" in out.getvalue()
+
+
+@pytest.mark.django_db(transaction=True)
+class TestMigrateBackwards:
+    """``migrate`` to the migration before ``0010`` drops the policy; forwards puts it back."""
+
+    def test_unapply_and_reapply(self):
+        with connection.cursor() as cursor:
+            cursor.execute("RESET ROLE")
+        executor = MigrationExecutor(connection)
+        try:
+            executor.migrate([("test_app", "0009_assignment")])
+            assert _rls_status() == (False, False, [])
+        finally:
+            MigrationExecutor(connection).migrate([_MIGRATION])
+        assert _rls_status() == (True, True, [_POLICY])
+
+
+def _other_field_for_order(model):
+    """A stand-in ``rls_policy_field()``: Order's policy reads another field than its entry."""
+    return "other" if model is Order else "owner"
+
+
+def _policy_oid(cursor):
+    cursor.execute("SELECT oid FROM pg_policy WHERE polname = %s", [_POLICY])
+    return cursor.fetchone()[0]
 
 
 class TestCheckRls:
@@ -223,6 +269,49 @@ class TestCheckRlsComparesWithTheSetting:
         call_command("check_rls", stdout=StringIO(), stderr=err)
         assert err.getvalue() == ""
 
+    def test_policy_of_a_removed_model_or_of_a_constraint_model_is_not_reported(self):
+        """An AddRLSPolicy for a model that is gone, or that adopted an RLSConstraint, is moot."""
+        err = StringIO()
+        with (
+            patch.object(
+                MigrationFacts,
+                "rls_policy_models",
+                return_value=[("test_app", "order"), ("gone", "thing")],
+            ),
+            patch.object(
+                MigrationFacts,
+                "rls_policy_migrations",
+                return_value=[("test_app", "0001_initial")],
+            ),
+            patch.object(MigrationFacts, "rls_policy_field", side_effect=_other_field_for_order),
+        ):
+            call_command("check_rls", stdout=StringIO(), stderr=err)
+        assert err.getvalue() == ""
+
+    def test_listed_model_with_a_constraint_gets_no_field_mismatch(self, settings):
+        """The constraint's policy is the one in force (W016 reports the entry)."""
+        settings.RLS_TENANTS = {
+            **settings.RLS_TENANTS,
+            "EXTERNAL_MODELS": {**settings.RLS_TENANTS["EXTERNAL_MODELS"], "test_app.Order": "x"},
+        }
+        err = StringIO()
+        with patch.object(MigrationFacts, "rls_policy_field", side_effect=_other_field_for_order):
+            call_command("check_rls", stdout=StringIO(), stderr=err)  # does not exit 1
+        assert FIELD_MISMATCH not in err.getvalue()
+
+    def test_generate_fails_when_the_migrations_cannot_be_read(self):
+        """``--generate`` needs the migrations: no degrading to advice."""
+        with (
+            patch(
+                "django_rls_tenants.management.commands.check_rls.MigrationFacts",
+                side_effect=RuntimeError("broken migration module"),
+            ),
+            pytest.raises(RuntimeError, match="broken migration module"),
+        ):
+            call_command(
+                "check_rls", "--generate", "--dry-run", stdout=StringIO(), stderr=StringIO()
+            )
+
     def test_migrations_that_cannot_be_read_do_not_fail_the_run(self):
         err = StringIO()
         with patch(
@@ -231,10 +320,31 @@ class TestCheckRlsComparesWithTheSetting:
         ):
             call_command("check_rls", stdout=StringIO(), stderr=err)
         assert (
-            "Could not read the migrations to compare their AddRLSPolicy operations with "
-            "RLS_TENANTS['EXTERNAL_MODELS']: RuntimeError: broken migration module."
-            in err.getvalue()
+            "Could not read the migrations (to compare their AddRLSPolicy operations with "
+            "RLS_TENANTS['EXTERNAL_MODELS'], and to tell how to fix any issues): "
+            "RuntimeError: broken migration module." in err.getvalue()
         )
+
+    def test_warning_is_printed_when_no_model_is_protected(self, settings):
+        """The orphan ``AddRLSPolicy`` is the only protection: it must be reported too."""
+        settings.RLS_TENANTS = {
+            key: value for key, value in settings.RLS_TENANTS.items() if key != "EXTERNAL_MODELS"
+        }
+        out, err = StringIO(), StringIO()
+        with (
+            patch(
+                "django_rls_tenants.management.commands.check_rls._collect_rls_models",
+                return_value={},
+            ),
+            patch(
+                "django_rls_tenants.management.commands.check_rls._collect_m2m_tables",
+                return_value={},
+            ),
+        ):
+            call_command("check_rls", stdout=out, stderr=err)
+        assert "No RLS-protected models found." in out.getvalue()
+        assert f"test_external_app.Book ({_TABLE}): migration" in err.getvalue()
+        assert "Add 'test_external_app.Book': 'owner' to" in err.getvalue()
 
 
 class TestExternalModelHints:
@@ -244,6 +354,18 @@ class TestExternalModelHints:
     def facts(self):
         return MigrationFacts("default")
 
+    def test_migrations_are_recorded_in_dependency_order(self, facts):
+        """Every migration comes after its dependencies, whatever the apps' names."""
+        order = facts._migration_order()
+        assert sorted(order) == sorted(facts._graph.nodes)
+        position = {key: index for index, key in enumerate(order)}
+        for key, node in facts._graph.node_map.items():
+            for parent in node.parents:
+                assert position[parent.key] < position[key], (parent.key, key)
+        # The policy of the external app's model comes from test_app's migration,
+        # which depends on the external app's: a cross-app order sorted() gets wrong.
+        assert position[("test_external_app", "0001_initial")] < position[_MIGRATION]
+
     def test_facts_record_the_operation_by_its_target_app(self, facts):
         assert facts.rls_policy_migrations(Book) == [_MIGRATION]
         assert facts.rls_policy_migrations(Loan) == []
@@ -251,6 +373,37 @@ class TestExternalModelHints:
         assert facts.rls_policy_field(Book) == "owner"
         assert facts.rls_policy_field(Order) is None
         assert ("test_external_app", "book") in facts.rls_policy_models()
+
+    def test_several_operations_for_one_model(self, facts):
+        """Without ``app_label`` the migration's app is the model's; the latest field wins."""
+        facts._record(("test_app", "9998_a"), AddRLSPolicy("Order"))
+        facts._record(("test_app", "9999_b"), AddRLSPolicy("Order", field="other"))
+        assert facts.rls_policy_migrations(Order) == [
+            ("test_app", "9998_a"),
+            ("test_app", "9999_b"),
+        ]
+        assert facts.rls_policy_field(Order) == "other"
+
+    def test_hints_pick_the_right_migration_of_several(self, facts, settings):
+        settings.RLS_TENANTS = {
+            **settings.RLS_TENANTS,
+            "EXTERNAL_MODELS": {"test_app.TenantUser": "tenant"},
+        }
+        first, second = ("test_app", "9998_a"), ("test_app", "9999_b")
+        facts._record(first, AddRLSPolicy("TenantUser"))
+        facts._record(second, AddRLSPolicy("TenantUser", field="owner"))
+        # A mismatch names the latest operation and its field.
+        hint = model_hint(facts, TenantUser, {FIELD_MISMATCH})
+        assert "migration test_app.9999_b reads 'owner'" in hint
+        # Of two unapplied migrations, the first to apply is named.
+        with patch.object(facts, "is_applied", return_value=False):
+            hint = model_hint(facts, TenantUser, {NO_POLICIES})
+        assert hint.startswith("migration test_app.9998_a adds its policy")
+        # Both applied and the policy gone: the latest is the one to replay.
+        with patch.object(facts, "is_applied", return_value=True):
+            hint = model_hint(facts, TenantUser, {NO_POLICIES})
+        assert "migration test_app.9999_b created its policy" in hint
+        assert "`sqlmigrate test_app 9999_b`" in hint
 
     def test_unapplied_migration(self, facts):
         with patch.object(facts, "is_applied", return_value=False):

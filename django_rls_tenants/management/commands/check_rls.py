@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from django.core.management.base import BaseCommand, CommandError
 from django.core.management.utils import run_formatters
-from django.db import Error, connections
+from django.db import Error, connections, transaction
 
 from django_rls_tenants.management._rls_migrations import (
     FIELD_MISMATCH,
@@ -227,6 +227,11 @@ class Command(BaseCommand):
         m2m_tables = _collect_m2m_tables()
 
         if not table_to_model and not m2m_tables:
+            # A model that only an AddRLSPolicy protects, and the setting does not
+            # list, is not among the protected models: it still gets its warning.
+            facts = self._migration_facts(db_alias, required=generate)
+            if facts is not None:
+                self._warn_about_unlisted_policies(facts)
             if not quiet:
                 self.stdout.write("No RLS-protected models found.")
             return
@@ -254,9 +259,12 @@ class Command(BaseCommand):
             )
             raise SystemExit(1) from exc
 
+        # After the table checks: they are the point of the command, and must not
+        # depend on the migrations (an advisory read) being readable.
         facts = self._migration_facts(db_alias, required=generate)
         if facts is not None:
-            self._check_external_policies(facts, table_to_model, issues)
+            self._warn_about_unlisted_policies(facts)
+            self._check_external_policy_fields(facts, table_to_model, issues)
         generated: dict[str, str] = {}
         if generate:
             assert facts is not None  # noqa: S101  -- required: MigrationFacts raised otherwise
@@ -273,7 +281,7 @@ class Command(BaseCommand):
             self.stderr.write(self.style.ERROR(f"\nFound {len(issues)} issue(s):"))
             for issue in issues:
                 self.stderr.write(self.style.ERROR(str(issue)))
-            self._write_hints(issues, table_to_model, m2m_tables, db_alias, facts, generated)
+            self._write_hints(issues, table_to_model, m2m_tables, facts, generated)
             # The database is still unprotected, whatever --generate wrote.
             raise SystemExit(1)
 
@@ -282,39 +290,41 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS(f"\nAll {total} RLS-protected tables verified."))
 
     def _migration_facts(self, db_alias: str, *, required: bool) -> MigrationFacts | None:
-        """Read the migrations and their record on ``db_alias``.
+        """Read the migrations and their record on ``db_alias``, once per run.
 
         Only ``--generate`` needs them (``required``); otherwise a failure is
-        reported and ``None`` returned, since the comparison of ``AddRLSPolicy``
-        with ``EXTERNAL_MODELS`` is advice on top of the checks.
+        reported and ``None`` returned, since what they feed (the comparison of
+        ``AddRLSPolicy`` with ``EXTERNAL_MODELS``, the ``How to fix:`` lines) is
+        advice on top of the checks, which stand without it.
         """
         if required:
             return MigrationFacts(db_alias)
         try:
-            return MigrationFacts(db_alias)
+            # A savepoint: a failed read of the applied-migrations record must not
+            # abort a transaction the caller opened (call_command() in atomic()).
+            with transaction.atomic(using=db_alias):
+                return MigrationFacts(db_alias)
         except Exception as exc:  # advice; the table checks stand without it
             self.stderr.write(
-                f"\nCould not read the migrations to compare their AddRLSPolicy "
-                f"operations with RLS_TENANTS['EXTERNAL_MODELS']: {_describe_error(exc)}."
+                f"\nCould not read the migrations (to compare their AddRLSPolicy operations "
+                f"with RLS_TENANTS['EXTERNAL_MODELS'], and to tell how to fix any issues): "
+                f"{_describe_error(exc)}."
             )
             return None
 
-    def _check_external_policies(
+    def _check_external_policy_fields(
         self,
         facts: MigrationFacts,
         table_to_model: dict[str, type[Model]],
         issues: list[_Issue],
     ) -> None:
-        """Compare the ``AddRLSPolicy`` operations on disk with ``EXTERNAL_MODELS``.
+        """Compare the field of each ``EXTERNAL_MODELS`` entry with its ``AddRLSPolicy``.
 
-        A listed model whose latest ``AddRLSPolicy`` reads another field than its
-        entry is an issue (``FIELD_MISMATCH``): the cross-tenant foreign key check
-        and the join filters would compare another column than the policy. A model
-        an ``AddRLSPolicy`` protects that the setting does not list gets a warning:
-        its table is protected, but the library's runtime does not know it.
+        A listed model whose latest ``AddRLSPolicy`` (in migration order) reads
+        another field than its entry is an issue (``FIELD_MISMATCH``): the
+        cross-tenant foreign key check and the join filters would compare another
+        column than the policy.
         """
-        from django.apps import apps  # noqa: PLC0415
-
         from django_rls_tenants.rls.constraints import RLSConstraint  # noqa: PLC0415
         from django_rls_tenants.tenants.models import _external_model_fields  # noqa: PLC0415
 
@@ -327,6 +337,19 @@ class Command(BaseCommand):
             policy_field = facts.rls_policy_field(model)
             if policy_field is not None and policy_field != entry:
                 issues.append(_Issue(table, model.__name__, FIELD_MISMATCH))
+
+    def _warn_about_unlisted_policies(self, facts: MigrationFacts) -> None:
+        """Warn about each model an ``AddRLSPolicy`` protects that ``EXTERNAL_MODELS`` omits.
+
+        Its table is protected, but the library's runtime does not know it. A
+        warning on stderr, not an issue: the run still passes.
+        """
+        from django.apps import apps  # noqa: PLC0415
+
+        from django_rls_tenants.rls.constraints import RLSConstraint  # noqa: PLC0415
+        from django_rls_tenants.tenants.models import _external_model_fields  # noqa: PLC0415
+
+        external = _external_model_fields()
         for app_label, model_name in facts.rls_policy_models():
             try:
                 model = apps.get_model(app_label, model_name)
@@ -558,20 +581,16 @@ class Command(BaseCommand):
         issues: list[_Issue],
         table_to_model: dict[str, type[Model]],
         m2m_tables: dict[str, dict[str, Any]],
-        db_alias: str,
         facts: MigrationFacts | None,
         generated: dict[str, str],
     ) -> None:
-        """Print the fix for the cause of each table's issues, read from the migrations."""
+        """Print the fix for the cause of each table's issues, read from the migrations.
+
+        Without ``facts`` (``_migration_facts()`` could not read the migrations and
+        said so) the issues stand on their own.
+        """
         if facts is None:
-            try:
-                facts = MigrationFacts(db_alias)
-            except Exception as exc:  # the hints are advice; the issues stand without them
-                self.stderr.write(
-                    f"\nCould not read the migrations to tell how to fix these issues: "
-                    f"{_describe_error(exc)}."
-                )
-                return
+            return
         problems_by_table: dict[str, set[str]] = {}
         labels: dict[str, str] = {}
         for issue in issues:

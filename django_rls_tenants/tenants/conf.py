@@ -259,9 +259,15 @@ class RLSTenantsConfig:
         class and pytest-django's ``settings`` fixture all take effect without
         touching the cache by hand. The unknown-key check runs again on the
         next read as well, so a typo introduced by an override is still reported.
+        The set of RLS-protected models, which reads ``EXTERNAL_MODELS``, is
+        dropped with it.
         """
+        # Lazy import: managers imports this module.
+        from django_rls_tenants.tenants.managers import _rls_model_cache  # noqa: PLC0415
+
         self._config_cache = None
         self._unknown_keys_checked = False
+        _rls_model_cache.cache_clear()
 
     def _get(self, key: str, default: Any = None) -> Any:
         """Read a key from ``settings.RLS_TENANTS``.

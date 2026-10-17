@@ -729,6 +729,7 @@ no entry.
 lists 'library.Book', which ...`:
 
 - `does not resolve to an installed model.`
+- `names a swapped-out model (replaced by accounts.User), which has no table.`
 - `names a proxy model, which has no table of its own.`
 - `names a model with an RLSConstraint, whose migrations create its policy, so the entry has
   no effect.`
@@ -741,16 +742,18 @@ lists 'library.Book', which ...`:
 **Cause:** The setting maps a model label to the name of the model's tenant foreign key,
 and the library reads both when it checks the table, validates foreign keys to it and
 filters joins into it. The label is not `"<app_label>.<ModelName>"` of an installed model
-(a typo, an app missing from `INSTALLED_APPS`, no dot), or the model is a proxy (its table
-is its concrete model's), or it already carries an `RLSConstraint` (its migrations create
+(a typo, an app missing from `INSTALLED_APPS`, no dot), or the model is swapped out (as
+`auth.User` is under a custom `AUTH_USER_MODEL`: no table) or a proxy (its table is its
+concrete model's), or it already carries an `RLSConstraint` (its migrations create
 the policy, so an `AddRLSPolicy` would find one and change nothing), or the field is
 missing, is not a `ForeignKey`, or points at another model than `TENANT_MODEL` (the policy
 compares that column with the current tenant). An entry in this state has no effect or,
 for a wrong field, would make the library filter on the wrong column. A `TENANT_MODEL`
 that does not resolve is left to `W008`.
 
-**Fix:** Correct the label or the field name, remove the entry, or for a proxy list the
-concrete model the hint names. Keep one entry per model.
+**Fix:** Correct the label or the field name, remove the entry, or list the model the hint
+names (the concrete model of a proxy; the model that replaces a swapped-out one). Keep one
+entry per model.
 
 **See:** [`EXTERNAL_MODELS`](getting-started/configuration.md#external_models),
 [Tables You Do Not Own](guides/protecting-models.md#tables-you-do-not-own).

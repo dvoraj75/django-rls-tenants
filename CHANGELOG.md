@@ -21,15 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a database the router refuses for the model's app, for an unmanaged model, or (in either
   direction) while the model has an `RLSConstraint` of its own, whose policy has the same
   name, and raises `ValueError` at migrate time for a missing model, a proxy, a missing or
-  non-foreign key field, or a table name with a quote or a dollar sign. Unset `guc_tenant_var`, `guc_admin_var` and `tenant_pk_type` are read from
-  `RLS_TENANTS` when the migration runs, not when it is written, so changing the settings
-  later does not rewrite an applied policy. Listing the model as
+  non-foreign key field, or a table name with a quote, a backslash or a dollar sign. Unset
+  `guc_tenant_var`, `guc_admin_var` and `tenant_pk_type` are read from `RLS_TENANTS` when
+  the migration runs, not when it is written, so changing the settings later does not
+  rewrite an applied policy. Listing the model as
   `RLS_TENANTS["EXTERNAL_MODELS"] = {"library.Book": "tenant"}` (label to tenant
   foreign key, model name case-insensitive) makes the runtime treat it as RLS-protected:
   `check_rls` checks its table, with a `How to fix:` line built from the `AddRLSPolicy`
   operations on disk, reports an entry that names another field than the model's latest
-  `AddRLSPolicy` reads, and warns about an `AddRLSPolicy` whose model is not listed; the cross-tenant foreign key check (`full_clean()`, forms, the admin,
-  DRF serializers) validates foreign keys that point at it; `select_related()` and the
+  `AddRLSPolicy` reads, and warns about an `AddRLSPolicy` whose model is not listed; the
+  cross-tenant foreign key check (`full_clean()`, forms, the admin, DRF serializers)
+  validates foreign keys that point at it; `select_related()` and the
   `prefetch_related()` tenant filter apply to joins into it; and `W012` reports its unique
   fields. Queries on the external model itself get no auto-scope filter, `for_user()` or
   `STRICT_MODE` guard (it keeps its own manager), so the policy is their only isolation,
@@ -40,10 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and
   [`EXTERNAL_MODELS`](https://dvoraj75.github.io/django-rls-tenants/getting-started/configuration/#external_models).
 - **`W016`: a system check for an `EXTERNAL_MODELS` entry the library cannot use** (#112).
-  It reports a label that names no installed model, a proxy, a model that already has an
-  `RLSConstraint`, a field that does not exist, is not a `ForeignKey` or does not point at
-  `TENANT_MODEL`, and two labels for one model. The stale-entry messages of `W012` and
-  `W015` now say "RLSConstraint or EXTERNAL_MODELS entry". See
+  It reports a label that names no installed model, a swapped-out model, a proxy, a model
+  that already has an `RLSConstraint`, a field that does not exist, is not a `ForeignKey`
+  or does not point at `TENANT_MODEL`, and two labels for one model. The stale-entry
+  messages of `W012` and `W015` now say "RLSConstraint or EXTERNAL_MODELS entry". See
   [W016](https://dvoraj75.github.io/django-rls-tenants/troubleshooting/#w016-an-external_models-entry-cannot-be-used).
 
 ### Changed

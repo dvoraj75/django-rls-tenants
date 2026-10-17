@@ -87,9 +87,23 @@ class MigrationFacts:
         self._rls_policies: dict[_Key, list[_Key]] = {}
         # (app_label, model_name) -> the field the latest of those operations reads.
         self._rls_policy_fields: dict[_Key, str] = {}
-        for key, migration in sorted(self._graph.nodes.items()):
-            for operation in _database_operations(migration.operations):
+        for key in self._migration_order():
+            for operation in _database_operations(self._graph.nodes[key].operations):
                 self._record(key, operation)
+
+    def _migration_order(self) -> list[_Key]:
+        """Return every migration in dependency order, so "latest" means what ``migrate`` means.
+
+        The order of the nodes' names (``sorted()``) is that of ``migrate`` only
+        inside one app: a project's ``AddRLSPolicy`` for a third-party model lives
+        in another app than the model, and a later migration of app ``a`` can
+        depend on one of app ``z``. The plan to each leaf (``forwards_plan()``)
+        follows the dependencies; independent branches keep the order of the leaves.
+        """
+        ordered: dict[_Key, None] = {}
+        for leaf in sorted(self._graph.leaf_nodes()):
+            ordered.update(dict.fromkeys(self._graph.forwards_plan(leaf)))
+        return list(ordered)
 
     def _record(self, key: _Key, operation: Operation) -> None:
         """Note what ``operation`` of migration ``key`` does to RLS, if anything."""

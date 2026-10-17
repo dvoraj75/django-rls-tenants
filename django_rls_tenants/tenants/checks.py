@@ -693,7 +693,7 @@ def _check_external_models() -> list[CheckWarning]:
     warnings: list[CheckWarning] = []
     seen: dict[type[models.Model], str] = {}
 
-    def warn(label: str, problem: str, hint: str, model: Any = None) -> None:
+    def warn(label: str, problem: str, hint: str, model: type[models.Model] | None = None) -> None:
         warnings.append(
             CheckWarning(
                 f"RLS_TENANTS['EXTERNAL_MODELS'] lists {label!r}, which {problem}.",
@@ -724,6 +724,15 @@ def _check_external_models() -> list[CheckWarning]:
             )
             continue
         seen[model] = label
+        if meta.swapped:
+            warn(
+                label,
+                f"names a swapped-out model (replaced by {meta.swapped}), which has no table",
+                f"List the model that replaces it, {meta.swapped!r}, if it is the one to "
+                f"protect, or remove the entry.",
+                model,
+            )
+            continue
         if meta.proxy:
             concrete = (meta.concrete_model or model)._meta.label  # noqa: SLF001
             warn(
