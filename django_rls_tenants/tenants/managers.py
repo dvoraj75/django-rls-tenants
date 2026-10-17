@@ -14,6 +14,11 @@ to joined RLS-protected tables, enabling PostgreSQL to use composite
 indexes on both sides of the join. ``prefetch_related()`` hops that Django
 fetches through the related model's base manager (forward foreign keys,
 one-to-one fields in both directions) get the same filter (#44).
+
+``RLSManager.including_shared()`` (#59) returns a queryset with none of these
+filters, for a model whose ``RLSConstraint`` has ``extra_predicates``: the RLS
+policies alone decide which rows it reads, the current tenant's and those the
+predicates share with it. Such a queryset refuses to update, delete or lock rows.
 """
 
 from __future__ import annotations
@@ -38,7 +43,8 @@ from django.db.models.fields.related_descriptors import (
 )
 from django.db.models.fields.reverse_related import ManyToOneRel
 
-from django_rls_tenants.exceptions import NoTenantContextError
+from django_rls_tenants.exceptions import NoTenantContextError, RLSConfigurationError
+from django_rls_tenants.rls.constraints import RLSConstraint
 from django_rls_tenants.rls.guc import set_guc
 from django_rls_tenants.tenants import audit
 from django_rls_tenants.tenants.affinity import apply_active_context, writing
@@ -60,7 +66,7 @@ from django_rls_tenants.tenants.state import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator, Mapping
+    from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 
     from django_rls_tenants.tenants.types import TenantUser
 
@@ -159,6 +165,20 @@ def _tenant_attname(model: type[models.Model]) -> str | None:
     return None if field is None else field.attname
 
 
+def _shares_rows(model: type[models.Model]) -> bool:
+    """Whether ``model``'s ``RLSConstraint`` has ``extra_predicates`` (a sharing policy).
+
+    The first ``RLSConstraint`` of the model, or of its concrete model for a
+    proxy (a proxy has no constraints of its own), as for
+    ``_get_tenant_fk_field()``.
+    """
+    concrete = model._meta.concrete_model or model  # noqa: SLF001
+    for constraint in concrete._meta.constraints:  # noqa: SLF001
+        if isinstance(constraint, RLSConstraint):
+            return bool(constraint.extra_predicates)
+    return False
+
+
 def _is_strict_mode_excluded(model: type[models.Model]) -> bool:
     """Whether ``RLS_TENANTS["STRICT_MODE_EXCLUDE"]`` lists ``model`` or its concrete model."""
     excluded = _strict_mode_excluded_labels(rls_tenants_config.STRICT_MODE_EXCLUDE)
@@ -207,9 +227,15 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
     for joined RLS-protected tables, enabling index usage on both sides
     of the join. ``prefetch_related()`` adds it to the prefetch queries
     Django would run unfiltered (see :meth:`_tenant_prefetch_lookups`).
+
+    A queryset from ``RLSManager.including_shared()`` adds none of these
+    tenant filters, and ``for_user()`` adds none either: the RLS policies
+    decide which rows it reads. It refuses ``update()``, ``delete()``,
+    ``bulk_update()``, ``update_or_create()`` and ``select_for_update()``.
     """
 
     _rls_user: TenantUser | None
+    _rls_including_shared: bool
 
     # Internal QuerySet attributes this class reads or pins; django-stubs
     # does not declare them.
@@ -221,6 +247,7 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._rls_user = None
+        self._rls_including_shared = False
 
     def for_user(self, as_user: TenantUser) -> TenantQuerySet:
         """Scope this queryset to the given user's tenant.
@@ -240,10 +267,11 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         """
         qs = self._clone()
         qs._rls_user = as_user  # noqa: SLF001
-        if not as_user.is_tenant_admin:
+        if not as_user.is_tenant_admin and not qs._rls_including_shared:  # noqa: SLF001
             # Defense-in-depth: Django-level filter provides isolation
             # even if GUC is misconfigured. RLS provides isolation even
-            # if the Django filter is bypassed (e.g., raw SQL).
+            # if the Django filter is bypassed (e.g., raw SQL). Not on an
+            # including_shared() queryset: it would hide the shared rows.
             conf = rls_tenants_config
             qs = qs.filter(**{f"{conf.TENANT_FK_FIELD}_id": as_user.rls_tenant_id})
         return qs
@@ -267,6 +295,10 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         tenant filters. ``select_related(False)`` is treated the same way
         as a convenience kept for existing callers; Django itself has
         never accepted ``False``.
+
+        An ``including_shared()`` queryset adds no tenant filters: a shared
+        row's related rows belong to another tenant, and the RLS policies
+        decide which of them the join returns.
         """
         # Django never accepted False (it reaches add_select_related() and
         # fails with 'bool' object has no attribute 'split'); normalize it
@@ -300,7 +332,7 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
             everything: TenantQuerySet = self._chain()  # type: ignore[attr-defined]
             everything.query.select_related = True
             return everything
-        tenant_id = self._get_active_tenant_id()
+        tenant_id = None if self._rls_including_shared else self._get_active_tenant_id()
         qs: TenantQuerySet = super().select_related(*fields)
         if tenant_id is None:
             return qs
@@ -339,12 +371,33 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         return None
 
     def _clone(self) -> TenantQuerySet:
-        """Propagate ``_rls_user`` to cloned querysets."""
+        """Propagate ``_rls_user`` and ``_rls_including_shared`` to cloned querysets."""
         # Type ignore explanation: _clone() is an internal Django API not typed in
         # django-stubs; return type is QuerySet, not TenantQuerySet.
         clone: TenantQuerySet = super()._clone()  # type: ignore[misc]
         clone._rls_user = self._rls_user
+        clone._rls_including_shared = self._rls_including_shared
         return clone
+
+    def _combined(self, combined: TenantQuerySet, other: Any) -> TenantQuerySet:
+        """Mark ``combined`` as ``including_shared()`` when ``other`` is one.
+
+        Django builds a ``&`` / ``|`` / ``^`` combination from a clone of the
+        left operand, so without this the right operand's shared rows would
+        reach a queryset that does not refuse writes.
+        """
+        if getattr(other, "_rls_including_shared", False):
+            combined._rls_including_shared = True
+        return combined
+
+    def __and__(self, other: Any) -> TenantQuerySet:
+        return self._combined(super().__and__(other), other)
+
+    def __or__(self, other: Any) -> TenantQuerySet:
+        return self._combined(super().__or__(other), other)
+
+    def __xor__(self, other: Any) -> TenantQuerySet:
+        return self._combined(super().__xor__(other), other)
 
     # ---- prefetch_related() tenant filters ----
 
@@ -363,10 +416,13 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         The tenant is the one the queryset's SQL runs under: the
         ``for_user()`` user's (none for an admin), or else the active
         context's. With no tenant (admin context, no context) the lookups
-        are returned unchanged, as they are when no hop needs a filter.
+        are returned unchanged, as they are when no hop needs a filter, and
+        so they are for an ``including_shared()`` queryset, whose shared rows
+        point at rows of other tenants: the RLS policies decide which of
+        those the prefetch reads.
         """
         lookups = self._prefetch_related_lookups
-        if not lookups:
+        if not lookups or self._rls_including_shared:
             return lookups
         user = self._rls_user
         if user is None:
@@ -405,6 +461,30 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         if self._result_cache:  # nothing to prefetch onto an empty result
             prefetch_related_objects(self._result_cache, *self._tenant_prefetch_lookups())
         self._prefetch_done = True
+
+    # ---- including_shared() write guard ----
+
+    def _refuse_on_shared_rows(self, method: str) -> None:
+        """Raise if this queryset is an ``including_shared()`` one.
+
+        Its rows include rows of other tenants that the sharing policy lets
+        the current tenant read and nothing else: the database would skip
+        them in an ``UPDATE`` or a ``DELETE`` and hide them from
+        ``SELECT ... FOR UPDATE``, while Django's ``delete()`` would still
+        run the delete signals and the cascades on the current tenant's own
+        rows related to them.
+
+        Raises:
+            TypeError: If ``including_shared()`` built this queryset.
+        """
+        if self._rls_including_shared:
+            msg = (
+                f"Cannot call {method}() on an including_shared() queryset: its rows "
+                f"include rows other tenants share, which the current tenant may read "
+                f"but not update, delete or lock. Call {method}() on a queryset of "
+                f"{self.model.__name__} without including_shared()."
+            )
+            raise TypeError(msg)
 
     # ---- Strict mode guard ----
 
@@ -635,7 +715,11 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
             return super().aggregate(*args, **kwargs)
 
     def update(self, **kwargs: Any) -> int:
-        """Run ``update()`` in the ``for_user()`` scope; guarded by strict mode."""
+        """Run ``update()`` in the ``for_user()`` scope; guarded by strict mode.
+
+        Refused on an ``including_shared()`` queryset.
+        """
+        self._refuse_on_shared_rows("update")
         self._check_strict_mode()
         with self._rls_scope(for_write=True):
             return super().update(**kwargs)
@@ -645,8 +729,10 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
 
         One scope covers the whole deletion: collecting the rows, the
         cascades and ``SET_NULL`` updates on related models, the delete
-        signals and the ``DELETE`` statements.
+        signals and the ``DELETE`` statements. Refused on an
+        ``including_shared()`` queryset.
         """
+        self._refuse_on_shared_rows("delete")
         self._check_strict_mode()
         with self._rls_scope(for_write=True, own_transaction=True):
             return super().delete()
@@ -775,7 +861,11 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         fields: Any,
         batch_size: int | None = None,
     ) -> int:
-        """Run ``bulk_update()`` in one ``for_user()`` scope; guarded by strict mode."""
+        """Run ``bulk_update()`` in one ``for_user()`` scope; guarded by strict mode.
+
+        Refused on an ``including_shared()`` queryset.
+        """
+        self._refuse_on_shared_rows("bulk_update")
         self._check_strict_mode()
         with self._rls_scope(for_write=True, own_transaction=True):
             return super().bulk_update(objs, fields, batch_size=batch_size)
@@ -791,14 +881,37 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         Updating an existing row calls ``Model.save()``, which writes
         through the model's base manager rather than this queryset, so one
         scope spans the whole call. The lookup runs through ``_fetch_all()``
-        and is guarded by strict mode there.
+        and is guarded by strict mode there. Refused on an
+        ``including_shared()`` queryset.
         """
+        self._refuse_on_shared_rows("update_or_create")
         with self._rls_scope(for_write=True, own_transaction=True):
             return super().update_or_create(
                 defaults=defaults,
                 create_defaults=create_defaults,
                 **kwargs,
             )
+
+    def select_for_update(
+        self,
+        nowait: bool = False,
+        skip_locked: bool = False,
+        of: Sequence[str] = (),
+        no_key: bool = False,
+    ) -> TenantQuerySet:
+        """Lock the rows; refused on an ``including_shared()`` queryset.
+
+        ``SELECT ... FOR UPDATE`` reads the rows through the tenant policy
+        only, so it would silently drop the shared rows.
+        """
+        self._refuse_on_shared_rows("select_for_update")
+        qs: TenantQuerySet = super().select_for_update(
+            nowait=nowait,
+            skip_locked=skip_locked,
+            of=of,
+            no_key=no_key,
+        )
+        return qs
 
     def explain(
         self,
@@ -1108,17 +1221,24 @@ class RLSManager(models.Manager):  # type: ignore[type-arg]
     # Django's router hints (``db_manager(hints=...)``); django-stubs does not declare it.
     _hints: dict[str, Any]
 
+    # Set on the copy of the manager including_shared() makes.
+    _rls_including_shared = False
+
     def get_queryset(self) -> TenantQuerySet:
         """Return a ``TenantQuerySet`` instance, auto-scoped if a tenant context is active.
 
         When ``tenant_context()``, ``admin_context()``, or ``RLSTenantMiddleware``
         has set a current tenant ID, the queryset is automatically filtered by
         ``WHERE tenant_id = X``. This enables PostgreSQL to use composite indexes
-        instead of relying solely on RLS ``current_setting()`` calls.
+        instead of relying solely on RLS ``current_setting()`` calls. Not for
+        :meth:`including_shared`, whose queryset has no filter.
         """
         # hints too, as BaseManager.get_queryset() passes them: a router reads
         # them (db_manager(hints=...), the hint Django adds for related objects).
         qs = TenantQuerySet(self.model, using=self._db, hints=self._hints)
+        if self._rls_including_shared:
+            qs._rls_including_shared = True  # noqa: SLF001
+            return qs
         tenant_id = get_current_tenant_id()
         if tenant_id is not None:
             conf = rls_tenants_config
@@ -1128,6 +1248,54 @@ class RLSManager(models.Manager):  # type: ignore[type-arg]
     def for_user(self, as_user: TenantUser) -> TenantQuerySet:
         """Return a queryset scoped to the given user's tenant."""
         return self.get_queryset().for_user(as_user=as_user)
+
+    def including_shared(self) -> TenantQuerySet:
+        """Return a queryset of the rows the RLS policies let the current tenant read.
+
+        Those are the tenant's own rows and the rows of other tenants that
+        the ``extra_predicates`` of the model's ``RLSConstraint`` share with
+        it. The queryset adds no ``WHERE tenant_id = X`` (the auto-scope
+        filter, ``for_user()``'s, nor those of ``select_related()`` and
+        ``prefetch_related()``), which would hide the shared rows: the
+        policies alone filter it. Call it before ``filter()`` /
+        ``for_user()``, which it does not undo:
+        ``Note.objects.including_shared().for_user(user)``. On a related
+        manager (``project.notes.including_shared()``) the relation's filter
+        stays.
+
+        Reading only: the queryset refuses ``update()``, ``delete()``,
+        ``bulk_update()``, ``update_or_create()`` and ``select_for_update()``
+        (``TypeError``). Strict mode guards it as any other queryset; with
+        no tenant context the policies return no rows of a tenant.
+
+        Raises:
+            RLSConfigurationError: If the model's ``RLSConstraint`` has no
+                ``extra_predicates``: the queryset would then read the same
+                rows as the default one, without its filters.
+        """
+        if not _shares_rows(self.model):
+            label = self.model._meta.label  # noqa: SLF001
+            msg = (
+                f"including_shared() on {label}: its RLSConstraint has no "
+                f"extra_predicates, so no rows of other tenants are shared with the "
+                f"current tenant."
+            )
+            hint = (
+                f"Add extra_predicates (SharedWith, TenantField, RawPredicate) to the "
+                f"RLSConstraint of {label} and run makemigrations, or use "
+                f"{self.model.__name__}.objects without including_shared()."
+            )
+            raise RLSConfigurationError(msg, hint=hint)
+        manager = copy.copy(self)
+        manager._rls_including_shared = True  # noqa: SLF001  -- a copy of this manager
+        qs = manager.get_queryset()
+        apply_rel_filters = getattr(manager, "_apply_rel_filters", None)
+        if not getattr(qs, "_rls_including_shared", False) and apply_rel_filters is not None:
+            # A related manager returned the rows prefetched for its instance,
+            # read with the tenant filter: build its queryset as it does when
+            # nothing is prefetched, from the manager class it extends.
+            qs = apply_rel_filters(super(type(manager), manager).get_queryset())
+        return qs
 
     def prepare_tenant_in_model_data(
         self,

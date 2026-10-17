@@ -16,6 +16,9 @@ from django_rls_tenants import (
     RLSProtectedModel,
     RLSTenantMiddleware,
     RLSTenantModelAdmin,
+    RawPredicate,
+    SharedWith,
+    TenantField,
     TenantQuerySet,
     TenantUser,
     admin_context,
@@ -90,6 +93,20 @@ asynchronous database cursor, so these are not non-blocking calls; see
 ::: django_rls_tenants.rls.constraints.RLSConstraint
 
 ::: django_rls_tenants.rls.constraints.RLSM2MConstraint
+
+### Predicates
+
+The `extra_predicates` an `RLSConstraint` or `AddRLSPolicy` takes (*1.6.0*; see
+[Sharing Rows Across Tenants](../guides/protecting-models.md#sharing-rows-across-tenants)).
+`Predicate` is the base class and is not re-exported from the package root.
+
+::: django_rls_tenants.rls.predicates.Predicate
+
+::: django_rls_tenants.rls.predicates.SharedWith
+
+::: django_rls_tenants.rls.predicates.TenantField
+
+::: django_rls_tenants.rls.predicates.RawPredicate
 
 ### Migration Operations
 

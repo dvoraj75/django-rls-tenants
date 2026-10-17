@@ -89,12 +89,18 @@ FK `owner`) and its proxy `BookProxy`. `tests/test_app/migrations/0010_loan_book
 protects `Book` with `AddRLSPolicy` (and creates `Loan`, an `RLSProtectedModel` with an FK to
 `Book`), and `tests/settings.py` lists it in `EXTERNAL_MODELS`.
 
+`SharedNote` and `NoteShare` (`tests/test_app/models.py`, migration `0011_shared_note.py`;
+#59) carry `extra_predicates`: `SharedNote` has `SharedWith` (through `NoteShare`) and
+`TenantField("partner")`, `NoteShare` has `TenantField("shared_with")`.
+`tests/test_integration/test_sharing_policies.py` runs them under `enforce_rls`.
+
 ## Architecture
 
 The library has two internal layers with a strict import boundary:
 
 - **`django_rls_tenants/rls/`** — Generic PostgreSQL RLS primitives (GUC helpers,
-  `RLSConstraint`, `RLSM2MConstraint`, context managers). **Zero imports from `tenants/`.**
+  `RLSConstraint`, `RLSM2MConstraint`, the `extra_predicates` in `rls/predicates.py`, context
+  managers). **Zero imports from `tenants/`.**
 - **`django_rls_tenants/tenants/`** — Django multitenancy built on `rls/` (models,
   managers, middleware, config, testing utilities).
 - **`django_rls_tenants/operations.py`** — Migration operations: `AddM2MRLSPolicy` for M2M
@@ -266,6 +272,54 @@ latest; `_rls_migrations.MigrationFacts.rls_policy_migrations()` /
 `for_user()` and the strict-mode guard on queries of the external model itself (it keeps its
 own manager, so the policy is the only isolation), and M2M coverage of its through tables
 (`register_m2m_rls()` and `check_rls` discovery look at `RLSProtectedModel` subclasses only).
+
+Extra predicates (#59): `RLSConstraint(extra_predicates=[...])` and
+`AddRLSPolicy(extra_predicates=[...])` take `Predicate` instances from
+`rls/predicates.py` (`SharedWith`, `TenantField`, `RawPredicate`; the three are exported
+from `rls/` and the package root; `@deconstructible` on the base, `_key()` for equality).
+They go into a **second** policy, `<table>_tenant_sharing_policy`, `AS PERMISSIVE FOR
+SELECT USING (p1 OR p2 ...)` (`_build_sharing_policy_create_sql()` /
+`_build_sharing_policy_drop_sql()` in `rls/constraints.py`); the tenant policy's SQL is
+byte-identical to before, and an empty list changes nothing (`deconstruct()` omits it, so
+existing migrations serialize the same). PostgreSQL ORs permissive policies per command, so
+the predicates widen `SELECT` only: `UPDATE`, `DELETE`, `INSERT` and `SELECT ... FOR
+UPDATE` / `FOR SHARE` read the tenant policy alone. Do not OR a predicate into the `FOR ALL`
+policy's `USING`: `WITH CHECK` checks only the new row, so the receiving tenant could delete
+the row or take it over with `UPDATE ... SET tenant_id`. Each predicate's `policy_sql(model,
+tenant_value=...)` builds from the model the policy is created on (`model._meta.apps` is the
+migration state's registry during `migrate`) and raises `ValueError`; identifiers are quoted
+and refused when they hold a quote, backslash, `$` or NUL (`_quoted()`); `RawPredicate`
+refuses empty text, `;`, `--`, `/*`, `$` and NUL, and is otherwise the developer's. `SharedWith`
+aliases the through table `"rls_shared"`. `RLSConstraint.create_sql()` returns a `Statement`
+whose sharing part is a `_SharingPolicySQL`, rendered by `__str__` when Django renders the
+statement: Django defers the constraint SQL of `CreateModel` to the end of the migration, so a
+share model created after the protected model in the same migration is found. `AddRLSPolicy`
+builds it in `database_forwards()` (the through model must already be in the state) from the
+GUC name and pk type `_policy_options()` read; `database_backwards()` drops the sharing
+policy first. The through model's own policy applies inside the `EXISTS`: `W018` warns when
+it is protected by another field than `tenant_fk` without `TenantField(tenant_fk)` among
+its `extra_predicates` (a `RawPredicate` that solves it is not recognized), `W017` when a
+predicate cannot be built (`_check_extra_predicates()` in `tenants/checks.py`; proxies are
+skipped; the next free id is `W019`).
+
+`RLSManager.including_shared()` (#59, `tenants/managers.py`) reads shared rows: the default
+queryset's `WHERE tenant_id = X` would hide them. It copies the manager with
+`_rls_including_shared = True`, whose `get_queryset()` returns a `TenantQuerySet` with the same
+flag and no auto-scope filter (a related manager that returned its prefetched rows gets its
+queryset rebuilt through `_apply_rel_filters()`). The flag is copied by `_clone()`, and makes
+`for_user()`, `select_related()` and `_tenant_prefetch_lookups()` (#44) add no tenant filter.
+It raises `RLSConfigurationError` unless `_shares_rows()` (the first `RLSConstraint` of the
+concrete model has `extra_predicates`), so it is never an "unscoped" switch. Strict mode and
+the `for_user()` scope are unchanged. `_refuse_on_shared_rows()` makes `update()`, `delete()`,
+`bulk_update()`, `update_or_create()` and `select_for_update()` raise `TypeError`: Django's
+`delete()` collector would fire the signals of shared rows and cascade-delete the current
+tenant's own related rows while the shared row survives. Not blocked: `instance.delete()` on
+a shared instance (the same cascade) and `instance.save()` (fails at the database). A
+new `TenantQuerySet` method that writes must call `_refuse_on_shared_rows()`. Django builds
+`&` / `|` / `^` from a clone of the left operand, so `__and__` / `__or__` / `__xor__` set the
+flag on the result when the right operand has it (`_combined()`). Relations of
+a shared row are not shared (an auto-created through table still needs both sides in the
+tenant). An `EXTERNAL_MODELS` model keeps its own manager and has no `including_shared()`.
 
 Cross-tenant foreign keys (#107): RLS cannot stop a row of tenant A from holding a foreign
 key to a row of tenant B (the policy checks the row's own tenant column; PostgreSQL runs

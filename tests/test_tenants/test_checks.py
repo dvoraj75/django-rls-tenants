@@ -19,10 +19,12 @@ from django.test.utils import isolate_apps
 
 from django_rls_tenants.pool import _policy_guc_names, reset_rls_gucs
 from django_rls_tenants.rls.constraints import RLSConstraint
+from django_rls_tenants.rls.predicates import RawPredicate, SharedWith, TenantField
 from django_rls_tenants.tenants.checks import (
     _check_conn_max_age_with_session_gucs,
     _check_databases_alias_exists,
     _check_external_models,
+    _check_extra_predicates,
     _check_guc_prefix_mismatch,
     _check_policy_guc_defaults,
     _check_pool_without_reset,
@@ -102,6 +104,8 @@ class TestCheckRlsConfig:
         "_check_unique_across_tenants",
         "_check_protected_models_have_constraint",
         "_check_strict_mode_exclude",
+        "_check_external_models",
+        "_check_extra_predicates",
     )
 
     def test_aggregates_every_helper(self):
@@ -1961,3 +1965,159 @@ class TestExternalModelsInOtherChecks:
         """Without its EXTERNAL_MODELS entry, Book is not guarded."""
         (warning,) = _w015(["test_external_app.Book"])
         assert "without an RLSConstraint or EXTERNAL_MODELS entry" in warning.msg
+
+
+_SHARE = SharedWith(through="test_app.Share", fk="note", tenant_fk="shared_with")
+
+
+def _sharing_models(*, note_predicates=(_SHARE,), share_field="tenant", share_predicates=()):
+    """Build ``Note`` (shared through ``Share``) and ``Share`` in the isolated registry."""
+
+    def meta(constraint):
+        return type(
+            "Meta",
+            (RLSProtectedModel.Meta,),
+            {"app_label": "test_app", "constraints": [constraint]},
+        )
+
+    note = type(
+        "Note",
+        (RLSProtectedModel,),
+        {
+            "__module__": __name__,
+            "title": models.CharField(max_length=10),
+            "Meta": meta(
+                RLSConstraint(field="tenant", name="note_rls", extra_predicates=note_predicates)
+            ),
+        },
+    )
+    share = type(
+        "Share",
+        (RLSProtectedModel,),
+        {
+            "__module__": __name__,
+            "note": models.ForeignKey(note, on_delete=models.CASCADE),
+            "shared_with": models.ForeignKey(
+                "test_app.Tenant", on_delete=models.CASCADE, related_name="+"
+            ),
+            "Meta": meta(
+                RLSConstraint(
+                    field=share_field, name="share_rls", extra_predicates=share_predicates
+                )
+            ),
+        },
+    )
+    return note, share
+
+
+def _w017_w018(models_):
+    """Run the extra-predicate checks over ``models_`` only."""
+    with patch.object(apps, "get_models", return_value=list(models_)):
+        return _check_extra_predicates()
+
+
+class TestCheckExtraPredicatesOfTheTestApp:
+    def test_no_warning_with_default_config(self):
+        """``SharedNote`` and ``NoteShare`` are set up as W018 asks."""
+        assert _check_extra_predicates() == []
+
+
+@pytest.mark.usefixtures("isolated_apps")
+class TestCheckExtraPredicates:
+    """Tests for _check_extra_predicates (W017, W018, #59)."""
+
+    def test_share_readable_by_the_tenant_it_shares_with(self):
+        models_ = _sharing_models(share_predicates=[TenantField("shared_with")])
+        assert _w017_w018(models_) == []
+
+    def test_share_owned_by_the_tenant_it_shares_with(self):
+        """The share's own tenant field is ``tenant_fk``: its policy already shows it."""
+        assert _w017_w018(_sharing_models(share_field="shared_with")) == []
+
+    def test_w018_share_hidden_from_the_tenant_it_shares_with(self):
+        note, share = _sharing_models()
+        [warning] = _w017_w018([note, share])
+        assert warning.id == "django_rls_tenants.W018"
+        assert isinstance(warning, CheckWarning)
+        assert warning.obj is note
+        assert warning.msg == (
+            "SharedWith(through='test_app.Share', fk='note', tenant_fk='shared_with') on "
+            "test_app.Note never matches: the RLS policy of test_app.Share filters its rows "
+            "on 'tenant', so the tenant in 'shared_with' cannot read the rows shared with "
+            "it, inside the sharing policy either."
+        )
+        assert warning.hint == (
+            "Add TenantField('shared_with') to the extra_predicates of test_app.Share's "
+            "RLSConstraint and run makemigrations."
+        )
+
+    def test_w018_ignores_other_predicates_of_the_share(self):
+        models_ = _sharing_models(share_predicates=[RawPredicate("shared_with_id = 1")])
+        assert [w.id for w in _w017_w018(models_)] == ["django_rls_tenants.W018"]
+
+    def test_through_model_without_a_policy(self):
+        note, _ = _sharing_models()
+        plain = type(
+            "Plain",
+            (models.Model,),
+            {
+                "__module__": __name__,
+                "note": models.ForeignKey(note, on_delete=models.CASCADE),
+                "reader": models.ForeignKey(
+                    "test_app.Tenant", on_delete=models.CASCADE, related_name="+"
+                ),
+                "Meta": type("Meta", (), {"app_label": "test_app"}),
+            },
+        )
+        predicate = SharedWith(through="test_app.Plain", fk="note", tenant_fk="reader")
+        note._meta.constraints[0].extra_predicates = [predicate]
+        assert _w017_w018([note, plain]) == []
+
+    def test_w018_reads_the_concrete_model_of_a_proxy_through_model(self):
+        note, share = _sharing_models()
+        proxy = type(
+            "ShareProxy",
+            (share,),
+            {
+                "__module__": __name__,
+                "Meta": type("Meta", (), {"app_label": "test_app", "proxy": True}),
+            },
+        )
+        predicate = SharedWith(through="test_app.ShareProxy", fk="note", tenant_fk="shared_with")
+        note._meta.constraints[0].extra_predicates = [predicate]
+        [warning] = _w017_w018([note, share, proxy])
+        assert warning.id == "django_rls_tenants.W018"
+        assert "the RLS policy of test_app.Share filters" in warning.msg
+
+    @pytest.mark.parametrize(
+        ("predicate", "problem"),
+        [
+            (
+                SharedWith(through="test_app.Missing", fk="note", tenant_fk="shared_with"),
+                "SharedWith on test_app.Note: there is no model 'test_app.Missing'.",
+            ),
+            (TenantField("title"), "field='title': test_app.Note.title is a CharField"),
+        ],
+    )
+    def test_w017_predicate_that_cannot_be_built(self, predicate, problem):
+        note, share = _sharing_models(note_predicates=[predicate])
+        [warning] = _w017_w018([note, share])
+        assert warning.id == "django_rls_tenants.W017"
+        assert warning.obj is note
+        assert warning.msg.startswith(
+            f"The extra predicate {predicate!r} of test_app.Note's RLSConstraint cannot be "
+            f"built: {problem}"
+        )
+        assert "migrate builds the sharing policy from it" in warning.hint
+
+    def test_proxy_and_models_without_predicates_are_skipped(self):
+        note, share = _sharing_models(note_predicates=[TenantField("title")])
+        proxy = type(
+            "NoteProxy",
+            (note,),
+            {
+                "__module__": __name__,
+                "Meta": type("Meta", (), {"app_label": "test_app", "proxy": True}),
+            },
+        )
+        assert [w.id for w in _w017_w018([proxy, share])] == []

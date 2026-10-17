@@ -21,16 +21,23 @@ from django_rls_tenants.rls.constraints import (
     _build_m2m_drop_sql,
     _build_policy_create_sql,
     _build_policy_drop_sql,
+    _build_sharing_policy_create_sql,
+    _build_sharing_policy_drop_sql,
     _validate_field_name,
     _validate_guc_name_for_ddl,
     _validate_model_path,
     _validate_pk_type,
 )
-from django_rls_tenants.rls.policy_sql import bool_flag_sql
+from django_rls_tenants.rls.policy_sql import bool_flag_sql, tenant_value_sql
+from django_rls_tenants.rls.predicates import _predicates_sql, _validated_predicates
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from django.db.backends.base.schema import BaseDatabaseSchemaEditor
     from django.db.migrations.state import ProjectState
+
+    from django_rls_tenants.rls.predicates import Predicate
 
 
 class AddM2MRLSPolicy(migrations.operations.base.Operation):
@@ -227,10 +234,15 @@ class AddRLSPolicy(migrations.operations.base.Operation):
             applied (``"rls.is_admin"``).
         extra_bypass_flags: Additional GUC variables that bypass the
             ``USING`` clause (but not ``WITH CHECK``), as on ``RLSConstraint``.
+        extra_predicates: Rows of other tenants the current tenant may read,
+            in a second, ``FOR SELECT`` policy, as on ``RLSConstraint``. A
+            ``SharedWith``'s ``through`` model must be in the migration state
+            when the operation runs (a dependency, or an earlier operation).
 
     Raises:
         ValueError: If an argument contains characters that cannot be
             interpolated into the policy SQL safely.
+        TypeError: If an item of ``extra_predicates`` is not a predicate.
     """
 
     reduces_to_sql = True
@@ -248,6 +260,7 @@ class AddRLSPolicy(migrations.operations.base.Operation):
         guc_tenant_var: str | None = None,
         guc_admin_var: str | None = None,
         extra_bypass_flags: list[str] | None = None,
+        extra_predicates: Sequence[Predicate] | None = None,
     ) -> None:
         _validate_field_name(model_name, "model_name")
         _validate_field_name(field, "field")
@@ -268,6 +281,7 @@ class AddRLSPolicy(migrations.operations.base.Operation):
         self.guc_tenant_var = guc_tenant_var
         self.guc_admin_var = guc_admin_var
         self.extra_bypass_flags = list(extra_bypass_flags or [])
+        self.extra_predicates = _validated_predicates(extra_predicates)
 
     @property
     def model_name_lower(self) -> str:
@@ -403,22 +417,37 @@ class AddRLSPolicy(migrations.operations.base.Operation):
     ) -> None:
         """Enable RLS on the model's table and create its tenant policy.
 
+        With ``extra_predicates``, create its sharing policy too.
+
         Raises:
             ValueError: If the model or its tenant foreign key is not in the
-                migration state, or a value cannot be interpolated safely.
+                migration state, a predicate cannot be built, or a value
+                cannot be interpolated safely.
         """
         model = self._model(app_label, to_state)
         if not self._applies_to(schema_editor.connection.alias, model):
             return
         guc_tenant_var, guc_admin_var, tenant_pk_type = self._policy_options()
+        table = self._table(model)
         sql = _build_policy_create_sql(
-            table=self._table(model),
+            table=table,
             column=self._column(model),
             guc_tenant_var=guc_tenant_var,
             guc_admin_var=guc_admin_var,
             tenant_pk_type=tenant_pk_type,
             extra_bypass_flags=self.extra_bypass_flags,
         )
+        if self.extra_predicates:
+            # Built before anything runs, so a predicate that cannot be built
+            # leaves the table as it was.
+            sql += _build_sharing_policy_create_sql(
+                table=table,
+                predicates=_predicates_sql(
+                    model,
+                    self.extra_predicates,
+                    tenant_value=tenant_value_sql(guc_tenant_var, tenant_pk_type),
+                ),
+            )
         schema_editor.execute(sql)
 
     def database_backwards(
@@ -428,11 +457,15 @@ class AddRLSPolicy(migrations.operations.base.Operation):
         from_state: ProjectState,  # noqa: ARG002
         to_state: ProjectState,
     ) -> None:
-        """Drop the tenant policy and disable RLS, where the operation applies."""
+        """Drop the tenant policy (and the sharing policy) and disable RLS, where it applies."""
         model = self._model(app_label, to_state)
         if not self._applies_to(schema_editor.connection.alias, model):
             return
-        schema_editor.execute(_build_policy_drop_sql(table=self._table(model)))
+        table = self._table(model)
+        sql = _build_policy_drop_sql(table=table)
+        if self.extra_predicates:
+            sql = _build_sharing_policy_drop_sql(table=table) + sql
+        schema_editor.execute(sql)
 
     def describe(self) -> str:
         """Return a human-readable description."""
@@ -460,4 +493,6 @@ class AddRLSPolicy(migrations.operations.base.Operation):
             kwargs["guc_admin_var"] = self.guc_admin_var
         if self.extra_bypass_flags:
             kwargs["extra_bypass_flags"] = self.extra_bypass_flags
+        if self.extra_predicates:
+            kwargs["extra_predicates"] = self.extra_predicates
         return (self.__class__.__name__, [], kwargs)

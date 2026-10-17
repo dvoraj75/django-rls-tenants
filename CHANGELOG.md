@@ -47,6 +47,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or does not point at `TENANT_MODEL`, and two labels for one model. The stale-entry
   messages of `W012` and `W015` now say "RLSConstraint or EXTERNAL_MODELS entry". See
   [W016](https://dvoraj75.github.io/django-rls-tenants/troubleshooting/#w016-an-external_models-entry-cannot-be-used).
+- **Sharing rows across tenants: `extra_predicates` and `including_shared()`** (#59).
+  `RLSConstraint(..., extra_predicates=[...])` and `AddRLSPolicy(..., extra_predicates=[...])`
+  take `SharedWith(through=..., fk=..., tenant_fk=...)` (rows a share table, such as
+  `NoteShare`, shares with the current tenant), `TenantField(field)` (rows whose second
+  tenant foreign key, a partner, is the current tenant) and `RawPredicate(sql)` (SQL you
+  write), all importable from `django_rls_tenants`. The predicates go into a second,
+  permissive `FOR SELECT` policy named `<table>_tenant_sharing_policy`; the tenant policy
+  is unchanged, and a model without predicates produces exactly the SQL and migrations it
+  did. PostgreSQL ORs permissive policies per command, so a tenant can **read** a shared
+  row, but `UPDATE`, `DELETE`, `INSERT`, `SELECT ... FOR UPDATE` and taking the row over
+  with `UPDATE ... SET tenant_id` still go through the tenant policy alone and match
+  nothing. `Model.objects.including_shared()` (on `RLSManager`, so also on related managers
+  such as `note.shares.including_shared()`) returns a queryset that adds no
+  `WHERE tenant_id = X`, no `for_user()` filter and no `select_related()` /
+  `prefetch_related()` tenant filter, so the policies alone decide which rows it reads; call
+  it before `filter()` / `for_user()`. It is read-only: `update()`, `delete()`,
+  `bulk_update()`, `update_or_create()` and `select_for_update()` (and their async
+  variants) raise `TypeError`. It raises `RLSConfigurationError` on a model whose
+  `RLSConstraint` has no `extra_predicates`, so it is never a switch that turns tenant
+  filtering off. Strict mode guards it like any queryset. `check_rls --verbose` prints the
+  sharing policy. A `SharedWith` share model that is RLS-protected by the owner's tenant
+  hides its rows from the tenant they are shared with and nothing matches: add
+  `TenantField("shared_with")` to the share model's `extra_predicates`. Index the share
+  table on `(fk, tenant_fk)`. See
+  [Sharing Rows Across Tenants](https://dvoraj75.github.io/django-rls-tenants/guides/protecting-models/#sharing-rows-across-tenants)
+  and [Security](https://dvoraj75.github.io/django-rls-tenants/advanced/security/#sharing-rows-across-tenants).
+- **`W017` and `W018`: system checks for `extra_predicates`** (#59). `W017` reports a
+  predicate of an installed model's `RLSConstraint` that cannot be built (a `SharedWith`
+  whose `through` model does not resolve or whose foreign keys are wrong, a `TenantField`
+  that names no foreign key): `migrate` would fail the same way. `W018` reports a
+  `SharedWith` that can never match, because its `through` model is RLS-protected on
+  another field than `tenant_fk` and has no `TenantField(tenant_fk)` among its own
+  `extra_predicates`. A `RawPredicate` that solves it is not recognized: silence the
+  warning then. See
+  [W017](https://dvoraj75.github.io/django-rls-tenants/troubleshooting/#w017-an-extra-predicate-cannot-be-built)
+  and
+  [W018](https://dvoraj75.github.io/django-rls-tenants/troubleshooting/#w018-a-sharedwith-predicate-never-matches).
 
 - **Audit logging** (#48). The library now logs structured records to a new child logger,
   `django_rls_tenants.audit`, which Django's `LOGGING` setting turns on and routes (no

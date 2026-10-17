@@ -2,7 +2,8 @@
 
 This layer has **zero imports** from ``django_rls_tenants.tenants``.
 It provides reusable building blocks: GUC variable helpers, a migration-aware
-``RLSConstraint``, and generic context managers.
+``RLSConstraint`` and the predicates its ``extra_predicates`` take, and generic
+context managers.
 """
 
 from __future__ import annotations
@@ -24,10 +25,15 @@ from django_rls_tenants.rls.guc import (
     restore_guc,
     set_guc,
 )
+from django_rls_tenants.rls.predicates import Predicate, RawPredicate, SharedWith, TenantField
 
 __all__ = [
+    "Predicate",
     "RLSConstraint",
     "RLSM2MConstraint",
+    "RawPredicate",
+    "SharedWith",
+    "TenantField",
     "aclear_guc",
     "aget_guc",
     "arestore_guc",

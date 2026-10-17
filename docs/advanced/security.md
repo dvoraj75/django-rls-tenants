@@ -237,6 +237,44 @@ The policy's GUC names and tenant type are read from `RLS_TENANTS` when the migr
 unless you pass them to the operation (`RLSConstraint` has the literal defaults instead), and
 a later `GUC_PREFIX` change does not rewrite an applied policy.
 
+### Sharing Rows Across Tenants
+
+*Added in 1.6.0.*
+
+`RLSConstraint(extra_predicates=[...])` and `AddRLSPolicy(extra_predicates=[...])` widen
+what a tenant can **read** (see
+[Sharing Rows Across Tenants](../guides/protecting-models.md#sharing-rows-across-tenants)).
+The predicates are not part of the tenant policy: they form a second permissive policy,
+`<table>_tenant_sharing_policy`, `FOR SELECT` only. What that does and does not allow:
+
+- **Reads widen only by what you list.** A row is also readable when one predicate matches
+  it: a `SharedWith` share row for the current tenant, a `TenantField` that is the current
+  tenant, or your `RawPredicate`. With no tenant context the tenant value is `NULL`, so
+  `SharedWith` and `TenantField` match nothing.
+- **Writes do not widen.** `UPDATE`, `DELETE` and `INSERT` apply the tenant policy alone,
+  so a tenant cannot update, delete or insert a shared row, nor take it over with
+  `UPDATE ... SET tenant_id`. `SELECT ... FOR UPDATE` / `FOR SHARE` applies it too, so
+  a shared row cannot be locked (it is not returned). The tenant policy itself is
+  unchanged.
+- **The ORM does not widen on its own.** The default manager still filters on the
+  tenant. Only `including_shared()` leaves the tenant filter out, only on a model with
+  predicates, and it refuses `update()`, `delete()`, `bulk_update()`,
+  `update_or_create()` and `select_for_update()`. An instance of another tenant read
+  through it can still be passed to `instance.delete()`: the database deletes nothing, but
+  Django's collector first runs the delete signals and cascades on the **current tenant's
+  own** rows that point at it. Do not call it on shared rows.
+- **A predicate is read access to another tenant's data.** Anything on the row is
+  readable: every column, and the foreign keys it holds. Relations of the row are not
+  shared; each related table applies its own policy.
+- **`RawPredicate` is yours.** The library refuses only text that breaks out of the policy
+  statement (`;`, `--`, `/*`, `$`, NUL, empty). It does not check what the expression
+  means. One that does not depend on the current tenant opens its rows to every tenant, and
+  to sessions with no context. Review it like the policy it is part of.
+- **The share model has a policy too.** It applies inside `SharedWith`'s subquery. A share
+  model protected by the owner's tenant is invisible to the tenant it shares with, so the
+  predicate matches nothing: it fails closed, not open. System check `W018` reports it.
+  `W017` reports a predicate that cannot be built, which `migrate` would fail on.
+
 ### Aggregate Leaks
 
 RLS prevents row-level access, but metadata can leak through side channels:
@@ -383,6 +421,7 @@ Properties of the DRF side worth knowing:
 | INSERT/UPDATE to wrong tenant | `WITH CHECK` clause validates writes |
 | M2M link to wrong tenant's records | `EXISTS`-based subquery policies on M2M through tables |
 | FK to another tenant's row in a form, the admin or a DRF serializer | `validate_cross_tenant_fks()` in `clean_fields()` and `RLSTenantSerializerMixin.validate()` |
+| A tenant changing or deleting a row shared with it | The sharing policy is `FOR SELECT`; writes and `FOR UPDATE` use the tenant policy alone |
 
 ### Not Protected Against
 
@@ -396,6 +435,7 @@ Properties of the DRF side worth knowing:
 | Schema-level information leaks | Shared tables, sequences, indexes |
 | Timing side channels | Query duration may reveal data volume |
 | GUC leak via connection pooling | Mitigated but not eliminated (see above): cleanup can fail, and an external pooler in transaction mode needs `USE_LOCAL_SET` |
+| A `RawPredicate` that ignores the tenant | The expression is yours: it can open rows to every tenant and to sessions with no context (see [Sharing Rows Across Tenants](#sharing-rows-across-tenants)) |
 | Application-level logic bugs | RLS filters rows, not application behavior |
 | Denial of service | RLS does not rate-limit or throttle |
 

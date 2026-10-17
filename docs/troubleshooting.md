@@ -762,6 +762,47 @@ entry per model.
 **See:** [`EXTERNAL_MODELS`](getting-started/configuration.md#external_models),
 [Tables You Do Not Own](guides/protecting-models.md#tables-you-do-not-own).
 
+### W017: an extra predicate cannot be built
+
+*Added in 1.6.0.*
+
+**Symptom:** `(django_rls_tenants.W017) The extra predicate SharedWith(through='notes.NoteShare',
+fk='note', tenant_fk='shared_with') of notes.Note's RLSConstraint cannot be built: ...`, followed
+by the reason (for example `SharedWith on notes.Note: there is no model 'notes.NoteShare'`,
+or `field='partner': notes.Note has no field 'partner'.`).
+
+**Cause:** A predicate in the `extra_predicates` of an installed model's `RLSConstraint`
+refers to something that does not exist: a `SharedWith` whose `through` model does not
+resolve, whose `fk` is not a `ForeignKey` to the model (or a proxy of it) or whose
+`tenant_fk` is not a `ForeignKey`, or a `TenantField` that names no foreign key. `migrate`
+builds the sharing policy from the same predicate and would fail with the same
+`ValueError`. Proxies are skipped; the concrete model is checked.
+
+**Fix:** Correct the predicate in the model's `Meta.constraints`, then `makemigrations`.
+
+**See:** [Sharing Rows Across Tenants](guides/protecting-models.md#sharing-rows-across-tenants).
+
+### W018: a `SharedWith` predicate never matches
+
+*Added in 1.6.0.*
+
+**Symptom:** `(django_rls_tenants.W018) SharedWith(through='notes.NoteShare', fk='note',
+tenant_fk='shared_with') on notes.Note never matches: the RLS policy of notes.NoteShare filters
+its rows on 'tenant', so the tenant in 'shared_with' cannot read the rows shared with it, inside
+the sharing policy either.` Shared rows never appear in `including_shared()`.
+
+**Cause:** The sharing policy reads the share model (`through`) in a subquery, and the share
+model's own RLS policy applies there. When it is protected by another field than `tenant_fk`
+(the owner's tenant, say), the tenant a row is shared with cannot see the share row, so the
+`EXISTS` is false.
+
+**Fix:** Add `TenantField("shared_with")` (your `tenant_fk`) to the `extra_predicates` of the
+share model's `RLSConstraint` and run `makemigrations`. If a `RawPredicate` of yours already
+makes the share rows visible to that tenant, silence the warning
+(`SILENCED_SYSTEM_CHECKS = ["django_rls_tenants.W018"]`): the check does not recognize it.
+
+**See:** [Sharing Rows Across Tenants](guides/protecting-models.md#the-share-model-must-be-readable-by-the-tenant-it-shares-with).
+
 ### W006 / W008 / W009: alias, tenant model or tenant field not found
 
 | ID | Message | Cause | Fix |
