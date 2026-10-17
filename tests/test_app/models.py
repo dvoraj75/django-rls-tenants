@@ -272,7 +272,9 @@ class OrderShipment(RLSProtectedModel):
 
     Used to test ``prefetch_related()`` tenant filters on the forward
     (``shipment.order``) and reverse (``order.shipment``) one-to-one hops,
-    which Django fetches through the base manager (#44).
+    which Django fetches through the base manager (#44). A one-to-one
+    field is unique across tenants by nature, so ``tests/settings.py``
+    lists it in ``UNIQUE_ACROSS_TENANTS`` (``W012``).
     """
 
     order = models.OneToOneField(Order, on_delete=models.CASCADE, related_name="shipment")

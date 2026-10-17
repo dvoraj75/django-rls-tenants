@@ -96,4 +96,8 @@ RLS_TENANTS = {
     "USER_PARAM_NAME": "as_user",
     "TENANT_PK_TYPE": "int",
     "USE_LOCAL_SET": False,
+    # OrderShipment.order is a one-to-one field (#44): unique across tenants by
+    # nature, so W012 would report it. Tests that run the checks over the real
+    # registry with a config of their own carry the same entry.
+    "UNIQUE_ACROSS_TENANTS": {"test_app.OrderShipment": ["order"]},
 }

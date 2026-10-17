@@ -41,6 +41,12 @@ pytestmark = pytest.mark.django_db
 # Patch target for the module-level singleton used by all check functions.
 _CONF_PATCH = "django_rls_tenants.tenants.conf.rls_tenants_config"
 
+# The test app's OrderShipment.order is a one-to-one field (#44), unique across
+# tenants by nature: a config of a test's own that runs the checks over the real
+# registry carries the UNIQUE_ACROSS_TENANTS entry tests/settings.py has, or W012
+# reports it.
+_TEST_APP_ALLOWLIST = {"test_app.OrderShipment": ["order"]}
+
 
 class TestCheckRlsConfig:
     """Tests for the top-level check_rls_config orchestrator."""
@@ -64,6 +70,7 @@ class TestCheckRlsConfig:
                 RLS_TENANTS={
                     "TENANT_MODEL": "test_app.Tenant",
                     "USE_LOCAL_SET": True,
+                    "UNIQUE_ACROSS_TENANTS": _TEST_APP_ALLOWLIST,
                 },
                 DATABASES={
                     "default": {"ENGINE": "django.db.backends.postgresql", "NAME": "test"},
@@ -112,7 +119,12 @@ class TestCheckRlsConfig:
     def test_w008_surfaces_from_real_config(self):
         """An unresolvable TENANT_MODEL reaches the aggregated result as W008."""
         with (
-            override_settings(RLS_TENANTS={"TENANT_MODEL": "nope.Nope"}),
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "nope.Nope",
+                    "UNIQUE_ACROSS_TENANTS": _TEST_APP_ALLOWLIST,
+                },
+            ),
             patch(_CONF_PATCH, RLSTenantsConfig()),
             patch(
                 "django_rls_tenants.tenants.checks._check_superuser_connection",
@@ -145,7 +157,7 @@ class TestCheckRlsConfig:
             override_settings(
                 RLS_TENANTS={
                     "TENANT_MODEL": "test_app.Tenant",
-                    "UNIQUE_ACROSS_TENANTS": {"test_app.Nope": ["slug"]},
+                    "UNIQUE_ACROSS_TENANTS": {"test_app.Nope": ["slug"], **_TEST_APP_ALLOWLIST},
                 },
             ),
             patch(_CONF_PATCH, RLSTenantsConfig()),
@@ -161,7 +173,10 @@ class TestCheckRlsConfig:
         """A pooled alias without a reset reaches the aggregated result as W010."""
         with (
             override_settings(
-                RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant"},
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "UNIQUE_ACROSS_TENANTS": _TEST_APP_ALLOWLIST,
+                },
                 DATABASES={"default": _pooled_database({"max_size": 4})},
             ),
             patch(_CONF_PATCH, RLSTenantsConfig()),
@@ -177,7 +192,11 @@ class TestCheckRlsConfig:
         """An unknown alias in RLS_TENANTS['DATABASES'] reaches the result as W006."""
         with (
             override_settings(
-                RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant", "DATABASES": ["default", "nope"]}
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "DATABASES": ["default", "nope"],
+                    "UNIQUE_ACROSS_TENANTS": _TEST_APP_ALLOWLIST,
+                },
             ),
             patch(_CONF_PATCH, RLSTenantsConfig()),
             patch(
@@ -1227,7 +1246,7 @@ class TestCheckUniqueAcrossTenants:
     """Tests for _check_unique_across_tenants (W012)."""
 
     def test_no_warning_with_default_config(self):
-        """The test app's only unique constraint includes the tenant field."""
+        """The test app's unique sets include the tenant field, or are allowlisted."""
         assert _check_unique_across_tenants() == []
 
     def test_unique_field_fires(self):
@@ -1561,7 +1580,10 @@ class TestCheckUniqueAcrossTenants:
             override_settings(
                 RLS_TENANTS={
                     "TENANT_MODEL": "test_app.Tenant",
-                    "UNIQUE_ACROSS_TENANTS": {"test_app.Invoice": [("tenant", "number")]},
+                    "UNIQUE_ACROSS_TENANTS": {
+                        "test_app.Invoice": [("tenant", "number")],
+                        **_TEST_APP_ALLOWLIST,
+                    },
                 },
             ),
             patch(_CONF_PATCH, RLSTenantsConfig()),
