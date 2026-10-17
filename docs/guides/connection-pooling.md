@@ -338,8 +338,10 @@ With `USE_LOCAL_SET=True` the library writes the tenant and admin GUCs only
 transaction-locally, and it assumes that a new connection's session holds none of them.
 Behind PgBouncer that is true only while nothing else writes them for the session through
 the same pool. A session-level write stays on its server connection until PgBouncer closes
-that connection (`server_lifetime`, one hour by default), and every client that gets the
-connection runs with the value whenever it has no context of its own. A leaked
+that connection (once it has been idle for `server_idle_timeout`, ten minutes by default,
+or, when idle, once it is older than `server_lifetime`, one hour; a busy pool rarely lets a
+connection idle that long), and every client that gets the connection runs with the value
+whenever it has no context of its own. A leaked
 `extra_bypass_flags` entry applies even inside a tenant context, for the models that
 declare it. Typical sources:
 
@@ -368,8 +370,9 @@ write as soon as the transaction that made it ends:
 - `USE_LOCAL_SET=True` works as before. The library's own values never outlive their
   transaction, so the reset finds nothing of theirs to remove.
 - `USE_LOCAL_SET=False` stops working, fail-closed: the GUCs the middleware writes are gone
-  before the view's first query, so every query returns zero rows. A deployment with the
-  wrong setting shows at once instead of leaking.
+  before the view's first query, so the view's queries return zero rows (only a context
+  entered inside `transaction.atomic()` still works, since its write and its queries share
+  the transaction). A deployment with the wrong setting shows at once instead of leaking.
 - A bypass flag set without `is_local=True` does not reach the next transaction. Set it with
   `is_local=True` inside `transaction.atomic()`, as transaction mode requires anyway.
 - Each transaction costs one more statement between PgBouncer and PostgreSQL. With
@@ -733,8 +736,9 @@ PgBouncer gives each transaction whichever server connection is free: run the qu
 times, or check a staging pool with `default_pool_size = 1`, which has only one.
 PgBouncer's `SHOW SERVERS` (on its admin console) lists each server connection with its
 backend's process id (`remote_pid`) and the time it connected. Behind pgpool-II with load
-balancing on, the query can run on a standby; start it with the comment
-`/*NO LOAD BALANCE*/` to run it on the primary.
+balancing on, the query can run on a standby; start it with a comment, such as
+`/*NO LOAD BALANCE*/ SELECT ...`, to run it on the primary: with pgpool's default
+`allow_sql_comments = off`, any leading comment keeps a query off the standby.
 
 ### 2. Check That the Pool Resets
 
@@ -785,8 +789,9 @@ or `ALTER DATABASE ... SET` as `W011` (see
 
 - **PgBouncer:** `RECONNECT` (every database) or `RECONNECT myproject` on the admin console
   closes each server connection once its client releases it, and the new ones start without
-  the value. Restarting PgBouncer does the same. Unused server connections are closed after
-  `server_lifetime` anyway (one hour by default).
+  the value. Restarting PgBouncer does the same. PgBouncer closes a server connection on
+  its own once it has been idle for `server_idle_timeout` (ten minutes by default) or, when
+  idle, once it is older than `server_lifetime` (one hour).
 - **pgpool-II:** the next disconnect of the client runs `reset_query_list`. A client that
   keeps its connection (`CONN_MAX_AGE > 0`) keeps its session until Django closes it.
 - **Django's pool:** every checkout clears the policy GUCs (see
