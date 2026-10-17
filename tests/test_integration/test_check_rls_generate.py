@@ -345,9 +345,11 @@ class TestHints:
         assert code == 1
         assert "  Order (test_order): RLS not enabled" in err
         assert (
-            "Could not read the migrations to tell how to fix these issues: RuntimeError: "
-            "broken migration graph."
+            "Could not read the migrations (to compare their AddRLSPolicy operations with "
+            "RLS_TENANTS['EXTERNAL_MODELS'], and to tell how to fix any issues): "
+            "RuntimeError: broken migration graph."
         ) in err
+        assert err.count("Could not read the migrations") == 1
         assert "How to fix:" not in err
 
 

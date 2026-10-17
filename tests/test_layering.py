@@ -76,6 +76,17 @@ class TestLazyImports:
 
         assert RLSConstraint is DirectCls
 
+    def test_migration_operations(self):
+        """The migration operations are importable from the top-level package."""
+        from django_rls_tenants import (  # noqa: PLC0415
+            AddM2MRLSPolicy,
+            AddRLSPolicy,
+            operations,
+        )
+
+        assert AddRLSPolicy is operations.AddRLSPolicy
+        assert AddM2MRLSPolicy is operations.AddM2MRLSPolicy
+
     def test_rls_protected_model(self):
         """RLSProtectedModel is importable from the top-level package."""
         from django_rls_tenants import RLSProtectedModel  # noqa: PLC0415

@@ -123,6 +123,26 @@ migration that assigns the correct tenant to each existing record.
 
 ## Upgrading django-rls-tenants
 
+### From 1.5.0 to 1.6.0
+
+Nothing needs to change for a project that does not set `RLS_TENANTS["EXTERNAL_MODELS"]`.
+
+- **`select_related()` and the `prefetch_related()` tenant filter use each joined model's
+  own tenant field** (#112). They filtered every joined RLS-protected model on
+  `{TENANT_FK_FIELD}_id`. They now filter on the field of the joined model's
+  `RLSConstraint(field=...)`, or of its `EXTERNAL_MODELS` entry, and add no filter when
+  that field does not exist (system check `W009` or `W016`; the policy still filters). The
+  SQL is the same for every model whose constraint uses the default field. It differs only
+  for a model whose constraint names another field than `TENANT_FK_FIELD`, where the join
+  now filters on the column the policy uses.
+- **The set of RLS-protected models follows `override_settings`.** The library computed it
+  once per process; it is now rebuilt when `RLS_TENANTS` or `INSTALLED_APPS` changes, so a
+  test that overrides either sees the new set.
+- **New: `AddRLSPolicy` and `EXTERNAL_MODELS`** protect a third-party app's table with the
+  same policy `RLSConstraint` creates. With the setting in use, `check_rls` also checks
+  those tables and the new system check `W016` reports an entry the library cannot use.
+  See [Tables You Do Not Own](../guides/protecting-models.md#tables-you-do-not-own).
+
 ### From 1.4.0 to 1.5.0
 
 - **With `USE_LOCAL_SET=True`, nothing in the library writes the GUCs inside

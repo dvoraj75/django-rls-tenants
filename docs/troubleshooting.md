@@ -707,18 +707,56 @@ Then run `makemigrations` and `migrate`; `check_rls` confirms the policy.
 
 **Symptom:** `(django_rls_tenants.W015) RLS_TENANTS['STRICT_MODE_EXCLUDE'] lists
 'accounts.Usr', which does not resolve to an installed model.` or `... lists
-'myapp.Country', which names a model without an RLSConstraint, which strict mode never
-guards, so the entry has no effect.`
+'myapp.Country', which names a model without an RLSConstraint or EXTERNAL_MODELS entry,
+which strict mode never guards, so the entry has no effect.`
 
 **Cause:** The label is not `"<app_label>.<ModelName>"` of an installed model (a typo, an
-app missing from `INSTALLED_APPS`, no dot), or the model has no `RLSConstraint`, so strict
-mode never guards it and listing it does nothing. The check runs whether or not
+app missing from `INSTALLED_APPS`, no dot), or the model has neither an `RLSConstraint`
+nor an [`EXTERNAL_MODELS`](getting-started/configuration.md#external_models) entry, so
+strict mode never guards it and listing it does nothing. The check runs whether or not
 `STRICT_MODE` is on.
 
 **Fix:** Correct the label, or remove the entry. A model without an `RLSConstraint` needs
 no entry.
 
 **See:** [`STRICT_MODE_EXCLUDE`](getting-started/configuration.md#strict_mode_exclude).
+
+### W016: an `EXTERNAL_MODELS` entry cannot be used
+
+*Added in 1.6.0.*
+
+**Symptom:** One of these, each starting `(django_rls_tenants.W016) RLS_TENANTS['EXTERNAL_MODELS']
+lists 'library.Book', which ...`:
+
+- `does not resolve to an installed model.`
+- `names a swapped-out model (replaced by accounts.User), which has no table.`
+- `names a proxy model, which has no table of its own.`
+- `names a model with an RLSConstraint, whose migrations create its policy, so the entry has
+  no effect.`
+- `has no field 'owner'.`
+- `maps it to 'title', a CharField, not a ForeignKey.`
+- `maps it to 'owner', a foreign key to auth.User, not to RLS_TENANTS['TENANT_MODEL']
+  (myapp.Tenant).`
+- `names the same model as 'library.book', so one of their fields is ignored.`
+
+**Cause:** The setting maps a model label to the name of the model's tenant foreign key,
+and the library reads both when it checks the table, validates foreign keys to it and
+filters joins into it. The label is not `"<app_label>.<ModelName>"` of an installed model
+(a typo, an app missing from `INSTALLED_APPS`, no dot), or the model is swapped out (as
+`auth.User` is under a custom `AUTH_USER_MODEL`: no table) or a proxy (its table is its
+concrete model's), or it already carries an `RLSConstraint` (its migrations create
+the policy, so an `AddRLSPolicy` would find one and change nothing), or the field is
+missing, is not a `ForeignKey`, or points at another model than `TENANT_MODEL` (the policy
+compares that column with the current tenant). An entry in this state has no effect or,
+for a wrong field, would make the library filter on the wrong column. A `TENANT_MODEL`
+that does not resolve is left to `W008`.
+
+**Fix:** Correct the label or the field name, remove the entry, or list the model the hint
+names (the concrete model of a proxy; the model that replaces a swapped-out one). Keep one
+entry per model.
+
+**See:** [`EXTERNAL_MODELS`](getting-started/configuration.md#external_models),
+[Tables You Do Not Own](guides/protecting-models.md#tables-you-do-not-own).
 
 ### W006 / W008 / W009: alias, tenant model or tenant field not found
 
@@ -763,7 +801,10 @@ table was dropped outside migrations.
 **Fix:** Do what the line says: `makemigrations <app>` and `migrate`, or the `ALTER TABLE
 ... ENABLE ROW LEVEL SECURITY` statement it prints, or run the `DO` block that
 `sqlmigrate <app> <migration>` prints. For a model without the constraint, make its `Meta`
-inherit from `RLSProtectedModel.Meta` first.
+inherit from `RLSProtectedModel.Meta` first. For a table listed in `EXTERNAL_MODELS`, the
+line says which migration holds its `AddRLSPolicy`, or prints the `AddRLSPolicy(...)` to
+add to a migration of your own app (see
+[Tables You Do Not Own](guides/protecting-models.md#tables-you-do-not-own)).
 
 **See:** [Meta Class Inheritance](guides/protecting-models.md#meta-class-inheritance),
 [W014](#w014-a-protected-model-has-no-rlsconstraint),

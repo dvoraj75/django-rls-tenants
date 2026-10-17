@@ -226,6 +226,7 @@ class DjangoRlsTenantsConfig(AppConfig):
 
         from django_rls_tenants.pool import _declared_policy_guc_names_cached  # noqa: PLC0415
         from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
+        from django_rls_tenants.tenants.managers import _rls_model_cache  # noqa: PLC0415
 
         # Safety net: clear GUC variables when a request finishes, in case
         # the middleware's process_response didn't run (e.g., worker crash).
@@ -304,6 +305,9 @@ class DjangoRlsTenantsConfig(AppConfig):
         # pytest-django's ``settings`` fixture would be silently ignored for
         # the rest of the process (#100). Django sends ``setting_changed`` on
         # both enter and exit of an override, so the cache is rebuilt both ways.
+        # The set of RLS-protected models reads both settings
+        # (RLS_TENANTS["EXTERNAL_MODELS"] and the registry), so it is dropped on
+        # either: reload() drops it with the config.
         def _reload_config_on_setting_changed(
             sender: object,  # noqa: ARG001  -- Django signal API
             setting: str,
@@ -314,6 +318,7 @@ class DjangoRlsTenantsConfig(AppConfig):
             elif setting == "INSTALLED_APPS":
                 # The registry changed, as when Django clears its own model caches.
                 _declared_policy_guc_names_cached.cache_clear()
+                _rls_model_cache.cache_clear()
 
         # Tests that override INSTALLED_APPS can call ready() more than once.
         setting_changed.connect(

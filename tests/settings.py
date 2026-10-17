@@ -30,6 +30,8 @@ INSTALLED_APPS = [
     "django_rls_tenants",
     "tests",
     "tests.test_app",
+    # Stands in for a third-party app whose model gets its policy from AddRLSPolicy (#112).
+    "tests.test_external_app",
 ]
 
 # Swapped-in auth user that also satisfies the TenantUser protocol, so the admin
@@ -100,4 +102,6 @@ RLS_TENANTS = {
     # nature, so W012 would report it. Tests that run the checks over the real
     # registry with a config of their own carry the same entry.
     "UNIQUE_ACROSS_TENANTS": {"test_app.OrderShipment": ["order"]},
+    # Book's policy comes from AddRLSPolicy in test_app's migration 0010 (#112).
+    "EXTERNAL_MODELS": {"test_external_app.Book": "owner"},
 }

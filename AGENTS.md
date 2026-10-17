@@ -80,8 +80,14 @@ tests/
 ├── test_tenants/            # unit tests for tenants/ layer
 ├── test_integration/        # end-to-end tests (marked @pytest.mark.integration)
 ├── test_app/management/     # probe commands (rls_probe, rls_echo) the run_as_tenant tests run
+├── test_external_app/       # stand-in third-party app (#112): Book (tenant FK `owner`), BookProxy
 └── test_layering.py         # enforces rls/ ← tenants/ import boundary
 ```
+
+`tests/test_external_app/` stands in for a third-party app: `Book` (no `RLSConstraint`, tenant
+FK `owner`) and its proxy `BookProxy`. `tests/test_app/migrations/0010_loan_book_rls_policy.py`
+protects `Book` with `AddRLSPolicy` (and creates `Loan`, an `RLSProtectedModel` with an FK to
+`Book`), and `tests/settings.py` lists it in `EXTERNAL_MODELS`.
 
 ## Architecture
 
@@ -91,8 +97,16 @@ The library has two internal layers with a strict import boundary:
   `RLSConstraint`, `RLSM2MConstraint`, context managers). **Zero imports from `tenants/`.**
 - **`django_rls_tenants/tenants/`** — Django multitenancy built on `rls/` (models,
   managers, middleware, config, testing utilities).
-- **`django_rls_tenants/operations.py`** — Migration operations (`AddM2MRLSPolicy`)
-  for M2M join table RLS policies. Imports from `rls/` for shared SQL builders and validation.
+- **`django_rls_tenants/operations.py`** — Migration operations: `AddM2MRLSPolicy` for M2M
+  join table RLS policies, and `AddRLSPolicy` (#112) for the tenant policy of a table whose
+  model cannot carry an `RLSConstraint` (a third-party app's). Imports from `rls/` for
+  shared SQL builders and validation; `AddRLSPolicy` imports `tenants.conf` only inside
+  `_policy_options()`, at migrate time (unset GUC names and `tenant_pk_type` come from
+  `RLS_TENANTS` then, so `deconstruct()` writes only the arguments given). `_applies_to()`
+  skips, in both directions, what `allow_migrate_model()` skips and a state model with an
+  `RLSConstraint` (same policy name: backwards would drop the constraint's policy); the
+  column `<field>_id` stays unquoted (same text as `RLSConstraint`), any other is quoted;
+  `_table()` refuses a `db_table` with a quote, a backslash or `$`.
 - **`django_rls_tenants/pool.py`** — `reset_rls_gucs()`, the `reset` callback for Django's
   psycopg connection pool, and the single statement that clears every GUC the policies
   read (used by the `connection_created` handler too). `settings.py` imports it before
@@ -198,8 +212,8 @@ same statement.
 `_policy_guc_names()` collects the names from the configured `GUC_PREFIX` GUCs and the
 installed models' constraints (`RLSConstraint` GUCs and `extra_bypass_flags`,
 `RLSM2MConstraint` GUCs), keeping only dotted custom-GUC names; hand-written policies and
-`AddM2MRLSPolicy` with non-default names are not covered. The registry part is cached once
-`apps.ready` and dropped on an `INSTALLED_APPS` change. The safety net skips a closed
+`AddM2MRLSPolicy` with non-default names, and the GUCs only an `AddRLSPolicy` reads (its
+explicit names and `extra_bypass_flags`), are not covered. The registry part is cached once `apps.ready` and dropped on an `INSTALLED_APPS` change. The safety net skips a closed
 connection (with a pool, Django has already returned it). System check `W010` asks for
 `reset_rls_gucs` as the pool's `reset`; `W011` warns about a database- or role-level
 default (`ALTER DATABASE/ROLE ... SET`) for a policy GUC, which every new session starts
@@ -220,7 +234,38 @@ warns about a concrete, non-proxy `RLSProtectedModel` subclass with no `RLSConst
 `Meta` does not inherit `RLSProtectedModel.Meta`, or sets its own `constraints`, which replaces
 the inherited list). `W015` (#45, `_check_strict_mode_exclude()` in `tenants/checks.py`)
 warns about a `RLS_TENANTS["STRICT_MODE_EXCLUDE"]` label that does not resolve to an installed
-model or names one without an `RLSConstraint`; it runs whether or not `STRICT_MODE` is on.
+model or names one without an `RLSConstraint` or `EXTERNAL_MODELS` entry; it runs whether or
+not `STRICT_MODE` is on. `W016` (#112, `_check_external_models()`) warns about an
+`EXTERNAL_MODELS` entry that is unusable: unresolved label, swapped-out model, proxy, a model
+that already has an `RLSConstraint`, a missing or non-FK field, an FK not to `TENANT_MODEL` (skipped when that
+does not resolve: `W008`), or two labels for one model.
+
+`RLS_TENANTS["EXTERNAL_MODELS"]` (#112, `{"app.Model": "tenant_fk_name"}`, validated in
+`conf.py`) makes the runtime treat a model without an `RLSConstraint` as RLS-protected; its
+policy comes from an `AddRLSPolicy` migration of the project (which shares
+`_build_policy_create_sql()` / `_build_policy_drop_sql()` in `rls/constraints.py` with
+`RLSConstraint`, so the SQL text is identical). It cannot be a runtime-injected `RLSConstraint`
+(as `register_m2m_rls()` does for through models): the constraint would be part of the
+third-party model's state, and `makemigrations` would emit a migration for that app.
+Consumers: `_get_tenant_fk_field()` (the `RLSConstraint`'s field, else the entry's, none for a
+proxy) via `_external_model_fields()` (labels normalized like `STRICT_MODE_EXCLUDE`'s, cached on
+the entries) in `tenants/models.py`; `_rls_model_cache()` in `managers.py` (cleared by the app
+config's `setting_changed` receiver on `RLS_TENANTS` and `INSTALLED_APPS`);
+`_tenant_attname()` in `managers.py`, which `select_related()` and the #44 prefetch filter use
+for each joined model's own tenant column (no filter when it is `None`: `W009` / `W016`);
+`_tenant_field()` (cross-tenant FKs); `W012` / `W015` / `W016`; `check_rls._collect_rls_models()`;
+`check_rls._check_external_policy_fields()` (an entry naming another field than the latest
+`AddRLSPolicy` is the `FIELD_MISMATCH` issue) and `_warn_about_unlisted_policies()` (an
+`AddRLSPolicy` whose model is not listed: a warning, printed before the "No RLS-protected
+models found" return too); `check_rls` reads `MigrationFacts` once per run
+(`_migration_facts()`, after the table checks, in a savepoint when optional), and `MigrationFacts` records migrations in dependency order
+(`_migration_order()`: the `forwards_plan()` of each leaf), so "latest" is `migrate`'s
+latest; `_rls_migrations.MigrationFacts.rls_policy_migrations()` /
+`rls_policy_field()` / `_external_model_hint()` for the
+`How to fix:` line. `--generate` writes no `AddRLSPolicy`. **Not given:** the auto-scope filter,
+`for_user()` and the strict-mode guard on queries of the external model itself (it keeps its
+own manager, so the policy is the only isolation), and M2M coverage of its through tables
+(`register_m2m_rls()` and `check_rls` discovery look at `RLSProtectedModel` subclasses only).
 
 Cross-tenant foreign keys (#107): RLS cannot stop a row of tenant A from holding a foreign
 key to a row of tenant B (the policy checks the row's own tenant column; PostgreSQL runs

@@ -25,6 +25,7 @@ from django_rls_tenants.tenants.state import (
 )
 from tests.test_app.models import (
     Document,
+    Loan,
     NoteRevision,
     Order,
     OrderItem,
@@ -37,6 +38,7 @@ from tests.test_app.models import (
     Tenant,
     TenantUser,
 )
+from tests.test_external_app.models import Book
 
 _POOLED_ALIAS = "pooled"
 
@@ -455,3 +457,14 @@ def sample_selfref(db, tenant_a, tenant_b):
         sr_b1.friends.add(sr_b1)  # self-friend
 
     return {"a1": sr_a1, "a2": sr_a2, "b1": sr_b1}
+
+
+@pytest.fixture
+def sample_books(db, tenant_a, tenant_b):
+    """One external ``Book`` per tenant, and a ``Loan`` of each in its own tenant (#112)."""
+    with admin_context():
+        book_a = Book.objects.create(title="Book A", owner=tenant_a)
+        book_b = Book.objects.create(title="Book B", owner=tenant_b)
+        loan_a = Loan.objects.create(borrower="Reader A", book=book_a, tenant=tenant_a)
+        loan_b = Loan.objects.create(borrower="Reader B", book=book_b, tenant=tenant_b)
+    return {"a": book_a, "b": book_b, "loan_a": loan_a, "loan_b": loan_b}

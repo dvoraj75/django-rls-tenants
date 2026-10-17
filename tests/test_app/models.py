@@ -307,3 +307,16 @@ class Assignment(RLSProtectedModel):
 
     class Meta(RLSProtectedModel.Meta):
         db_table = "test_assignment"
+
+
+class Loan(RLSProtectedModel):
+    """A protected model with a foreign key to the external ``test_external_app.Book`` (#112).
+
+    Joins into ``Book`` get the tenant filter on its own field (``owner``).
+    """
+
+    borrower = models.CharField(max_length=100)
+    book = models.ForeignKey("test_external_app.Book", on_delete=models.CASCADE)
+
+    class Meta(RLSProtectedModel.Meta):
+        db_table = "test_loan"

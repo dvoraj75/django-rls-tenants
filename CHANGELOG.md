@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`AddRLSPolicy` and `RLS_TENANTS["EXTERNAL_MODELS"]`: RLS for tables you do not own**
+  (#112). A model of a third-party app cannot inherit `RLSProtectedModel` or carry an
+  `RLSConstraint`. `AddRLSPolicy("Book", app_label="library")` in a migration of your own
+  app, which depends on the migration that creates the model and its tenant foreign key,
+  now creates the policy `RLSConstraint` creates (the same SQL, from the same builder:
+  named `<table>_tenant_isolation_policy`, RLS enabled and forced, admin and
+  `extra_bypass_flags` in `USING`, only admin in `WITH CHECK`). `field=` names the tenant
+  foreign key (default `"tenant"`; its real column is read from the migration state), and
+  the operation adds no column. It is reversible, changes no model state, does nothing on
+  a database the router refuses for the model's app, for an unmanaged model, or (in either
+  direction) while the model has an `RLSConstraint` of its own, whose policy has the same
+  name, and raises `ValueError` at migrate time for a missing model, a proxy, a missing or
+  non-foreign key field, or a table name with a quote, a backslash or a dollar sign. Unset
+  `guc_tenant_var`, `guc_admin_var` and `tenant_pk_type` are read from `RLS_TENANTS` when
+  the migration runs, not when it is written, so changing the settings later does not
+  rewrite an applied policy. Listing the model as
+  `RLS_TENANTS["EXTERNAL_MODELS"] = {"library.Book": "tenant"}` (label to tenant
+  foreign key, model name case-insensitive) makes the runtime treat it as RLS-protected:
+  `check_rls` checks its table, with a `How to fix:` line built from the `AddRLSPolicy`
+  operations on disk, reports an entry that names another field than the model's latest
+  `AddRLSPolicy` reads, and warns about an `AddRLSPolicy` whose model is not listed; the
+  cross-tenant foreign key check (`full_clean()`, forms, the admin, DRF serializers)
+  validates foreign keys that point at it; `select_related()` and the
+  `prefetch_related()` tenant filter apply to joins into it; and `W012` reports its unique
+  fields. Queries on the external model itself get no auto-scope filter, `for_user()` or
+  `STRICT_MODE` guard (it keeps its own manager), so the policy is their only isolation,
+  and its many-to-many through tables are not covered. A value that is not a dict of
+  strings raises `RLSConfigurationError`. `check_rls --generate` does not write
+  `AddRLSPolicy` migrations. See
+  [Tables You Do Not Own](https://dvoraj75.github.io/django-rls-tenants/guides/protecting-models/#tables-you-do-not-own)
+  and
+  [`EXTERNAL_MODELS`](https://dvoraj75.github.io/django-rls-tenants/getting-started/configuration/#external_models).
+- **`W016`: a system check for an `EXTERNAL_MODELS` entry the library cannot use** (#112).
+  It reports a label that names no installed model, a swapped-out model, a proxy, a model
+  that already has an `RLSConstraint`, a field that does not exist, is not a `ForeignKey`
+  or does not point at `TENANT_MODEL`, and two labels for one model. The stale-entry
+  messages of `W012` and `W015` now say "RLSConstraint or EXTERNAL_MODELS entry". See
+  [W016](https://dvoraj75.github.io/django-rls-tenants/troubleshooting/#w016-an-external_models-entry-cannot-be-used).
+
+### Changed
+
+- **`select_related()` and the `prefetch_related()` tenant filter use each joined model's
+  own tenant field** (#112). They filtered every joined RLS-protected model on
+  `{TENANT_FK_FIELD}_id`. They now use the field of that model's `RLSConstraint(field=...)`
+  or `EXTERNAL_MODELS` entry, and add no filter when it cannot be resolved (`W009` /
+  `W016`; the policy still filters). The SQL is unchanged for every model whose constraint
+  uses the default field.
+- **The set of RLS-protected models follows `override_settings`** (#112). The library
+  cached it for the process; it is now rebuilt when `RLS_TENANTS` or `INSTALLED_APPS`
+  changes.
 - **psycopg 3 on the oldest supported Django and on PostgreSQL 17 in CI** (#151). Two new
   legs: Python 3.12 / Django 5.2 / psycopg 3 in the main matrix (PostgreSQL 16), and
   PostgreSQL 17 / Django 5.2 / Python 3.12 / psycopg 3 in the `test-postgres` job. Before,

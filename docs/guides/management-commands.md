@@ -2,7 +2,8 @@
 
 ## check_rls
 
-The `check_rls` management command verifies that all `RLSProtectedModel` subclasses
+The `check_rls` management command verifies that all `RLSProtectedModel` subclasses, and
+the models listed in [`EXTERNAL_MODELS`](../getting-started/configuration.md#external_models),
 have the expected RLS policies applied in the database.
 
 ### Usage
@@ -60,6 +61,11 @@ apart:
 | A migration that adds it is not applied on this database | `migrate` (the line names the migration). |
 | The policy exists but RLS is turned off | The `ALTER TABLE ... ENABLE / FORCE ROW LEVEL SECURITY` statements. |
 | The migration is applied, but the policy or table was dropped outside migrations | `sqlmigrate <app> <migration>` prints the `DO` block that creates the policy; run it again. |
+| `EXTERNAL_MODELS` table: a migration with `AddRLSPolicy` for the model is not applied | `migrate` (the line names the migration). |
+| `EXTERNAL_MODELS` table: no migration has an `AddRLSPolicy` for the model | The line prints the operation to add, e.g. `AddRLSPolicy('Book', app_label='library')` (with `field=` when the tenant foreign key is not named `tenant`), to a migration of your own app that depends on the migration creating the field. |
+| `EXTERNAL_MODELS` table: the migration is applied, but the policy was dropped | `sqlmigrate <app> <migration>` prints the `DO` block that creates the policy; run it again. |
+| `EXTERNAL_MODELS` table: the model is unmanaged (`managed = False`) | `AddRLSPolicy` does nothing for it: create the policy by hand. |
+| `EXTERNAL_MODELS` table: its latest `AddRLSPolicy` reads another field than the entry names (issue `its AddRLSPolicy reads another field than EXTERNAL_MODELS names`) | Map the entry to the field the policy reads; or, if the entry is right, replace the policy in a new migration (`DROP POLICY`, then `AddRLSPolicy(..., field=...)`). The line prints both. |
 | M2M table: a migration with `AddM2MRLSPolicy` is not applied | `migrate`. |
 | M2M table: that migration is applied, but the policy was dropped | `setup_m2m_rls --database <alias>`. |
 | M2M table: no migration adds the policy | `check_rls --generate`, then `migrate`. |
@@ -84,8 +90,9 @@ before it checks anything.
 
 ### What It Checks
 
-The command performs two batched queries against PostgreSQL system catalogs for both
-standard RLS-protected tables and M2M through tables:
+The command performs two batched queries against PostgreSQL system catalogs for the
+tables of standard RLS-protected models, of `EXTERNAL_MODELS` models (*added in 1.6.0*;
+a proxy of one is reported through its concrete model) and M2M through tables:
 
 1. **`pg_class`**: verifies that `relrowsecurity` (RLS enabled) and `relforcerowsecurity`
    (RLS forced) are both `True` for each protected table.
@@ -94,6 +101,15 @@ standard RLS-protected tables and M2M through tables:
 
 M2M through tables are auto-discovered by scanning `RLSProtectedModel` subclasses for
 `ManyToManyField` definitions with auto-generated through tables.
+
+It also compares the `AddRLSPolicy` operations on disk with
+[`EXTERNAL_MODELS`](../getting-started/configuration.md#external_models) (*added in
+1.6.0*). A listed model whose latest `AddRLSPolicy` reads another field than its entry is
+an issue: the cross-tenant foreign key check and the join filters would read another
+column than the policy. A model an `AddRLSPolicy` protects that the setting does not list
+gets a warning on stderr, naming the entry to add; the run still passes, since the table
+is protected, but foreign keys to it are not checked against the tenant. If the migrations
+cannot be read, `check_rls` says so and checks the tables anyway.
 
 `migrate` creates the policy of a table whose model carries an `RLSConstraint`, but
 **never** that of an auto-created M2M through table: the library adds its constraint
@@ -226,11 +242,17 @@ takes precedence, so verbose detail only appears on a non-quiet run.
 
 - Does not verify the **content** of the RLS policy (e.g., correct GUC variable names).
   It only checks that a policy exists. Use `--verbose` to eyeball the policy body manually.
-- Does not check policies on non-`RLSProtectedModel` tables. If you manually manage
-  RLS policies, use `assert_rls_policy_exists()` from the testing helpers.
+- Does not check policies on tables of models that are neither `RLSProtectedModel`
+  subclasses nor listed in `EXTERNAL_MODELS`. If you manually manage RLS policies, use
+  `assert_rls_policy_exists()` from the testing helpers.
 - `--generate` covers auto-created M2M through tables only. Models with an
   `RLSConstraint` get their policy from `makemigrations`, and an explicit through model is
-  an ordinary model.
+  an ordinary model. It does not write `AddRLSPolicy` migrations for `EXTERNAL_MODELS`
+  models: you add those yourself (see
+  [Tables You Do Not Own](protecting-models.md#tables-you-do-not-own)), and the `How to fix:`
+  line for such a table prints the operation.
+- M2M discovery looks at `RLSProtectedModel` subclasses only: the through tables of an
+  `EXTERNAL_MODELS` model are not checked.
 - The `How to fix:` lines reflect the migrations as the loader sees them. A policy
   created by hand (not by a migration) reads as "no migration adds it".
 

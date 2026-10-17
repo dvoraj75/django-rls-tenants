@@ -436,7 +436,9 @@ How it decides:
   read with one small query (per foreign key, per validation) inside `admin_context()`, so
   the result does not depend on the active context, and it works under `STRICT_MODE`.
 - Checked: concrete `ForeignKey` and `OneToOneField` fields whose target model has an
-  `RLSConstraint` (a proxy's target counts as its concrete model). Skipped: the tenant
+  `RLSConstraint` or is listed in
+  [`EXTERNAL_MODELS`](#tables-you-do-not-own) (a proxy's target counts as its concrete
+  model; a listed target is compared through its own tenant field). Skipped: the tenant
   foreign key itself, multi-table-inheritance parent links, empty foreign keys, unsaved
   targets, models without an `RLSConstraint`, and every foreign key while the instance has
   no tenant yet (code that sets the tenant after validation). `RLSTenantModelAdmin` sets an
@@ -472,6 +474,155 @@ class OpenOrder(Order):
 ```
 
 It inherits `RLSManager`; a manager you give it should subclass `RLSManager` too.
+
+## Tables You Do Not Own
+
+*Added in 1.6.0.*
+
+A model of a third-party app cannot inherit `RLSProtectedModel` or carry an
+`RLSConstraint`: its `Meta` and its migrations are not yours. If its table has a foreign
+key to your tenant model, you can still give the table the policy `RLSConstraint` would
+create, in two steps:
+
+1. Add an `AddRLSPolicy` operation to a migration of **your own** app. It creates the
+   policy in the database.
+2. List the model in `RLS_TENANTS["EXTERNAL_MODELS"]`, so the library treats it as
+   RLS-protected at runtime (`check_rls`, the
+   [cross-tenant foreign key check](#cross-tenant-foreign-keys), `select_related()` and
+   `prefetch_related()`).
+
+The example assumes a third-party app `library` whose `Book` model has a foreign key to
+your tenant model, named `tenant`. The operation adds no column, so the table must already
+have it.
+
+```python title="myapp/migrations/0007_library_book_rls_policy.py"
+from django.db import migrations
+
+from django_rls_tenants import AddRLSPolicy
+
+
+class Migration(migrations.Migration):
+    dependencies = [
+        ("myapp", "0006_previous"),
+        # The migration of the third-party app that creates Book and its tenant FK.
+        ("library", "0001_initial"),
+    ]
+
+    operations = [
+        AddRLSPolicy("Book", app_label="library"),
+    ]
+```
+
+```python title="settings.py"
+RLS_TENANTS = {
+    "TENANT_MODEL": "myapp.Tenant",
+    "EXTERNAL_MODELS": {"library.Book": "tenant"},
+}
+```
+
+Run `python manage.py migrate`, then `python manage.py check_rls`. It lists the table with
+the others and verifies that RLS is enabled, forced and has a policy:
+
+```
+  Book (library_book): library_book_tenant_isolation_policy
+```
+
+You write this migration by hand: `makemigrations` does not detect it, and
+`check_rls --generate` writes only M2M migrations. The setting exists because the library
+cannot add an `RLSConstraint` to the third-party model's `Meta` at startup: the migration
+autodetector would then write a migration for the third-party app.
+
+### The operation
+
+`AddRLSPolicy(model_name, *, field="tenant", app_label=None, tenant_pk_type=None,
+guc_tenant_var=None, guc_admin_var=None, extra_bypass_flags=None)` is exported from the
+package root (`from django_rls_tenants import AddRLSPolicy`).
+
+| Argument | Meaning |
+|----------|---------|
+| `model_name` | The model's name, `"Book"`. |
+| `field` | The name of the model's tenant `ForeignKey` (a `OneToOneField` is accepted). Default `"tenant"`. The policy reads the field's real column from the migration state, so `db_column` is respected. A column other than the lower-case `<field>_id` Django names (a `db_column`, which may be a reserved word, or a name with an upper-case letter) is quoted. |
+| `app_label` | The model's app. Without it, the app of the migration the operation is in; for a third-party model, pass it. |
+| `tenant_pk_type`, `guc_tenant_var`, `guc_admin_var` | As on [`RLSConstraint`](../reference/api.md). When unset, they come from `RLS_TENANTS` (see below). |
+| `extra_bypass_flags` | Additional GUCs that bypass the `USING` clause but not `WITH CHECK`, as on `RLSConstraint` (see [Extra Bypass Flags](#extra-bypass-flags)). |
+
+The policy is the one `RLSConstraint` creates: the same SQL text, from the same builder.
+It is named `<table>_tenant_isolation_policy`, enables and **forces** RLS on the table,
+lets the admin flag (and the extra bypass flags) through in `USING`, and only the admin
+flag in `WITH CHECK`. The creating `DO` block skips a table that already has a policy of
+that name, so applying the operation twice changes nothing.
+
+- **Dependencies.** The migration must list, in `dependencies`, the third-party migration
+  that creates the model and its tenant foreign key. A model or field missing from the
+  migration state raises `ValueError` at migrate time, naming what to add. A proxy model
+  or a field that is not a `ForeignKey` raises `ValueError` too.
+- **Reversible.** Migrating backwards drops the policy and disables RLS on the table
+  (`NO FORCE` and `DISABLE`).
+- **Database only.** `state_forwards()` changes nothing. `sqlmigrate` prints the SQL, and
+  `makemigrations`-style listings show `+ Add RLS policy to library.Book`.
+- **Routers and unmanaged models.** Like Django's own operations, it does nothing on a
+  database that your router does not let the **model's** app migrate to (the router is
+  asked about the target model, not the migration's app), and nothing for an unmanaged
+  (`managed = False`) or swapped-out model.
+- **Models with an `RLSConstraint`.** While the model has an `RLSConstraint` in the
+  migration state (the third-party app adopted one), the operation does nothing in either
+  direction: the constraint's policy has the same name, and migrating backwards must not
+  drop it. If the operation ran first, the table keeps its policy, since the
+  constraint's `DO` block skips a policy that exists.
+- **Table names.** A `db_table` with a quote, a backslash or a dollar sign (the
+  `'schema"."table'` idiom among them) raises `ValueError`: the policy SQL cannot hold it.
+
+!!! warning "GUC names and the tenant type are read when the migration runs"
+    `guc_tenant_var`, `guc_admin_var` and `tenant_pk_type`, when you leave them out, are
+    read from `RLS_TENANTS` (`GUC_PREFIX`, `TENANT_PK_TYPE`) **when the migration runs**,
+    not when you write it, and the migration file stores only the arguments you gave.
+    Changing the settings later does not rewrite a policy that is applied, and the output
+    of `sqlmigrate` depends on the settings in force. `AddM2MRLSPolicy` and `RLSConstraint`
+    have the literal defaults `rls.current_tenant`, `rls.is_admin` and `int` instead. Pass
+    the three arguments explicitly if the migration must not follow the settings.
+
+### What `EXTERNAL_MODELS` gives the model
+
+The setting maps the model's label to the name of its tenant foreign key (see
+[`EXTERNAL_MODELS`](../getting-started/configuration.md#external_models)). A listed model
+is treated as RLS-protected by:
+
+- **`check_rls`**, which checks its table and prints the fix for a failure, built from the
+  `AddRLSPolicy` operations on disk (see
+  [Management Commands](management-commands.md#what-it-checks));
+- **the [cross-tenant foreign key check](#cross-tenant-foreign-keys)** of models with a
+  foreign key to it, which compares the target's tenant, read through the listed field;
+- **`select_related()` and the `prefetch_related()` tenant filter** on joins into it,
+  which filter on the listed model's own tenant column (`owner_id`, say), not on
+  `TENANT_FK_FIELD`;
+- **system checks** `W012` (its unique fields and constraints that span tenants; see
+  [`UNIQUE_ACROSS_TENANTS`](../getting-started/configuration.md#unique_across_tenants)),
+  `W015` and the new `W016`, which reports an entry the library cannot use.
+
+A proxy of a listed model is treated as protected through its concrete model. An entry
+that names a proxy itself is ignored (`W016`).
+
+### What it does not give
+
+The model keeps its own manager, so the application-level protections of
+`RLSProtectedModel` do not apply to **queries on the external model itself**. For those,
+the database policy is the only isolation:
+
+- No automatic `WHERE tenant_id = X` filter, no `for_user()`, and no `STRICT_MODE` guard.
+  Without a context, a query on the model returns no rows (fail closed), and the planner
+  cannot use the tenant index through the policy alone (see the
+  [Performance guide](performance.md)). Add the tenant filter yourself where it matters.
+- No tenant is filled in on new rows. Pass the tenant foreign key when you create a row;
+  outside the admin context, `WITH CHECK` rejects a row whose tenant is not the
+  context's.
+- No coverage of the model's many-to-many through tables. `register_m2m_rls()` and the
+  `check_rls` M2M discovery look at `RLSProtectedModel` subclasses only. An M2M field from
+  an `RLSProtectedModel` to an external model gets a policy that checks the protected side
+  only.
+- `check_rls --generate` does not write `AddRLSPolicy` migrations, only M2M ones.
+
+See [Security](../advanced/security.md#models-you-do-not-own) for the same limits from the
+isolation point of view.
 
 ## Multiple Protected Models
 

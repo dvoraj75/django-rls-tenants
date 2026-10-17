@@ -328,7 +328,9 @@ every GUC the library's RLS policies read, before the new borrower's first query
 `GUC_PREFIX`) and, from the constraints of every installed model, each `RLSConstraint`'s
 `guc_tenant_var`, `guc_admin_var` and `extra_bypass_flags` entries, and each
 `RLSM2MConstraint`'s `guc_tenant_var` and `guc_admin_var`. GUCs read only by hand-written
-policies, or by `AddM2MRLSPolicy` operations with non-default names, are not cleared.
+policies, by `AddM2MRLSPolicy` operations with non-default names, or only by an
+`AddRLSPolicy` (its explicit GUC names and `extra_bypass_flags`, which live in the migration,
+not on a model), are not cleared.
 Names that are not custom GUC names, such as an `extra_bypass_flags` entry without a dot
 (PostgreSQL only accepts dotted names for custom settings), are left out, so they cannot
 fail the statement.

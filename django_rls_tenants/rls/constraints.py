@@ -20,6 +20,8 @@ from django_rls_tenants.rls.guc import _GUC_NAME_RE
 from django_rls_tenants.rls.policy_sql import bool_flag_sql, tenant_match_sql, tenant_value_sql
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from django.db.backends.base.schema import BaseDatabaseSchemaEditor
     from django.db.models import Model
 
@@ -74,6 +76,86 @@ def _validate_guc_name_for_ddl(name: str, param: str) -> None:
             f"(e.g., 'rls.current_tenant')."
         )
         raise ValueError(msg)
+
+
+def _build_policy_create_sql(
+    *,
+    table: str,
+    column: str,
+    guc_tenant_var: str,
+    guc_admin_var: str,
+    tenant_pk_type: str,
+    extra_bypass_flags: Sequence[str] = (),
+) -> str:
+    """Build idempotent SQL that enables RLS on ``table`` and creates its tenant policy.
+
+    Shared by ``RLSConstraint`` and the ``AddRLSPolicy`` migration operation, so
+    both emit the same text. The policy is named ``<table>_tenant_isolation_policy``
+    and is created only when the table has no policy of that name.
+
+    ``USING`` lets the admin flag and each of ``extra_bypass_flags`` through;
+    ``WITH CHECK`` only the admin flag. Otherwise ``column`` must equal the
+    current-tenant GUC cast to ``tenant_pk_type``.
+
+    Safety: interpolation only. Callers validate ``column`` and the GUC names
+    (``_validate_field_name``, ``_validate_guc_name_for_ddl``) and the PK type
+    (``_validate_pk_type``); ``table`` is a model's ``db_table``.
+    """
+    policy_name = f"{table}_tenant_isolation_policy"
+    tenant_match = tenant_match_sql(column, guc_tenant_var, tenant_pk_type)
+    admin_check = bool_flag_sql(guc_admin_var)
+
+    # Build bypass conditions for CASE WHEN: admin is always first,
+    # extra bypass flags are appended (USING only, NOT WITH CHECK).
+    bypass_conditions_using = [admin_check]
+    bypass_conditions_using.extend(bool_flag_sql(flag) for flag in extra_bypass_flags)
+
+    bypass_clause_using = "\n                              OR ".join(bypass_conditions_using)
+    bypass_clause_check = admin_check  # only admin in WITH CHECK
+    return f"""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_policies
+                        WHERE policyname = '{policy_name}'
+                        AND tablename = '{table}'
+                        AND schemaname = current_schema()
+                    ) THEN
+                        EXECUTE $BODY$
+                            ALTER TABLE "{table}" ENABLE ROW LEVEL SECURITY;
+                            ALTER TABLE "{table}" FORCE ROW LEVEL SECURITY;
+                            CREATE POLICY "{policy_name}"
+                            ON "{table}"
+                            USING (
+                                CASE WHEN {bypass_clause_using}
+                                     THEN true
+                                     ELSE {tenant_match}
+                                END
+                            )
+                            WITH CHECK (
+                                CASE WHEN {bypass_clause_check}
+                                     THEN true
+                                     ELSE {tenant_match}
+                                END
+                            );
+                        $BODY$;
+                    END IF;
+                END
+                $$;
+            """
+
+
+def _build_policy_drop_sql(*, table: str) -> str:
+    """Build SQL that drops ``table``'s tenant policy and disables RLS on it.
+
+    The reverse of :func:`_build_policy_create_sql`.
+    """
+    policy_name = f"{table}_tenant_isolation_policy"
+    return f"""
+            DROP POLICY IF EXISTS "{policy_name}" ON "{table}";
+            ALTER TABLE "{table}" NO FORCE ROW LEVEL SECURITY;
+            ALTER TABLE "{table}" DISABLE ROW LEVEL SECURITY;
+            """
 
 
 class RLSConstraint(BaseConstraint):
@@ -144,56 +226,16 @@ class RLSConstraint(BaseConstraint):
     ) -> Statement:
         """Generate SQL to enable RLS and create the isolation policy."""
         table = model._meta.db_table  # type: ignore[union-attr]  # noqa: SLF001  -- Django's standard public API
-        policy_name = f"{table}_tenant_isolation_policy"
-
-        tenant_match = tenant_match_sql(
-            f"{self.field}_id", self.guc_tenant_var, self.tenant_pk_type
-        )
-        admin_check = bool_flag_sql(self.guc_admin_var)
-
-        # Build bypass conditions for CASE WHEN: admin is always first,
-        # extra bypass flags are appended (USING only, NOT WITH CHECK).
-        bypass_conditions_using = [admin_check]
-        bypass_conditions_using.extend(bool_flag_sql(flag) for flag in self.extra_bypass_flags)
-
-        bypass_clause_using = "\n                              OR ".join(bypass_conditions_using)
-        bypass_clause_check = admin_check  # only admin in WITH CHECK
-
-        # Safety: all interpolated values come from model._meta (developer-defined)
-        # and constructor args, not from user input. SQL injection is not possible.
         return Statement(
             template="%(sql)s",
-            sql=f"""
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1 FROM pg_policies
-                        WHERE policyname = '{policy_name}'
-                        AND tablename = '{table}'
-                        AND schemaname = current_schema()
-                    ) THEN
-                        EXECUTE $BODY$
-                            ALTER TABLE "{table}" ENABLE ROW LEVEL SECURITY;
-                            ALTER TABLE "{table}" FORCE ROW LEVEL SECURITY;
-                            CREATE POLICY "{policy_name}"
-                            ON "{table}"
-                            USING (
-                                CASE WHEN {bypass_clause_using}
-                                     THEN true
-                                     ELSE {tenant_match}
-                                END
-                            )
-                            WITH CHECK (
-                                CASE WHEN {bypass_clause_check}
-                                     THEN true
-                                     ELSE {tenant_match}
-                                END
-                            );
-                        $BODY$;
-                    END IF;
-                END
-                $$;
-            """,
+            sql=_build_policy_create_sql(
+                table=table,
+                column=f"{self.field}_id",
+                guc_tenant_var=self.guc_tenant_var,
+                guc_admin_var=self.guc_admin_var,
+                tenant_pk_type=self.tenant_pk_type,
+                extra_bypass_flags=self.extra_bypass_flags,
+            ),
         )
 
     def remove_sql(  # type: ignore[override]
@@ -203,16 +245,7 @@ class RLSConstraint(BaseConstraint):
     ) -> Statement:
         """Generate SQL to drop the policy and disable RLS."""
         table = model._meta.db_table  # type: ignore[union-attr]  # noqa: SLF001  -- Django's standard public API
-        policy_name = f"{table}_tenant_isolation_policy"
-        # Safety: values come from model._meta, not user input.
-        return Statement(
-            template="%(sql)s",
-            sql=f"""
-            DROP POLICY IF EXISTS "{policy_name}" ON "{table}";
-            ALTER TABLE "{table}" NO FORCE ROW LEVEL SECURITY;
-            ALTER TABLE "{table}" DISABLE ROW LEVEL SECURITY;
-            """,
-        )
+        return Statement(template="%(sql)s", sql=_build_policy_drop_sql(table=table))
 
     def validate(
         self,

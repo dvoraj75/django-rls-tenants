@@ -93,7 +93,7 @@ def _next_chunk(rows: Iterator[Any], size: int) -> list[Any]:
 
 
 def _is_rls_protected(model: type[models.Model]) -> bool:
-    """Check if a Django model has an ``RLSConstraint`` in its Meta.
+    """Check if a Django model is RLS-protected (see :func:`_rls_model_cache`).
 
     Uses lazy import and caching to avoid circular imports and repeated
     introspection.
@@ -102,7 +102,8 @@ def _is_rls_protected(model: type[models.Model]) -> bool:
         model: A Django model class.
 
     Returns:
-        ``True`` if the model has at least one ``RLSConstraint``.
+        ``True`` if the model (or the concrete model of a proxy) has an
+        ``RLSConstraint`` or is listed in ``RLS_TENANTS["EXTERNAL_MODELS"]``.
     """
     return model in _rls_model_cache()
 
@@ -111,8 +112,11 @@ def _is_rls_protected(model: type[models.Model]) -> bool:
 def _rls_model_cache() -> frozenset[type[models.Model]]:
     """Build a cached set of all RLS-protected models, proxies of them included.
 
-    Called lazily after Django's app registry is ready. The result is
-    cached for the lifetime of the process (model set doesn't change).
+    A model is RLS-protected when it has an ``RLSConstraint`` or is listed in
+    ``RLS_TENANTS["EXTERNAL_MODELS"]`` (its policy comes from an
+    ``AddRLSPolicy`` migration). Called lazily after Django's app registry is
+    ready. The result is cached until ``RLS_TENANTS`` or ``INSTALLED_APPS``
+    changes (the app config clears it on ``setting_changed``).
 
     Raises:
         RuntimeError: If called before ``django.apps`` is fully ready,
@@ -121,7 +125,7 @@ def _rls_model_cache() -> frozenset[type[models.Model]]:
     # Lazy import avoids a circular import.
     from django.apps import apps  # noqa: PLC0415
 
-    from django_rls_tenants.rls.constraints import RLSConstraint  # noqa: PLC0415
+    from django_rls_tenants.tenants.models import _get_tenant_fk_field  # noqa: PLC0415
 
     if not apps.ready:
         msg = (
@@ -135,9 +139,23 @@ def _rls_model_cache() -> frozenset[type[models.Model]]:
     for model in apps.get_models():
         # A proxy has no constraints of its own; its table is its concrete model's.
         concrete = model._meta.concrete_model or model  # noqa: SLF001
-        if any(isinstance(c, RLSConstraint) for c in concrete._meta.constraints):  # noqa: SLF001
+        if _get_tenant_fk_field(concrete) is not None:
             protected.add(model)
     return frozenset(protected)
+
+
+def _tenant_attname(model: type[models.Model]) -> str | None:
+    """Return the column attribute of ``model``'s tenant foreign key (``"tenant_id"``).
+
+    The foreign key its ``RLSConstraint`` or ``EXTERNAL_MODELS`` entry names,
+    which need not be ``TENANT_FK_FIELD``; ``None`` when ``model`` is not
+    RLS-protected or lacks that field (``W009`` / ``W016``).
+    """
+    # Lazy import avoids a circular import (models imports this module).
+    from django_rls_tenants.tenants.models import _tenant_field  # noqa: PLC0415
+
+    field = _tenant_field(model)
+    return None if field is None else field.attname
 
 
 def _is_strict_mode_excluded(model: type[models.Model]) -> bool:
@@ -285,21 +303,25 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         qs: TenantQuerySet = super().select_related(*fields)
         if tenant_id is None:
             return qs
-        conf = rls_tenants_config
-        fk_field_id = f"{conf.TENANT_FK_FIELD}_id"
         for field_path in fields:
             related_model, nullable = _resolve_related_path(self.model, field_path)
-            if related_model is not None and _is_rls_protected(related_model):
-                tenant_filter = Q(**{f"{field_path}__{fk_field_id}": tenant_id})
-                # Preserve LEFT OUTER JOIN semantics when *any* hop of the
-                # path is nullable: include rows whose chain ends in NULL.
-                # Without this, .filter() forces an INNER JOIN which
-                # silently drops those rows. The check must cover every
-                # segment, not just the first or the last one -- a nullable
-                # intermediate FK breaks the chain just as well (#79).
-                if nullable:
-                    tenant_filter = tenant_filter | Q(**{f"{field_path}__isnull": True})
-                qs = qs.filter(tenant_filter)
+            if related_model is None or not _is_rls_protected(related_model):
+                continue
+            # The joined model's own tenant field: an EXTERNAL_MODELS entry
+            # may name another one than TENANT_FK_FIELD.
+            tenant_attname = _tenant_attname(related_model)
+            if tenant_attname is None:
+                continue  # W009 / W016: the policy alone filters the joined rows
+            tenant_filter = Q(**{f"{field_path}__{tenant_attname}": tenant_id})
+            # Preserve LEFT OUTER JOIN semantics when *any* hop of the
+            # path is nullable: include rows whose chain ends in NULL.
+            # Without this, .filter() forces an INNER JOIN which
+            # silently drops those rows. The check must cover every
+            # segment, not just the first or the last one -- a nullable
+            # intermediate FK breaks the chain just as well (#79).
+            if nullable:
+                tenant_filter = tenant_filter | Q(**{f"{field_path}__isnull": True})
+            qs = qs.filter(tenant_filter)
         return qs
 
     def _get_active_tenant_id(self) -> int | str | None:
@@ -1055,10 +1077,14 @@ def _tenant_rows(
 
     The base manager is the one Django would prefetch through, so a filter
     of the default manager (soft deletion, say) does not hide a related
-    object that the plain prefetch would find.
+    object that the plain prefetch would find. The filter is on the model's
+    own tenant field (see :func:`_tenant_attname`); without one (``W009`` /
+    ``W016``) the rows are those the plain prefetch would read.
     """
-    conf = rls_tenants_config
-    rows = model._base_manager.filter(**{f"{conf.TENANT_FK_FIELD}_id": tenant_id})  # noqa: SLF001
+    rows = model._base_manager.all()  # noqa: SLF001
+    tenant_attname = _tenant_attname(model)
+    if tenant_attname is not None:
+        rows = rows.filter(**{tenant_attname: tenant_id})
     if fetch_mode is not None:
         rows = rows.fetch_mode(fetch_mode)
     return rows
