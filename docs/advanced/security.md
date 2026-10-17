@@ -119,11 +119,19 @@ uniqueness.
 - **Foreign keys can point across tenants.** The `WITH CHECK` clause validates the
   tenant FK of the row being written, not the tenant of the rows it references. A
   tenant that knows or guesses another tenant's primary key can save an `Order`
-  whose `customer_id` belongs to someone else, and the FK check accepts it. Resolve
-  referenced objects through the tenant-scoped manager before assigning them (an
-  RLS-filtered lookup raises `DoesNotExist` for another tenant's row), or enforce it
-  in the schema with a composite foreign key on `(tenant_id, customer_id)` that
-  references a unique `(tenant_id, id)` pair. Many-to-many through tables are the
+  whose `customer_id` belongs to someone else, and the FK check accepts it. The
+  library validates this in Python: `RLSProtectedModel.clean_fields()` and DRF
+  serializers with `RLSTenantSerializerMixin` reject a foreign key to a row of another
+  tenant (`validate_cross_tenant_fks()`, see
+  [Cross-Tenant Foreign Keys](../guides/protecting-models.md#cross-tenant-foreign-keys)),
+  with the error Django gives a missing row, so it does not reveal that the row exists.
+  That covers `full_clean()` paths (`ModelForm`, the admin) only, not `save()`,
+  `bulk_create()`, `update()` or raw SQL: call `validate_cross_tenant_fks()` in service
+  code, resolve referenced objects through the tenant-scoped manager before assigning
+  them (an RLS-filtered lookup raises `DoesNotExist` for another tenant's row), or
+  enforce it in the schema with a composite foreign key on `(tenant_id, customer_id)`
+  that references a unique `(tenant_id, id)` pair, the only option that also covers
+  bulk writes and raw SQL. Many-to-many through tables are the
   exception: `RLSM2MConstraint` policies check both ends with `EXISTS` subqueries.
 - **Unique indexes span all tenants.** A global unique constraint rejects a value
   that exists only in another tenant, and the resulting `IntegrityError` tells the
@@ -313,6 +321,10 @@ Three properties of the DRF side are worth knowing:
   [Referential Integrity and Unique Indexes](#referential-integrity-and-unique-indexes)
   apply regardless; per-tenant uniqueness belongs in a `UniqueConstraint` that
   includes the tenant FK, which the serializer then validates as a `400`.
+- `RLSTenantSerializerMixin.validate()` does run the cross-tenant foreign key check
+  that `full_clean()` would, so a foreign key to another tenant's row is a `400` (see
+  [Serializers](../guides/drf.md#serializers)). A serializer that overrides
+  `validate()` must call `super().validate(attrs)`.
 
 ## Threat Model
 
@@ -329,6 +341,7 @@ Three properties of the DRF side are worth knowing:
 | Background job without tenant context | Fail-closed: zero rows returned |
 | INSERT/UPDATE to wrong tenant | `WITH CHECK` clause validates writes |
 | M2M link to wrong tenant's records | `EXISTS`-based subquery policies on M2M through tables |
+| FK to another tenant's row in a form, the admin or a DRF serializer | `validate_cross_tenant_fks()` in `clean_fields()` and `RLSTenantSerializerMixin.validate()` |
 
 ### Not Protected Against
 
@@ -337,7 +350,7 @@ Three properties of the DRF side are worth knowing:
 | Arbitrary SQL on the application connection | SQL injection, compromised code, or a `dbshell` with the app credentials can call `set_config()` to change the tenant or admin GUC |
 | Superuser or `BYPASSRLS` role | These roles bypass all RLS (`W005` warns; `E001` is an error with `DEBUG = False`) |
 | Database- or role-level default for a policy GUC (`ALTER DATABASE/ROLE ... SET`) | In force in every new session before any context is set, and never cleared by the library (`W011` warns on every configured alias) |
-| Cross-tenant FK references | Referential-integrity checks are exempt from RLS |
+| Cross-tenant FK references written without validation | Referential-integrity checks are exempt from RLS. Validated on `full_clean()` paths and in DRF serializers with the mixin; not on `save()`, bulk writes or raw SQL (composite FK) |
 | Cross-tenant uniqueness probes | Unique indexes are exempt from RLS and span all tenants |
 | Schema-level information leaks | Shared tables, sequences, indexes |
 | Timing side channels | Query duration may reveal data volume |
@@ -419,8 +432,10 @@ See [Configuration](../getting-started/configuration.md#strict_mode) for setup, 
 4. **Use UUIDs** for tenant PKs if sequence-based leaks are a concern.
 5. **Include tenant FK in unique constraints** that should be per-tenant, and keep
    `W012` clean (see [Cross-Tenant Unique Constraints](#cross-tenant-unique-constraints)).
-6. **Validate FK targets through tenant-scoped managers** (or composite FKs) -- RLS
-   does not check the tenant of referenced rows.
+6. **Validate FK targets**: forms, the admin and `RLSTenantSerializerMixin` do it for
+   you; in service code that uses `save()`, call `validate_cross_tenant_fks()`, resolve
+   targets through tenant-scoped managers, or add composite FKs. RLS does not check the
+   tenant of referenced rows.
 7. **Run `check_rls`** in CI to verify policies exist.
 8. **Audit bypass usage** (`admin_context`, `bypass_flag`) regularly.
 9. **Test fail-closed behavior** with `assert_rls_blocks_without_context`.

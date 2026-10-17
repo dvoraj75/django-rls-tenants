@@ -337,6 +337,27 @@ for `rls_tenant_id`), logged as `Failed to set RLS GUC variables`.
 
 **See:** [User Integration](guides/user-integration.md#implementing-on-your-user-model).
 
+### A form or serializer says `... instance with id 5 is not a valid choice` (or `Invalid pk "5" - object does not exist`) for a row that exists
+
+**Symptom:** `full_clean()`, a `ModelForm`, the admin or a DRF serializer rejects a foreign
+key value, although `SELECT` as a superuser shows the row.
+
+**Cause:** The row belongs to another tenant than the object being validated, or it has no
+tenant (`NULL`). `validate_cross_tenant_fks()` (called by `RLSProtectedModel.clean_fields()`
+and `RLSTenantSerializerMixin.validate()`) compares the target's tenant with the object's
+own tenant field and reports a mismatch with the message of a missing row, so the error
+does not reveal that the id exists in another tenant. When an admin edits a row of tenant
+A, the foreign key must point at tenant A's rows too, whatever tenant the admin has
+selected.
+
+**Fix:** Use a target of the object's tenant. If the object has the wrong tenant, fix its
+tenant field first. A foreign key that is meant to cross tenants should point at a model
+without an `RLSConstraint` (shared data). Otherwise skip it in the model's `clean_fields()`
+override: `super().clean_fields({*(exclude or ()), "customer"})` (but Django then skips
+that field's own validation too).
+
+**See:** [Cross-Tenant Foreign Keys](guides/protecting-models.md#cross-tenant-foreign-keys).
+
 ### `RLSConfigurationError: RLS_TENANTS['TENANT_MODEL'] is required`
 
 **Symptom:** The error is raised the first time anything touches the configuration,

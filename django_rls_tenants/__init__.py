@@ -28,6 +28,7 @@ __all__ = [
     "current_tenant_value_sql",
     "safe_tenant_sql",
     "tenant_context",
+    "validate_cross_tenant_fks",
     "with_rls_context",
 ]
 
@@ -47,6 +48,10 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "current_tenant_value_sql": ("django_rls_tenants.tenants.sql", "current_tenant_value_sql"),
     "safe_tenant_sql": ("django_rls_tenants.tenants.sql", "safe_tenant_sql"),
     "tenant_context": ("django_rls_tenants.tenants.context", "tenant_context"),
+    "validate_cross_tenant_fks": (
+        "django_rls_tenants.tenants.models",
+        "validate_cross_tenant_fks",
+    ),
     "with_rls_context": ("django_rls_tenants.tenants.context", "with_rls_context"),
 }
 

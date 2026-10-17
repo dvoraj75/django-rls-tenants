@@ -26,7 +26,7 @@ from django_rls_tenants.tenants.context import (
     with_rls_context,
 )
 from django_rls_tenants.tenants.managers import RLSManager, TenantQuerySet
-from django_rls_tenants.tenants.models import RLSProtectedModel
+from django_rls_tenants.tenants.models import RLSProtectedModel, validate_cross_tenant_fks
 from django_rls_tenants.tenants.state import (
     get_current_tenant_id,
     get_rls_context_active,
@@ -60,5 +60,6 @@ __all__ = [
     "set_current_tenant_id",
     "set_rls_context_active",
     "tenant_context",
+    "validate_cross_tenant_fks",
     "with_rls_context",
 ]

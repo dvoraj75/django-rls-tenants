@@ -38,9 +38,9 @@ from django_rls_tenants.tenants.admin import (
     RLSTenantModelAdmin,
     TenantSwitchListFilter,
 )
-from django_rls_tenants.tenants.context import admin_context
+from django_rls_tenants.tenants.context import admin_context, tenant_context
 from django_rls_tenants.tenants.errors import HINT_USER_NO_TENANT
-from tests.test_app.models import AdminUser, Order
+from tests.test_app.models import AdminUser, Order, OrderItem
 
 # ---------------------------------------------------------------------------
 # Unit-test helpers
@@ -359,6 +359,50 @@ class TestSaveModel:
             _order_admin().save_model(request, obj, form=None, change=True)
         assert obj.tenant_id == tenant_id
         base_save.assert_called_once_with(request, obj, None, True)
+
+
+class UnscopedOrderItemAdmin(RLSTenantModelAdmin):
+    """Its ``order`` choices come from the base manager, which has no tenant filter."""
+
+    def formfield_for_foreignkey(self, db_field: Any, request: Any, **kwargs: Any) -> Any:
+        if db_field.name == "order":
+            kwargs["queryset"] = Order._base_manager.all()
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
+
+def _staff(user: SimpleNamespace) -> SimpleNamespace:
+    """``user`` with every Django permission, which ``get_form()`` checks."""
+    user.has_perm = lambda *args, **kwargs: True
+    return user
+
+
+@pytest.mark.django_db
+class TestGetForm:
+    """The form stamps an implicit tenant on its instance before it validates (#107)."""
+
+    def test_add_form_instance_gets_the_tenant(self, tenant_a):
+        model_admin = RLSTenantModelAdmin(OrderItem, admin.site)
+        form_class = model_admin.get_form(_request(_staff(_scoped_user(str(tenant_a.pk)))))
+        assert form_class.__name__ == "OrderItemForm"
+        form = form_class(data={})
+        assert form.instance.tenant_id == tenant_a.pk
+
+    def test_admin_without_selection_gets_the_plain_form(self):
+        model_admin = RLSTenantModelAdmin(OrderItem, admin.site)
+        form = model_admin.get_form(_request(_staff(_admin_user())))(data={})
+        assert form.instance.tenant_id is None
+
+    def test_add_form_rejects_a_target_of_another_tenant(self, tenant_a, sample_orders):
+        """Whether RLS hid the row (plain role) or the model check caught it (superuser)."""
+        model_admin = UnscopedOrderItemAdmin(OrderItem, admin.site)
+        request = _request(_staff(_scoped_user(tenant_a.pk)))
+        with tenant_context(tenant_a.pk):
+            form_class = model_admin.get_form(request)
+            form = form_class(data={"description": "x", "order": sample_orders["b1"].pk})
+            assert not form.is_valid()
+            assert set(form.errors) == {"order"}
+            ok = form_class(data={"description": "x", "order": sample_orders["a1"].pk})
+            assert ok.is_valid(), ok.errors
 
 
 # ---------------------------------------------------------------------------

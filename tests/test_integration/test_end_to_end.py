@@ -356,6 +356,7 @@ class TestCheckRlsCommand:
         assert "Order" in output
         assert "Document" in output
         assert "ProtectedUser" in output
+        assert "OrderProxy" not in output  # it shares Order's table
 
     def test_exits_with_error_when_rls_missing(self):
         """Command exits with SystemExit(1) when RLS is missing on a table.

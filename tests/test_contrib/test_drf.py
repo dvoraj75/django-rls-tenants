@@ -52,9 +52,9 @@ from django_rls_tenants.tenants.state import (
     get_current_tenant_id,
     get_rls_context_active,
 )
-from tests.drf_views import InvoiceSerializer, StateView
+from tests.drf_views import InvoiceSerializer, OrderItemSerializer, StateView
 from tests.session_gucs import session_gucs
-from tests.test_app.models import AdminUser, Invoice, Order, Tag, Tenant
+from tests.test_app.models import AdminUser, Invoice, Order, OrderItem, OrderNote, Tag, Tenant
 
 pytestmark = [pytest.mark.django_db, pytest.mark.urls("tests.drf_urls")]
 
@@ -424,6 +424,196 @@ class TestRLSTenantSerializerMixin:
             invoice = serializer.save()
             assert invoice.tenant_id == tenant_a.pk
             assert "tenant" not in serializer.data
+
+
+class AdminOrderItemSerializer(RLSTenantModelSerializer):
+    """Lists ``tenant``, so that an admin chooses it."""
+
+    class Meta:
+        model = OrderItem
+        fields = ("id", "tenant", "order", "description")
+
+
+class TenantOnlyOrderItemSerializer(RLSTenantModelSerializer):
+    """Writes the tenant but not ``order``."""
+
+    class Meta:
+        model = OrderItem
+        fields = ("id", "tenant", "description")
+
+
+class DeclaredOrderItemSerializer(RLSTenantModelSerializer):
+    """A queryset built at import time, with no context: no auto-scope filter."""
+
+    order = serializers.PrimaryKeyRelatedField(queryset=Order.objects.all())
+
+    class Meta:
+        model = OrderItem
+        fields = ("id", "order", "description")
+
+
+class SlugOrderItemSerializer(RLSTenantModelSerializer):
+    order = serializers.SlugRelatedField(slug_field="product", queryset=Order.objects.all())
+
+    class Meta:
+        model = OrderItem
+        fields = ("id", "order", "description")
+
+
+class RawOrderItemSerializer(RLSTenantModelSerializer):
+    order_id = serializers.IntegerField()
+
+    class Meta:
+        model = OrderItem
+        fields = ("id", "order_id", "description")
+
+
+def _pk_does_not_exist(pk):
+    """The error ``PrimaryKeyRelatedField`` gives a primary key that matches no row."""
+    return [f'Invalid pk "{pk}" - object does not exist.']
+
+
+class TestCrossTenantForeignKeys:
+    """``RLSTenantSerializerMixin.validate()`` (#107): DRF never calls ``full_clean()``."""
+
+    def test_admin_chooses_a_target_of_another_tenant(self, tenant_a, sample_orders):
+        b1 = sample_orders["b1"]
+        data = {"tenant": tenant_a.pk, "order": b1.pk, "description": "x"}
+        with admin_context():
+            serializer = AdminOrderItemSerializer(data=data)
+            assert not serializer.is_valid()
+        assert serializer.errors == {"order": _pk_does_not_exist(b1.pk)}
+        assert serializer.errors["order"][0].code == "does_not_exist"
+
+    @pytest.mark.parametrize("sent", ["0{pk}", " {pk}"])
+    def test_error_shows_what_the_client_sent(self, tenant_a, sample_orders, sent):
+        """Not the target's own pk, which would tell the client that the row exists."""
+        sent = sent.format(pk=sample_orders["b1"].pk)
+        data = {"tenant": tenant_a.pk, "order": sent, "description": "x"}
+        with admin_context():
+            serializer = AdminOrderItemSerializer(data=data)
+            assert not serializer.is_valid()
+            missing = AdminOrderItemSerializer(data={**data, "order": "0999999"})
+            assert not missing.is_valid()
+        assert serializer.errors == {"order": _pk_does_not_exist(sent)}
+        assert missing.errors == {"order": _pk_does_not_exist("0999999")}
+
+    def test_nested_write_is_not_a_foreign_key_write(self, tenant_a):
+        class NestedOrderSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = Order
+                fields = ("product", "amount")
+
+        class NestedOrderItemSerializer(RLSTenantModelSerializer):
+            order = NestedOrderSerializer()
+
+            class Meta:
+                model = OrderItem
+                fields = ("id", "order", "description")
+
+        data = {"order": {"product": "p", "amount": "1.00"}, "description": "x"}
+        with tenant_context(tenant_a.pk):
+            serializer = NestedOrderItemSerializer(data=data)
+            assert serializer.is_valid(), serializer.errors
+
+    def test_admin_chooses_a_target_of_the_same_tenant(self, tenant_a, sample_orders):
+        data = {"tenant": tenant_a.pk, "order": sample_orders["a1"].pk, "description": "x"}
+        with admin_context():
+            serializer = AdminOrderItemSerializer(data=data)
+            assert serializer.is_valid(), serializer.errors
+
+    def test_tenant_user_with_an_unscoped_queryset(self, tenant_a, sample_orders):
+        """Whether RLS hid the row (plain role) or this check caught it (superuser)."""
+        b1 = sample_orders["b1"]
+        with tenant_context(tenant_a.pk):
+            serializer = DeclaredOrderItemSerializer(data={"order": b1.pk, "description": "x"})
+            assert not serializer.is_valid()
+            assert serializer.errors == {"order": _pk_does_not_exist(b1.pk)}
+            ok = DeclaredOrderItemSerializer(
+                data={"order": sample_orders["a1"].pk, "description": "x"},
+            )
+            assert ok.is_valid(), ok.errors
+
+    def test_slug_field_error(self, tenant_a, sample_orders):
+        with tenant_context(tenant_a.pk):
+            serializer = SlugOrderItemSerializer(data={"order": "Gadget B1", "description": "x"})
+            assert not serializer.is_valid()
+        assert serializer.errors == {"order": ["Object with product=Gadget B1 does not exist."]}
+
+    def test_raw_foreign_key_field_error(self, tenant_a, sample_orders):
+        b1 = sample_orders["b1"]
+        with tenant_context(tenant_a.pk):
+            serializer = RawOrderItemSerializer(data={"order_id": b1.pk, "description": "x"})
+            assert not serializer.is_valid()
+        assert serializer.errors == {
+            "order_id": [f"order instance with id {b1.pk} is not a valid choice."],
+        }
+        assert serializer.errors["order_id"][0].code == "invalid"
+
+    def test_moving_an_object_checks_its_foreign_keys(self, tenant_b, sample_order_items):
+        item = sample_order_items["a1"]
+        with admin_context():
+            serializer = AdminOrderItemSerializer(item, data={"tenant": tenant_b.pk}, partial=True)
+            assert not serializer.is_valid()
+        assert serializer.errors == {"order": _pk_does_not_exist(item.order_id)}
+
+    def test_moving_an_object_without_the_field_is_a_non_field_error(
+        self, tenant_b, sample_order_items
+    ):
+        item = sample_order_items["a1"]
+        with admin_context():
+            serializer = TenantOnlyOrderItemSerializer(
+                item,
+                data={"tenant": tenant_b.pk},
+                partial=True,
+            )
+            assert not serializer.is_valid()
+        assert serializer.errors == {
+            "non_field_errors": [f"order instance with id {item.order_id} is not a valid choice."],
+        }
+
+    def test_update_that_keeps_the_tenant_checks_only_written_keys(
+        self, tenant_a, sample_order_items, django_assert_num_queries
+    ):
+        item = sample_order_items["a1"]
+        with tenant_context(tenant_a.pk):
+            serializer = OrderItemSerializer(item, data={"description": "y"}, partial=True)
+            with django_assert_num_queries(0):
+                assert serializer.is_valid(), serializer.errors
+
+    def test_empty_foreign_key_is_not_checked(self, tenant_a, django_assert_num_queries):
+        class OrderNoteSerializer(RLSTenantModelSerializer):
+            class Meta:
+                model = OrderNote
+                fields = ("id", "order", "body")
+
+        with tenant_context(tenant_a.pk):
+            serializer = OrderNoteSerializer(data={"order": None, "body": "x"})
+            with django_assert_num_queries(0):
+                assert serializer.is_valid(), serializer.errors
+
+    def test_no_tenant_is_not_checked(self, sample_orders):
+        with admin_context():
+            serializer = OrderItemSerializer(
+                data={"order": sample_orders["b1"].pk, "description": "x"},
+            )
+            assert serializer.is_valid(), serializer.errors
+
+    def test_model_without_an_rls_constraint(self, tenant_a):
+        class TagSerializer(RLSTenantModelSerializer):
+            class Meta:
+                model = Tag
+                fields = ("id", "name")
+
+        with tenant_context(tenant_a.pk):
+            serializer = TagSerializer(data={"name": "x"})
+            assert serializer.is_valid(), serializer.errors
+
+    def test_hyperlink_field_error(self):
+        field = serializers.HyperlinkedRelatedField(view_name="order-detail", read_only=True)
+        detail = drf_mod._does_not_exist(field, OrderItem._meta.get_field("order"), 5, None)
+        assert detail == ["Invalid hyperlink - Object does not exist."]
+        assert detail[0].code == "does_not_exist"
 
 
 # ---------------------------------------------------------------------------

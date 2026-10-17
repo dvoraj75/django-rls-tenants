@@ -51,7 +51,13 @@ pytestmark = pytest.mark.django_db
 
 _M2M_TABLES = ("test_project_members", "test_project_tags", "test_selfref_friends")
 _HAND_WRITTEN = "0005_m2m_rls_policies"
-_GENERATED = "0009_m2m_rls_policies"
+# The test app's two latest migrations (zero-padded names sort in order): the generated
+# migration is numbered after the leaf and depends on it.
+_PARENT, _LEAF = sorted(
+    source.stem for source in Path(test_app_migrations.__file__).parent.glob("0*.py")
+)[-2:]
+_LEAF_NUMBER = int(_LEAF.split("_", 1)[0])
+_GENERATED = f"{_LEAF_NUMBER + 1:04d}_m2m_rls_policies"
 
 
 @pytest.fixture
@@ -128,7 +134,7 @@ class TestGenerate:
 
         package = migrations_without_m2m_policies.name
         module = importlib.import_module(f"{package}.{_GENERATED}")
-        assert module.Migration.dependencies == [("test_app", "0008_ordershipment")]
+        assert module.Migration.dependencies == [("test_app", _LEAF)]
         assert _operations(f"{package}.{_GENERATED}") == _operations(
             f"tests.test_app.migrations.{_HAND_WRITTEN}"
         )
@@ -171,7 +177,8 @@ class TestGenerate:
 
     def test_name(self, migrations_without_m2m_policies):
         _check_rls("--generate", "--name", "protect_m2m")
-        assert (migrations_without_m2m_policies / "0009_protect_m2m.py").is_file()
+        named = f"{_LEAF_NUMBER + 1:04d}_protect_m2m.py"
+        assert (migrations_without_m2m_policies / named).is_file()
 
     @override_settings(RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant", "GUC_PREFIX": "myco"})
     def test_guc_names_come_from_settings(self, migrations_without_m2m_policies):
@@ -203,35 +210,36 @@ class TestGenerate:
         }
 
     def test_skips_an_app_with_conflicting_migrations(self, migrations_without_m2m_policies):
-        (migrations_without_m2m_policies / "0008_conflict.py").write_text(
+        conflict = f"{_LEAF_NUMBER:04d}_conflict"  # a second leaf, beside _LEAF
+        (migrations_without_m2m_policies / f"{conflict}.py").write_text(
             "from django.db import migrations\n\n\n"
             "class Migration(migrations.Migration):\n"
-            '    dependencies = [("test_app", "0007_invoice")]\n'
+            f'    dependencies = [("test_app", "{_PARENT}")]\n'
         )
         code, out, err = _check_rls("--generate")
         assert code == 0
         assert "Migrations for" not in out
         assert not (migrations_without_m2m_policies / f"{_GENERATED}.py").exists()
+        leaves = ", ".join(f"test_app.{name}" for name in sorted([conflict, _LEAF]))
         for table in _M2M_TABLES:
             assert (
-                f"({table}): app 'test_app' has conflicting migrations "
-                f"(test_app.0008_conflict, test_app.0008_ordershipment): run makemigrations "
-                f"--merge first."
+                f"({table}): app 'test_app' has conflicting migrations ({leaves}): run "
+                f"makemigrations --merge first."
             ) in err
 
     def test_refuses_to_overwrite(self, migrations_without_m2m_policies):
-        """A file at the planned path is never overwritten (number it after 0007 to collide)."""
-        existing = migrations_without_m2m_policies / "0008_ordershipment.py"
+        """A file at the planned path is never overwritten (numbered to collide with the leaf)."""
+        existing = migrations_without_m2m_policies / f"{_LEAF}.py"
         before = existing.read_text()
         with (
-            patch.object(MigrationAutodetector, "parse_number", return_value=7),
-            pytest.raises(CommandError, match=r"0008_ordershipment\.py exists already"),
+            patch.object(MigrationAutodetector, "parse_number", return_value=_LEAF_NUMBER - 1),
+            pytest.raises(CommandError, match=rf"{_LEAF}\.py exists already"),
         ):
             call_command(
                 "check_rls",
                 "--generate",
                 "--name",
-                "ordershipment",
+                _LEAF.split("_", 1)[1],
                 stdout=StringIO(),
                 stderr=StringIO(),
             )
@@ -382,7 +390,7 @@ class _Facts:
         return self._m2m_migrations
 
     def leaf_nodes(self, app_label):
-        return [("test_app", "0008_ordershipment")]
+        return [("test_app", _LEAF)]
 
 
 def _tags_info():
@@ -479,7 +487,7 @@ class TestHintCauses:
         )
         assert skipped == {}
         [migration] = planned
-        assert migration.writer.migration.name == "0009_m2m_rls_policies"
+        assert migration.writer.migration.name == _GENERATED
         assert migration.tables == ["test_project_tags"]
         [operation] = migration.writer.migration.operations
         assert operation.from_model == Project._meta.label

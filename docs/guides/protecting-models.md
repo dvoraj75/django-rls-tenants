@@ -394,6 +394,85 @@ class Project(RLSProtectedModel):
     members = models.ManyToManyField("User", through=ProjectMembership)
 ```
 
+## Cross-Tenant Foreign Keys
+
+RLS does not stop a row of tenant A from holding a foreign key to a row of tenant B.
+The policy checks the row's own tenant column, and PostgreSQL runs foreign key checks
+outside row security (see [Security](../advanced/security.md#referential-integrity-and-unique-indexes)).
+`RLSProtectedModel` therefore validates, in `clean_fields()`, that each foreign key to
+another RLS-protected model points at a row of the **same tenant as the row itself**:
+
+```python
+class Order(RLSProtectedModel):
+    customer = models.ForeignKey("Customer", on_delete=models.PROTECT)  # Customer is RLS-protected
+
+order = Order(tenant=tenant_a, customer=customer_of_b)
+order.full_clean()
+# ValidationError: {'customer': ['customer instance with id 7 is not a valid choice.']}
+```
+
+This runs wherever Django calls `full_clean()`: a `ModelForm` (the Django admin
+included) and an explicit `full_clean()`. A foreign key the form does not show is
+skipped, as Django skips excluded fields. It does **not** run on `save()`,
+`objects.create()`, `bulk_create()`, `update()`, `bulk_update()` or raw SQL. In service
+code that writes with `save()` and no form, call the helper yourself:
+
+```python
+from django_rls_tenants import validate_cross_tenant_fks
+
+order = Order(tenant=tenant, customer=customer)
+validate_cross_tenant_fks(order)  # raises ValidationError keyed by field name
+order.save()
+```
+
+`validate_cross_tenant_fks(instance, *, exclude=None)` skips the foreign keys named in
+`exclude`. If you override `clean_fields()` on a model, call
+`super().clean_fields(exclude)` or the check is lost.
+
+How it decides:
+
+- The target's tenant is compared with the instance's **own** tenant field, not with the
+  active context, so an admin editing another tenant's row is not rejected. Each target is
+  read with one small query (per foreign key, per validation) inside `admin_context()`, so
+  the result does not depend on the active context, and it works under `STRICT_MODE`.
+- Checked: concrete `ForeignKey` and `OneToOneField` fields whose target model has an
+  `RLSConstraint` (a proxy's target counts as its concrete model). Skipped: the tenant
+  foreign key itself, multi-table-inheritance parent links, empty foreign keys, unsaved
+  targets, models without an `RLSConstraint`, and every foreign key while the instance has
+  no tenant yet (code that sets the tenant after validation). `RLSTenantModelAdmin` sets an
+  implicit tenant on the form's object before the form validates.
+- A target that does not exist, or whose tenant is `NULL` (for example a cross-tenant
+  admin row on a user model with a nullable tenant foreign key), counts as another
+  tenant's row: tenant A cannot see it under RLS either.
+- The error is the field's own `invalid` message, the one Django gives a row that does
+  not exist, on purpose. A distinct "belongs to another tenant" message would tell a
+  tenant user that the id exists in another tenant. On a plain database role in a tenant
+  context Django's own foreign key validation already rejects such an id, because RLS hides
+  the row; this check adds the protection on superuser and `BYPASSRLS` connections and in
+  the admin context, and reports one error, not two.
+
+Django REST Framework serializers do not call `full_clean()`; `RLSTenantSerializerMixin`
+runs the same check in `validate()` (see the [DRF guide](drf.md#serializers)).
+
+The only protection that also covers `save()`, bulk writes and raw SQL is a composite
+foreign key in the schema, on `(tenant_id, customer_id)` to a unique `(tenant_id, id)`
+pair; see [Security](../advanced/security.md#referential-integrity-and-unique-indexes).
+
+## Proxy Models
+
+A proxy of an `RLSProtectedModel` reads and writes its concrete model's table, so the
+concrete model's policy applies to it. It gets no tenant field of its own, and the
+library treats it as RLS-protected (`STRICT_MODE`, `prefetch_related()`, the
+[cross-tenant foreign key check](#cross-tenant-foreign-keys)):
+
+```python
+class OpenOrder(Order):
+    class Meta:
+        proxy = True
+```
+
+It inherits `RLSManager`; a manager you give it should subclass `RLSManager` too.
+
 ## Multiple Protected Models
 
 You can have as many `RLSProtectedModel` subclasses as needed. Each gets its own

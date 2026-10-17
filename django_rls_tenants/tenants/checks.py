@@ -549,6 +549,8 @@ def _check_tenant_fk_field_exists() -> list[CheckWarning]:
     for model in apps.get_models():
         if not issubclass(model, RLSProtectedModel) or model._meta.abstract:  # noqa: SLF001
             continue
+        if model._meta.proxy:  # noqa: SLF001
+            continue  # its policy is its concrete model's, checked on that model
         fk_field = _get_tenant_fk_field(model) or default_fk_field
         try:
             model._meta.get_field(fk_field)  # noqa: SLF001
