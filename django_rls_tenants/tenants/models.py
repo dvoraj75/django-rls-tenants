@@ -324,8 +324,9 @@ def _foreign_keys_of_other_tenants(
     includes those in ``rejected``: foreign keys the caller's validation has
     already rejected as not found, which is what Django's and DRF's own
     validation report for a row that RLS or the auto-scope filter hides. They
-    are looked up for the audit record only, and only when the audit logger
-    logs it.
+    are looked up for the audit record only, only when the audit logger logs
+    ``WARNING``, and in a savepoint whose failure loses the record but never
+    changes the validation (:func:`_audited_target_tenants`).
 
     Args:
         tenant_id: The tenant of the row that holds the foreign keys.
@@ -338,10 +339,9 @@ def _foreign_keys_of_other_tenants(
         user_id: The primary key of the user who sent the data, if known.
         rejected: Foreign keys already rejected as not found, and their values.
     """
-    lookups = dict(targets)
+    found = _target_tenants(targets, instance=instance)
     if rejected and audit.audit_logger.isEnabledFor(logging.WARNING):
-        lookups.update(rejected)
-    found = _target_tenants(lookups, instance=instance)
+        found.update(_audited_target_tenants(rejected, instance=instance))
     # Exists, in another tenant or in none.
     cross_tenant = sorted(
         (field for field, tenants in found.items() if tenants and tenants != [tenant_id]),
@@ -364,11 +364,19 @@ def _target_tenants(
     targets: Mapping[models.ForeignKey[Any, Any], Any],
     *,
     instance: models.Model | None,
+    savepoint: bool = False,
 ) -> dict[models.ForeignKey[Any, Any], list[Any]]:
     """Return each foreign key's target tenant: ``[tenant]``, or ``[]`` when there is no target.
 
     One ``values_list()`` query per foreign key, inside ``admin_context()`` on
     the router's read alias (see :func:`_foreign_keys_of_other_tenants`).
+
+    Args:
+        targets: Each foreign key and the value to look up.
+        instance: The row, passed to the router.
+        savepoint: Run each alias's lookups in ``transaction.atomic()`` (a
+            savepoint inside an open transaction), so a failure leaves the
+            caller's transaction usable.
     """
     by_alias: dict[str, list[tuple[models.ForeignKey[Any, Any], Any]]] = {}
     for field, value in targets.items():
@@ -377,7 +385,7 @@ def _target_tenants(
     found: dict[models.ForeignKey[Any, Any], list[Any]] = {}
     for alias, pairs in by_alias.items():
         with ExitStack() as stack:
-            if _needs_own_transaction(alias):
+            if savepoint or _needs_own_transaction(alias):
                 stack.enter_context(transaction.atomic(using=alias))
             stack.enter_context(audit.silenced(admin_context(using=alias)))
             for field, value in pairs:
@@ -390,6 +398,83 @@ def _target_tenants(
                     .values_list(target_tenant.attname, flat=True)[:1],
                 )
     return found
+
+
+def _audited_target_tenants(
+    rejected: Mapping[models.ForeignKey[Any, Any], Any],
+    *,
+    instance: models.Model | None,
+) -> dict[models.ForeignKey[Any, Any], list[Any]]:
+    """Return :func:`_target_tenants` of ``rejected``, or ``{}`` if the lookup fails.
+
+    The lookup only feeds the audit record: validation has already rejected
+    these values, so a failure (a replica down, a statement timeout, a
+    transaction that has already failed) loses the record, never the error the
+    caller reports. It runs in a savepoint, which keeps an open transaction
+    usable when it fails.
+    """
+    try:
+        return _target_tenants(rejected, instance=instance, savepoint=True)
+    except Exception:
+        logger.debug(
+            "Audit: could not look up the tenants of rejected foreign key targets.",
+            exc_info=True,
+        )
+        return {}
+
+
+def _audit_rejected_values(
+    model: type[models.Model],
+    tenant_id: Any,
+    values: Mapping[models.ForeignKey[Any, Any], Any],
+    *,
+    instance: models.Model | None,
+    source: audit.Source,
+    user_id: Any,
+) -> None:
+    """Log the foreign keys an integration's validation rejected as not found, if cross-tenant.
+
+    For a form's ``ModelChoiceField`` (``invalid_choice``) or a DRF
+    ``PrimaryKeyRelatedField`` (``does_not_exist``): in a tenant context their
+    queryset hides another tenant's rows, so they reject such a target before
+    :func:`validate_cross_tenant_fks` sees it. Audit-only (see
+    :func:`_foreign_keys_of_other_tenants`).
+
+    Args:
+        model: The model of the row.
+        tenant_id: The tenant of the row (the active one), converted here.
+        values: Each foreign key and the value sent for it, converted here
+            with the target field's ``to_python()``; one that does not convert
+            is not a target and is skipped.
+        instance: The row, passed to the router.
+        source: Who validates, for the audit record.
+        user_id: The primary key of the user who sent the data, if known.
+    """
+    checked = _checked_foreign_keys(model)
+    if checked is None or not audit.audit_logger.isEnabledFor(logging.WARNING):
+        return
+    try:
+        tenant_id = checked[0].to_python(tenant_id)
+    except ValidationError:
+        return
+    rejected: dict[models.ForeignKey[Any, Any], Any] = {}
+    for field, value in values.items():
+        try:
+            converted = field.target_field.to_python(value)
+        except (ValidationError, TypeError, ValueError):
+            continue  # not a value of the target's type
+        if converted not in (None, ""):
+            rejected[field] = converted
+    if rejected:
+        _foreign_keys_of_other_tenants(
+            tenant_id,
+            {},
+            model=model,
+            instance=instance,
+            source=source,
+            user_id=user_id,
+            rejected=rejected,
+        )
 
 
 def _not_found_value(

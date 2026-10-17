@@ -32,7 +32,9 @@ LOGGING = {
 }
 ```
 
-Example output (the message lists the fields that are set):
+Example output (the message lists the fields that are set; a string value with whitespace,
+`=` or a non-printable character is quoted with `repr()`, so it cannot forge another field or
+line):
 
 ```
 context.entered source=middleware tenant_id=42 admin=False user_id=7
@@ -106,7 +108,7 @@ And, depending on the event:
 | `rls_reason` | `context.denied` | Why the context was refused, see [Events](#events). |
 | `rls_model` | `context.denied` (`strict_mode`, `object_of_other_tenant`), `fk.cross_tenant_rejected` | The model label, `"app_label.ModelName"`. |
 | `rls_fields` | `fk.cross_tenant_rejected` | The names of the foreign keys whose target belongs to another tenant. |
-| `rls_databases` | `gucs.cleared` | The aliases cleared (`RLS_TENANTS["DATABASES"]`). |
+| `rls_databases` | `gucs.cleared` | The aliases the safety net covered (`RLS_TENANTS["DATABASES"]`). It skips a closed connection, and with `USE_LOCAL_SET=True` it writes nothing: it marks the sessions for the GUC affinity guard, which clears them before their next statement. |
 
 The user is identified by primary key only. No username, email address or other personal
 data is logged, so the trail stays pseudonymous; resolve a primary key in a system with
@@ -122,7 +124,7 @@ handler.
 | `context.entered` | `INFO` | A tenant or admin context is entered. |
 | `context.exited` | `INFO` | That context ends, also when its block raises. One per `context.entered`, same fields. For a request whose middleware cleanup never ran, none is logged and the safety net's `gucs.cleared` comes instead; if the middleware's clear itself failed, `context.exited` is logged and `gucs.cleared` follows. |
 | `context.denied` | `WARNING` | The library refuses to run without the right context (reasons below). |
-| `fk.cross_tenant_rejected` | `WARNING` | Validation rejects a foreign key whose target row exists but belongs to another tenant, or to none (see [Cross-tenant foreign keys](protecting-models.md#cross-tenant-foreign-keys)). That includes a target Django's or DRF's own validation already rejected as not found because RLS or the auto-scope filter hides it (a tenant user sending another tenant's id): the library then reads the target's tenant once in `admin_context()`, only when this record is logged, and leaves the error as it was. A target that does not exist is an ordinary invalid value and is not logged. |
+| `fk.cross_tenant_rejected` | `WARNING` | Validation rejects a foreign key whose target row exists but belongs to another tenant, or to none (see [Cross-tenant foreign keys](protecting-models.md#cross-tenant-foreign-keys)). That includes a target that validation already rejected as not found because RLS or the auto-scope filter hides it (a tenant user sending another tenant's id): Django's foreign key validation in `full_clean()`, a related-field dropdown of an `RLSTenantModelAdmin` form (`invalid_choice`, source `admin`), and a DRF `PrimaryKeyRelatedField` (`does_not_exist`). The library then reads the target's tenant once in `admin_context()` and leaves the error as it was. It does so only when the audit logger is enabled for `WARNING`, which it is when `LOGGING` does not configure it (the root logger's default level), and in a savepoint: if the lookup fails, the record is lost, never the error. A target that does not exist is an ordinary invalid value and is not logged. |
 | `gucs.cleared` | `WARNING` | The `request_finished` safety net found a request's context still set (the middleware's own cleanup did not run, or its clear failed) and ran its clear, which skips a connection that is already closed (see [Connection-Level State](../advanced/security.md#connection-level-state)). If the clear raises, a warning goes to the `django_rls_tenants` logger instead. |
 
 `context.denied` reasons:
@@ -132,7 +134,7 @@ handler.
 | `user_without_tenant` | `middleware`, `drf`, `admin`, `decorator`, `for_user` | A user who is not a tenant admin has `rls_tenant_id=None` (`NoTenantContextError`, or `PermissionDenied` / a 403 in the admin and DRF; the admin only while `rls_deny_without_tenant` is `True`, the default). |
 | `tenant_id_none` | the block's source | `tenant_context(None)` / `async_tenant_context(None)`. |
 | `strict_mode` | `queryset` | `STRICT_MODE` refused a query with no context (`rls_model` names the model). |
-| `no_context` | `drf`, `celery` | `RLSTenantPermission` found no context for an authenticated user (a view without `RLSTenantAPIViewMixin`), an `RLSTask` with `rls_require_context = True` arrived without one, or `CurrentTenantDefault` was called outside a tenant context (`rls_admin=True`: in the admin context). |
+| `no_context` | `drf`, `celery` | `RLSTenantPermission` found no context for an authenticated user (a view without `RLSTenantAPIViewMixin`), an `RLSTask` with `rls_require_context = True` arrived without one, or `CurrentTenantDefault` was called outside a tenant context (`rls_admin=True` in the admin context, `None` with no context). |
 | `context_mismatch` | `drf` | `RLSTenantPermission.has_permission()`: the active context is not the user's (`rls_tenant_id` / `rls_admin` describe the active one). |
 | `object_of_other_tenant` | `drf` | `RLSTenantPermission.has_object_permission()` refused an object of another tenant (`rls_model` names its model). |
 
@@ -142,14 +144,14 @@ handler.
 |--------------|-----------|------------|
 | `middleware` | `RLSTenantMiddleware`, on every path (WSGI, ASGI, a subclass with its own hooks). The context ends with the request, before a streaming body is sent. | yes |
 | `drf` | `RLSTenantAPIViewMixin` (the context `get_rls_context()` returned, an override's too), `RLSTenantPermission`, `RLSTenantSerializerMixin`, `CurrentTenantDefault` | yes (the serializer: when its `context` has the `request`) |
-| `admin` | `RLSTenantModelAdmin`'s view wrappers | yes |
+| `admin` | `RLSTenantModelAdmin`'s view wrappers, and its forms' dropdowns rejecting another tenant's row | yes |
 | `decorator` | `@with_rls_context`, sync and async | yes |
 | `celery` | `RLSTask` and the `install()` signal handlers, on the worker | no |
 | `command` | `run_as_tenant`, `run_for_all_tenants` (one entry per tenant; with `--parallel` the records come from the worker processes, so a file handler must be safe for several processes) | no |
 | `context_manager` | `tenant_context()`, `admin_context()` and the async forms, called by your code (including blocks nested inside any of the above) | no |
 | `queryset` | `STRICT_MODE` | no |
 | `for_user` | `for_user()` with a tenantless user | yes |
-| `validation` | `validate_cross_tenant_fks()` and `RLSProtectedModel.clean_fields()` (`full_clean()`, forms, the admin) | no |
+| `validation` | `validate_cross_tenant_fks()` and `RLSProtectedModel.clean_fields()` (`full_clean()`, a `ModelForm`, the admin) | no |
 | `safety_net` | the `request_finished` receiver | no |
 
 A request served by the middleware logs one entry and one exit. A DRF view behind the
@@ -174,8 +176,18 @@ nothing.
   their use in code (see [Recommendations](../advanced/security.md#recommendations)).
 - **The GUC affinity guard re-applying a context** on another connection or thread. That is
   the same context, already logged when it was entered.
+- **A `ModelForm` outside the admin, or a DRF slug or hyperlink field, rejecting another
+  tenant's row.** Their querysets hide the row, so they report an invalid choice or a row
+  that does not exist before the model's own check runs, and the library does not look
+  the value up. Only the admin's forms and `PrimaryKeyRelatedField` are classified (see
+  `fk.cross_tenant_rejected` above).
 - **`@with_rls_context` called with `None` as the user.** It runs the function without a
   context (fail-closed) and logs a warning on the `django_rls_tenants` logger, as before.
+
+`RLSTenantPermission` logs a `context.denied` record each time it returns `False`. DRF can
+call it without refusing the request: a composed permission (`IsAdminUser |
+RLSTenantPermission`) that another operand allows, or the browsable API checking the
+permissions again for each form it renders. Such a request can log a denial, or several.
 
 The `DEBUG` messages on the `django_rls_tenants` logger (see
 [Debug Logging](middleware.md#debug-logging)) are unchanged; the audit records are
@@ -214,6 +226,11 @@ The logger checks its level before it builds a record, so with the audit logger 
 ## Keeping the trail trustworthy
 
 The records describe what the library did; they are not tamper-proof by themselves.
+A record the logging system cannot log (a filter or handler that raises) is dropped, as
+`logging` drops one whose handler fails, and the failure is logged at `ERROR` on the
+`django_rls_tenants` logger: the library behaves the same whether or not its audit sink
+works. A slow, synchronous handler adds its latency to the request that logs the record; a
+`QueueHandler` keeps it off the request path.
 Send them to an append-only store (a log service, a write-once bucket) that the
 application's database role and its operators cannot edit, and keep its retention in line
 with your compliance requirements.

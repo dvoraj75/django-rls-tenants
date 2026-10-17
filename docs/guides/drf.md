@@ -296,7 +296,10 @@ classes while it builds `APIView`.
 `object_of_other_tenant`), as is the mixin's 403 for a user without a tenant
 (`user_without_tenant`). The context the mixin enters logs a `context.entered` /
 `context.exited` pair with the user's primary key, and a serializer that rejects a foreign
-key to another tenant's row logs `fk.cross_tenant_rejected`.
+key to another tenant's row logs `fk.cross_tenant_rejected` (a `PrimaryKeyRelatedField`
+that reports the row as not found too, not a slug or hyperlink field). The permission logs
+each `False` it returns, also when DRF does not refuse the request (a composed `|`
+permission, the browsable API's form checks).
 
 ## Serializers
 

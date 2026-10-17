@@ -19,6 +19,7 @@ from asgiref.sync import sync_to_async
 from django.db import connections
 
 from django_rls_tenants.rls.context import rls_context
+from django_rls_tenants.tenants import audit
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import (
     _writes_gucs,
@@ -239,7 +240,7 @@ def assert_rls_blocks_without_context(
 
     # Pre-check: verify the table has data (via admin bypass) so the
     # assertion is not vacuously true on an empty table.
-    with admin_context(using=using):
+    with audit.silenced(admin_context(using=using)):
         total = _count_rows(model_class, using=using)
     assert total > 0, (
         f"assert_rls_blocks_without_context requires at least one row in "

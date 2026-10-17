@@ -400,12 +400,18 @@ class CurrentTenantDefault:
 
     requires_context = True
 
-    def __call__(self, serializer_field: serializers.Field[Any, Any, Any, Any]) -> Model:  # noqa: ARG002  -- DRF calls it with the field
+    def __call__(self, serializer_field: serializers.Field[Any, Any, Any, Any]) -> Model:
         """Return the active tenant."""
         tenant_id = get_current_tenant_id()
         if tenant_id is None:
             admin = get_rls_context_active()
-            audit.denied("drf", "no_context", admin=admin)
+            request = getattr(serializer_field, "context", {}).get("request")
+            audit.denied(
+                "drf",
+                "no_context",
+                user_id=audit.user_id_of(getattr(request, "user", None)),
+                admin=True if admin else None,
+            )
             state = "the admin context" if admin else "no RLS context"
             msg = (
                 f"CurrentTenantDefault needs a tenant context, but the serializer is "
@@ -496,11 +502,12 @@ class RLSTenantSerializerMixin(_ModelSerializerBase):
 
         Only inside a tenant context, the only one in which the field's
         queryset hides another tenant's rows; the row's tenant is then the
-        active one (the tenant field is hidden and filled from it).
+        active one (the tenant field is hidden and filled from it). Only
+        ``PrimaryKeyRelatedField``: a slug or hyperlink is not looked up.
         """
         from django_rls_tenants.tenants.models import (  # noqa: PLC0415  -- needs the app registry
+            _audit_rejected_values,
             _checked_foreign_keys,
-            _foreign_keys_of_other_tenants,
         )
 
         tenant_id = get_current_tenant_id()
@@ -510,7 +517,7 @@ class RLSTenantSerializerMixin(_ModelSerializerBase):
         if checked is None:
             return
         by_name = {key: field for field in checked[1] for key in (field.name, field.attname)}
-        rejected: dict[ForeignKey[Any, Any], Any] = {}
+        values: dict[ForeignKey[Any, Any], Any] = {}
         for name, errors in detail.items():
             serializer_field = self.fields.get(name)
             if not isinstance(serializer_field, serializers.PrimaryKeyRelatedField) or not any(
@@ -521,24 +528,21 @@ class RLSTenantSerializerMixin(_ModelSerializerBase):
             if field is None or not field.target_field.primary_key:
                 continue
             value = serializer_field.get_value(data)
-            try:
-                if serializer_field.pk_field is not None:
+            if serializer_field.pk_field is not None:
+                try:
                     value = serializer_field.pk_field.to_internal_value(value)
-                value = field.target_field.to_python(value)
-            except (DjangoValidationError, serializers.ValidationError, TypeError, ValueError):
-                continue
-            if value is not None:
-                rejected[field] = value
-        if rejected:
+                except (DjangoValidationError, serializers.ValidationError, TypeError, ValueError):
+                    continue
+            values[field] = value
+        if values:
             request = self.context.get("request")
-            _foreign_keys_of_other_tenants(
+            _audit_rejected_values(
+                self.Meta.model,
                 tenant_id,
-                {},
-                model=self.Meta.model,
+                values,
                 instance=self.instance if isinstance(self.instance, self.Meta.model) else None,
                 source="drf",
                 user_id=audit.user_id_of(getattr(request, "user", None)),
-                rejected=rejected,
             )
 
     def validate(self, attrs: Any) -> Any:

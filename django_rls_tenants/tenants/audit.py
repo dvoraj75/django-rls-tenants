@@ -25,7 +25,7 @@ foreign key's target, the tenants a management command lists).
 from __future__ import annotations
 
 import logging
-from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager
+from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
@@ -37,6 +37,7 @@ AUDIT_LOGGER_NAME = "django_rls_tenants.audit"
 """Name of the logger the audit records go to; configure it in Django's ``LOGGING``."""
 
 audit_logger = logging.getLogger(AUDIT_LOGGER_NAME)
+_logger = logging.getLogger("django_rls_tenants")
 
 CONTEXT_ENTERED = "context.entered"
 CONTEXT_EXITED = "context.exited"
@@ -105,7 +106,14 @@ def emit(
 
     The message lists the fields that are not ``None``, for a plain-text
     handler: ``context.entered source=middleware tenant_id=42 admin=False
-    user_id=7``.
+    user_id=7``. A string value with whitespace, ``=`` or a character that is
+    not printable is quoted (``repr()``), so a value such as a tenant id read
+    from a Celery header cannot forge fields or lines.
+
+    A record that cannot be logged (a filter or handler that raises) is
+    dropped, as ``logging`` drops one whose handler fails: the library's
+    behaviour never depends on its audit sink. The failure is logged on the
+    ``django_rls_tenants`` logger.
 
     Args:
         event: The event name (``CONTEXT_ENTERED``, ...).
@@ -128,8 +136,23 @@ def emit(
         **details,
     }
     extra = {"rls_event": event, **{f"rls_{name}": value for name, value in fields.items()}}
-    text = " ".join(f"{name}={value}" for name, value in fields.items() if value is not None)
-    audit_logger.log(level, "%s %s", event, text, extra=extra)
+    try:
+        text = " ".join(
+            f"{name}={_plain(value)}" for name, value in fields.items() if value is not None
+        )
+        audit_logger.log(level, "%s %s", event, text, extra=extra)
+    except Exception:
+        with suppress(Exception):
+            _logger.exception("Audit record %s could not be logged.", event)
+
+
+def _plain(value: object) -> str:
+    """Render ``value`` for the plain-text message, quoting a string that could forge a field."""
+    if isinstance(value, str) and (
+        not value.isprintable() or "=" in value or any(char.isspace() for char in value)
+    ):
+        return repr(value)
+    return str(value)
 
 
 def denied(

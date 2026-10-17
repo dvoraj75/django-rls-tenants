@@ -62,15 +62,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tenant_context(None)`, `STRICT_MODE`, `RLSTenantPermission`, `CurrentTenantDefault`, an
   `RLSTask` with `rls_require_context`); `fk.cross_tenant_rejected` (`WARNING`) when
   validation rejects a foreign key whose target exists in another tenant (#107), including
-  a target that Django's or DRF's own validation already rejected as not found because RLS
-  or the auto-scope filter hides it (the target's tenant is then read once in
-  `admin_context()`, only when the record is logged; the error is unchanged); and
+  a target that Django's model validation, an `RLSTenantModelAdmin` form's dropdown or a DRF
+  `PrimaryKeyRelatedField` already rejected as not found because RLS or the auto-scope
+  filter hides it (the target's tenant is then read once in `admin_context()`, in a
+  savepoint, only when the audit logger logs `WARNING`; the error is unchanged, also when
+  that lookup fails); and
   `gucs.cleared` (`WARNING`)
   when the `request_finished` safety net clears a context the middleware's cleanup left
   set. `for_user()` scopes, which run per SQL statement, and the `admin_context()` blocks
   the library enters for its own lookups are not logged. With no handler configured the
   `INFO` records are dropped and the `WARNING` ones reach Python's last-resort handler
-  (`stderr`), like the library's other warnings. The `DEBUG` messages on the
+  (`stderr`), like the library's other warnings. A record whose filter or handler raises is
+  dropped (the failure is logged on `django_rls_tenants`), and a string value that could
+  forge a field of the plain-text message is quoted. The `DEBUG` messages on the
   `django_rls_tenants` logger are unchanged. See
   [Audit Logging](https://dvoraj75.github.io/django-rls-tenants/guides/audit-logging/).
 

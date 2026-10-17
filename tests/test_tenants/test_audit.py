@@ -6,6 +6,7 @@ The DRF and Celery sources are covered in ``tests/test_contrib``.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -15,13 +16,14 @@ from asgiref.sync import async_to_sync, sync_to_async
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.core.management import call_command
 from django.core.signals import request_finished
-from django.db import connection
+from django.db import DatabaseError, connection, transaction
 from django.test import AsyncClient, Client, override_settings
 from django.test.utils import CaptureQueriesContext
 
 from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.guc import get_guc
 from django_rls_tenants.tenants import audit
+from django_rls_tenants.tenants import models as tenant_models
 from django_rls_tenants.tenants.admin import RLSTenantModelAdmin
 from django_rls_tenants.tenants.context import (
     admin_context,
@@ -31,13 +33,30 @@ from django_rls_tenants.tenants.context import (
     with_rls_context,
 )
 from django_rls_tenants.tenants.middleware import RLSTenantMiddleware, _mark_gucs_set
-from django_rls_tenants.tenants.models import validate_cross_tenant_fks
+from django_rls_tenants.tenants.models import (
+    _audit_rejected_values,
+    _cross_tenant_errors,
+    validate_cross_tenant_fks,
+)
 from django_rls_tenants.tenants.state import (
     _get_context_gucs,
     get_current_tenant_id,
     get_rls_context_active,
 )
-from tests.test_app.models import AdminUser, Assignment, Order, OrderItem, ProtectedUser
+from django_rls_tenants.tenants.testing import (
+    aassert_rls_blocks_without_context,
+    assert_rls_blocks_without_context,
+)
+from tests.test_app.models import (
+    AdminUser,
+    Assignment,
+    NoteRevision,
+    Order,
+    OrderItem,
+    ProtectedUser,
+    Tag,
+    Tenant,
+)
 
 pytestmark = pytest.mark.django_db
 
@@ -84,6 +103,43 @@ def _make_request(user=None):
 def _web_user(username, *, tenant=None, rls_admin=False):
     """A real ``AUTH_USER_MODEL`` user, for requests through Django's test clients."""
     return AdminUser.objects.create_user(
+        username=username,
+        password="pw",  # noqa: S106  -- test-only credential
+        tenant=tenant,
+        rls_admin=rls_admin,
+    )
+
+
+class _RaisingFilter(logging.Filter):
+    """A filter on the audit logger that fails, like a broken audit sink."""
+
+    def filter(self, record):
+        msg = "the audit sink is down"
+        raise RuntimeError(msg)
+
+
+@pytest.fixture
+def failing_sink(caplog):
+    """Make every audit record fail to be logged (a logging filter that raises)."""
+    caplog.set_level(logging.INFO, logger=audit.AUDIT_LOGGER_NAME)
+    sink = _RaisingFilter()
+    audit.audit_logger.addFilter(sink)
+    try:
+        yield sink
+    finally:
+        audit.audit_logger.removeFilter(sink)
+
+
+def _library_errors(caplog):
+    """The ``ERROR`` records on the ``django_rls_tenants`` logger."""
+    return [
+        r for r in caplog.records if r.name == "django_rls_tenants" and r.levelno == logging.ERROR
+    ]
+
+
+def _staff(username, *, tenant=None, rls_admin=False):
+    """A Django superuser (so it clears the admin's own permissions) with an RLS role."""
+    return AdminUser.objects.create_superuser(
         username=username,
         password="pw",  # noqa: S106  -- test-only credential
         tenant=tenant,
@@ -139,10 +195,155 @@ class TestEmit:
     def test_the_audit_logger_is_a_child_of_the_library_logger(self):
         assert audit.audit_logger.parent is logging.getLogger("django_rls_tenants")
 
+    def test_nothing_is_logged_and_log_is_not_called_at_error_level(self, caplog):
+        caplog.set_level(logging.ERROR, logger=audit.AUDIT_LOGGER_NAME)
+
+        with (
+            patch.object(audit.audit_logger, "log") as log,
+            tenant_context(5),
+            admin_context(),
+        ):
+            audit.denied("queryset", "strict_mode")
+            audit.emit(audit.GUCS_CLEARED, source="safety_net", level=logging.WARNING)
+
+        log.assert_not_called()
+        assert not [r for r in caplog.records if r.name == audit.AUDIT_LOGGER_NAME]
+
+    @pytest.mark.parametrize(
+        ("value", "shown"),
+        [
+            ("middleware", "middleware"),
+            (42, "42"),
+            (True, "True"),
+            ("Zoë", "Zoë"),
+            ("a b admin=True", "'a b admin=True'"),
+            ("a=b", "'a=b'"),
+            ("tab\there", "'tab\\there'"),
+            ("x\nforged", "'x\\nforged'"),
+            ("nul\x00", "'nul\\x00'"),
+        ],
+    )
+    def test_message_quotes_a_string_that_could_forge_a_field(self, records, value, shown):
+        audit.emit(audit.CONTEXT_ENTERED, source="celery", tenant_id=value)
+
+        (record,) = records()
+        assert record.getMessage() == f"context.entered source=celery tenant_id={shown}"
+        assert record.rls_tenant_id == value  # the extra keeps the raw value
+
+    def test_a_forged_tenant_id_cannot_add_a_field_or_a_line(self, records):
+        with tenant_context("a b admin=True"):
+            pass
+        with tenant_context("x\nforged"):
+            pass
+
+        entered = [r for r in records() if r.rls_event == "context.entered"]
+        first = "context.entered source=context_manager tenant_id='a b admin=True'"
+        second = "context.entered source=context_manager tenant_id='x\\nforged'"
+        assert [r.getMessage() for r in entered] == [
+            f"{first} admin=False using=default",
+            f"{second} admin=False using=default",
+        ]
+        assert [r.rls_tenant_id for r in entered] == ["a b admin=True", "x\nforged"]
+        assert all("\n" not in r.getMessage() for r in records())
+        assert all(r.rls_admin is False for r in entered)
+
+    def test_a_record_that_cannot_be_logged_is_dropped(self, caplog, failing_sink):
+        audit.emit(audit.CONTEXT_ENTERED, source="middleware", tenant_id=1)
+        audit.denied("queryset", "strict_mode")
+
+        assert not [r for r in caplog.records if r.name == audit.AUDIT_LOGGER_NAME]
+        failures = _library_errors(caplog)
+        assert [r.getMessage() for r in failures] == [
+            "Audit record context.entered could not be logged.",
+            "Audit record context.denied could not be logged.",
+        ]
+        assert failures[0].exc_info[0] is RuntimeError
+
+    def test_a_value_that_cannot_be_rendered_is_dropped(self, caplog, records):
+        class Unprintable:
+            def __str__(self):
+                msg = "no text"
+                raise TypeError(msg)
+
+        audit.emit(audit.CONTEXT_ENTERED, source="middleware", tenant_id=Unprintable())
+
+        assert records() == []
+        assert len(_library_errors(caplog)) == 1
+
+    def test_a_failure_to_report_the_failure_is_swallowed(self, failing_sink):
+        with patch.object(audit, "_logger") as library_logger:
+            library_logger.exception.side_effect = RuntimeError("the library logger is down")
+            audit.emit(audit.CONTEXT_ENTERED, source="middleware")
+
+        library_logger.exception.assert_called_once()
+
+    def test_tenant_context_works_with_a_failing_sink(self, failing_sink):
+        with tenant_context(5):
+            assert get_current_tenant_id() == 5
+            assert get_guc("rls.current_tenant") == "5"
+
+        _assert_no_context()
+
+    def test_admin_context_works_with_a_failing_sink(self, failing_sink):
+        with admin_context():
+            assert get_rls_context_active() is True
+
+        _assert_no_context()
+
+    def test_async_context_works_with_a_failing_sink(self, failing_sink):
+        async def run():
+            async with async_tenant_context(5):
+                assert get_current_tenant_id() == 5
+
+        async_to_sync(run)()
+
+        _assert_no_context()
+
 
 # ---------------------------------------------------------------------------
 # Context managers, attribution, decorator
 # ---------------------------------------------------------------------------
+
+
+def _use_tenant_context():
+    with tenant_context(5):
+        pass
+
+
+def _use_admin_context():
+    with admin_context():
+        pass
+
+
+def _use_async_tenant_context():
+    async def run():
+        async with async_tenant_context(5):
+            pass
+
+    async_to_sync(run)()
+
+
+def _use_async_admin_context():
+    async def run():
+        async with async_admin_context():
+            pass
+
+    async_to_sync(run)()
+
+
+_CONTEXT = "django_rls_tenants.tenants.context"
+
+# (how the manager is used, what fails its entry)
+_MANAGERS = [
+    pytest.param(_use_tenant_context, f"{_CONTEXT}.set_guc", id="tenant_context"),
+    pytest.param(_use_admin_context, f"{_CONTEXT}.set_guc", id="admin_context"),
+    pytest.param(
+        _use_async_tenant_context, f"{_CONTEXT}._enter_tenant_gucs", id="async_tenant_context"
+    ),
+    pytest.param(
+        _use_async_admin_context, f"{_CONTEXT}._enter_tenant_gucs", id="async_admin_context"
+    ),
+]
 
 
 class TestContextManagers:
@@ -200,6 +401,23 @@ class TestContextManagers:
             pass  # pragma: no cover - never entered
 
         assert records() == []
+
+    @pytest.mark.parametrize(("use", "entry"), _MANAGERS)
+    def test_failed_entry_logs_no_exit_of_any_manager(self, records, use, entry):
+        with patch(entry, side_effect=RuntimeError), pytest.raises(RuntimeError):
+            use()
+
+        assert records() == []
+
+    @pytest.mark.parametrize(("use", "entry"), _MANAGERS)
+    def test_exit_is_logged_when_the_restore_raises(self, records, use, entry):
+        with (
+            patch(f"{_CONTEXT}._restore_tenant_gucs", side_effect=RuntimeError),
+            pytest.raises(RuntimeError),
+        ):
+            use()
+
+        assert [r.rls_event for r in records()] == ["context.entered", "context.exited"]
 
     def test_async_tenant_context(self, records):
         async def run():
@@ -376,6 +594,67 @@ class TestMiddleware:
         mw.process_response(request, MagicMock())
 
         assert [r.rls_event for r in records()] == ["context.entered", "context.exited"]
+
+    def test_base_exception_skipping_process_response_logs_one_exit(self, records, tenant_a_user):
+        """Not an ``Exception``: it skips ``process_response`` (WSGI); one exit is logged."""
+
+        def interrupted(request):
+            raise KeyboardInterrupt
+
+        mw = RLSTenantMiddleware(get_response=interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            mw(_make_request(user=tenant_a_user))
+
+        tenant = tenant_a_user.rls_tenant_id
+        assert _events(records()) == [
+            ("context.entered", "middleware", tenant, False, tenant_a_user.pk),
+            ("context.exited", "middleware", tenant, False, tenant_a_user.pk),
+        ]
+        _assert_no_context()
+
+    def test_request_with_a_failing_sink_leaves_no_context(self, failing_sink, tenant_a_user):
+        seen = []
+
+        def view(request):
+            seen.append(get_current_tenant_id())
+            return MagicMock()
+
+        RLSTenantMiddleware(get_response=view)(_make_request(user=tenant_a_user))
+
+        assert seen == [tenant_a_user.rls_tenant_id]
+        _assert_no_context()
+
+    def test_native_async_request_with_a_failing_sink_leaves_no_context(
+        self, failing_sink, tenant_a_user
+    ):
+        async def aget_response(request):
+            return MagicMock()
+
+        async_to_sync(RLSTenantMiddleware(get_response=aget_response))(
+            _make_request(user=tenant_a_user),
+        )
+
+        _assert_no_context()
+
+    @pytest.mark.parametrize("use_local_set", [False, True], ids=["session", "local"])
+    def test_wsgi_view_exception_logs_one_exit(self, records, tenant_a, use_local_set):
+        """A view that raises: Django answers 500, and the request's exit is logged once."""
+        user = _web_user("web_a", tenant=tenant_a)
+        client = Client(raise_request_exception=False)
+        client.force_login(user)
+
+        with override_settings(
+            MIDDLEWARE=_MIDDLEWARE_WITH_RLS,
+            RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant", "USE_LOCAL_SET": use_local_set},
+        ):
+            response = client.get("/rls/boom/")
+
+        assert response.status_code == 500
+        assert _events(records()) == [
+            ("context.entered", "middleware", tenant_a.pk, False, user.pk),
+            ("context.exited", "middleware", tenant_a.pk, False, user.pk),
+        ]
+        _assert_no_context()
 
     def test_tenantless_user_is_denied(self, records):
         user = SimpleNamespace(
@@ -662,6 +941,193 @@ class TestCrossTenantForeignKeys:
         )
         assert records() == []
 
+    def test_failed_audit_lookup_loses_the_record_never_the_error(
+        self, records, enforce_rls, tenant_a, sample_orders
+    ):
+        """The lookup only feeds the record: when it fails, validation reports what it would."""
+        real = tenant_models._target_tenants
+
+        def fail_in_a_savepoint(targets, *, instance, savepoint=False):
+            if savepoint:
+                msg = "replica down"
+                raise DatabaseError(msg)
+            return real(targets, instance=instance, savepoint=savepoint)
+
+        item = OrderItem(tenant=tenant_a, order_id=sample_orders["b1"].pk, description="x")
+
+        with (
+            patch.object(tenant_models, "_target_tenants", side_effect=fail_in_a_savepoint),
+            audit.silenced(tenant_context(tenant_a.pk)),
+            pytest.raises(ValidationError) as exc,
+        ):
+            item.full_clean()
+
+        assert exc.value.message_dict == {
+            "order": [f"order instance with id {sample_orders['b1'].pk} is not a valid choice."],
+        }
+        assert records() == []
+
+    def test_database_error_in_the_audit_lookup_leaves_the_transaction_usable(
+        self, records, enforce_rls, tenant_a, sample_orders
+    ):
+        """The lookup runs in a savepoint: its SQL error leaves the caller's transaction usable."""
+
+        @contextmanager
+        def failing_admin_context(*, using):
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1 / 0")
+            yield  # pragma: no cover - the query raised
+
+        item = OrderItem(tenant=tenant_a, order_id=sample_orders["b1"].pk, description="x")
+
+        with transaction.atomic():
+            with (
+                patch.object(tenant_models, "admin_context", failing_admin_context),
+                audit.silenced(tenant_context(tenant_a.pk)),
+                pytest.raises(ValidationError) as exc,
+            ):
+                item.full_clean()
+
+            assert Tenant.objects.filter(pk=tenant_a.pk).exists()  # not "transaction is aborted"
+
+        assert exc.value.message_dict == {
+            "order": [f"order instance with id {sample_orders['b1'].pk} is not a valid choice."],
+        }
+        assert records() == []
+
+    def test_two_rejected_targets_are_listed_in_declaration_order(
+        self, records, tenant_a, sample_order_notes, sample_order_items
+    ):
+        """``NoteRevision`` declares ``note`` before ``item``: not the alphabetical order."""
+        revision = NoteRevision(
+            tenant=tenant_a,
+            note=sample_order_notes["b_linked"],
+            item=sample_order_items["b1"],
+            summary="x",
+        )
+
+        with pytest.raises(ValidationError):
+            validate_cross_tenant_fks(revision)
+
+        (record,) = records()
+        assert record.rls_fields == ["note", "item"]
+
+    def test_two_targets_hidden_by_rls_are_listed_in_declaration_order(
+        self, records, enforce_rls, tenant_a, sample_order_notes, sample_order_items
+    ):
+        revision = NoteRevision(
+            tenant=tenant_a,
+            note_id=sample_order_notes["b_linked"].pk,
+            item_id=sample_order_items["b1"].pk,
+            summary="x",
+        )
+
+        with audit.silenced(tenant_context(tenant_a.pk)), pytest.raises(ValidationError):
+            revision.full_clean()
+
+        (record,) = records()
+        assert record.rls_fields == ["note", "item"]
+
+    def test_rejected_and_found_targets_are_listed_in_declaration_order(
+        self, records, enforce_rls, tenant_a, sample_order_notes, sample_order_items
+    ):
+        """``item`` is found cross-tenant, ``note`` was rejected as not found: one record."""
+        revision = NoteRevision(
+            tenant=tenant_a,
+            note_id=sample_order_notes["b_linked"].pk,
+            item_id=sample_order_items["b1"].pk,
+            summary="x",
+        )
+        not_found = {"note": [ValidationError("gone", code="invalid")]}
+
+        with audit.silenced(admin_context()):
+            errors = _cross_tenant_errors(revision, (), failed=not_found)
+
+        assert list(errors) == ["item"]
+        (record,) = records()
+        assert record.rls_fields == ["note", "item"]
+
+    def test_value_that_is_not_the_targets_type_logs_nothing(self, records, enforce_rls, tenant_a):
+        item = OrderItem(tenant=tenant_a, order_id="abc", description="x")
+
+        with audit.silenced(tenant_context(tenant_a.pk)), pytest.raises(ValidationError) as exc:
+            item.full_clean()
+
+        (error,) = exc.value.error_dict["order"]
+        assert error.code == "invalid"  # Django's own error for "abc"
+        assert "abc" in error.messages[0]
+        assert records() == []
+
+    def test_null_foreign_key_logs_nothing(self, records, enforce_rls, tenant_a):
+        item = OrderItem(tenant=tenant_a, order_id=None, description="x")
+
+        with audit.silenced(tenant_context(tenant_a.pk)), pytest.raises(ValidationError) as exc:
+            item.full_clean()
+
+        assert [error.code for error in exc.value.error_dict["order"]] == ["null"]
+        assert records() == []
+
+
+class TestAuditRejectedValues:
+    """``_audit_rejected_values()``: the helper behind the admin's and DRF's audit records."""
+
+    def _log(self, tenant_id, value):
+        field = OrderItem._meta.get_field("order")
+        _audit_rejected_values(
+            OrderItem,
+            tenant_id,
+            {field: value},
+            instance=None,
+            source="admin",
+            user_id=3,
+        )
+
+    def test_values_and_tenant_are_converted_with_the_fields_to_python(
+        self, records, tenant_a, sample_orders
+    ):
+        self._log(str(tenant_a.pk), str(sample_orders["b1"].pk))
+
+        (record,) = records()
+        assert (record.rls_source, record.rls_user_id, record.rls_fields) == (
+            "admin",
+            3,
+            ["order"],
+        )
+        assert record.rls_tenant_id == tenant_a.pk  # the int, not the string it came as
+
+    def test_target_of_the_same_tenant_logs_nothing(self, records, tenant_a, sample_orders):
+        self._log(str(tenant_a.pk), str(sample_orders["a1"].pk))
+        assert records() == []
+
+    @pytest.mark.parametrize("value", [None, "", "abc", [1]])
+    def test_value_that_is_no_target_logs_nothing(self, records, tenant_a, value):
+        self._log(tenant_a.pk, value)
+        assert records() == []
+
+    def test_tenant_that_is_not_a_tenant_id_logs_nothing(self, records, sample_orders):
+        self._log("abc", sample_orders["b1"].pk)
+        assert records() == []
+
+    def test_model_without_a_tenant_field_logs_nothing(self, records, tenant_a, sample_orders):
+        field = OrderItem._meta.get_field("order")
+        _audit_rejected_values(
+            Tag,
+            tenant_a.pk,
+            {field: sample_orders["b1"].pk},
+            instance=None,
+            source="admin",
+            user_id=3,
+        )
+        assert records() == []
+
+    def test_nothing_is_looked_up_below_warning(self, caplog, tenant_a, sample_orders):
+        caplog.set_level(logging.ERROR, logger=audit.AUDIT_LOGGER_NAME)
+
+        with CaptureQueriesContext(connection) as queries:
+            self._log(tenant_a.pk, sample_orders["b1"].pk)
+
+        assert len(queries) == 0
+
 
 # ---------------------------------------------------------------------------
 # Admin
@@ -687,6 +1153,70 @@ class TestAdmin:
             ("context.exited", "admin", tenant_a.pk, False, user.pk),
         ]
 
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/admin/test_app/order/add/",
+            "/admin/test_app/order/{pk}/change/",
+            "/admin/test_app/order/{pk}/delete/",
+            "/admin/test_app/order/{pk}/history/",
+        ],
+        ids=["add", "change", "delete", "history"],
+    )
+    def test_every_view_is_attributed_to_the_admin(
+        self, records, enforce_rls, client, tenant_a, sample_orders, path
+    ):
+        user = _staff("staff_a", tenant=tenant_a)
+        client.force_login(user)
+
+        assert client.get(path.format(pk=sample_orders["a1"].pk)).status_code == 200
+
+        admin_records = [r for r in records() if r.rls_source == "admin"]
+        assert _events(admin_records) == [
+            ("context.entered", "admin", tenant_a.pk, False, user.pk),
+            ("context.exited", "admin", tenant_a.pk, False, user.pk),
+        ]
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/admin/test_app/order/",
+            "/admin/test_app/order/add/",
+            "/admin/test_app/order/{pk}/change/",
+            "/admin/test_app/order/{pk}/delete/",
+            "/admin/test_app/order/{pk}/history/",
+        ],
+        ids=["changelist", "add", "change", "delete", "history"],
+    )
+    def test_rls_admin_user_enters_the_admin_context(
+        self, records, enforce_rls, client, sample_orders, path
+    ):
+        user = _staff("root", rls_admin=True)
+        client.force_login(user)
+
+        assert client.get(path.format(pk=sample_orders["a1"].pk)).status_code == 200
+
+        admin_records = [r for r in records() if r.rls_source == "admin"]
+        assert _events(admin_records) == [
+            ("context.entered", "admin", None, True, user.pk),
+            ("context.exited", "admin", None, True, user.pk),
+        ]
+
+    def test_switched_admin_is_attributed_to_the_chosen_tenant(
+        self, records, enforce_rls, client, tenant_a, sample_orders
+    ):
+        user = _staff("root", rls_admin=True)
+        client.force_login(user)
+
+        client.get("/admin/test_app/order/", {"rls_tenant": str(tenant_a.pk)})
+
+        admin_records = [r for r in records() if r.rls_source == "admin"]
+        # The switcher keeps the chosen tenant in the session as a string.
+        assert _events(admin_records) == [
+            ("context.entered", "admin", str(tenant_a.pk), False, user.pk),
+            ("context.exited", "admin", str(tenant_a.pk), False, user.pk),
+        ]
+
     def test_tenantless_user_is_denied(self, records):
         user = SimpleNamespace(pk=8, is_tenant_admin=False, rls_tenant_id=None)
         model_admin = RLSTenantModelAdmin(Order, MagicMock())
@@ -697,6 +1227,175 @@ class TestAdmin:
         assert [(r.rls_event, r.rls_source, r.rls_reason, r.rls_user_id) for r in records()] == [
             ("context.denied", "admin", "user_without_tenant", 8),
         ]
+
+
+_ORDER_ITEM_ADD = "/admin/test_app/orderitem/add/"
+
+
+def _rejected_choices(records):
+    """``(source, tenant_id, user_id, model, fields)`` of each ``fk.cross_tenant_rejected``."""
+    return [
+        (r.rls_source, r.rls_tenant_id, r.rls_user_id, r.rls_model, r.rls_fields)
+        for r in records
+        if r.rls_event == "fk.cross_tenant_rejected"
+    ]
+
+
+def _form_error_codes(response, field):
+    """The error codes the admin form reports for ``field``."""
+    form = response.context["adminform"].form
+    return [error.code for error in form.errors.as_data().get(field, [])]
+
+
+@pytest.mark.integration
+class TestAdminForeignKeyChoices:
+    """The admin's scoped dropdown rejects another tenant's row as ``invalid_choice`` (#48)."""
+
+    def test_choice_of_another_tenant_is_logged(
+        self, records, enforce_rls, client, tenant_a, sample_orders
+    ):
+        user = _staff("staff_a", tenant=tenant_a)
+        client.force_login(user)
+
+        response = client.post(
+            _ORDER_ITEM_ADD,
+            {"description": "x", "order": sample_orders["b1"].pk, "_save": "Save"},
+        )
+
+        assert response.status_code == 200
+        assert _form_error_codes(response, "order") == ["invalid_choice"]  # unchanged
+        assert _rejected_choices(records()) == [
+            ("admin", tenant_a.pk, user.pk, "test_app.OrderItem", ["order"]),
+        ]
+
+    def test_choice_of_another_tenant_by_a_switched_admin_is_logged(
+        self, records, enforce_rls, client, tenant_a, sample_orders
+    ):
+        user = _staff("root", rls_admin=True)
+        client.force_login(user)
+        client.get("/admin/test_app/order/", {"rls_tenant": str(tenant_a.pk)})
+
+        response = client.post(
+            _ORDER_ITEM_ADD,
+            {"description": "x", "order": sample_orders["b1"].pk, "_save": "Save"},
+        )
+
+        assert response.status_code == 200
+        assert _form_error_codes(response, "order") == ["invalid_choice"]
+        assert _rejected_choices(records()) == [
+            ("admin", tenant_a.pk, user.pk, "test_app.OrderItem", ["order"]),
+        ]
+
+    def test_other_errors_of_the_form_do_not_hide_the_record(
+        self, records, enforce_rls, client, tenant_a, sample_orders
+    ):
+        client.force_login(_staff("staff_a", tenant=tenant_a))
+
+        response = client.post(
+            _ORDER_ITEM_ADD,
+            {"description": "", "order": sample_orders["b1"].pk, "_save": "Save"},
+        )
+
+        assert _form_error_codes(response, "description") == ["required"]
+        assert [fields for *_, fields in _rejected_choices(records())] == [["order"]]
+
+    def test_nonexistent_choice_logs_nothing(self, records, enforce_rls, client, tenant_a):
+        client.force_login(_staff("staff_a", tenant=tenant_a))
+
+        response = client.post(
+            _ORDER_ITEM_ADD,
+            {"description": "x", "order": 999_999, "_save": "Save"},
+        )
+
+        assert response.status_code == 200
+        assert _form_error_codes(response, "order") == ["invalid_choice"]
+        assert _rejected_choices(records()) == []
+
+    def test_missing_choice_logs_nothing(self, records, enforce_rls, client, tenant_a):
+        client.force_login(_staff("staff_a", tenant=tenant_a))
+
+        response = client.post(_ORDER_ITEM_ADD, {"description": "x", "_save": "Save"})
+
+        assert _form_error_codes(response, "order") == ["required"]
+        assert _rejected_choices(records()) == []
+
+    def test_choice_of_the_same_tenant_logs_nothing(
+        self, records, enforce_rls, client, tenant_a, sample_orders
+    ):
+        client.force_login(_staff("staff_a", tenant=tenant_a))
+
+        response = client.post(
+            _ORDER_ITEM_ADD,
+            {"description": "x", "order": sample_orders["a1"].pk, "_save": "Save"},
+        )
+
+        assert response.status_code == 302
+        assert _rejected_choices(records()) == []
+
+    def test_unbound_form_logs_nothing(self, records, enforce_rls, client, tenant_a):
+        client.force_login(_staff("staff_a", tenant=tenant_a))
+
+        assert client.get(_ORDER_ITEM_ADD).status_code == 200
+
+        assert _rejected_choices(records()) == []
+
+    def test_admin_without_a_tenant_chosen_is_not_rejected_by_the_dropdown(
+        self, records, enforce_rls, client, tenant_a, sample_orders
+    ):
+        """In the admin context the dropdown shows every tenant's rows.
+
+        The model's own check rejects the cross-tenant choice instead, and that
+        record is the ``validation`` one, not the admin's.
+        """
+        client.force_login(_staff("root", rls_admin=True))
+
+        response = client.post(
+            _ORDER_ITEM_ADD,
+            {
+                "description": "x",
+                "order": sample_orders["b1"].pk,
+                "tenant": tenant_a.pk,
+                "_save": "Save",
+            },
+        )
+
+        assert _form_error_codes(response, "order") == ["invalid"]
+        assert _rejected_choices(records()) == [
+            ("validation", tenant_a.pk, None, "test_app.OrderItem", ["order"]),
+        ]
+
+    def test_no_record_below_warning(self, caplog, enforce_rls, client, tenant_a, sample_orders):
+        caplog.set_level(logging.ERROR, logger=audit.AUDIT_LOGGER_NAME)
+        client.force_login(_staff("staff_a", tenant=tenant_a))
+
+        response = client.post(
+            _ORDER_ITEM_ADD,
+            {"description": "x", "order": sample_orders["b1"].pk, "_save": "Save"},
+        )
+
+        assert _form_error_codes(response, "order") == ["invalid_choice"]
+        assert not [r for r in caplog.records if r.name == audit.AUDIT_LOGGER_NAME]
+
+
+# ---------------------------------------------------------------------------
+# Testing helpers
+# ---------------------------------------------------------------------------
+
+
+class TestTestingHelpers:
+    """The row-count pre-check of the helpers is the library's own lookup."""
+
+    def test_assert_rls_blocks_without_context_logs_no_context(
+        self, records, enforce_rls, sample_orders
+    ):
+        assert_rls_blocks_without_context(Order)
+        assert records() == []
+
+    def test_aassert_rls_blocks_without_context_logs_no_context(
+        self, records, enforce_rls, sample_orders
+    ):
+        async_to_sync(aassert_rls_blocks_without_context)(Order)
+        assert records() == []
 
 
 # ---------------------------------------------------------------------------

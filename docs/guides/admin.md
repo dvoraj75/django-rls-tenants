@@ -163,7 +163,8 @@ the queries simply return nothing.
 *1.6.0+.* With `rls_deny_without_tenant = True` the refusal is logged as a
 `context.denied` [audit record](audit-logging.md) (`user_without_tenant`, source `admin`),
 and each wrapped admin view logs a `context.entered` / `context.exited` pair with the
-user's primary key.
+user's primary key. A form whose dropdown rejects another tenant's row as an invalid choice
+(a hand-edited request) logs `fk.cross_tenant_rejected` with source `admin`.
 
 ## Notes
 

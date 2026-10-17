@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any, cast
 from django.apps import apps
 from django.contrib import admin
 from django.core.exceptions import PermissionDenied, ValidationError
+from django.forms import ModelChoiceField
 
 from django_rls_tenants.tenants import audit
 from django_rls_tenants.tenants.conf import rls_tenants_config
@@ -172,6 +173,44 @@ class TenantSwitchListFilter(admin.SimpleListFilter):
                 "query_string": changelist.get_query_string({self.parameter_name: lookup}),
                 "display": title,
             }
+
+
+def _audit_rejected_choices(form: ModelForm[Any], tenant_id: int | str, user_id: Any) -> None:
+    """Log the foreign key choices ``form`` rejected that are rows of another tenant.
+
+    A ``ModelChoiceField`` scoped to the tenant reports another tenant's row
+    as ``invalid_choice``, and the ``ModelForm`` then leaves the field out of
+    ``full_clean()``, so the model's own check never sees it.
+    """
+    from django_rls_tenants.tenants.models import (  # noqa: PLC0415  -- models import the app registry
+        _audit_rejected_values,
+        _checked_foreign_keys,
+    )
+
+    model = form._meta.model  # noqa: SLF001
+    checked = _checked_foreign_keys(model)
+    if checked is None:
+        return
+    by_name = {field.name: field for field in checked[1]}
+    values: dict[Any, Any] = {}
+    for name, errors in form.errors.as_data().items():
+        field = by_name.get(name)
+        if (
+            field is None
+            or not isinstance(form.fields.get(name), ModelChoiceField)
+            or not any(error.code == "invalid_choice" for error in errors)
+        ):
+            continue
+        values[field] = form[name].data
+    if values:
+        _audit_rejected_values(
+            model,
+            tenant_id,
+            values,
+            instance=form.instance,
+            source="admin",
+            user_id=user_id,
+        )
 
 
 class RLSTenantModelAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
@@ -415,6 +454,11 @@ class RLSTenantModelAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
         (:func:`~django_rls_tenants.tenants.models.validate_cross_tenant_fks`).
         The form sets it on its instance when it is built, as
         :meth:`save_model` does before saving.
+
+        Its related-field dropdowns are scoped to that tenant, so they reject
+        another tenant's row as an invalid choice before ``full_clean()``
+        sees it; such a choice is logged as ``fk.cross_tenant_rejected``
+        (:func:`_audit_rejected_choices`).
         """
         form = super().get_form(request, obj, change, **kwargs)
         tenant_id = self._effective_tenant_id(request)
@@ -422,11 +466,17 @@ class RLSTenantModelAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
             return form
         stamp = self._stamp_tenant
         selected: int | str = tenant_id  # narrowed for the class body
+        user_id = audit.user_id_of(request.user)
 
         class TenantStampedForm(form):  # type: ignore[valid-type,misc]  # a form class built at runtime
             def __init__(self, *args: Any, **form_kwargs: Any) -> None:
                 super().__init__(*args, **form_kwargs)
                 stamp(self.instance, selected)
+
+            def full_clean(self) -> None:
+                super().full_clean()
+                if self.is_bound and self.errors:
+                    _audit_rejected_choices(self, selected, user_id)
 
         TenantStampedForm.__name__ = TenantStampedForm.__qualname__ = form.__name__
         return TenantStampedForm

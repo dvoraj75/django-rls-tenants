@@ -236,8 +236,9 @@ coroutine; see [Async Tests](../guides/testing.md#async-tests).
 ### Audit Logging
 
 The audit records go to the `django_rls_tenants.audit` logger. Its fields, events and
-sources are described in the [Audit Logging guide](../guides/audit-logging.md); the module
-has no public functions to call.
+sources are described in the [Audit Logging guide](../guides/audit-logging.md). You
+configure the logger; the module's functions are the library's own hooks, not an API to
+call.
 
 ::: django_rls_tenants.tenants.audit.AUDIT_LOGGER_NAME
 
