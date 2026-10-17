@@ -73,6 +73,11 @@ returns zero rows, never leaked data.
   [Raw SQL guide →](https://dvoraj75.github.io/django-rls-tenants/guides/raw-sql/)
 - **M2M isolation** -- auto-detected subquery-based RLS policies on M2M through tables;
   `check_rls --generate` writes the migration that creates them.
+- **Third-party tables** -- `AddRLSPolicy` adds the same policy to a table of an app you
+  do not own, and `RLS_TENANTS["EXTERNAL_MODELS"]` makes `check_rls`, the cross-tenant
+  foreign key check and the `select_related()` / `prefetch_related()` tenant filters treat
+  the model as protected.
+  [Guide →](https://dvoraj75.github.io/django-rls-tenants/guides/protecting-models/#tables-you-do-not-own)
 - **Single schema, single database** -- no schema-per-tenant overhead, no connection
   routing.
 

@@ -17,6 +17,7 @@ RLS_TENANTS = {
     "TENANT_PK_TYPE": "int",
     "USE_LOCAL_SET": False,
     "UNIQUE_ACROSS_TENANTS": {},
+    "EXTERNAL_MODELS": {},
 }
 ```
 
@@ -384,6 +385,52 @@ RLS-protected model, is reported as `W012`. See
 [Cross-Tenant Unique Constraints](../advanced/security.md#cross-tenant-unique-constraints)
 for why a unique index that spans tenants leaks, and how to scope it.
 
+### `EXTERNAL_MODELS`
+
+| | |
+|---|---|
+| **Type** | `dict[str, str]` |
+| **Default** | `{}` |
+| **Example** | `{"library.Book": "tenant"}` |
+
+*Added in 1.6.0.* Models of other apps (third-party ones) whose tables you protect with an
+[`AddRLSPolicy`](../guides/protecting-models.md#tables-you-do-not-own) migration. Maps a
+model label, `"app_label.ModelName"` (the model name is case-insensitive and the app label
+is matched exactly, as `apps.get_model()` does), to the name of the model's tenant
+`ForeignKey`:
+
+```python
+RLS_TENANTS = {
+    "TENANT_MODEL": "myapp.Tenant",
+    "EXTERNAL_MODELS": {
+        "library.Book": "tenant",
+        "billing.Invoice": "customer",  # the tenant FK need not be named TENANT_FK_FIELD
+    },
+}
+```
+
+The setting creates no policy; the migration does. It makes the library's runtime treat the
+model as RLS-protected, as it treats a model with an `RLSConstraint`:
+
+- `check_rls` checks the table and tells how to fix a failing one;
+- the [cross-tenant foreign key check](../guides/protecting-models.md#cross-tenant-foreign-keys)
+  covers foreign keys that point at the model;
+- `select_related()` and the `prefetch_related()` tenant filter apply to joins into the
+  model, filtering on **its** tenant column;
+- `W012` reports its unique fields and constraints that span tenants (allow intended ones
+  in [`UNIQUE_ACROSS_TENANTS`](#unique_across_tenants)).
+
+It does not give queries on the model itself the auto-scope filter, `for_user()` or the
+`STRICT_MODE` guard, which come from `RLSManager`, and a third-party model does not use it.
+The database policy filters those queries. See
+[What it does not give](../guides/protecting-models.md#what-it-does-not-give).
+
+A proxy of a listed model is protected through its concrete model; an entry that names a
+proxy is ignored. A value that is not a dict of strings raises `RLSConfigurationError` when
+the setting is read. An entry that does not resolve to an installed, non-proxy model, names
+a model that already has an `RLSConstraint`, or names a field that is not a foreign key to
+`TENANT_MODEL`, is reported as `W016`.
+
 ## System Checks
 
 django-rls-tenants registers Django system checks that warn about common misconfigurations:
@@ -401,15 +448,16 @@ django-rls-tenants registers Django system checks that warn about common misconf
 | `W009` | Warning | Tenant field referenced by an `RLSProtectedModel`'s RLS policy is missing |
 | `W010` | Warning | Django's connection pool (`OPTIONS["pool"]`) with `USE_LOCAL_SET=False` and no pool `reset` callback |
 | `W011` | Warning | PostgreSQL applies a database- or role-level default (`ALTER DATABASE/ROLE ... SET`) for a GUC the RLS policies read, in force in every new session; checked on every alias in `RLS_TENANTS["DATABASES"]` |
-| `W012` | Warning | A unique field, `unique_together` entry or `UniqueConstraint` of an RLS-protected model does not include the tenant field, so its `IntegrityError` reveals values held by other tenants; also a stale `UNIQUE_ACROSS_TENANTS` entry. Listed in [`UNIQUE_ACROSS_TENANTS`](#unique_across_tenants) when intended |
+| `W012` | Warning | A unique field, `unique_together` entry or `UniqueConstraint` of an RLS-protected model (one with an `RLSConstraint` or an `EXTERNAL_MODELS` entry) does not include the tenant field, so its `IntegrityError` reveals values held by other tenants; also a stale `UNIQUE_ACROSS_TENANTS` entry. Listed in [`UNIQUE_ACROSS_TENANTS`](#unique_across_tenants) when intended |
 | `W013` | Warning | `W005`/`E001` or `W011` could not be determined: the database was reachable but the catalogue query failed (for example `permission denied for view pg_roles`). A clean `check` is not a pass |
 | `W014` | Warning | A concrete, non-proxy `RLSProtectedModel` subclass has no `RLSConstraint` in `Meta.constraints`: its `Meta` does not inherit `RLSProtectedModel.Meta`, or sets `constraints` of its own, so no migration creates a policy for its table. See [W014](../troubleshooting.md#w014-a-protected-model-has-no-rlsconstraint) |
-| `W015` | Warning | A `STRICT_MODE_EXCLUDE` label does not resolve to an installed model, or names a model without an `RLSConstraint` (strict mode never guards it, so the entry has no effect). Checked whether or not `STRICT_MODE` is on. See [`STRICT_MODE_EXCLUDE`](#strict_mode_exclude) |
+| `W015` | Warning | A `STRICT_MODE_EXCLUDE` label does not resolve to an installed model, or names a model without an `RLSConstraint` or `EXTERNAL_MODELS` entry (strict mode never guards it, so the entry has no effect). Checked whether or not `STRICT_MODE` is on. See [`STRICT_MODE_EXCLUDE`](#strict_mode_exclude) |
+| `W016` | Warning | An `EXTERNAL_MODELS` entry cannot be used: its label does not resolve to an installed model, it names a proxy, a model that already has an `RLSConstraint`, or a field that does not exist, is not a `ForeignKey` or does not point at `TENANT_MODEL`; or two labels name the same model. See [W016](../troubleshooting.md#w016-an-external_models-entry-cannot-be-used) and [`EXTERNAL_MODELS`](#external_models) |
 | `E001` | Error | The connection role of a `DATABASES` alias is a superuser or has `BYPASSRLS` and `settings.DEBUG` is `False` (a production deployment). Replaces `W005`; fails `manage.py check` and every command that runs the system checks, such as `migrate` |
 
 Run `python manage.py check` to see any warnings and errors.
 
-`W005`, `W011`, `W012`, `W013`, `W014` and `W015` stay warnings. `E001` is an error, so it also aborts `migrate`,
+`W005`, `W011`, `W012`, `W013`, `W014`, `W015` and `W016` stay warnings. `E001` is an error, so it also aborts `migrate`,
 `createsuperuser`, `check_rls`, `setup_m2m_rls` and Django's test runner (which sets
 `DEBUG = False` before it runs the checks). If a settings module has to connect as such a
 role on purpose (a migration job, a superuser test database), record that decision there

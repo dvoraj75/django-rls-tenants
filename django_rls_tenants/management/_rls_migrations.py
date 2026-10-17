@@ -1,7 +1,10 @@
 """What the migrations on disk say about RLS: ``check_rls``'s hints and ``--generate``.
 
 ``makemigrations`` writes the policy of a model whose ``Meta`` carries an
-``RLSConstraint``, but never that of an auto-created many-to-many through table:
+``RLSConstraint``. The policy of a model listed in ``RLS_TENANTS["EXTERNAL_MODELS"]``
+(a third-party app's) comes from an ``AddRLSPolicy`` operation the project writes
+in a migration of its own app (#112). ``makemigrations`` never writes the policy
+of an auto-created many-to-many through table either:
 ``register_m2m_rls()`` adds the ``RLSM2MConstraint`` to the through model at
 startup, outside the migration state, so ``migrate`` does not create it. That
 policy comes from an ``AddM2MRLSPolicy`` operation, or from ``setup_m2m_rls``,
@@ -23,7 +26,7 @@ from django.db.migrations.autodetector import MigrationAutodetector
 from django.db.migrations.loader import MigrationLoader
 from django.db.migrations.writer import MigrationWriter
 
-from django_rls_tenants.operations import AddM2MRLSPolicy
+from django_rls_tenants.operations import AddM2MRLSPolicy, AddRLSPolicy
 from django_rls_tenants.rls.constraints import RLSConstraint
 
 if TYPE_CHECKING:
@@ -40,6 +43,8 @@ TABLE_MISSING = "table does not exist"
 RLS_NOT_ENABLED = "RLS not enabled"
 RLS_NOT_FORCED = "RLS not forced"
 NO_POLICIES = "no RLS policies found"
+# A table listed in EXTERNAL_MODELS whose AddRLSPolicy reads another field than the entry.
+FIELD_MISMATCH = "its AddRLSPolicy reads another field than EXTERNAL_MODELS names"
 
 _Key = tuple[str, str]
 
@@ -78,6 +83,10 @@ class MigrationFacts:
         self._m2m_policies: dict[str, list[_Key]] = {}
         # (app_label, model_name) -> migrations whose database side adds an RLSConstraint.
         self._rls_constraints: dict[_Key, list[_Key]] = {}
+        # (app_label, model_name) -> migrations with an AddRLSPolicy for the model.
+        self._rls_policies: dict[_Key, list[_Key]] = {}
+        # (app_label, model_name) -> the field the latest of those operations reads.
+        self._rls_policy_fields: dict[_Key, str] = {}
         for key, migration in sorted(self._graph.nodes.items()):
             for operation in _database_operations(migration.operations):
                 self._record(key, operation)
@@ -86,6 +95,10 @@ class MigrationFacts:
         """Note what ``operation`` of migration ``key`` does to RLS, if anything."""
         if isinstance(operation, AddM2MRLSPolicy):
             self._m2m_policies.setdefault(operation.m2m_table, []).append(key)
+        elif isinstance(operation, AddRLSPolicy):
+            model_key = (operation.app_label or key[0], operation.model_name_lower)
+            self._rls_policies.setdefault(model_key, []).append(key)
+            self._rls_policy_fields[model_key] = operation.field
         elif isinstance(operation, migrations.CreateModel):
             constraints = operation.options.get("constraints", [])
             if any(isinstance(constraint, RLSConstraint) for constraint in constraints):
@@ -126,6 +139,18 @@ class MigrationFacts:
         """Return the migrations whose database side adds an ``RLSConstraint`` to ``model``."""
         return self._rls_constraints.get(_model_key(model), [])
 
+    def rls_policy_migrations(self, model: type[Model]) -> list[_Key]:
+        """Return the migrations with an ``AddRLSPolicy`` for ``model``."""
+        return self._rls_policies.get(_model_key(model), [])
+
+    def rls_policy_field(self, model: type[Model]) -> str | None:
+        """Return the field the latest ``AddRLSPolicy`` for ``model`` reads, or ``None``."""
+        return self._rls_policy_fields.get(_model_key(model))
+
+    def rls_policy_models(self) -> list[_Key]:
+        """Return ``(app_label, model_name)`` of every model an ``AddRLSPolicy`` targets."""
+        return sorted(self._rls_policies)
+
     def m2m_policy_migrations(self, table: str) -> list[_Key]:
         """Return the migrations with an ``AddM2MRLSPolicy`` for through table ``table``."""
         return self._m2m_policies.get(table, [])
@@ -159,7 +184,8 @@ def model_hint(facts: MigrationFacts, model: type[Model], problems: set[str]) ->
 
     Args:
         facts: The migrations and their record on the checked database.
-        model: The ``RLSProtectedModel`` subclass whose table has the problems.
+        model: The ``RLSProtectedModel`` subclass, or the model listed in
+            ``RLS_TENANTS["EXTERNAL_MODELS"]``, whose table has the problems.
         problems: The problems reported for its table (``TABLE_MISSING``, ...).
 
     Returns:
@@ -167,9 +193,25 @@ def model_hint(facts: MigrationFacts, model: type[Model], problems: set[str]) ->
     """
     from django_rls_tenants.tenants.models import _get_tenant_fk_field  # noqa: PLC0415
 
+    tenant_fk = _get_tenant_fk_field(model)
+    constraints = model._meta.constraints  # noqa: SLF001
+    if tenant_fk is not None and not any(isinstance(c, RLSConstraint) for c in constraints):
+        # Listed in EXTERNAL_MODELS: its policy comes from an AddRLSPolicy migration.
+        return _external_model_hint(facts, model, tenant_fk, problems)
+    return _protected_model_hint(facts, model, problems, has_constraint=tenant_fk is not None)
+
+
+def _protected_model_hint(
+    facts: MigrationFacts,
+    model: type[Model],
+    problems: set[str],
+    *,
+    has_constraint: bool,
+) -> str:
+    """Return how to fix the problems of an ``RLSProtectedModel`` subclass's table."""
     meta = model._meta  # noqa: SLF001
     app_label = meta.app_label
-    if _get_tenant_fk_field(model) is None:
+    if not has_constraint:
         return (
             "the model has no RLSConstraint, because its Meta does not inherit "
             "RLSProtectedModel.Meta (system check W014). Fix the model, then run "
@@ -192,6 +234,62 @@ def model_hint(facts: MigrationFacts, model: type[Model], problems: set[str]) ->
         return (
             f"the migrations of {app_label!r} give it an RLSConstraint, but none of them "
             f"creates its policy: check them, and the table, by hand."
+        )
+    return (
+        f"migration {_label(keys[-1])} created its policy and is applied on database "
+        f"{facts.alias!r}, so the policy or the table was dropped outside migrations. "
+        f"`sqlmigrate {keys[-1][0]} {keys[-1][1]}` prints the DO block that creates the "
+        f"policy (it skips a policy that exists): run that block again."
+    )
+
+
+def _external_model_hint(
+    facts: MigrationFacts,
+    model: type[Model],
+    tenant_fk: str,
+    problems: set[str],
+) -> str:
+    """Return how to fix the problems of a model listed in ``EXTERNAL_MODELS``.
+
+    Its policy comes from an ``AddRLSPolicy`` operation in a migration of any app.
+    """
+    meta = model._meta  # noqa: SLF001
+    if FIELD_MISMATCH in problems:
+        key = facts.rls_policy_migrations(model)[-1]
+        policy_field = facts.rls_policy_field(model)
+        return (
+            f"the AddRLSPolicy of migration {_label(key)} reads {policy_field!r}, but "
+            f"RLS_TENANTS['EXTERNAL_MODELS'] maps {meta.label} to {tenant_fk!r}, so the "
+            f"cross-tenant foreign key check and the join filters read another column "
+            f"than the policy. Map it to {policy_field!r}; or, if {tenant_fk!r} is the "
+            f"tenant field, replace the policy in a new migration: DROP POLICY "
+            f'"{meta.db_table}_tenant_isolation_policy" ON "{meta.db_table}", then '
+            f"AddRLSPolicy({meta.object_name!r}, app_label={meta.app_label!r}, "
+            f"field={tenant_fk!r})."
+        )
+    if not meta.managed and _policy_missing(problems):
+        return (
+            "the model is unmanaged (Meta.managed = False), and AddRLSPolicy, like "
+            "Django's own operations, does nothing for an unmanaged model: create the "
+            "policy by hand."
+        )
+    keys = facts.rls_policy_migrations(model)
+    pending = [key for key in keys if not facts.is_applied(key)]
+    if pending:
+        return (
+            f"migration {_label(pending[0])} adds its policy (AddRLSPolicy) and is not "
+            f"applied on database {facts.alias!r}: run migrate."
+        )
+    if not _policy_missing(problems):
+        return _rls_off_hint(meta.db_table, problems)
+    if not keys:
+        field = "" if tenant_fk == "tenant" else f", field={tenant_fk!r}"
+        return (
+            f"RLS_TENANTS['EXTERNAL_MODELS'] lists {meta.label}, but no migration has an "
+            f"AddRLSPolicy for it. Add AddRLSPolicy({meta.object_name!r}, "
+            f"app_label={meta.app_label!r}{field}) to a migration of your own app that "
+            f"depends on the {meta.app_label!r} migration creating {tenant_fk!r}, then "
+            f"run migrate."
         )
     return (
         f"migration {_label(keys[-1])} created its policy and is applied on database "

@@ -39,6 +39,7 @@ from django_rls_tenants.tenants.managers import (
     _prefetch_hop,
     _resolve_related_model,
     _resolve_related_path,
+    _rls_model_cache,
     _scoped_prefetch_lookups,
 )
 from django_rls_tenants.tenants.middleware import RLSTenantMiddleware
@@ -51,6 +52,7 @@ from django_rls_tenants.tenants.state import (
 from tests.session_gucs import session_gucs
 from tests.test_app.models import (
     Document,
+    Loan,
     NoteRevision,
     Order,
     OrderItem,
@@ -63,6 +65,7 @@ from tests.test_app.models import (
     Tenant,
     TenantUser,
 )
+from tests.test_external_app.models import Book, BookProxy
 
 pytestmark = pytest.mark.django_db
 
@@ -311,6 +314,29 @@ class TestIsRlsProtected:
     def test_proxy_of_protected_model(self):
         """A proxy has no constraints of its own; it reads its concrete model's table."""
         assert _is_rls_protected(OrderProxy) is True
+
+    def test_external_model_and_its_proxy(self):
+        """A model listed in EXTERNAL_MODELS is protected, and so is a proxy of it (#112)."""
+        assert _is_rls_protected(Book) is True
+        assert _is_rls_protected(BookProxy) is True
+
+    def test_cache_follows_an_rls_tenants_change(self, settings):
+        """The app config drops the cache on ``setting_changed`` for RLS_TENANTS."""
+        assert Book in _rls_model_cache()
+        settings.RLS_TENANTS = {
+            key: value for key, value in settings.RLS_TENANTS.items() if key != "EXTERNAL_MODELS"
+        }
+        assert Book not in _rls_model_cache()
+        assert BookProxy not in _rls_model_cache()
+        assert Order in _rls_model_cache()
+
+    def test_cache_is_dropped_on_an_installed_apps_change(self):
+        """A registry change rebuilds the cache, as Django clears its own model caches."""
+        before = _rls_model_cache()
+        with override_settings(INSTALLED_APPS=["django.contrib.contenttypes"]):
+            pass  # setting_changed fires on enter and exit
+        assert _rls_model_cache() is not before
+        assert _rls_model_cache() == before
 
 
 class TestPrepareTenantInModelData:
@@ -1012,6 +1038,53 @@ class TestPrefetchRelated:
         unfiltered = item_modes(admin_context())
         assert unfiltered
         assert item_modes(tenant_context(tenant_a.pk)) == unfiltered
+
+
+class TestExternalModelJoins:
+    """Joins into a model listed in EXTERNAL_MODELS filter on its own tenant field (#112).
+
+    ``Book``'s tenant foreign key is ``owner``, not ``TENANT_FK_FIELD``; before
+    #112 the filter named ``tenant_id`` on every protected model, so it would
+    have failed with a ``FieldError``.
+    """
+
+    def test_select_related_filters_the_external_tenant_field(self, sample_books, tenant_a):
+        with tenant_context(tenant_a.pk):
+            qs = Loan.objects.select_related("book")
+            sql = str(qs.query)
+            assert [(loan.borrower, loan.book.title) for loan in qs] == [("Reader A", "Book A")]
+        assert f'"test_external_book"."owner_id" = {tenant_a.pk}' in sql
+
+    def test_forward_fk_prefetch_filters_the_external_tenant_field(self, sample_books, tenant_a):
+        with tenant_context(tenant_a.pk), CaptureQueriesContext(connection) as captured:
+            (loan,) = Loan.objects.prefetch_related("book")
+            assert loan.book.title == "Book A"
+        (sql,) = _queries_on(captured, "test_external_book")
+        assert f'"test_external_book"."owner_id" = {tenant_a.pk}' in sql
+
+    def test_unresolvable_tenant_field_adds_no_filter(self, sample_books, tenant_a, settings):
+        """An entry naming a missing field (W016) leaves the joined rows to the policy."""
+        settings.RLS_TENANTS = {
+            **settings.RLS_TENANTS,
+            "EXTERNAL_MODELS": {"test_external_app.Book": "missing"},
+        }
+        assert _is_rls_protected(Book) is True
+        with tenant_context(tenant_a.pk), CaptureQueriesContext(connection) as captured:
+            qs = Loan.objects.select_related("book")
+            assert '"test_external_book"."owner_id" =' not in str(qs.query).partition(" WHERE ")[2]
+            (loan,) = Loan.objects.prefetch_related("book")
+            assert loan.book.title == "Book A"
+        (sql,) = _queries_on(captured, "test_external_book")
+        assert '"owner_id" =' not in sql.partition(" WHERE ")[2]
+
+    def test_unlisted_external_model_is_not_filtered(self, sample_books, tenant_a, settings):
+        """Without the entry, Book is not RLS-protected for the ORM."""
+        settings.RLS_TENANTS = {
+            key: value for key, value in settings.RLS_TENANTS.items() if key != "EXTERNAL_MODELS"
+        }
+        with tenant_context(tenant_a.pk):
+            sql = str(Loan.objects.select_related("book").query)
+        assert '"test_external_book"."owner_id" =' not in sql.partition(" WHERE ")[2]
 
 
 class TestPrefetchHop:

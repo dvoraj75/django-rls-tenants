@@ -17,6 +17,7 @@ from django_rls_tenants.exceptions import RLSConfigurationError
 _KNOWN_KEYS = frozenset(
     {
         "DATABASES",
+        "EXTERNAL_MODELS",
         "GUC_PREFIX",
         "STRICT_MODE",
         "STRICT_MODE_EXCLUDE",
@@ -46,6 +47,7 @@ class RLSTenantsConfig:
             "TENANT_PK_TYPE": "int",               # Default: "int"
             "USE_LOCAL_SET": False,                 # Default: False
             "UNIQUE_ACROSS_TENANTS": {},           # Default: {}
+            "EXTERNAL_MODELS": {},                 # Default: {}
         }
     """
 
@@ -199,6 +201,44 @@ class RLSTenantsConfig:
                 raise RLSConfigurationError(msg)
             allowlist[label] = [_allowlist_entry(label, entry) for entry in entries]
         return allowlist
+
+    @property
+    def EXTERNAL_MODELS(self) -> dict[str, str]:
+        """Models protected by an ``AddRLSPolicy`` migration. Default: ``{}``.
+
+        Maps a model label (``"app_label.ModelName"``, the model name
+        case-insensitive) to the name of its tenant foreign key: a model that
+        has no ``RLSConstraint`` (a third-party app's) whose table gets its
+        policy from an ``AddRLSPolicy`` operation in a migration of the
+        project. The library then treats the model as RLS-protected:
+        ``check_rls`` checks its table, foreign keys to it are validated
+        against the tenant, the ``select_related()`` and ``prefetch_related()``
+        tenant filters apply to joins into it, and check ``W012`` reports its
+        unique fields::
+
+            RLS_TENANTS = {
+                "EXTERNAL_MODELS": {"library.Book": "tenant"},
+            }
+
+        An entry that does not resolve to an installed, non-proxy model with
+        that foreign key to ``TENANT_MODEL``, or that names a model with an
+        ``RLSConstraint``, is reported by check ``W016``.
+
+        Raises:
+            RLSConfigurationError: If the value is not a dict mapping model
+                labels to field names.
+        """
+        value = self._get("EXTERNAL_MODELS", {})
+        if not isinstance(value, dict) or not all(
+            isinstance(label, str) and isinstance(field, str) for label, field in value.items()
+        ):
+            msg = (
+                f"RLS_TENANTS['EXTERNAL_MODELS'] must be a dict mapping model labels "
+                f"('app_label.ModelName') to the name of each model's tenant foreign key, "
+                f"got {value!r}. Example: {{'library.Book': 'tenant'}}."
+            )
+            raise RLSConfigurationError(msg)
+        return dict(value)
 
     def __repr__(self) -> str:
         try:

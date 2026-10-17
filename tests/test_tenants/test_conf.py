@@ -163,6 +163,36 @@ class TestRLSTenantsConfig:
             with pytest.raises(RLSConfigurationError, match=r"must be a list of model labels"):
                 _ = conf.STRICT_MODE_EXCLUDE
 
+    def test_external_models_default(self):
+        """EXTERNAL_MODELS defaults to an empty dict."""
+        with override_settings(RLS_TENANTS={"TENANT_MODEL": "x.Y"}):
+            conf = RLSTenantsConfig()
+            assert conf.EXTERNAL_MODELS == {}
+
+    def test_external_models_returns_a_copy(self):
+        """A dict of label to field name is returned as given, as a copy."""
+        value = {"library.Book": "owner", "shop.Item": "tenant"}
+        with override_settings(RLS_TENANTS={"TENANT_MODEL": "x.Y", "EXTERNAL_MODELS": value}):
+            conf = RLSTenantsConfig()
+            with w.catch_warnings():
+                w.simplefilter("error")  # a known key: no unknown-key warning
+                result = conf.EXTERNAL_MODELS
+            assert result == value
+            result["other.Model"] = "x"
+            assert "other.Model" not in conf.EXTERNAL_MODELS
+
+    @pytest.mark.parametrize(
+        "value",
+        [["library.Book"], {"library.Book": None}, {"library.Book": ["owner"]}, {1: "owner"}],
+        ids=["list", "none_field", "list_field", "non_string_label"],
+    )
+    def test_external_models_rejects_malformed_values(self, value):
+        """Anything but a dict of strings to strings raises RLSConfigurationError."""
+        with override_settings(RLS_TENANTS={"TENANT_MODEL": "x.Y", "EXTERNAL_MODELS": value}):
+            conf = RLSTenantsConfig()
+            with pytest.raises(RLSConfigurationError, match=r"must be a dict mapping model"):
+                _ = conf.EXTERNAL_MODELS
+
     def test_unique_across_tenants_default(self):
         """UNIQUE_ACROSS_TENANTS defaults to an empty dict."""
         with override_settings(RLS_TENANTS={"TENANT_MODEL": "x.Y"}):

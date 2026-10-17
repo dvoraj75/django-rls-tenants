@@ -120,8 +120,10 @@ def _policy_guc_names() -> tuple[str, ...]:
     every call, so a settings override applies), then the names the installed
     models' ``RLSConstraint`` and ``RLSM2MConstraint`` declare. Those can differ
     from the configured ones (system checks ``W001`` / ``W002``), and include
-    every ``extra_bypass_flags`` entry. GUCs read by hand-written policies, or
-    by ``AddM2MRLSPolicy`` with non-default names, are not covered.
+    every ``extra_bypass_flags`` entry. GUCs read by hand-written policies, by
+    ``AddM2MRLSPolicy`` with non-default names, or only by an ``AddRLSPolicy``
+    (its explicit GUC names and ``extra_bypass_flags``, which live in the
+    migration, not on a model), are not covered.
 
     Only custom (dotted) GUC names are kept (``_CUSTOM_GUC_NAME_RE``).
     ``set_config()`` rejects any other name, such as a flag without a dot,

@@ -22,6 +22,7 @@ from django_rls_tenants.rls.constraints import RLSConstraint
 from django_rls_tenants.tenants.checks import (
     _check_conn_max_age_with_session_gucs,
     _check_databases_alias_exists,
+    _check_external_models,
     _check_guc_prefix_mismatch,
     _check_policy_guc_defaults,
     _check_pool_without_reset,
@@ -1764,3 +1765,163 @@ class TestCheckProtectedModelsHaveConstraint:
             {"__module__": __name__, "Meta": type("Meta", (), {"app_label": "test_app"})},
         )
         assert _w014([plain]) == []
+
+
+def _w016(entries, tenant_model="test_app.Tenant"):
+    """Run the W016 check with ``entries`` as EXTERNAL_MODELS."""
+    with (
+        override_settings(
+            RLS_TENANTS={"TENANT_MODEL": tenant_model, "EXTERNAL_MODELS": entries},
+        ),
+        patch(_CONF_PATCH, RLSTenantsConfig()),
+    ):
+        return _check_external_models()
+
+
+class TestCheckExternalModels:
+    """Tests for _check_external_models (W016, #112)."""
+
+    def test_no_warning_when_unset(self):
+        """No W016 with the default (empty) mapping."""
+        assert _w016({}) == []
+
+    def test_no_warning_for_the_test_settings(self):
+        """``tests/settings.py`` lists Book with its tenant foreign key ``owner``."""
+        assert _check_external_models() == []
+
+    def test_no_warning_for_a_valid_entry_in_any_case(self):
+        """The model name is case-insensitive, as ``apps.get_model()`` reads it."""
+        assert _w016({"test_external_app.book": "owner"}) == []
+
+    @pytest.mark.parametrize(
+        "label",
+        ["test_external_app.Nope", "nope_app.Book", "Book", "a.b.c"],
+        ids=["unknown_model", "unknown_app", "no_dot", "two_dots"],
+    )
+    def test_unresolvable_label(self, label):
+        """A label that names no installed model is reported."""
+        warnings = _w016({label: "owner"})
+        assert len(warnings) == 1
+        assert warnings[0].id == "django_rls_tenants.W016"
+        assert f"lists {label!r}, which does not resolve to an installed model" in warnings[0].msg
+        assert warnings[0].obj is None
+
+    def test_proxy_model_names_its_concrete_model(self):
+        """A proxy has no table of its own; the hint names the model to list."""
+        (warning,) = _w016({"test_external_app.BookProxy": "owner"})
+        assert warning.id == "django_rls_tenants.W016"
+        assert "names a proxy model" in warning.msg
+        assert "'test_external_app.Book'" in warning.hint
+        assert warning.obj.__name__ == "BookProxy"
+
+    def test_model_with_an_rls_constraint(self):
+        """Its migrations create the policy, so the entry changes nothing."""
+        (warning,) = _w016({"test_app.Order": "tenant"})
+        assert "names a model with an RLSConstraint" in warning.msg
+        assert "Remove the entry" in warning.hint
+
+    def test_missing_field(self):
+        """The field the entry names must exist."""
+        (warning,) = _w016({"test_external_app.Book": "tenant"})
+        assert "has no field 'tenant'" in warning.msg
+
+    def test_field_that_is_not_a_foreign_key(self):
+        """The policy compares a foreign key's column with the tenant."""
+        (warning,) = _w016({"test_external_app.Book": "title"})
+        assert "maps it to 'title', a CharField, not a ForeignKey" in warning.msg
+
+    def test_foreign_key_to_another_model_than_the_tenant(self):
+        """``admin.LogEntry.user`` points at the user model, not at the tenant model."""
+        (warning,) = _w016({"admin.LogEntry": "user"})
+        assert "a foreign key to test_app.AdminUser" in warning.msg
+        assert "RLS_TENANTS['TENANT_MODEL'] (test_app.Tenant)" in warning.msg
+
+    def test_target_is_not_checked_when_the_tenant_model_does_not_resolve(self):
+        """An unresolvable TENANT_MODEL is W008's to report."""
+        assert _w016({"admin.LogEntry": "user"}, tenant_model="nope.Tenant") == []
+
+    def test_two_labels_for_one_model(self):
+        """Two spellings of one label: only one of their fields would be used."""
+        warnings = _w016({"test_external_app.Book": "owner", "test_external_app.book": "owner"})
+        assert len(warnings) == 1
+        assert "names the same model as 'test_external_app.Book'" in warnings[0].msg
+
+    def test_surfaces_from_real_config(self):
+        """A bad entry reaches the aggregated result as W016."""
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "UNIQUE_ACROSS_TENANTS": _TEST_APP_ALLOWLIST,
+                    "EXTERNAL_MODELS": {"test_external_app.Book": "missing"},
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+            patch(
+                "django_rls_tenants.tenants.checks._check_superuser_connection",
+                return_value=[],
+            ),
+        ):
+            warnings = check_rls_config()
+        assert [w.id for w in warnings] == ["django_rls_tenants.W016"]
+
+
+class TestExternalModelsInOtherChecks:
+    """W012 and W015 treat a model listed in EXTERNAL_MODELS as RLS-protected (#112)."""
+
+    def test_w012_reports_a_unique_field_of_an_external_model(self):
+        """``AdminUser.username`` is unique across tenants once AdminUser is listed."""
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "UNIQUE_ACROSS_TENANTS": _TEST_APP_ALLOWLIST,
+                    "EXTERNAL_MODELS": {"test_app.AdminUser": "tenant"},
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_unique_across_tenants()
+        assert len(warnings) == 1
+        assert warnings[0].obj is AdminUser
+        assert "Field 'username' (unique=True)" in warnings[0].msg
+        assert "'test_app.AdminUser': ['username']" in warnings[0].hint
+
+    def test_w012_allowlist_entry_for_an_external_model_is_not_stale(self):
+        """An allowlist entry for a listed model is matched, not reported as stale."""
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "UNIQUE_ACROSS_TENANTS": {
+                        **_TEST_APP_ALLOWLIST,
+                        "test_app.AdminUser": ["username"],
+                    },
+                    "EXTERNAL_MODELS": {"test_app.AdminUser": "tenant"},
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            assert _check_unique_across_tenants() == []
+
+    def test_w015_accepts_an_external_model_and_its_proxy(self):
+        """W015 counts a listed model as RLS-protected, as it counts one with a constraint."""
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "STRICT_MODE_EXCLUDE": [
+                        "test_external_app.Book",
+                        "test_external_app.BookProxy",
+                    ],
+                    "EXTERNAL_MODELS": {"test_external_app.Book": "owner"},
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            assert _check_strict_mode_exclude() == []
+
+    def test_w015_reports_an_unlisted_external_model(self):
+        """Without its EXTERNAL_MODELS entry, Book is not guarded."""
+        (warning,) = _w015(["test_external_app.Book"])
+        assert "without an RLSConstraint or EXTERNAL_MODELS entry" in warning.msg

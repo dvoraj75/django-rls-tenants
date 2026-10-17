@@ -169,7 +169,7 @@ tenants. Saving a value that only another tenant holds fails with an `IntegrityE
 which tells the writer that the value exists there: a company registration number, a
 slug or a tag name becomes an existence oracle. System check `W012`
 (`django_rls_tenants.W012`) reports every such set on a model that has an
-`RLSConstraint`, primary keys excepted:
+`RLSConstraint` or an [`EXTERNAL_MODELS`](#models-you-do-not-own) entry, primary keys excepted:
 
 - `unique=True` fields (a `OneToOneField` is one; a unique tenant field itself, as on a
   one-row-per-tenant model, is fine),
@@ -203,6 +203,39 @@ matches nothing, or a label that names no RLS-protected model, is reported as `W
 too, so the list cannot go stale. Only a model's own fields are checked: the unique
 fields of a multi-table-inheritance parent are reported on the parent. See
 [`UNIQUE_ACROSS_TENANTS`](../getting-started/configuration.md#unique_across_tenants).
+
+### Models You Do Not Own
+
+*Added in 1.6.0.*
+
+A third-party app's model cannot carry an `RLSConstraint`. Its table can still get the
+same policy from an `AddRLSPolicy` migration of your project, and `RLS_TENANTS["EXTERNAL_MODELS"]`
+tells the library's runtime about the model (see
+[Tables You Do Not Own](../guides/protecting-models.md#tables-you-do-not-own)). The
+database policy is identical to the one `RLSConstraint` creates, so **the isolation of the
+table is as strong as for any other protected table**: enabled, forced, admin bypass in
+`USING` and `WITH CHECK`, fail closed without a context.
+
+What differs is the application layer. The model keeps its own manager, not `RLSManager`,
+so queries **on the external model itself** have no automatic tenant filter, no
+`for_user()` and no `STRICT_MODE` guard: the policy is the only thing that filters them,
+and a missing context shows up as an empty result, not as `NoTenantContextError`. Joins
+**into** it from a protected model (`select_related()`, `prefetch_related()`) and foreign
+keys to it do get the library's tenant filter and the
+[cross-tenant foreign key check](#referential-integrity-and-unique-indexes), through the
+tenant field the entry names.
+
+Two further limits:
+
+- The policy is created only by the migration. An `EXTERNAL_MODELS` entry without an
+  `AddRLSPolicy` leaves the table unprotected; `check_rls` reports it
+  (`no RLS policies found`) and prints the operation to add. Run it in CI.
+- The model's many-to-many through tables are not covered: `register_m2m_rls()` and the
+  `check_rls` M2M discovery only look at `RLSProtectedModel` subclasses.
+
+The policy's GUC names and tenant type are read from `RLS_TENANTS` when the migration runs
+unless you pass them to the operation (`RLSConstraint` has the literal defaults instead), and
+a later `GUC_PREFIX` change does not rewrite an applied policy.
 
 ### Aggregate Leaks
 
@@ -273,7 +306,8 @@ Mitigations:
   did not reach starts clean (#96). The pool's `reset` callback
   `django_rls_tenants.pool.reset_rls_gucs` clears them again as the connection goes back,
   and system check `W010` asks for it. GUCs read only by hand-written policies, or by
-  `AddM2MRLSPolicy` with non-default names, are not cleared.
+  `AddM2MRLSPolicy` with non-default names, or only by an `AddRLSPolicy` (its explicit
+  GUC names and `extra_bypass_flags`), are not cleared.
 - **USE_LOCAL_SET**: transaction-local GUCs end with their transaction, so they never stay
   on a connection. The transaction is the WSGI middleware's request transaction, one you
   open with `transaction.atomic()`, or, on the middleware's async path (ASGI) and for code

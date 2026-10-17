@@ -23,6 +23,9 @@ silent failures at runtime:
   ``constraints``, so no migration creates a policy for its table.
 - A ``STRICT_MODE_EXCLUDE`` label that names no installed RLS-protected model
   (``W015``): the entry exempts nothing.
+- An ``EXTERNAL_MODELS`` entry the library cannot use (``W016``): its label names
+  no installed, non-proxy model, the model already has an ``RLSConstraint``, or
+  the field it names is not a foreign key to ``TENANT_MODEL``.
 
 Check IDs are never renumbered. ``W003`` (retired in 1.3.1) and ``W007``
 (retired in 1.3.2) are no longer emitted: ``RLSTenantMiddleware`` opens its
@@ -69,6 +72,7 @@ def check_rls_config(
     errors.extend(_check_unique_across_tenants())
     errors.extend(_check_protected_models_have_constraint())
     errors.extend(_check_strict_mode_exclude())
+    errors.extend(_check_external_models())
     return errors
 
 
@@ -643,8 +647,8 @@ def _check_strict_mode_exclude() -> list[CheckWarning]:
             if (model._meta.concrete_model or model) in guarded:  # noqa: SLF001
                 continue
             problem = (
-                "names a model without an RLSConstraint, which strict mode never guards, "
-                "so the entry has no effect"
+                "names a model without an RLSConstraint or EXTERNAL_MODELS entry, which "
+                "strict mode never guards, so the entry has no effect"
             )
         warnings.append(
             CheckWarning(
@@ -656,6 +660,117 @@ def _check_strict_mode_exclude() -> list[CheckWarning]:
                 id="django_rls_tenants.W015",
             )
         )
+    return warnings
+
+
+def _check_external_models() -> list[CheckWarning]:
+    """Warn about ``EXTERNAL_MODELS`` entries the library cannot use (``W016``).
+
+    Each label must resolve (as ``apps.get_model()`` resolves it) to an
+    installed model that is not a proxy (its table is its concrete model's)
+    and has no ``RLSConstraint`` (its migrations create its policy, and an
+    ``AddRLSPolicy`` for it would find the policy and change nothing). The
+    field must be a foreign key of that model to ``TENANT_MODEL``: the policy
+    compares its column with the current tenant. Two labels that name the
+    same model are reported too (one field would win). A ``TENANT_MODEL``
+    that does not resolve is left to ``W008``.
+    """
+    from django.apps import apps  # noqa: PLC0415
+    from django.core.exceptions import FieldDoesNotExist  # noqa: PLC0415
+    from django.db import models  # noqa: PLC0415
+
+    from django_rls_tenants.exceptions import RLSConfigurationError  # noqa: PLC0415
+    from django_rls_tenants.rls.constraints import RLSConstraint  # noqa: PLC0415
+    from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
+
+    entries = rls_tenants_config.EXTERNAL_MODELS
+    if not entries:
+        return []
+    try:
+        tenant_model: type[models.Model] | None = apps.get_model(rls_tenants_config.TENANT_MODEL)
+    except (LookupError, ValueError, RLSConfigurationError):
+        tenant_model = None
+    warnings: list[CheckWarning] = []
+    seen: dict[type[models.Model], str] = {}
+
+    def warn(label: str, problem: str, hint: str, model: Any = None) -> None:
+        warnings.append(
+            CheckWarning(
+                f"RLS_TENANTS['EXTERNAL_MODELS'] lists {label!r}, which {problem}.",
+                hint=hint,
+                id="django_rls_tenants.W016",
+                obj=model,
+            )
+        )
+
+    for label, field_name in entries.items():
+        try:
+            model = apps.get_model(label)
+        except (LookupError, ValueError):
+            warn(
+                label,
+                "does not resolve to an installed model",
+                "Correct the label to '<app_label>.<ModelName>' of a model in "
+                "INSTALLED_APPS, or remove the entry.",
+            )
+            continue
+        meta = model._meta  # noqa: SLF001
+        if model in seen:
+            warn(
+                label,
+                f"names the same model as {seen[model]!r}, so one of their fields is ignored",
+                "Keep one entry per model.",
+                model,
+            )
+            continue
+        seen[model] = label
+        if meta.proxy:
+            concrete = (meta.concrete_model or model)._meta.label  # noqa: SLF001
+            warn(
+                label,
+                "names a proxy model, which has no table of its own",
+                f"List its concrete model, {concrete!r}, instead.",
+                model,
+            )
+            continue
+        if any(isinstance(constraint, RLSConstraint) for constraint in meta.constraints):
+            warn(
+                label,
+                "names a model with an RLSConstraint, whose migrations create its "
+                "policy, so the entry has no effect",
+                "Remove the entry: EXTERNAL_MODELS is for models without an "
+                "RLSConstraint, whose policy an AddRLSPolicy migration creates.",
+                model,
+            )
+            continue
+        try:
+            field = meta.get_field(field_name)
+        except FieldDoesNotExist:
+            warn(
+                label,
+                f"has no field {field_name!r}",
+                f"Map {label!r} to the name of its tenant foreign key.",
+                model,
+            )
+            continue
+        if not isinstance(field, models.ForeignKey):
+            warn(
+                label,
+                f"maps it to {field_name!r}, a {type(field).__name__}, not a ForeignKey",
+                f"Map {label!r} to the name of its foreign key to the tenant model.",
+                model,
+            )
+        elif tenant_model is not None and field.related_model is not tenant_model:
+            target = getattr(field.related_model, "_meta", None)
+            target_label = target.label if target is not None else field.related_model
+            warn(
+                label,
+                f"maps it to {field_name!r}, a foreign key to {target_label}, not to "
+                f"RLS_TENANTS['TENANT_MODEL'] ({tenant_model._meta.label})",  # noqa: SLF001
+                f"Map {label!r} to the name of its foreign key to the tenant model: the "
+                f"policy compares that column with the current tenant.",
+                model,
+            )
     return warnings
 
 
@@ -719,7 +834,7 @@ def _check_unique_across_tenants() -> list[CheckWarning]:
     warnings.extend(
         CheckWarning(
             f"RLS_TENANTS['UNIQUE_ACROSS_TENANTS'] lists {label!r}, which names no "
-            f"installed, non-proxy model with an RLSConstraint.",
+            f"installed, non-proxy model with an RLSConstraint or EXTERNAL_MODELS entry.",
             hint=(
                 "Remove the entry, or correct the label to '<app_label>.<ModelName>' "
                 "of an RLS-protected model."

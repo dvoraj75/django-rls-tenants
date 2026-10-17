@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import logging
 from contextlib import ExitStack
+from functools import lru_cache
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from django.core.exceptions import FieldDoesNotExist, ValidationError
@@ -62,15 +64,43 @@ def _add_tenant_fk(sender: type, **kwargs: Any) -> None:  # noqa: ARG001  -- sig
 
 
 def _get_tenant_fk_field(model: type[models.Model]) -> str | None:
-    """Return the tenant FK field name if ``model`` has an ``RLSConstraint``, else ``None``.
+    """Return the tenant FK field name the policy of ``model``'s table filters on, or ``None``.
 
-    Checks for an ``RLSConstraint`` in the model's ``Meta.constraints``
-    and returns its ``field`` attribute.
+    The ``field`` of the first ``RLSConstraint`` in the model's
+    ``Meta.constraints``; for a model without one, the field
+    ``RLS_TENANTS["EXTERNAL_MODELS"]`` maps its label to (a model whose policy
+    an ``AddRLSPolicy`` migration creates). A proxy model has neither: its
+    table is its concrete model's.
     """
-    for c in model._meta.constraints:  # noqa: SLF001
+    meta = model._meta  # noqa: SLF001
+    for c in meta.constraints:
         if isinstance(c, RLSConstraint):
             return c.field
-    return None
+    if meta.proxy:
+        return None
+    return _external_model_fields().get(meta.label_lower)
+
+
+def _external_model_fields() -> Mapping[str, str]:
+    """Return ``RLS_TENANTS["EXTERNAL_MODELS"]`` keyed by ``Options.label_lower``."""
+    from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
+
+    return _normalized_external_models(tuple(rls_tenants_config.EXTERNAL_MODELS.items()))
+
+
+@lru_cache(maxsize=1)
+def _normalized_external_models(entries: tuple[tuple[str, str], ...]) -> Mapping[str, str]:
+    """Key the ``EXTERNAL_MODELS`` entries by ``Options.label_lower``.
+
+    The app label stays as given and the model name is lower-cased, as
+    ``apps.get_model()`` resolves them (and ``STRICT_MODE_EXCLUDE`` labels are
+    read); a label that matches no model is reported by check ``W016``.
+    """
+    normalized: dict[str, str] = {}
+    for label, field in entries:
+        app_label, _, model_name = label.partition(".")
+        normalized[f"{app_label}.{model_name.lower()}"] = field
+    return MappingProxyType(normalized)
 
 
 def register_m2m_rls() -> None:
@@ -185,11 +215,12 @@ def register_m2m_rls() -> None:
 
 
 def _tenant_field(model: type[models.Model]) -> models.ForeignKey[Any, Any] | None:
-    """Return the foreign key ``model``'s ``RLSConstraint`` names, or ``None``.
+    """Return the foreign key ``model``'s policy filters on, or ``None``.
 
-    A proxy model's is its concrete model's (a proxy has no constraints of its
-    own). ``None`` too when the model lacks that field (``W009`` reports it) or
-    it is not a foreign key.
+    The one its ``RLSConstraint`` or its ``EXTERNAL_MODELS`` entry names (see
+    :func:`_get_tenant_fk_field`). A proxy model's is its concrete model's (a
+    proxy has no constraints of its own). ``None`` too when the model lacks
+    that field (``W009`` / ``W016`` report it) or it is not a foreign key.
     """
     concrete = model._meta.concrete_model or model  # noqa: SLF001
     tenant_name = _get_tenant_fk_field(concrete)
@@ -207,14 +238,16 @@ def _checked_foreign_keys(
 ) -> tuple[models.ForeignKey[Any, Any], list[models.ForeignKey[Any, Any]]] | None:
     """Return ``model``'s tenant field and its foreign keys to RLS-protected models.
 
-    The tenant field is the one the model's ``RLSConstraint`` names. The
-    foreign keys (one-to-one fields included) are those whose target has an
-    ``RLSConstraint``, except the tenant field and multi-table-inheritance
-    parent links, which Django's own foreign key validation skips too.
+    The tenant field is the one the model's ``RLSConstraint`` (or its
+    ``EXTERNAL_MODELS`` entry) names. The foreign keys (one-to-one fields
+    included) are those whose target is RLS-protected that way, except the
+    tenant field and multi-table-inheritance parent links, which Django's own
+    foreign key validation skips too.
 
     Returns:
         ``(tenant_field, foreign_keys)``, or ``None`` when ``model`` has no
-        ``RLSConstraint`` or lacks the field it names (``W009``).
+        ``RLSConstraint`` or ``EXTERNAL_MODELS`` entry, or lacks the field it
+        names (``W009`` / ``W016``).
     """
     tenant_field = _tenant_field(model)
     if tenant_field is None:
@@ -372,13 +405,15 @@ def validate_cross_tenant_fks(
     yourself before a ``save()`` that no form validated.
 
     Each foreign key (one-to-one fields included) to a model with an
-    ``RLSConstraint`` is compared with the instance's **own** tenant field,
-    not with the active context, so an admin editing another tenant's row
+    ``RLSConstraint``, or listed in ``RLS_TENANTS["EXTERNAL_MODELS"]``, is
+    compared with the instance's **own** tenant field, not with the active
+    context, so an admin editing another tenant's row
     is not rejected. The target's tenant is read in ``admin_context()``
     with one query per foreign key, whatever the active context. Skipped:
     the tenant field itself, parent links, empty foreign keys and unsaved
     targets, and every foreign key while the instance has no tenant. A
-    model without an ``RLSConstraint`` has nothing to check.
+    model without an ``RLSConstraint`` (or ``EXTERNAL_MODELS`` entry) has
+    nothing to check.
 
     The error is the one Django's foreign key validation gives a row that
     does not exist (the field's ``invalid`` message), so it does not reveal

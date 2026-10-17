@@ -13,6 +13,7 @@ __version__: str = importlib.metadata.version("django-rls-tenants")
 
 __all__ = [
     "AddM2MRLSPolicy",
+    "AddRLSPolicy",
     "RLSConstraint",
     "RLSM2MConstraint",
     "RLSManager",
@@ -34,6 +35,7 @@ __all__ = [
 
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "AddM2MRLSPolicy": ("django_rls_tenants.operations", "AddM2MRLSPolicy"),
+    "AddRLSPolicy": ("django_rls_tenants.operations", "AddRLSPolicy"),
     "RLSConstraint": ("django_rls_tenants.rls.constraints", "RLSConstraint"),
     "RLSM2MConstraint": ("django_rls_tenants.rls.constraints", "RLSM2MConstraint"),
     "RLSManager": ("django_rls_tenants.tenants.managers", "RLSManager"),

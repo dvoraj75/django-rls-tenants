@@ -9,6 +9,7 @@ The most common symbols are available directly from `django_rls_tenants`:
 ```python
 from django_rls_tenants import (
     AddM2MRLSPolicy,
+    AddRLSPolicy,
     RLSConstraint,
     RLSM2MConstraint,
     RLSManager,
@@ -93,6 +94,8 @@ asynchronous database cursor, so these are not non-blocking calls; see
 ### Migration Operations
 
 ::: django_rls_tenants.operations.AddM2MRLSPolicy
+
+::: django_rls_tenants.operations.AddRLSPolicy
 
 ### Context Managers
 

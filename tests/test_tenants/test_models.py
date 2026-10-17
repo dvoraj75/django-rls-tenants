@@ -18,11 +18,14 @@ from django_rls_tenants.tenants.managers import RLSManager
 from django_rls_tenants.tenants.models import (
     RLSProtectedModel,
     _add_tenant_fk,
+    _get_tenant_fk_field,
+    _tenant_field,
     validate_cross_tenant_fks,
 )
 from tests.test_app.models import (
     Assignment,
     Document,
+    Loan,
     NoteRevision,
     Order,
     OrderItem,
@@ -33,6 +36,7 @@ from tests.test_app.models import (
     Tag,
     Tenant,
 )
+from tests.test_external_app.models import Book, BookProxy
 
 pytestmark = pytest.mark.django_db
 
@@ -400,3 +404,88 @@ class TestCrossTenantForeignKeys:
                 validate_cross_tenant_fks(item)
             assert Order._base_manager.count() == 2
             validate_cross_tenant_fks(OrderItem(tenant=tenant_a, order=sample_orders["a1"]))
+
+
+class TestExternalModels:
+    """``RLS_TENANTS["EXTERNAL_MODELS"]`` names the tenant field of a model without a constraint.
+
+    #112: such a model's policy comes from an ``AddRLSPolicy`` migration.
+    """
+
+    def test_tenant_field_name_comes_from_the_entry(self):
+        assert _get_tenant_fk_field(Book) == "owner"
+        assert _tenant_field(Book) is Book._meta.get_field("owner")
+
+    def test_proxy_follows_its_concrete_model(self):
+        """A proxy has no entry of its own; ``_tenant_field()`` reads the concrete model."""
+        assert _get_tenant_fk_field(BookProxy) is None
+        assert _tenant_field(BookProxy) is Book._meta.get_field("owner")
+
+    def test_entry_naming_a_proxy_is_ignored(self, settings):
+        """W016 reports it; the proxy's table is the concrete model's."""
+        settings.RLS_TENANTS = {
+            **settings.RLS_TENANTS,
+            "EXTERNAL_MODELS": {"test_external_app.BookProxy": "owner"},
+        }
+        assert _get_tenant_fk_field(BookProxy) is None
+        assert _tenant_field(Book) is None
+
+    def test_label_model_name_is_case_insensitive(self, settings):
+        settings.RLS_TENANTS = {
+            **settings.RLS_TENANTS,
+            "EXTERNAL_MODELS": {"test_external_app.BOOK": "owner"},
+        }
+        assert _get_tenant_fk_field(Book) == "owner"
+
+    def test_constraint_wins_over_an_entry(self, settings):
+        """W016 reports the entry; the policy is the constraint's."""
+        settings.RLS_TENANTS = {
+            **settings.RLS_TENANTS,
+            "EXTERNAL_MODELS": {"test_app.Order": "other"},
+        }
+        assert _get_tenant_fk_field(Order) == "tenant"
+
+    def test_unlisted_model_has_no_tenant_field(self, settings):
+        settings.RLS_TENANTS = {
+            key: value for key, value in settings.RLS_TENANTS.items() if key != "EXTERNAL_MODELS"
+        }
+        assert _get_tenant_fk_field(Book) is None
+        assert _tenant_field(Book) is None
+
+    def test_missing_or_non_fk_field_gives_no_tenant_field(self, settings):
+        for field in ("missing", "title"):
+            settings.RLS_TENANTS = {
+                **settings.RLS_TENANTS,
+                "EXTERNAL_MODELS": {"test_external_app.Book": field},
+            }
+            assert _get_tenant_fk_field(Book) == field
+            assert _tenant_field(Book) is None
+
+
+class TestCrossTenantForeignKeysToExternalModels:
+    """A foreign key to a model listed in EXTERNAL_MODELS is validated against the tenant."""
+
+    def test_same_tenant_target_passes(self, tenant_a, sample_books):
+        loan = Loan(tenant=tenant_a, book=sample_books["a"], borrower="x")
+        with admin_context():
+            assert _errors(loan) == {}
+
+    def test_other_tenants_target_is_rejected(self, tenant_a, sample_books):
+        book_b = sample_books["b"]
+        loan = Loan(tenant=tenant_a, book=book_b, borrower="x")
+        with admin_context():
+            assert _errors(loan) == {"book": [_invalid("book", book_b.pk)]}
+
+    def test_tenant_context_under_rls_reports_one_error(self, enforce_rls, tenant_a, sample_books):
+        book_b = sample_books["b"]
+        loan = Loan(tenant=tenant_a, book_id=book_b.pk, borrower="x")
+        with tenant_context(tenant_a.pk):
+            assert _errors(loan) == {"book": [_invalid("book", book_b.pk)]}
+
+    def test_unlisted_external_model_is_not_checked(self, tenant_a, sample_books, settings):
+        settings.RLS_TENANTS = {
+            key: value for key, value in settings.RLS_TENANTS.items() if key != "EXTERNAL_MODELS"
+        }
+        loan = Loan(tenant=tenant_a, book=sample_books["b"], borrower="x")
+        with admin_context():
+            assert _errors(loan) == {}
