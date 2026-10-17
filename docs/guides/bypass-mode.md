@@ -139,6 +139,23 @@ queries have separate context requirements when the user model inherits
 `RLSProtectedModel`; see
 [Protecting the User Model](protecting-models.md#protecting-the-user-model).
 
+!!! note "With `STRICT_MODE=True`, list the user model"
+    `bypass_flag()` sets a GUC but does not establish an RLS context, so with
+    `STRICT_MODE=True` the backend's `authenticate()` and `get_user()` raise
+    `NoTenantContextError`. List the user model in
+    [`STRICT_MODE_EXCLUDE`](../getting-started/configuration.md#strict_mode_exclude):
+
+    ```python title="settings.py"
+    RLS_TENANTS = {
+        "TENANT_MODEL": "myapp.Tenant",
+        "STRICT_MODE": True,
+        "STRICT_MODE_EXCLUDE": ["accounts.User"],
+    }
+    ```
+
+    Only the strict-mode check is skipped. The read still passes the policy through the
+    bypass flag, and a read with no flag returns no rows.
+
 ## Security Implications
 
 !!! warning

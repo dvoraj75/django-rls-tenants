@@ -91,9 +91,14 @@ keep it on the request's thread with `thread_sensitive=True` (the default for
 
 | Hint starts with | Cause | Fix |
 |---|---|---|
-| `Establish an RLS context before the query` | `STRICT_MODE=True` and a query ran with no context | Wrap the code in `tenant_context()` / `admin_context()`, use `.for_user()`, or run it under the middleware |
+| `Establish an RLS context before the query` | `STRICT_MODE=True` and a query ran with no context | Wrap the code in `tenant_context()` / `admin_context()`, use `.for_user()`, or run it under the middleware. If the model is meant to be read without a context (an auth backend under `bypass_flag()`), list it in [`STRICT_MODE_EXCLUDE`](getting-started/configuration.md#strict_mode_exclude), as the hint says |
 | `Assign the user to a tenant (set rls_tenant_id)` | A non-admin `TenantUser` has `rls_tenant_id=None`: a `createsuperuser` account, a user not yet attached to a tenant | Give the user a tenant, or set `is_tenant_admin=True` |
 | `Pass a concrete tenant primary key` | `tenant_context(None)` was called | Pass a real tenant PK, or use `admin_context()` for cross-tenant access |
+
+For the first hint, the full text continues: `If Order is meant to be read without a
+context, list 'app.Order' in RLS_TENANTS['STRICT_MODE_EXCLUDE']; to disable this guard
+for every model, set STRICT_MODE=False in RLS_TENANTS.` The exclusion removes only this
+check; the query still returns just the rows the database policy allows without a context.
 
 The first hint also appears when a Celery task with `rls_require_context=True`
 arrives without propagated context. Enqueue it **inside** a tenant or admin context;
@@ -642,6 +647,23 @@ RLS_TENANTS = {
 
 **See:** [`UNIQUE_ACROSS_TENANTS`](getting-started/configuration.md#unique_across_tenants),
 [Cross-Tenant Unique Constraints](advanced/security.md#cross-tenant-unique-constraints).
+
+### W015: a `STRICT_MODE_EXCLUDE` entry exempts nothing
+
+**Symptom:** `(django_rls_tenants.W015) RLS_TENANTS['STRICT_MODE_EXCLUDE'] lists
+'accounts.Usr', which does not resolve to an installed model.` or `... lists
+'myapp.Country', which names a model without an RLSConstraint, which strict mode never
+guards, so the entry has no effect.`
+
+**Cause:** The label is not `"<app_label>.<ModelName>"` of an installed model (a typo, an
+app missing from `INSTALLED_APPS`, no dot), or the model has no `RLSConstraint`, so strict
+mode never guards it and listing it does nothing. The check runs whether or not
+`STRICT_MODE` is on.
+
+**Fix:** Correct the label, or remove the entry. A model without an `RLSConstraint` needs
+no entry.
+
+**See:** [`STRICT_MODE_EXCLUDE`](getting-started/configuration.md#strict_mode_exclude).
 
 ### W006 / W008 / W009: alias, tenant model or tenant field not found
 

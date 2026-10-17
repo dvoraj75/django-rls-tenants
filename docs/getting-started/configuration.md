@@ -10,6 +10,7 @@ RLS_TENANTS = {
     "TENANT_MODEL": "myapp.Tenant",
     "DATABASES": ["default"],
     "STRICT_MODE": False,
+    "STRICT_MODE_EXCLUDE": [],
     "TENANT_FK_FIELD": "tenant",
     "GUC_PREFIX": "rls",
     "USER_PARAM_NAME": "as_user",
@@ -130,6 +131,56 @@ RLS_TENANTS = {
         log.error(exc.message)  # "RLS strict mode: query on Order attempted ..."
         show_hint(exc.hint)     # "Establish an RLS context before the query: ..."
     ```
+
+### `STRICT_MODE_EXCLUDE`
+
+| | |
+|---|---|
+| **Type** | `list[str]` (a tuple or set is accepted too) |
+| **Default** | `[]` |
+| **Example** | `["accounts.User"]` |
+
+Models that `STRICT_MODE` does not guard. Each entry is a model label,
+`"app_label.ModelName"`: the model name is case-insensitive and the app label is matched
+exactly, as `apps.get_model()` does. With `STRICT_MODE=True`, a query on a listed model
+that runs with no active RLS context no longer raises `NoTenantContextError`. A proxy
+follows its concrete model: listing a model also exempts its proxies, and listing a proxy
+does not exempt its concrete model.
+
+```python
+RLS_TENANTS = {
+    "TENANT_MODEL": "myapp.Tenant",
+    "STRICT_MODE": True,
+    "STRICT_MODE_EXCLUDE": ["accounts.User"],
+}
+```
+
+The main use is reading an RLS-protected user model under
+[`bypass_flag()`](../guides/bypass-mode.md#use-case-authentication) in an authentication
+backend. `bypass_flag()` sets a GUC but does not establish an RLS context, so with
+`STRICT_MODE=True` the backend's `get_user()` and `authenticate()` raise until the user
+model is listed. Other cases are startup code, health checks and signal handlers that run
+before the middleware and can live with fail-closed results.
+
+!!! warning "Only the strict-mode check changes"
+    The exclusion removes the application-level guard and nothing else. The auto-scope
+    filter, `for_user()`, `tenant_context()` / `admin_context()` and the database RLS
+    policies behave exactly as before. With no context, a listed model still fails closed
+    at the database: it returns only the rows the policy lets through, which is none
+    unless a bypass flag from the constraint's `extra_bypass_flags` is set (or the
+    connection role bypasses RLS). A query that should see a tenant's rows still needs a
+    context.
+
+It is not a per-query escape hatch: the setting applies to every query on the model, in
+every code path. A per-query override is on the
+[roadmap](../development/roadmap.md).
+
+Models without an `RLSConstraint` (shared lookup tables, the tenant model) are never
+guarded by strict mode and never need listing. The value must be a list of strings;
+anything else raises `RLSConfigurationError` when the setting is read. A label that names
+no installed model (a typo, an unknown app, no dot), or a model without an `RLSConstraint`,
+is reported as `W015`, whether or not `STRICT_MODE` is on. The strict-mode error's hint
+names the label to list.
 
 ### `TENANT_FK_FIELD`
 
@@ -352,11 +403,12 @@ django-rls-tenants registers Django system checks that warn about common misconf
 | `W011` | Warning | PostgreSQL applies a database- or role-level default (`ALTER DATABASE/ROLE ... SET`) for a GUC the RLS policies read, in force in every new session; checked on every alias in `RLS_TENANTS["DATABASES"]` |
 | `W012` | Warning | A unique field, `unique_together` entry or `UniqueConstraint` of an RLS-protected model does not include the tenant field, so its `IntegrityError` reveals values held by other tenants; also a stale `UNIQUE_ACROSS_TENANTS` entry. Listed in [`UNIQUE_ACROSS_TENANTS`](#unique_across_tenants) when intended |
 | `W013` | Warning | `W005`/`E001` or `W011` could not be determined: the database was reachable but the catalogue query failed (for example `permission denied for view pg_roles`). A clean `check` is not a pass |
+| `W015` | Warning | A `STRICT_MODE_EXCLUDE` label does not resolve to an installed model, or names a model without an `RLSConstraint` (strict mode never guards it, so the entry has no effect). Checked whether or not `STRICT_MODE` is on. See [`STRICT_MODE_EXCLUDE`](#strict_mode_exclude) |
 | `E001` | Error | The connection role of a `DATABASES` alias is a superuser or has `BYPASSRLS` and `settings.DEBUG` is `False` (a production deployment). Replaces `W005`; fails `manage.py check` and every command that runs the system checks, such as `migrate` |
 
 Run `python manage.py check` to see any warnings and errors.
 
-`W005`, `W011`, `W012` and `W013` stay warnings. `E001` is an error, so it also aborts `migrate`,
+`W005`, `W011`, `W012`, `W013` and `W015` stay warnings. `E001` is an error, so it also aborts `migrate`,
 `createsuperuser`, `check_rls`, `setup_m2m_rls` and Django's test runner (which sets
 `DEBUG = False` before it runs the checks). If a settings module has to connect as such a
 role on purpose (a migration job, a superuser test database), record that decision there

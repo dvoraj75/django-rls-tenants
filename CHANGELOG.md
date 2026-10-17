@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Granular strict mode: `STRICT_MODE_EXCLUDE`** (#45). A new setting,
+  `RLS_TENANTS["STRICT_MODE_EXCLUDE"] = ["accounts.User"]`, lists models (labels
+  `"app_label.ModelName"`, the model name case-insensitive) that `STRICT_MODE=True` does
+  not guard: a query on one, or on a proxy of one, with no active RLS context no longer
+  raises `NoTenantContextError`. The main use is an authentication backend that reads the
+  user model under `bypass_flag()` (see
+  [Use Case: Authentication](https://dvoraj75.github.io/django-rls-tenants/guides/bypass-mode/#use-case-authentication)),
+  which sets a GUC but establishes no context, so `authenticate()` and `get_user()`
+  raised under strict mode. Only the strict-mode check changes: the auto-scope filter,
+  `for_user()`, the context managers and the RLS policies are as before, so a listed model
+  with no context still returns only what the policy lets through (no rows, unless a
+  bypass flag is set). It applies to every query on the model, not to one call. A value
+  that is not a list of strings raises `RLSConfigurationError`. New system check `W015`
+  reports an entry that names no installed model or a model without an `RLSConstraint`
+  (strict mode never guards it). The strict-mode error's hint now names the label to list.
+  See
+  [`STRICT_MODE_EXCLUDE`](https://dvoraj75.github.io/django-rls-tenants/getting-started/configuration/#strict_mode_exclude).
 - **`run_as_tenant` and `run_for_all_tenants` management commands** (#111). Run any
   management command (a nightly report, a re-index, a per-tenant data fix, a backfill)
   inside the right RLS context without writing context handling into it.

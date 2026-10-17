@@ -18,6 +18,8 @@ silent failures at runtime:
 - A unique field or constraint on an RLS-protected model that omits the tenant
   field (``W012``): unique indexes are checked outside the RLS policies, so the
   ``IntegrityError`` tells one tenant that a value exists in another.
+- A ``STRICT_MODE_EXCLUDE`` label that names no installed RLS-protected model
+  (``W015``): the entry exempts nothing.
 
 Check IDs are never renumbered. ``W003`` (retired in 1.3.1) and ``W007``
 (retired in 1.3.2) are no longer emitted: ``RLSTenantMiddleware`` opens its
@@ -62,6 +64,7 @@ def check_rls_config(
     errors.extend(_check_tenant_model_resolves())
     errors.extend(_check_tenant_fk_field_exists())
     errors.extend(_check_unique_across_tenants())
+    errors.extend(_check_strict_mode_exclude())
     return errors
 
 
@@ -558,6 +561,54 @@ def _check_tenant_fk_field_exists() -> list[CheckWarning]:
                     obj=model,
                 )
             )
+    return warnings
+
+
+def _check_strict_mode_exclude() -> list[CheckWarning]:
+    """Warn about ``STRICT_MODE_EXCLUDE`` labels that exempt nothing (``W015``).
+
+    A label must resolve (as ``apps.get_model()`` resolves it) to an installed
+    model that strict mode guards: one with an ``RLSConstraint``, or the
+    concrete model of a proxy that has one. A typo or a model that is not
+    RLS-protected (strict mode never guards it) is reported. The check runs
+    whether or not ``STRICT_MODE`` is on, so a list kept for the environments
+    that turn it on stays correct.
+    """
+    from django.apps import apps  # noqa: PLC0415
+
+    from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
+    from django_rls_tenants.tenants.models import _get_tenant_fk_field  # noqa: PLC0415
+
+    labels = rls_tenants_config.STRICT_MODE_EXCLUDE
+    if not labels:
+        return []
+    guarded: set[type[models.Model]] = set()
+    for model in apps.get_models():
+        if _get_tenant_fk_field(model) is not None:
+            guarded.update((model, model._meta.concrete_model or model))  # noqa: SLF001
+    warnings: list[CheckWarning] = []
+    for label in labels:
+        try:
+            model = apps.get_model(label)
+        except (LookupError, ValueError):
+            problem = "does not resolve to an installed model"
+        else:
+            if model in guarded:
+                continue
+            problem = (
+                "names a model without an RLSConstraint, which strict mode never guards, "
+                "so the entry has no effect"
+            )
+        warnings.append(
+            CheckWarning(
+                f"RLS_TENANTS['STRICT_MODE_EXCLUDE'] lists {label!r}, which {problem}.",
+                hint=(
+                    "Remove the entry, or correct it to '<app_label>.<ModelName>' of an "
+                    "RLS-protected model in INSTALLED_APPS."
+                ),
+                id="django_rls_tenants.W015",
+            )
+        )
     return warnings
 
 

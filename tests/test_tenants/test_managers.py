@@ -18,12 +18,13 @@ from django.db import DatabaseError, DataError, NotSupportedError, connection, t
 from django.db.models import Count, F, Prefetch, QuerySet, Sum
 from django.db.models.signals import pre_delete
 from django.test import override_settings
-from django.test.utils import CaptureQueriesContext
+from django.test.utils import CaptureQueriesContext, isolate_apps
 from django.utils.connection import ConnectionDoesNotExist
 
 from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.guc import get_guc
 from django_rls_tenants.tenants import managers
+from django_rls_tenants.tenants.bypass import bypass_flag
 from django_rls_tenants.tenants.context import (
     admin_context,
     async_tenant_context,
@@ -34,6 +35,7 @@ from django_rls_tenants.tenants.managers import (
     RLSManager,
     TenantQuerySet,
     _is_rls_protected,
+    _is_strict_mode_excluded,
     _prefetch_hop,
     _resolve_related_model,
     _resolve_related_path,
@@ -1177,6 +1179,7 @@ class TestStrictModeRaises:
         assert hint is not None
         assert "tenant_context(" in hint
         assert "STRICT_MODE=False" in hint
+        assert "'test_app.Order' in RLS_TENANTS['STRICT_MODE_EXCLUDE']" in hint
 
 
 class TestStrictModeAllowsContext:
@@ -1228,6 +1231,127 @@ class TestStrictModeAllowsContext:
             Order.objects.all().first()
             Order.objects.all().last()
             list(Order.objects.all().iterator())
+
+
+class TestStrictModeExclude:
+    """``STRICT_MODE_EXCLUDE`` exempts listed models from the strict mode check only (#45)."""
+
+    @staticmethod
+    def _settings(*labels):
+        return override_settings(
+            RLS_TENANTS={
+                "TENANT_MODEL": "test_app.Tenant",
+                "STRICT_MODE": True,
+                "STRICT_MODE_EXCLUDE": list(labels),
+            },
+        )
+
+    def test_excluded_model_does_not_raise_and_rls_still_hides_rows(
+        self, sample_orders, enforce_rls
+    ):
+        """An excluded model queries without a context; the policy still fails closed."""
+        with self._settings("test_app.Order"):
+            assert list(Order.objects.all()) == []
+            assert Order.objects.count() == 0
+            assert Order.objects.exists() is False
+            assert Order.objects.first() is None
+            assert list(Order.objects.iterator()) == []
+
+    def test_other_models_still_raise(self, sample_orders):
+        """Only the listed model is exempt."""
+        with (
+            self._settings("test_app.Order"),
+            pytest.raises(NoTenantContextError, match="OrderItem"),
+        ):
+            list(OrderItem.objects.all())
+
+    def test_model_name_is_case_insensitive(self, sample_orders, enforce_rls):
+        """The model name matches in any case, as ``apps.get_model()`` resolves it."""
+        with self._settings("test_app.order"):
+            assert list(Order.objects.all()) == []
+        with self._settings("test_app.ORDER"):
+            assert list(Order.objects.all()) == []
+
+    def test_app_label_must_match_exactly(self, sample_orders):
+        """The app label is not lower-cased: ``apps.get_model()`` does not either."""
+        with (
+            self._settings("Test_App.Order"),
+            pytest.raises(NoTenantContextError, match="strict mode"),
+        ):
+            list(Order.objects.all())
+
+    def test_malformed_label_matches_nothing(self, sample_orders):
+        """A label without a dot exempts nothing (check W015 reports it)."""
+        with self._settings("Order"), pytest.raises(NoTenantContextError, match="strict mode"):
+            list(Order.objects.all())
+
+    def test_change_of_setting_takes_effect(self, sample_orders, enforce_rls):
+        """The normalized labels follow the setting, not the first read."""
+        with self._settings("test_app.Order"):
+            assert list(Order.objects.all()) == []
+        with self._settings("test_app.OrderItem"), pytest.raises(NoTenantContextError):
+            list(Order.objects.all())
+
+    def test_context_still_scopes_an_excluded_model(self, sample_orders, tenant_a):
+        """Inside a context the auto-scope filter applies to an excluded model as before."""
+        with self._settings("test_app.Order"), tenant_context(tenant_a.pk):
+            products = sorted(Order.objects.values_list("product", flat=True))
+        assert products == ["Widget A1", "Widget A2"]
+
+    def test_for_user_still_scopes_an_excluded_model(
+        self, sample_orders, tenant_a_user, enforce_rls
+    ):
+        """``for_user()`` applies the user's context to an excluded model as before."""
+        with self._settings("test_app.Order"):
+            qs = Order.objects.for_user(tenant_a_user)
+            assert sorted(qs.values_list("product", flat=True)) == ["Widget A1", "Widget A2"]
+
+    def test_async_query_on_excluded_model(self, sample_orders, enforce_rls):
+        """The async ORM reaches the same check."""
+
+        async def count():
+            return await Order.objects.acount()
+
+        with self._settings("test_app.Order"):
+            assert async_to_sync(count)() == 0
+
+    def test_bypass_flag_read_needs_the_exclusion(self, sample_protected_users, enforce_rls):
+        """A read under an ``extra_bypass_flags`` flag (a login lookup) sets no context.
+
+        Without the exclusion strict mode rejects it; with it, the policy lets
+        the flagged read through.
+        """
+        with (
+            _strict_settings(),
+            bypass_flag("rls.is_login_request"),
+            pytest.raises(NoTenantContextError, match="ProtectedUser"),
+        ):
+            ProtectedUser.objects.get(email="alice@a.com")
+        with self._settings("test_app.ProtectedUser"):
+            with bypass_flag("rls.is_login_request"):
+                user = ProtectedUser.objects.get(email="alice@a.com")
+            assert user == sample_protected_users["a"]
+            assert list(ProtectedUser.objects.all()) == []  # without the flag: no rows
+
+    def test_proxy_follows_its_concrete_model(self):
+        """A proxy is exempt when its concrete model is listed, not the other way round."""
+        with isolate_apps("tests.test_app"):
+
+            class OrderProxy(Order):
+                class Meta:
+                    proxy = True
+                    app_label = "test_app"
+
+            with self._settings("test_app.Order"):
+                assert _is_strict_mode_excluded(OrderProxy) is True
+            with self._settings("test_app.OrderProxy"):
+                assert _is_strict_mode_excluded(OrderProxy) is True
+                assert _is_strict_mode_excluded(Order) is False
+
+    def test_empty_list_excludes_nothing(self):
+        """The default excludes nothing."""
+        with self._settings():
+            assert _is_strict_mode_excluded(Order) is False
 
 
 class TestStrictModeContextVarLifecycle:

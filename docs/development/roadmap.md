@@ -341,8 +341,15 @@ First-class support for the most popular Django API framework.
   the database level, but ORM filters enable composite index usage and make
   the isolation visible in query logs.
 
-- [ ] **Granular strict mode** — `STRICT_MODE_EXCLUDE` setting to exempt
-  specific models (e.g., shared lookup tables) from strict mode checks.
+- [ ] **Granular strict mode** — `RLS_TENANTS["STRICT_MODE_EXCLUDE"]`, a list
+  of `"app_label.ModelName"` labels that strict mode does not guard (a proxy
+  follows its concrete model), with system check `W015` for an entry that names
+  no installed RLS-protected model. Only the strict-mode check is skipped: the
+  RLS policies, the auto-scope filter and `for_user()` are unchanged, so a
+  listed model with no context still fails closed at the database. The main
+  case is a user model read under `bypass_flag()` in an authentication backend,
+  which sets a GUC but establishes no context. Models without an
+  `RLSConstraint` (shared lookup tables) are never guarded and need no entry.
   *Why:* Current strict mode is all-or-nothing, which forces workarounds for
   legitimately unscoped models.
 

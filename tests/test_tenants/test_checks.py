@@ -25,6 +25,7 @@ from django_rls_tenants.tenants.checks import (
     _check_guc_prefix_mismatch,
     _check_policy_guc_defaults,
     _check_pool_without_reset,
+    _check_strict_mode_exclude,
     _check_superuser_connection,
     _check_tenant_fk_field_exists,
     _check_tenant_model_resolves,
@@ -97,6 +98,7 @@ class TestCheckRlsConfig:
         "_check_tenant_model_resolves",
         "_check_tenant_fk_field_exists",
         "_check_unique_across_tenants",
+        "_check_strict_mode_exclude",
     )
 
     def test_aggregates_every_helper(self):
@@ -168,6 +170,25 @@ class TestCheckRlsConfig:
         ):
             warnings = check_rls_config()
         assert [w.id for w in warnings] == ["django_rls_tenants.W012"]
+
+    def test_w015_surfaces_from_real_config(self):
+        """A STRICT_MODE_EXCLUDE label that names no model reaches the result as W015."""
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "STRICT_MODE_EXCLUDE": ["test_app.Order", "test_app.Nope"],
+                    "UNIQUE_ACROSS_TENANTS": _TEST_APP_ALLOWLIST,
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+            patch(
+                "django_rls_tenants.tenants.checks._check_superuser_connection",
+                return_value=[],
+            ),
+        ):
+            warnings = check_rls_config()
+        assert [w.id for w in warnings] == ["django_rls_tenants.W015"]
 
     def test_w010_surfaces_from_real_config(self):
         """A pooled alias without a reset reaches the aggregated result as W010."""
@@ -1134,6 +1155,80 @@ class TestCheckTenantModelResolves:
         ):
             warnings = _check_tenant_model_resolves()
         assert warnings == []
+
+
+def _w015(labels):
+    """Run the W015 check with ``labels`` as STRICT_MODE_EXCLUDE."""
+    with (
+        override_settings(
+            RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant", "STRICT_MODE_EXCLUDE": labels},
+        ),
+        patch(_CONF_PATCH, RLSTenantsConfig()),
+    ):
+        return _check_strict_mode_exclude()
+
+
+class TestCheckStrictModeExclude:
+    """Tests for _check_strict_mode_exclude (W015)."""
+
+    def test_no_warning_when_unset(self):
+        """No W015 with the default (empty) list."""
+        assert _w015([]) == []
+
+    def test_no_warning_for_protected_models(self):
+        """RLS-protected models, the model name in any case, pass."""
+        assert _w015(["test_app.Order", "test_app.protecteduser", "test_app.ORDERITEM"]) == []
+
+    @pytest.mark.parametrize(
+        "label",
+        ["test_app.Nope", "nope_app.Order", "Order", "test_app.Order.extra"],
+        ids=["unknown_model", "unknown_app", "no_dot", "two_dots"],
+    )
+    def test_w015_unresolvable_label(self, label):
+        """A label that does not resolve to an installed model fires W015 naming it."""
+        warnings = _w015([label])
+        assert [w.id for w in warnings] == ["django_rls_tenants.W015"]
+        assert isinstance(warnings[0], CheckWarning)
+        assert f"lists {label!r}, which does not resolve to an installed model" in warnings[0].msg
+
+    def test_w015_model_without_rls_constraint(self):
+        """A model strict mode never guards (the tenant model) fires W015: the entry is a no-op."""
+        warnings = _w015(["test_app.Tenant"])
+        assert [w.id for w in warnings] == ["django_rls_tenants.W015"]
+        assert "without an RLSConstraint" in warnings[0].msg
+        assert "has no effect" in warnings[0].msg
+
+    def test_one_warning_per_bad_label(self):
+        """Each bad label gets its own W015; good ones none."""
+        warnings = _w015(["test_app.Nope", "test_app.Order", "test_app.Tenant"])
+        assert [w.id for w in warnings] == ["django_rls_tenants.W015"] * 2
+
+    def test_runs_without_strict_mode(self):
+        """The list is checked whether or not STRICT_MODE is on (it is off in tests)."""
+        with override_settings(
+            RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant", "STRICT_MODE": False},
+        ):
+            assert _w015(["test_app.Nope"])[0].id == "django_rls_tenants.W015"
+
+    @pytest.mark.usefixtures("isolated_apps")
+    def test_concrete_model_of_a_protected_proxy_passes(self):
+        """A model whose proxy carries the RLSConstraint is guarded through that proxy."""
+        plain = type(
+            "Plain",
+            (models.Model,),
+            {"__module__": __name__, "Meta": type("Meta", (), {"app_label": "test_app"})},
+        )
+        proxy_meta = type(
+            "Meta",
+            (RLSProtectedModel.Meta,),
+            {"app_label": "test_app", "proxy": True},
+        )
+        proxy = type("PlainProxy", (plain,), {"__module__": __name__, "Meta": proxy_meta})
+        with (
+            patch.object(apps, "get_models", return_value=[plain, proxy]),
+            patch.object(apps, "get_model", return_value=plain),
+        ):
+            assert _w015(["test_app.Plain"]) == []
 
 
 class TestCheckTenantFkFieldExists:

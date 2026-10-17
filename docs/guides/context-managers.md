@@ -502,6 +502,12 @@ user argument is provided, so decorated functions pass the strict mode check (fo
 `async_tenant_context()` and `async_admin_context()` set the flag in the coroutine, so the
 async ORM passes the check inside them too (see [Async Code](#async-code)).
 
+A model that is meant to be read without a context, such as the user model in an
+authentication backend that uses `bypass_flag()` (which sets a GUC but establishes no
+context), can be listed in `RLS_TENANTS["STRICT_MODE_EXCLUDE"]`. That removes only the
+strict-mode check; the database still returns only what the policy allows. See
+[`STRICT_MODE_EXCLUDE`](../getting-started/configuration.md#strict_mode_exclude).
+
 See [Configuration](../getting-started/configuration.md#strict_mode) for setup
 instructions.
 
