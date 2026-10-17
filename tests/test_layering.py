@@ -83,6 +83,13 @@ class TestLazyImports:
 
         assert RLSProtectedModel is models_mod.RLSProtectedModel
 
+    def test_validate_cross_tenant_fks(self):
+        """validate_cross_tenant_fks is importable from the top-level package."""
+        from django_rls_tenants import validate_cross_tenant_fks  # noqa: PLC0415
+        from django_rls_tenants.tenants import models as models_mod  # noqa: PLC0415
+
+        assert validate_cross_tenant_fks is models_mod.validate_cross_tenant_fks
+
     def test_context_managers(self):
         """Context managers are importable from the top-level package."""
         from django_rls_tenants import (  # noqa: PLC0415

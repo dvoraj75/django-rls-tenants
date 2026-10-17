@@ -282,3 +282,28 @@ class OrderShipment(RLSProtectedModel):
 
     class Meta(RLSProtectedModel.Meta):
         db_table = "test_order_shipment"
+
+
+class OrderProxy(Order):
+    """Proxy of ``Order``: it has no constraints of its own."""
+
+    class Meta:
+        proxy = True
+
+
+class Assignment(RLSProtectedModel):
+    """RLS-protected model for the cross-tenant foreign key validation tests (#107).
+
+    - ``assignee``: a model whose tenant is nullable. An assignee with no
+      tenant (a cross-tenant admin row of ``ProtectedUser``) is invisible to
+      every tenant, so it counts as another tenant's row.
+    - ``order``: a proxy of an RLS-protected model, checked as its concrete
+      model.
+    """
+
+    assignee = models.ForeignKey(ProtectedUser, on_delete=models.CASCADE, null=True, blank=True)
+    order = models.ForeignKey(OrderProxy, on_delete=models.CASCADE, null=True, blank=True)
+    title = models.CharField(max_length=100)
+
+    class Meta(RLSProtectedModel.Meta):
+        db_table = "test_assignment"

@@ -23,6 +23,7 @@ from django_rls_tenants import (
     current_tenant_value_sql,
     safe_tenant_sql,
     tenant_context,
+    validate_cross_tenant_fks,
     with_rls_context,
 )
 ```
@@ -116,6 +117,8 @@ Django multitenancy built on top of the `rls/` primitives.
 ### Models
 
 ::: django_rls_tenants.tenants.models.RLSProtectedModel
+
+::: django_rls_tenants.tenants.models.validate_cross_tenant_fks
 
 ### Managers
 

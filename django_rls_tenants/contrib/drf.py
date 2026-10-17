@@ -18,7 +18,8 @@ where DRF knows the user:
   and an object of another tenant.
 - :class:`RLSTenantSerializerMixin` / :class:`RLSTenantModelSerializer` -- a
   ``ModelSerializer`` that hides the tenant foreign key and fills it from the
-  active context; :class:`CurrentTenantDefault` is its field default.
+  active context, and rejects a foreign key to another tenant's row;
+  :class:`CurrentTenantDefault` is its field default.
 
 There is deliberately no authentication class that sets the context: DRF never
 calls an authenticator back when the request ends, so it could not exit the
@@ -41,8 +42,10 @@ from typing import TYPE_CHECKING, Any
 # be circular. It is imported where it is used.
 try:
     from rest_framework import serializers
-    from rest_framework.exceptions import PermissionDenied
+    from rest_framework.exceptions import ErrorDetail, PermissionDenied
+    from rest_framework.fields import empty
     from rest_framework.permissions import BasePermission
+    from rest_framework.settings import api_settings
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
     msg = (
         "django_rls_tenants.contrib.drf requires Django REST Framework. "
@@ -53,7 +56,9 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 from django.apps import apps
 from django.core.exceptions import FieldDoesNotExist
 from django.db import connections
+from django.db.models import Model
 from django.template.response import SimpleTemplateResponse
+from django.utils.encoding import smart_str
 
 from django_rls_tenants.exceptions import NoTenantContextError, RLSConfigurationError
 from django_rls_tenants.tenants.conf import rls_tenants_config
@@ -70,7 +75,7 @@ from django_rls_tenants.tenants.state import (
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
 
-    from django.db.models import Model
+    from django.db.models import ForeignKey
     from django.http import HttpRequest
     from django.http.response import HttpResponseBase
     from rest_framework.request import Request
@@ -381,6 +386,12 @@ class RLSTenantSerializerMixin(_ModelSerializerBase):
 
     The fields are built on first access, inside the view, so the context the
     serializer sees is the request's.
+
+    ``validate()`` then rejects a foreign key to a row of another tenant, which
+    ``ModelSerializer`` never checks (it does not call ``full_clean()``); see
+    :func:`~django_rls_tenants.tenants.models.validate_cross_tenant_fks`. It
+    checks the foreign keys the data writes, against the tenant the row will
+    have, and every foreign key of an object the data moves to another tenant.
     """
 
     def get_fields(self) -> dict[str, serializers.Field[Any, Any, Any, Any]]:
@@ -401,6 +412,147 @@ class RLSTenantSerializerMixin(_ModelSerializerBase):
         }
         fields[tenant_fk.name] = serializers.HiddenField(default=CurrentTenantDefault())
         return fields
+
+    def to_internal_value(self, data: Any) -> Any:
+        """Convert ``data``, keeping it for the errors of :meth:`validate`.
+
+        Not ``initial_data``: a ``many=True`` child serializer has none.
+        """
+        self._rls_data = data
+        return super().to_internal_value(data)
+
+    def validate(self, attrs: Any) -> Any:
+        """Validate, then reject a foreign key to a row of another tenant.
+
+        The row's tenant is the one the data writes, else the object's. Each
+        foreign key to an RLS-protected model that the data writes is checked
+        against it, and every such foreign key of the object when the data
+        moves it to another tenant. A target's tenant is read in
+        ``admin_context()``, one query per foreign key.
+
+        The error is the one the serializer field gives an object that does
+        not exist (``does_not_exist`` of a primary key, slug or hyperlink
+        field, else the model field's ``invalid`` message), so it does not
+        reveal that the row exists in another tenant.
+
+        Raises:
+            rest_framework.serializers.ValidationError: Keyed by serializer
+                field name (``non_field_errors`` for a foreign key the
+                serializer has no writable field for).
+        """
+        from django_rls_tenants.tenants.models import (  # noqa: PLC0415  -- needs the app registry
+            _checked_foreign_keys,
+            _foreign_keys_of_other_tenants,
+        )
+
+        attrs = super().validate(attrs)
+        checked = _checked_foreign_keys(self.Meta.model)
+        if checked is None:
+            return attrs
+        tenant_field, foreign_keys = checked
+        instance = self.instance if isinstance(self.instance, self.Meta.model) else None
+        tenant_written, tenant_id = _written_value(attrs, tenant_field)
+        if not tenant_written and instance is not None:
+            tenant_id = getattr(instance, tenant_field.attname)
+        # The values passed the serializer fields; DRF reports a to_python() error.
+        tenant_id = tenant_field.to_python(tenant_id)
+        if tenant_id is None:
+            return attrs
+        moved = (
+            tenant_written
+            and instance is not None
+            and tenant_id != getattr(instance, tenant_field.attname)
+        )
+        targets: dict[ForeignKey[Any, Any], Any] = {}
+        for field in foreign_keys:
+            written, value = _written_value(attrs, field)
+            if not written:
+                if not moved:
+                    continue
+                value = getattr(instance, field.attname)
+            value = field.to_python(value)
+            if value is not None:
+                targets[field] = value
+        if not targets:
+            return attrs
+        mismatched = _foreign_keys_of_other_tenants(tenant_id, targets, instance=instance)
+        if mismatched:
+            sources = {
+                declared.source: name
+                for name, declared in self.fields.items()
+                if not declared.read_only
+            }
+            errors: dict[str, list[ErrorDetail]] = {}
+            for field in mismatched:
+                name = sources.get(field.name) or sources.get(field.attname)
+                key = api_settings.NON_FIELD_ERRORS_KEY if name is None else name
+                serializer_field = None if name is None else self.fields[name]
+                sent = (
+                    empty
+                    if serializer_field is None
+                    else serializer_field.get_value(getattr(self, "_rls_data", {}))
+                )
+                errors.setdefault(key, []).extend(
+                    _does_not_exist(serializer_field, field, targets[field], sent),
+                )
+            raise serializers.ValidationError(errors)
+        return attrs
+
+
+def _written_value(attrs: Any, field: ForeignKey[Any, Any]) -> tuple[bool, Any]:
+    """Return whether ``attrs`` writes ``field``, and the ``attname`` value it writes.
+
+    A value that is not an object (the data of a nested serializer, which a
+    custom ``create()`` turns into a new row) is not a write of the field.
+    """
+    if field.name in attrs:
+        related = attrs[field.name]
+        if related is None:
+            return True, None
+        if not isinstance(related, Model):
+            return False, None
+        return True, getattr(related, field.target_field.attname)
+    if field.attname in attrs:
+        return True, attrs[field.attname]
+    return False, None
+
+
+def _does_not_exist(
+    serializer_field: serializers.Field[Any, Any, Any, Any] | None,
+    field: ForeignKey[Any, Any],
+    value: Any,
+    sent: Any = empty,
+) -> list[ErrorDetail]:
+    """Return the error ``serializer_field`` gives a target that does not exist.
+
+    The message shows what the client sent, as DRF's does: the target's own
+    primary key or slug would differ for input such as ``"03"``, and tell the
+    client that the row exists.
+
+    Args:
+        serializer_field: The serializer field that writes ``field``, if any.
+        field: The model's foreign key.
+        value: The ``attname`` value the foreign key holds.
+        sent: The field's value in the request data (``empty``: not sent, as
+            for an object the data moves to another tenant).
+    """
+    from django_rls_tenants.tenants.models import _invalid_target  # noqa: PLC0415
+
+    if isinstance(serializer_field, serializers.HyperlinkedRelatedField):
+        shown: Any = value  # its message has no placeholder
+    elif isinstance(serializer_field, serializers.PrimaryKeyRelatedField):
+        shown = value if sent is empty else sent
+    elif isinstance(serializer_field, serializers.SlugRelatedField) and sent is not empty:
+        shown = smart_str(sent)
+    else:
+        return [ErrorDetail(_invalid_target(field, value).messages[0], code="invalid")]
+    # As Field.fail() formats it; str.format() ignores the unused keywords.
+    message = serializer_field.error_messages["does_not_exist"].format(
+        pk_value=shown,
+        slug_name=getattr(serializer_field, "slug_field", None),
+        value=shown,
+    )
+    return [ErrorDetail(message, code="does_not_exist")]
 
 
 class RLSTenantModelSerializer(RLSTenantSerializerMixin, serializers.ModelSerializer):  # type: ignore[type-arg]

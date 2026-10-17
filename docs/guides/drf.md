@@ -263,6 +263,33 @@ In the **admin context** the serializer is left as declared. List the field in
 [`RLSTenantModelAdmin`](admin.md)); leave it out and an admin create has no tenant to
 write. A model without the tenant field is left alone.
 
+#### Foreign keys to another tenant's rows
+
+A `ModelSerializer` never calls `full_clean()`, so `validate()` of the mixin runs the
+check that `RLSProtectedModel.clean_fields()` runs on forms
+([Cross-Tenant Foreign Keys](protecting-models.md#cross-tenant-foreign-keys)). The row's
+tenant is the one the data writes (the hidden field's context value, or the tenant an
+admin chooses), else the instance's. Each foreign key to an RLS-protected model that the
+data writes must point at a row of that tenant, and so must every such foreign key of an
+instance the data moves to another tenant (an admin's partial update of just `tenant`).
+Otherwise the response is a `400` keyed by the serializer field (`non_field_errors` if the
+serializer has no writable field for that foreign key), with the field's own "does not
+exist" error, for example `Invalid pk "5" - object does not exist.` for a
+`PrimaryKeyRelatedField` (code `does_not_exist`; `SlugRelatedField` and
+`HyperlinkedRelatedField` likewise), else the model field's `invalid` message. It reads like
+a missing row on purpose, so it does not reveal that the id exists in another tenant.
+
+This matters when a field is declared as `PrimaryKeyRelatedField(queryset=Order.objects.all())`
+at class level: that queryset is built at import time with no context, so it gets no tenant
+filter, and only RLS on a plain database role would hide other tenants' rows. The check
+holds on a superuser or `BYPASSRLS` connection too. It costs one small query per checked
+foreign key; an update that writes neither the tenant nor a foreign key runs none.
+
+The error shows the value the client sent, as DRF's own does. The data of a nested
+serializer (a new object that a custom `create()` makes) is not a foreign key write and is
+not checked. A serializer that overrides `validate()` must call `super().validate(attrs)`
+and return its result, or the check is lost.
+
 The fields are built on first access, inside the view, so the context a serializer
 sees is the request's. Construct a serializer outside a request (in a shell or a
 test) inside `tenant_context()`.
@@ -387,7 +414,8 @@ exactly the leak the library exists to prevent. The mixin owns both the entry
 - The tenant foreign key is the one named by `RLS_TENANTS["TENANT_FK_FIELD"]`, and
   `CurrentTenantDefault` expects it to reference the tenant's primary key.
 - DRF's `ModelSerializer` does not call `Model.full_clean()`, so model validators
-  and `clean()` do not run on API writes (see [Security](../advanced/security.md)).
+  and `clean()` do not run on API writes (see [Security](../advanced/security.md)). The
+  cross-tenant foreign key check is the exception: the serializer mixin runs it itself.
   Use serializer validators, or call `full_clean()` yourself in `perform_create()`.
 - Only DRF code is covered. A plain Django view inside the same project still needs
   `RLSTenantMiddleware`, or an explicit context manager.

@@ -153,6 +153,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uniqueness across tenants is intended, add it to `UNIQUE_ACROSS_TENANTS`; the warning
   stays a warning, so it fails nothing. See
   [Cross-Tenant Unique Constraints](https://dvoraj75.github.io/django-rls-tenants/advanced/security/#cross-tenant-unique-constraints).
+- **`validate_cross_tenant_fks()`: a check for foreign keys that point at another tenant's
+  row** (#107). RLS cannot stop a row of tenant A from holding a foreign key to a row of
+  tenant B: the policy checks the row's own tenant column, and PostgreSQL runs
+  referential-integrity checks outside row security. The new helper
+  `validate_cross_tenant_fks(instance, *, exclude=None)` (importable from
+  `django_rls_tenants` and `django_rls_tenants.tenants`) compares, for each concrete
+  `ForeignKey` / `OneToOneField` whose target model has an `RLSConstraint`, the target
+  row's tenant with the instance's **own** tenant field, not with the active context, so
+  an admin editing another tenant's row is not rejected. It reads each target's tenant
+  with one small query inside `admin_context()`, so it works under `STRICT_MODE` and with
+  no context. `RLSProtectedModel.clean_fields()` now calls it, so `full_clean()`,
+  `ModelForm` and the Django admin reject such a foreign key with a field error.
+  `save()`, `objects.create()`, `bulk_create()`, `update()`, `bulk_update()` and raw SQL
+  do not run it: call `validate_cross_tenant_fks(obj)` before a `save()` that no form
+  validated, or add a composite foreign key for a database-level guarantee. A subclass
+  that overrides `clean_fields()` must call `super().clean_fields(exclude)`. The error is
+  the one Django gives a row that does not exist ("order instance with id 5 is not a valid
+  choice."), on purpose: a distinct message would tell a tenant user that the id exists in
+  another tenant. A target without a tenant (`NULL`) counts as another tenant's row. The
+  tenant field itself, parent links, empty foreign keys and unsaved targets are skipped,
+  and so is every foreign key while the instance has no tenant yet. A foreign key to a
+  proxy of an RLS-protected model is checked as one to its concrete model.
+  **`RLSTenantModelAdmin` sets an implicit tenant (a scoped user's, or the switcher's
+  selection) on the form's object when it builds the form**, not only in `save_model()`,
+  so the check also runs on an add form.
+  **`RLSTenantSerializerMixin` / `RLSTenantModelSerializer` now run the same check in
+  `validate()`**, because a `ModelSerializer` never calls `full_clean()`: a foreign key to
+  an RLS-protected model that the data writes, and every such foreign key of an object an
+  admin moves to another tenant, must point at a row of the tenant the row will have, or
+  the request gets a `400` keyed by the serializer field, with that field's own "does not
+  exist" error. This matters most for a `PrimaryKeyRelatedField(queryset=Order.objects.all())`
+  declared at class level, whose queryset is built at import time with no tenant filter. A
+  write that touches neither the tenant nor a foreign key runs no extra query. **A write
+  that used to be accepted on a superuser or `BYPASSRLS` connection (or in the admin
+  context) with a foreign key to another tenant's row now fails validation.** See
+  [Cross-Tenant Foreign Keys](https://dvoraj75.github.io/django-rls-tenants/guides/protecting-models/#cross-tenant-foreign-keys).
 
 ### Changed
 
@@ -269,6 +305,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RLS-protected model shares its table, and `check_rls` reported that table under the
   proxy's name. It now reports the concrete model, so the `How to fix:` line reads that
   model's `Meta` and migrations (a proxy's `Meta` holds no `RLSConstraint`).
+- **A proxy of an `RLSProtectedModel` can be defined** (found while working on #107).
+  The `class_prepared` handler added a tenant foreign key to the proxy too, which fails
+  `models.E017` ("Proxy model contains model fields"). A proxy now uses its concrete
+  model's tenant field and table policy: `STRICT_MODE`, the `prefetch_related()` tenant
+  filter and the cross-tenant foreign key check treat it as RLS-protected, and `W009`
+  reports the concrete model only (as `check_rls` does, above).
 
 ## [1.4.0] - 2026-10-16
 

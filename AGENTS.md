@@ -215,6 +215,33 @@ the inherited list). `W015` (#45, `_check_strict_mode_exclude()` in `tenants/che
 warns about a `RLS_TENANTS["STRICT_MODE_EXCLUDE"]` label that does not resolve to an installed
 model or names one without an `RLSConstraint`; it runs whether or not `STRICT_MODE` is on.
 
+Cross-tenant foreign keys (#107): RLS cannot stop a row of tenant A from holding a foreign
+key to a row of tenant B (the policy checks the row's own tenant column; PostgreSQL runs
+referential-integrity checks outside row security). `tenants/models.py` holds the check:
+`validate_cross_tenant_fks()` (public; exported from the package root and `tenants/`),
+`_checked_foreign_keys()` (the tenant field and the concrete forward FKs / one-to-one
+fields whose target has an `RLSConstraint`, minus the tenant FK and parent links),
+`_foreign_keys_of_other_tenants()` (one `values_list()` per FK inside `admin_context()` on
+the router's read alias; a missing or `NULL`-tenant target counts as another tenant's) and
+`_invalid_target()`. It compares with the instance's own tenant value, not the active
+context, and skips everything while the instance has no tenant; `RLSTenantModelAdmin.get_form()`
+therefore sets an implicit tenant on the form's instance when the form is built (as
+`save_model()` does), so add forms are checked. `_tenant_field()` reads a proxy's concrete
+model (a proxy has no constraints). Proxies of an `RLSProtectedModel`: `_add_tenant_fk()`
+skips them, `_rls_model_cache()` includes them (via the concrete model's constraints), and
+`W009` / `check_rls` skip them (the concrete model is reported). `RLSProtectedModel.clean_fields()` calls it, not `clean()`:
+a `clean()` error keyed by a field a `ModelForm` lacks would be a `ValueError`, while
+`clean_fields(exclude)` skips what the form skips. `save()`, `create()`, bulk writes and raw
+SQL do not run it. `contrib/drf.py` `RLSTenantSerializerMixin.validate()` reuses the helpers
+through a function-level import (`tenants/` needs the app registry) because `ModelSerializer`
+never calls `full_clean()`. The error is always the one Django gives a missing row (the FK's
+`invalid` message, or the serializer field's `does_not_exist`): a distinct "belongs to
+another tenant" message would be an existence oracle, like the one `W012` is about. The test
+model `Assignment` (`tests/test_app/models.py`, migration `0009_assignment.py`; an FK to
+`ProtectedUser`, whose tenant is nullable, and one to the proxy `OrderProxy`) covers the
+`NULL`-tenant rule and proxies. The DRF error echoes the value the client sent
+(`to_internal_value()` keeps the data), never the target's own pk or slug.
+
 When modifying middleware or GUC-related code, ensure all database iteration
 uses `conf.DATABASES` rather than hardcoding `"default"`.
 

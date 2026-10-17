@@ -109,7 +109,7 @@ def _is_rls_protected(model: type[models.Model]) -> bool:
 
 @lru_cache(maxsize=1)
 def _rls_model_cache() -> frozenset[type[models.Model]]:
-    """Build a cached set of all RLS-protected models.
+    """Build a cached set of all RLS-protected models, proxies of them included.
 
     Called lazily after Django's app registry is ready. The result is
     cached for the lifetime of the process (model set doesn't change).
@@ -133,7 +133,9 @@ def _rls_model_cache() -> frozenset[type[models.Model]]:
 
     protected: set[type[models.Model]] = set()
     for model in apps.get_models():
-        if any(isinstance(c, RLSConstraint) for c in model._meta.constraints):  # noqa: SLF001
+        # A proxy has no constraints of its own; its table is its concrete model's.
+        concrete = model._meta.concrete_model or model  # noqa: SLF001
+        if any(isinstance(c, RLSConstraint) for c in concrete._meta.constraints):  # noqa: SLF001
             protected.add(model)
     return frozenset(protected)
 

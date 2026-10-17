@@ -99,6 +99,18 @@ tenant a new record belongs to.
 `save_model()` stamps the effective tenant onto new objects, so an auto-hidden
 FK is always populated correctly.
 
+## Cross-tenant foreign keys
+
+Admin forms call `full_clean()`, so `RLSProtectedModel`'s foreign key check runs: a
+cross-tenant admin who picks a foreign key (an `Order`'s customer) from another tenant
+than the row's gets a form error on that field, worded like a missing choice. When the
+tenant is implicit (a scoped user, or an admin with a tenant selected in the switcher), the
+form sets it on the object it validates, so an add form is checked too; the foreign key
+dropdowns of such a form list only that tenant's rows anyway, unless you replace their
+queryset (`formfield_for_foreignkey()` with the base manager, say). A foreign key the form
+does not show is not checked. See
+[Cross-Tenant Foreign Keys](protecting-models.md#cross-tenant-foreign-keys).
+
 ## The tenant switcher
 
 Cross-tenant admins (`is_tenant_admin=True`) get a **tenant switcher** rendered

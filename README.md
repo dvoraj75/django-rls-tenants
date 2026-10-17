@@ -43,6 +43,10 @@ returns zero rows, never leaked data.
   related dropdowns to the current tenant, with a tenant switcher for cross-tenant
   admins.
   [Admin guide →](https://dvoraj75.github.io/django-rls-tenants/guides/admin/)
+- **Cross-tenant foreign key validation** -- `full_clean()`, forms, the admin and DRF
+  serializers reject a foreign key to another tenant's row, which RLS cannot catch;
+  `validate_cross_tenant_fks()` covers service code.
+  [Guide →](https://dvoraj75.github.io/django-rls-tenants/guides/protecting-models/#cross-tenant-foreign-keys)
 - **Native Celery integration** -- `@rls_task` carries the active tenant context from
   enqueue to worker, including across chains, groups, and chords
   (`pip install "django-rls-tenants[celery]"`).

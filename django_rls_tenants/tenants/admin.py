@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from django.contrib.admin.options import _FieldOpts, _FieldsetSpec
     from django.contrib.admin.views.main import ChangeList
     from django.db.models import Model
+    from django.forms import ModelForm
     from django.http import HttpRequest, HttpResponse
     from django.utils.datastructures import _ListOrTuple
 
@@ -393,6 +394,37 @@ class RLSTenantModelAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
             return fieldsets
         return _fieldsets_without(fieldsets, rls_tenants_config.TENANT_FK_FIELD)
 
+    def get_form(
+        self,
+        request: HttpRequest,
+        obj: Model | None = None,
+        change: bool = False,
+        **kwargs: Any,
+    ) -> type[ModelForm[Any]]:
+        """Return the form class; it stamps an implicit tenant on its instance.
+
+        When the tenant FK is hidden (implicit tenant), the instance of an add
+        form has no tenant while the form validates, so ``full_clean()`` could
+        not compare the foreign keys' targets with it
+        (:func:`~django_rls_tenants.tenants.models.validate_cross_tenant_fks`).
+        The form sets it on its instance when it is built, as
+        :meth:`save_model` does before saving.
+        """
+        form = super().get_form(request, obj, change, **kwargs)
+        tenant_id = self._effective_tenant_id(request)
+        if tenant_id is None:
+            return form
+        stamp = self._stamp_tenant
+        selected: int | str = tenant_id  # narrowed for the class body
+
+        class TenantStampedForm(form):  # type: ignore[valid-type,misc]  # a form class built at runtime
+            def __init__(self, *args: Any, **form_kwargs: Any) -> None:
+                super().__init__(*args, **form_kwargs)
+                stamp(self.instance, selected)
+
+        TenantStampedForm.__name__ = TenantStampedForm.__qualname__ = form.__name__
+        return TenantStampedForm
+
     def save_model(
         self,
         request: HttpRequest,
@@ -408,13 +440,17 @@ class RLSTenantModelAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
         """
         tenant_id = self._effective_tenant_id(request)
         if tenant_id is not None:
-            # The switcher persists its selection as a session string; normalise it
-            # to the tenant pk's Python type (int/UUID) via the FK's target field so
-            # pre_save signal handlers see the column's real type, not a bare str.
-            fk = self.model._meta.get_field(rls_tenants_config.TENANT_FK_FIELD)  # noqa: SLF001
-            target = fk.target_field  # the Tenant pk field the FK points at
-            setattr(obj, fk.attname, target.to_python(tenant_id))
+            self._stamp_tenant(obj, tenant_id)
         super().save_model(request, obj, form, change)
+
+    def _stamp_tenant(self, obj: Model, tenant_id: int | str) -> None:
+        """Set ``obj``'s tenant FK to ``tenant_id``, converted to the tenant pk's type."""
+        # The switcher persists its selection as a session string; normalise it
+        # to the tenant pk's Python type (int/UUID) via the FK's target field so
+        # pre_save signal handlers see the column's real type, not a bare str.
+        fk = self.model._meta.get_field(rls_tenants_config.TENANT_FK_FIELD)  # noqa: SLF001
+        target = fk.target_field  # the Tenant pk field the FK points at
+        setattr(obj, fk.attname, target.to_python(tenant_id))
 
     def get_list_filter(self, request: HttpRequest) -> list[Any]:
         """Prepend the tenant switcher for switch-capable admins."""

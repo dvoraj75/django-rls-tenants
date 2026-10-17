@@ -56,6 +56,7 @@ from tests.test_app.models import (
     OrderItem,
     OrderNote,
     OrderNoteAttachment,
+    OrderProxy,
     OrderShipment,
     Project,
     ProtectedUser,
@@ -306,6 +307,10 @@ class TestIsRlsProtected:
     def test_tenant_is_not_protected(self):
         """Tenant model (plain model) is not RLS-protected."""
         assert _is_rls_protected(Tenant) is False
+
+    def test_proxy_of_protected_model(self):
+        """A proxy has no constraints of its own; it reads its concrete model's table."""
+        assert _is_rls_protected(OrderProxy) is True
 
 
 class TestPrepareTenantInModelData:
@@ -1082,6 +1087,12 @@ class TestStrictModeRaises:
         qs = Order.objects.all()
         with pytest.raises(NoTenantContextError, match="strict mode"):
             list(qs)
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_proxy_raises(self, sample_orders):
+        """A proxy of a protected model is guarded too."""
+        with pytest.raises(NoTenantContextError, match="strict mode"):
+            list(OrderProxy.objects.all())
 
     @pytest.mark.usefixtures("_strict_mode")
     def test_count_raises(self, sample_orders):
