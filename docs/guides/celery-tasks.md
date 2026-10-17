@@ -182,6 +182,10 @@ def charge_invoices() -> None:
 Enqueued without a context, `charge_invoices` raises `NoTenantContextError`
 (carrying a `Hint:` on how to fix it) instead of running.
 
+*1.6.0+.* The refusal is logged as a `context.denied` [audit record](audit-logging.md)
+(`no_context`, source `celery`). Each propagated context the worker enters logs a
+`context.entered` / `context.exited` pair with source `celery` and no user.
+
 ## Cross-tenant and scheduled tasks
 
 For periodic (beat) tasks that operate across all tenants, enqueue under

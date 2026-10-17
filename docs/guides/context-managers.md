@@ -542,6 +542,11 @@ DEBUG admin_context entered: using=default
 DEBUG admin_context exited: using=default
 ```
 
+*1.6.0+.* For a record of who entered which context, with the code path, the tenant and
+the user, use the [audit log](audit-logging.md): it is separate from these `DEBUG` messages
+and logs at `INFO`. `tenant_context(None)` is logged there as `context.denied`
+(`tenant_id_none`).
+
 ## Multi-Database Support
 
 All context managers accept a `using` parameter for multi-database setups:

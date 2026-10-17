@@ -56,12 +56,14 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 
 from django.apps import apps
 from django.core.exceptions import FieldDoesNotExist
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import connections
 from django.db.models import Model
 from django.template.response import SimpleTemplateResponse
 from django.utils.encoding import smart_str
 
 from django_rls_tenants.exceptions import NoTenantContextError, RLSConfigurationError
+from django_rls_tenants.tenants import audit
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import admin_context, tenant_context
 from django_rls_tenants.tenants.errors import HINT_NO_CONTEXT, HINT_USER_NO_TENANT
@@ -233,6 +235,7 @@ class RLSTenantAPIViewMixin(_APIViewBase):
                 getattr(user, "pk", None),
                 HINT_USER_NO_TENANT,
             )
+            audit.denied("drf", "user_without_tenant", user_id=audit.user_id_of(user))
             raise PermissionDenied(_NO_TENANT_DETAIL)
         if _get_context_gucs() == wanted:
             return None
@@ -250,7 +253,7 @@ class RLSTenantAPIViewMixin(_APIViewBase):
         context = self.get_rls_context(request)
         if context is not None:
             enclosing = _current_live()
-            stack.enter_context(context)
+            stack.enter_context(audit.attributed(context, source="drf", user=request.user))
             self._rls_context_entered = True
             entered = _current_live()
             # A context manager that sets up no RLS context (``nullcontext()``)
@@ -322,28 +325,42 @@ class RLSTenantPermission(BasePermission):
         """Return whether the active RLS context is the view's or the one ``request.user`` implies.
 
         The view's is the tenant context :class:`RLSTenantAPIViewMixin`
-        entered for this request, while it is the active one.
+        entered for this request, while it is the active one. A refusal of an
+        authenticated user is logged as a ``context.denied`` audit record; an
+        unauthenticated request is not (DRF answers it 401).
         """
         user: Any = request.user
         if not _is_authenticated(user):
             return False
         active = _get_context_gucs()
         if active is None:
+            audit.denied("drf", "no_context", user_id=audit.user_id_of(user))
             return False
-        if user.is_tenant_admin:
+        if user.is_tenant_admin or active == _context_gucs_for(user):
             return True
-        if active == ADMIN_GUCS:
-            return False  # the admin bypass is a tenant admin's only
-        if isinstance(view, RLSTenantAPIViewMixin):
+        # The admin bypass is a tenant admin's only.
+        if active != ADMIN_GUCS and isinstance(view, RLSTenantAPIViewMixin):
             entered = view._rls_entered_context  # noqa: SLF001  -- the mixin's per-request state
             if entered is not None and entered is _current_live():
                 return True
-        return active == _context_gucs_for(user)
+        audit.denied(
+            "drf",
+            "context_mismatch",
+            user_id=audit.user_id_of(user),
+            tenant_id=get_current_tenant_id(),
+            admin=active == ADMIN_GUCS,
+        )
+        return False
 
     def has_object_permission(self, request: Request, view: APIView, obj: Any) -> bool:  # noqa: ARG002  -- DRF signature
-        """Return whether ``obj`` belongs to the active tenant (always, in the admin context)."""
+        """Return whether ``obj`` belongs to the active tenant (always, in the admin context).
+
+        A refusal is logged as a ``context.denied`` audit record.
+        """
+        user_id = audit.user_id_of(request.user)
         active = _get_context_gucs()
         if active is None:
+            audit.denied("drf", "no_context", user_id=user_id)
             return False
         if active == ADMIN_GUCS:
             return True
@@ -352,7 +369,17 @@ class RLSTenantPermission(BasePermission):
         except (AttributeError, FieldDoesNotExist):
             return True  # not a tenant-scoped model instance
         value = getattr(obj, field.attname, None)
-        return value is not None and str(value) == active.current_tenant
+        if value is not None and str(value) == active.current_tenant:
+            return True
+        audit.denied(
+            "drf",
+            "object_of_other_tenant",
+            user_id=user_id,
+            tenant_id=get_current_tenant_id(),
+            admin=False,
+            model=obj._meta.label,  # noqa: SLF001
+        )
+        return False
 
 
 class CurrentTenantDefault:
@@ -373,11 +400,19 @@ class CurrentTenantDefault:
 
     requires_context = True
 
-    def __call__(self, serializer_field: serializers.Field[Any, Any, Any, Any]) -> Model:  # noqa: ARG002  -- DRF calls it with the field
+    def __call__(self, serializer_field: serializers.Field[Any, Any, Any, Any]) -> Model:
         """Return the active tenant."""
         tenant_id = get_current_tenant_id()
         if tenant_id is None:
-            state = "the admin context" if get_rls_context_active() else "no RLS context"
+            admin = get_rls_context_active()
+            request = getattr(serializer_field, "context", {}).get("request")
+            audit.denied(
+                "drf",
+                "no_context",
+                user_id=audit.user_id_of(getattr(request, "user", None)),
+                admin=True if admin else None,
+            )
+            state = "the admin context" if admin else "no RLS context"
             msg = (
                 f"CurrentTenantDefault needs a tenant context, but the serializer is "
                 f"validated in {state}."
@@ -450,9 +485,65 @@ class RLSTenantSerializerMixin(_ModelSerializerBase):
         """Convert ``data``, keeping it for the errors of :meth:`validate`.
 
         Not ``initial_data``: a ``many=True`` child serializer has none.
+        A primary key field that failed with ``does_not_exist`` (what it
+        reports for a row of another tenant, which the auto-scope filter and
+        RLS hide) is looked up for the ``fk.cross_tenant_rejected`` audit
+        record; the error is unchanged.
         """
         self._rls_data = data
-        return super().to_internal_value(data)
+        try:
+            return super().to_internal_value(data)
+        except serializers.ValidationError as exc:
+            self._audit_hidden_targets(data, exc.detail)
+            raise
+
+    def _audit_hidden_targets(self, data: Any, detail: Any) -> None:
+        """Log the primary keys ``detail`` reports as not found that exist in another tenant.
+
+        Only inside a tenant context, the only one in which the field's
+        queryset hides another tenant's rows; the row's tenant is then the
+        active one (the tenant field is hidden and filled from it). Only
+        ``PrimaryKeyRelatedField``: a slug or hyperlink is not looked up.
+        """
+        from django_rls_tenants.tenants.models import (  # noqa: PLC0415  -- needs the app registry
+            _audit_rejected_values,
+            _checked_foreign_keys,
+        )
+
+        tenant_id = get_current_tenant_id()
+        if tenant_id is None or not isinstance(detail, dict):
+            return
+        checked = _checked_foreign_keys(self.Meta.model)
+        if checked is None:
+            return
+        by_name = {key: field for field in checked[1] for key in (field.name, field.attname)}
+        values: dict[ForeignKey[Any, Any], Any] = {}
+        for name, errors in detail.items():
+            serializer_field = self.fields.get(name)
+            if not isinstance(serializer_field, serializers.PrimaryKeyRelatedField) or not any(
+                getattr(error, "code", None) == "does_not_exist" for error in errors
+            ):
+                continue
+            field = by_name.get(serializer_field.source or name)
+            if field is None or not field.target_field.primary_key:
+                continue
+            value = serializer_field.get_value(data)
+            if serializer_field.pk_field is not None:
+                try:
+                    value = serializer_field.pk_field.to_internal_value(value)
+                except (DjangoValidationError, serializers.ValidationError, TypeError, ValueError):
+                    continue
+            values[field] = value
+        if values:
+            request = self.context.get("request")
+            _audit_rejected_values(
+                self.Meta.model,
+                tenant_id,
+                values,
+                instance=self.instance if isinstance(self.instance, self.Meta.model) else None,
+                source="drf",
+                user_id=audit.user_id_of(getattr(request, "user", None)),
+            )
 
     def validate(self, attrs: Any) -> Any:
         """Validate, then reject a foreign key to a row of another tenant.
@@ -508,7 +599,15 @@ class RLSTenantSerializerMixin(_ModelSerializerBase):
                 targets[field] = value
         if not targets:
             return attrs
-        mismatched = _foreign_keys_of_other_tenants(tenant_id, targets, instance=instance)
+        request = self.context.get("request")
+        mismatched = _foreign_keys_of_other_tenants(
+            tenant_id,
+            targets,
+            model=self.Meta.model,
+            instance=instance,
+            source="drf",
+            user_id=audit.user_id_of(getattr(request, "user", None)),
+        )
         if mismatched:
             sources = {
                 declared.source: name

@@ -20,7 +20,8 @@ from django.conf import settings
 from django.db import connections, transaction
 from django.utils.module_loading import import_string
 
-from django_rls_tenants.exceptions import RLSConfigurationError
+from django_rls_tenants.exceptions import NoTenantContextError, RLSConfigurationError
+from django_rls_tenants.tenants import audit
 from django_rls_tenants.tenants.affinity import suspect_sessions, write_gucs
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import _context_gucs_of, _resolve_user_guc_vars
@@ -311,12 +312,61 @@ def _clear_request_gucs(conf: RLSTenantsConfig) -> None:
     logger.debug("Middleware cleared GUCs on databases=%s", conf.DATABASES)
 
 
+def _resolve_request_user(user: Any, conf: RLSTenantsConfig) -> dict[str, str]:
+    """Return the GUC values of the request's user; log ``context.denied`` for a tenantless one.
+
+    Raises:
+        NoTenantContextError: If a non-admin user has ``rls_tenant_id=None``.
+    """
+    try:
+        return _resolve_user_guc_vars(user, conf)
+    except NoTenantContextError:
+        audit.denied("middleware", "user_without_tenant", user_id=audit.user_id_of(user))
+        raise
+
+
+class _AuditedContext(NamedTuple):
+    """The request context a ``context.entered`` record was logged for."""
+
+    tenant_id: int | str | None
+    admin: bool
+    user_id: Any
+
+
+def _audit_request_entered(
+    request: HttpRequest,
+    tenant_id: int | str | None,
+    *,
+    admin: bool,
+    user_id: Any,
+) -> None:
+    """Log ``context.entered`` for the request, and remember it for ``_audit_request_exited``."""
+    entered = _AuditedContext(tenant_id, admin, user_id)
+    audit.emit(audit.CONTEXT_ENTERED, source="middleware", **entered._asdict())
+    setattr(request, "_rls_audited_context", entered)  # noqa: B010  -- dynamic attr on HttpRequest
+
+
+def _audit_request_exited(request: HttpRequest) -> None:
+    """Log ``context.exited`` for the request's context, once, if it was entered.
+
+    Called wherever the request's context ends: the cleanup
+    (``process_response``, ``process_exception``, a ``BaseException`` on the
+    sync path) and the end of the native async path.
+    """
+    entered = getattr(request, "_rls_audited_context", None)
+    if not isinstance(entered, _AuditedContext):
+        return
+    setattr(request, "_rls_audited_context", None)  # noqa: B010  -- dynamic attr on HttpRequest
+    audit.emit(audit.CONTEXT_EXITED, source="middleware", **entered._asdict())
+
+
 class _RequestScope(NamedTuple):
     """State of a request whose GUCs the async enter hop has set."""
 
     tenant_id: int | str | None
     gucs: ContextGucs
     thread_marker: _ThreadMarker
+    user_id: Any
 
 
 class RLSTenantMiddleware(MiddlewareMixin):
@@ -490,6 +540,12 @@ class RLSTenantMiddleware(MiddlewareMixin):
         # The hop's thread, not the event loop's, owns the GUCs.
         _mark_gucs_set(scope.thread_marker)
         try:
+            _audit_request_entered(
+                request,
+                scope.tenant_id,
+                admin=scope.tenant_id is None,
+                user_id=scope.user_id,
+            )
             return await self._aget_response(request)
         finally:
             try:
@@ -498,12 +554,16 @@ class RLSTenantMiddleware(MiddlewareMixin):
                 reset_current_tenant_id(tenant_token)
                 reset_rls_context_active(active_token)
             finally:
-                # False when process_exception has already cleared the GUCs. Left
-                # set if the clear fails, so the request_finished safety net can
-                # retry. Runs even if a reset fails, as in _cleanup_rls_state.
-                if _were_gucs_set():
-                    await sync_to_async(_clear_request_gucs, thread_sensitive=True)(conf)
-                    _clear_gucs_set_flag()
+                try:
+                    # False when process_exception has already cleared the GUCs. Left
+                    # set if the clear fails, so the request_finished safety net can
+                    # retry. Runs even if a reset fails, as in _cleanup_rls_state.
+                    if _were_gucs_set():
+                        await sync_to_async(_clear_request_gucs, thread_sensitive=True)(conf)
+                        _clear_gucs_set_flag()
+                finally:
+                    # A no-op when process_exception has already ended the context.
+                    _audit_request_exited(request)
 
     def _enter_request_gucs(
         self,
@@ -530,7 +590,7 @@ class RLSTenantMiddleware(MiddlewareMixin):
             return None
         user: Any = request.user
         try:
-            guc_vars = _resolve_user_guc_vars(user, conf)
+            guc_vars = _resolve_request_user(user, conf)
             self._set_gucs_on_all_databases(guc_vars, conf)
             tenant_id = None if user.is_tenant_admin else user.rls_tenant_id
         except Exception:
@@ -544,7 +604,12 @@ class RLSTenantMiddleware(MiddlewareMixin):
             user.is_tenant_admin,
             getattr(user, "rls_tenant_id", None),
         )
-        return _RequestScope(tenant_id, _context_gucs_of(guc_vars, conf), _current_thread_marker())
+        return _RequestScope(
+            tenant_id,
+            _context_gucs_of(guc_vars, conf),
+            _current_thread_marker(),
+            audit.user_id_of(user),
+        )
 
     async def _aenter_request(
         self,
@@ -636,7 +701,7 @@ class RLSTenantMiddleware(MiddlewareMixin):
         active_token: Token[bool] | None = None
         gucs_token: _ContextGucsToken | None = None
         try:
-            guc_vars = _resolve_user_guc_vars(user, conf)
+            guc_vars = _resolve_request_user(user, conf)
             self._set_gucs_on_all_databases(guc_vars, conf)
             logger.debug(
                 "Middleware set GUCs on databases=%s for user=%s (admin=%s, tenant=%s)",
@@ -667,6 +732,12 @@ class RLSTenantMiddleware(MiddlewareMixin):
             gucs_token = _set_context_gucs(_context_gucs_of(guc_vars, conf), block=False)
             setattr(request, "_rls_context_gucs_token", gucs_token)  # noqa: B010  -- dynamic attr on HttpRequest
             _mark_gucs_set()
+            _audit_request_entered(
+                request,
+                None if user.is_tenant_admin else user.rls_tenant_id,
+                admin=bool(user.is_tenant_admin),
+                user_id=audit.user_id_of(user),
+            )
         except Exception:
             logger.exception("Failed to set RLS GUC variables, clearing to prevent leak")
             # Reset via token when available to avoid stacking unreset
@@ -805,6 +876,9 @@ class RLSTenantMiddleware(MiddlewareMixin):
                     )
                 setattr(request, "_rls_state_reset", True)  # noqa: B010 -- request cleanup marker
         finally:
-            if _were_gucs_set():
-                _clear_request_gucs(rls_tenants_config)
-                _clear_gucs_set_flag()
+            try:
+                if _were_gucs_set():
+                    _clear_request_gucs(rls_tenants_config)
+                    _clear_gucs_set_flag()
+            finally:
+                _audit_request_exited(request)

@@ -48,6 +48,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   messages of `W012` and `W015` now say "RLSConstraint or EXTERNAL_MODELS entry". See
   [W016](https://dvoraj75.github.io/django-rls-tenants/troubleshooting/#w016-an-external_models-entry-cannot-be-used).
 
+- **Audit logging** (#48). The library now logs structured records to a new child logger,
+  `django_rls_tenants.audit`, which Django's `LOGGING` setting turns on and routes (no
+  library setting). Each field is a `LogRecord` attribute prefixed with `rls_`, so a JSON
+  formatter writes it without parsing the message: `rls_event`, `rls_source` (the code path),
+  `rls_tenant_id`, `rls_admin`, `rls_user_id` (the user's primary key only, no other
+  personal data), plus `rls_using`, `rls_reason`, `rls_model`, `rls_fields` or
+  `rls_databases` where they apply. Events: `context.entered` / `context.exited` (`INFO`)
+  for every tenant or admin context, attributed to the middleware (every path), the DRF
+  mixin, the admin, `@with_rls_context`, Celery, `run_as_tenant` / `run_for_all_tenants`, or
+  a context manager called directly; `context.denied` (`WARNING`) for every refusal (a
+  tenantless user in the middleware, DRF, the admin, the decorator or `for_user()`,
+  `tenant_context(None)`, `STRICT_MODE`, `RLSTenantPermission`, `CurrentTenantDefault`, an
+  `RLSTask` with `rls_require_context`); `fk.cross_tenant_rejected` (`WARNING`) when
+  validation rejects a foreign key whose target exists in another tenant (#107), including
+  a target that Django's model validation, an `RLSTenantModelAdmin` form's dropdown or a DRF
+  `PrimaryKeyRelatedField` already rejected as not found because RLS or the auto-scope
+  filter hides it (the target's tenant is then read once in `admin_context()`, in a
+  savepoint, only when the audit logger logs `WARNING`; the error is unchanged, also when
+  that lookup fails); and
+  `gucs.cleared` (`WARNING`)
+  when the `request_finished` safety net clears a context the middleware's cleanup left
+  set. `for_user()` scopes, which run per SQL statement, and the `admin_context()` blocks
+  the library enters for its own lookups are not logged. With no handler configured the
+  `INFO` records are dropped and the `WARNING` ones reach Python's last-resort handler
+  (`stderr`), like the library's other warnings. A record whose filter or handler raises is
+  dropped (the failure is logged on `django_rls_tenants`), and a string value that could
+  forge a field of the plain-text message is quoted. The `DEBUG` messages on the
+  `django_rls_tenants` logger are unchanged. See
+  [Audit Logging](https://dvoraj75.github.io/django-rls-tenants/guides/audit-logging/).
+
 ### Changed
 
 - **`select_related()` and the `prefetch_related()` tenant filter use each joined model's
@@ -71,8 +101,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   newest Django or runs only on the default PostgreSQL, or when a leg names an unsupported
   version. The supported-versions policy in the installation guide now states the driver
   coverage, and says that every listed PostgreSQL major is run.
-### Changed
-
 - **`RLSTenantPermission` accepts the tenant context `get_rls_context()` chose** (#150).
   `has_permission()` let a non-admin user through only in `tenant_context(user.rls_tenant_id)`,
   so a view whose `RLSTenantAPIViewMixin.get_rls_context()` override let a user select one

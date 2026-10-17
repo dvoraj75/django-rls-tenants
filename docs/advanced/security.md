@@ -282,7 +282,8 @@ Mitigations:
   of its async path (ASGI).
 - **Safety net**: `request_finished` signal clears GUCs if `process_response` is skipped,
   on a connection that is still open (with Django's pool the next checkout clears it
-  instead).
+  instead). It logs a `gucs.cleared` [audit record](../guides/audit-logging.md) at
+  `WARNING` when it runs.
 - **Other threads**: with session GUCs, the `connection_created` handler sets the request's
   GUCs on connect only on connections opened on the thread that set them, where the cleanup
   above runs. A
@@ -477,5 +478,8 @@ See [Configuration](../getting-started/configuration.md#strict_mode) for setup, 
    targets through tenant-scoped managers, or add composite FKs. RLS does not check the
    tenant of referenced rows.
 7. **Run `check_rls`** in CI to verify policies exist.
-8. **Audit bypass usage** (`admin_context`, `bypass_flag`) regularly.
+8. **Audit bypass usage** (`admin_context`, `bypass_flag`) regularly. The
+   [audit log](../guides/audit-logging.md) records every `admin_context()` entry with its
+   source and user, and every refusal; `bypass_flag()` and `set_guc()` are not logged, so
+   review those in code.
 9. **Test fail-closed behavior** with `assert_rls_blocks_without_context`.

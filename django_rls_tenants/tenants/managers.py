@@ -40,6 +40,7 @@ from django.db.models.fields.reverse_related import ManyToOneRel
 
 from django_rls_tenants.exceptions import NoTenantContextError
 from django_rls_tenants.rls.guc import set_guc
+from django_rls_tenants.tenants import audit
 from django_rls_tenants.tenants.affinity import apply_active_context, writing
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import (
@@ -436,6 +437,7 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
             return  # listed in STRICT_MODE_EXCLUDE; RLS still filters at the database
         model_name = self.model.__name__
         label = self.model._meta.label  # noqa: SLF001
+        audit.denied("queryset", "strict_mode", model=label)
         msg = f"RLS strict mode: query on {model_name} attempted without an active RLS context."
         hint = (
             f"{HINT_NO_CONTEXT} If {model_name} is meant to be read without a context, list "
@@ -516,7 +518,11 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         is_local = conf.USE_LOCAL_SET
         if using is None:
             using = self._db_for_write() if for_write else self.db
-        variables = _resolve_user_guc_vars(user, conf)
+        try:
+            variables = _resolve_user_guc_vars(user, conf)
+        except NoTenantContextError:
+            audit.denied("for_user", "user_without_tenant", user_id=audit.user_id_of(user))
+            raise
         # False with USE_LOCAL_SET on an alias the guard covers: the guard writes
         # the values (for own_transaction, once, inside the transaction below).
         writes = _writes_gucs(using, is_local=is_local)

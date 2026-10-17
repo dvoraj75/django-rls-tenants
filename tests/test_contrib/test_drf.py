@@ -20,6 +20,7 @@ The suite splits into:
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -35,7 +36,7 @@ from django.db import transaction
 from django.test import AsyncClient, override_settings
 from rest_framework import serializers
 from rest_framework.authtoken.models import Token
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import ErrorDetail, PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.test import APIClient, APIRequestFactory, force_authenticate
@@ -50,6 +51,8 @@ from django_rls_tenants.contrib.drf import (
     RLSTenantPermission,
 )
 from django_rls_tenants.exceptions import NoTenantContextError, RLSConfigurationError
+from django_rls_tenants.tenants import audit
+from django_rls_tenants.tenants.audit import AUDIT_LOGGER_NAME
 from django_rls_tenants.tenants.context import admin_context, tenant_context
 from django_rls_tenants.tenants.state import (
     _current_live,
@@ -1338,3 +1341,344 @@ class TestAsgi:
 
         assert response.status_code == 500
         _assert_context_closed()
+
+
+# ---------------------------------------------------------------------------
+# Audit records (#48)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def audit_records(caplog):
+    """Return a function listing the audit records logged so far."""
+    caplog.set_level(logging.INFO, logger=AUDIT_LOGGER_NAME)
+
+    def records():
+        return [record for record in caplog.records if record.name == AUDIT_LOGGER_NAME]
+
+    return records
+
+
+def _denials(records):
+    """``(source, reason, tenant_id, admin, user_id)`` of each ``context.denied`` record."""
+    return [
+        (r.rls_source, r.rls_reason, r.rls_tenant_id, r.rls_admin, r.rls_user_id)
+        for r in records
+        if r.rls_event == "context.denied"
+    ]
+
+
+class TestAuditRecords:
+    """The mixin's context is attributed to ``drf``; refusals are ``context.denied``."""
+
+    def test_token_request_is_attributed_to_the_user(
+        self, audit_records, enforce_rls, user_a, sample_orders, tenant_a
+    ):
+        assert _token_client(user_a).get("/api/state/").status_code == 200
+
+        assert [
+            (r.rls_event, r.rls_source, r.rls_tenant_id, r.rls_admin, r.rls_user_id)
+            for r in audit_records()
+        ] == [
+            ("context.entered", "drf", tenant_a.pk, False, user_a.pk),
+            ("context.exited", "drf", tenant_a.pk, False, user_a.pk),
+        ]
+
+    def test_tenantless_user_is_denied(self, audit_records, enforce_rls, tenantless_user):
+        assert _token_client(tenantless_user).get("/api/state/").status_code == 403
+
+        assert _denials(audit_records()) == [
+            ("drf", "user_without_tenant", None, None, tenantless_user.pk),
+        ]
+
+    def test_view_without_the_mixin_is_denied(self, audit_records, enforce_rls, user_a):
+        assert _token_client(user_a).get("/api/unmixed/").status_code == 403
+
+        assert _denials(audit_records()) == [("drf", "no_context", None, None, user_a.pk)]
+
+    def test_anonymous_request_is_not_logged(self, audit_records, enforce_rls):
+        assert APIClient().get("/api/unmixed/").status_code == 401
+        assert audit_records() == []
+
+    def test_other_context_is_denied(self, audit_records):
+        with tenant_context(4):
+            assert not RLSTenantPermission().has_permission(_drf_request(_scoped(3)), None)
+        with admin_context():
+            assert not RLSTenantPermission().has_permission(_drf_request(_scoped(3)), None)
+
+        assert _denials(audit_records()) == [
+            ("drf", "context_mismatch", 4, False, None),
+            ("drf", "context_mismatch", None, True, None),
+        ]
+
+    def test_object_of_another_tenant_is_denied(self, audit_records):
+        permission = RLSTenantPermission()
+        request = _drf_request(SimpleNamespace(pk=5, **vars(_scoped(3))))
+        with tenant_context(3):
+            assert permission.has_object_permission(request, None, Order(tenant_id=3))
+            assert not permission.has_object_permission(request, None, Order(tenant_id=4))
+        assert not permission.has_object_permission(request, None, Order(tenant_id=3))
+
+        assert _denials(audit_records()) == [
+            ("drf", "object_of_other_tenant", 3, False, 5),
+            ("drf", "no_context", None, None, 5),
+        ]
+        denied = [r for r in audit_records() if r.rls_event == "context.denied"]
+        assert denied[0].rls_model == "test_app.Order"
+
+    def test_cross_tenant_foreign_key_is_logged(self, audit_records, tenant_a, sample_orders):
+        request = SimpleNamespace(user=SimpleNamespace(pk=5))
+        data = {"tenant": tenant_a.pk, "order": sample_orders["b1"].pk, "description": "x"}
+        with audit.silenced(admin_context()):
+            serializer = AdminOrderItemSerializer(data=data, context={"request": request})
+            assert not serializer.is_valid()
+
+        cross = [r for r in audit_records() if r.rls_event == "fk.cross_tenant_rejected"]
+        assert [
+            (r.rls_source, r.rls_tenant_id, r.rls_user_id, r.rls_model, r.rls_fields)
+            for r in cross
+        ] == [("drf", tenant_a.pk, 5, "test_app.OrderItem", ["order"])]
+
+    def test_target_hidden_from_the_tenant_is_logged(
+        self, audit_records, enforce_rls, user_a, sample_orders, tenant_a
+    ):
+        """The field rejects the hidden order as not found; the record is logged anyway."""
+        b1 = sample_orders["b1"]
+        response = _token_client(user_a).post(
+            "/api/order-items/",
+            {"order": b1.pk, "description": "x"},
+            format="json",
+        )
+
+        assert response.status_code == 400
+        assert response.json() == {"order": _pk_does_not_exist(b1.pk)}  # unchanged
+        cross = [r for r in audit_records() if r.rls_event == "fk.cross_tenant_rejected"]
+        assert [
+            (r.rls_source, r.rls_tenant_id, r.rls_user_id, r.rls_model, r.rls_fields)
+            for r in cross
+        ] == [("drf", tenant_a.pk, user_a.pk, "test_app.OrderItem", ["order"])]
+
+    def test_missing_target_is_not_logged(self, audit_records, enforce_rls, user_a, tenant_a):
+        response = _token_client(user_a).post(
+            "/api/order-items/",
+            {"order": 999_999, "description": "x"},
+            format="json",
+        )
+
+        assert response.status_code == 400
+        assert not [r for r in audit_records() if r.rls_event == "fk.cross_tenant_rejected"]
+
+    def test_current_tenant_default_refusal_is_denied(self, audit_records):
+        with pytest.raises(NoTenantContextError):
+            CurrentTenantDefault()(None)
+        with admin_context(), pytest.raises(NoTenantContextError):
+            CurrentTenantDefault()(None)
+
+        # No context at all: whether it is the admin one is not known (None).
+        assert _denials(audit_records()) == [
+            ("drf", "no_context", None, None, None),
+            ("drf", "no_context", None, True, None),
+        ]
+
+    def test_current_tenant_default_refusal_names_the_requests_user(self, audit_records):
+        field = SimpleNamespace(context={"request": SimpleNamespace(user=SimpleNamespace(pk=5))})
+        with pytest.raises(NoTenantContextError):
+            CurrentTenantDefault()(field)
+        with admin_context(), pytest.raises(NoTenantContextError):
+            CurrentTenantDefault()(field)
+
+        assert _denials(audit_records()) == [
+            ("drf", "no_context", None, None, 5),
+            ("drf", "no_context", None, True, 5),
+        ]
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            SimpleNamespace(context={}),
+            SimpleNamespace(context={"request": SimpleNamespace()}),
+        ],
+        ids=["no-request", "request-without-user"],
+    )
+    def test_current_tenant_default_refusal_without_a_user(self, audit_records, field):
+        with pytest.raises(NoTenantContextError):
+            CurrentTenantDefault()(field)
+
+        assert _denials(audit_records()) == [("drf", "no_context", None, None, None)]
+
+
+class PickyOrderItemSerializer(RLSTenantModelSerializer):
+    """Its ``order`` queryset leaves out an order of the tenant's own (``Widget A2``)."""
+
+    order = serializers.PrimaryKeyRelatedField(queryset=Order.objects.exclude(product="Widget A2"))
+
+    class Meta:
+        model = OrderItem
+        fields = ("id", "order", "description")
+
+
+class IntegerPkOrderItemSerializer(RLSTenantModelSerializer):
+    """Its ``order`` field converts the primary key with a ``pk_field``."""
+
+    order = serializers.PrimaryKeyRelatedField(
+        queryset=Order.objects.all(),
+        pk_field=serializers.IntegerField(),
+    )
+
+    class Meta:
+        model = OrderItem
+        fields = ("id", "order", "description")
+
+
+def _cross_tenant_records(records):
+    """``(tenant_id, user_id, model, fields)`` of each ``fk.cross_tenant_rejected`` record."""
+    return [
+        (r.rls_tenant_id, r.rls_user_id, r.rls_model, r.rls_fields)
+        for r in records
+        if r.rls_event == "fk.cross_tenant_rejected"
+    ]
+
+
+class TestAuditHiddenTargets:
+    """``RLSTenantSerializerMixin._audit_hidden_targets()`` logs only rows of another tenant."""
+
+    def _validate(self, serializer_class, tenant_id, data, **kwargs):
+        with tenant_context(tenant_id):
+            serializer = serializer_class(data=data, **kwargs)
+            assert not serializer.is_valid()
+        return serializer
+
+    def test_same_tenant_row_the_queryset_leaves_out_is_not_logged(
+        self, audit_records, enforce_rls, tenant_a, sample_orders
+    ):
+        """The tenant context holds a string: it is compared as the tenant's primary key."""
+        a2 = sample_orders["a2"]
+
+        serializer = self._validate(
+            PickyOrderItemSerializer,
+            str(tenant_a.pk),
+            {"order": a2.pk, "description": "x"},
+        )
+
+        assert serializer.errors == {"order": _pk_does_not_exist(a2.pk)}
+        assert _cross_tenant_records(audit_records()) == []
+
+    def test_row_of_another_tenant_is_logged_under_a_string_tenant(
+        self, audit_records, enforce_rls, tenant_a, sample_orders
+    ):
+        b1 = sample_orders["b1"]
+        request = SimpleNamespace(user=SimpleNamespace(pk=5))
+
+        serializer = self._validate(
+            PickyOrderItemSerializer,
+            str(tenant_a.pk),
+            {"order": b1.pk, "description": "x"},
+            context={"request": request},
+        )
+
+        assert serializer.errors == {"order": _pk_does_not_exist(b1.pk)}  # unchanged
+        assert _cross_tenant_records(audit_records()) == [
+            (tenant_a.pk, 5, "test_app.OrderItem", ["order"]),
+        ]
+
+    def test_serializer_without_a_request_logs_no_user(
+        self, audit_records, enforce_rls, tenant_a, sample_orders
+    ):
+        self._validate(
+            PickyOrderItemSerializer,
+            tenant_a.pk,
+            {"order": sample_orders["b1"].pk, "description": "x"},
+        )
+
+        assert _cross_tenant_records(audit_records()) == [
+            (tenant_a.pk, None, "test_app.OrderItem", ["order"]),
+        ]
+
+    def test_request_without_a_user_logs_no_user(
+        self, audit_records, enforce_rls, tenant_a, sample_orders
+    ):
+        self._validate(
+            PickyOrderItemSerializer,
+            tenant_a.pk,
+            {"order": sample_orders["b1"].pk, "description": "x"},
+            context={"request": SimpleNamespace()},
+        )
+
+        assert _cross_tenant_records(audit_records()) == [
+            (tenant_a.pk, None, "test_app.OrderItem", ["order"]),
+        ]
+
+    def test_value_that_is_not_a_primary_key_is_unchanged_and_not_logged(
+        self, audit_records, enforce_rls, tenant_a, sample_orders
+    ):
+        serializer = self._validate(
+            PickyOrderItemSerializer,
+            tenant_a.pk,
+            {"order": "abc", "description": "x"},
+        )
+
+        assert [error.code for error in serializer.errors["order"]] == ["incorrect_type"]
+        assert _cross_tenant_records(audit_records()) == []
+
+    @pytest.mark.parametrize("value", [None, ""])
+    def test_null_or_empty_value_is_not_logged(
+        self, audit_records, enforce_rls, tenant_a, sample_orders, value
+    ):
+        serializer = self._validate(
+            PickyOrderItemSerializer,
+            tenant_a.pk,
+            {"order": value, "description": "x"},
+        )
+
+        assert [error.code for error in serializer.errors["order"]] == ["null"]
+        assert _cross_tenant_records(audit_records()) == []
+
+    def test_pk_field_converts_the_value(
+        self, audit_records, enforce_rls, tenant_a, sample_orders
+    ):
+        b1 = sample_orders["b1"]
+
+        self._validate(
+            IntegerPkOrderItemSerializer,
+            tenant_a.pk,
+            {"order": str(b1.pk), "description": "x"},
+        )
+
+        assert _cross_tenant_records(audit_records()) == [
+            (tenant_a.pk, None, "test_app.OrderItem", ["order"]),
+        ]
+
+    def test_pk_field_that_cannot_convert_the_value_is_skipped(
+        self, audit_records, enforce_rls, tenant_a
+    ):
+        not_found = ErrorDetail("gone", code="does_not_exist")
+        with tenant_context(tenant_a.pk):
+            serializer = IntegerPkOrderItemSerializer()
+            serializer._audit_hidden_targets({"order": "abc"}, {"order": [not_found]})
+
+        assert _cross_tenant_records(audit_records()) == []
+
+    def test_detail_that_is_not_a_dict_is_skipped(
+        self, audit_records, enforce_rls, tenant_a, sample_orders
+    ):
+        data = {"order": sample_orders["b1"].pk, "description": "x"}
+        not_found = ErrorDetail("gone", code="does_not_exist")
+        with tenant_context(tenant_a.pk):
+            serializer = PickyOrderItemSerializer()
+            serializer._audit_hidden_targets(data, [not_found])
+            assert _cross_tenant_records(audit_records()) == []
+            serializer._audit_hidden_targets(data, {"order": [not_found]})  # the same, as a dict
+
+        assert len(_cross_tenant_records(audit_records())) == 1
+
+    def test_no_record_below_warning(self, caplog, enforce_rls, tenant_a, sample_orders):
+        caplog.set_level(logging.ERROR, logger=AUDIT_LOGGER_NAME)
+
+        serializer = self._validate(
+            PickyOrderItemSerializer,
+            tenant_a.pk,
+            {"order": sample_orders["b1"].pk, "description": "x"},
+        )
+
+        assert "order" in serializer.errors
+        assert not [r for r in caplog.records if r.name == AUDIT_LOGGER_NAME]

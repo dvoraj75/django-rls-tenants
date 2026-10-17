@@ -23,6 +23,7 @@ fixture in ``tests/conftest.py`` already pulls in ``db``).
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -43,6 +44,7 @@ from django_rls_tenants.contrib.celery import (
     uninstall,
 )
 from django_rls_tenants.exceptions import NoTenantContextError
+from django_rls_tenants.tenants.audit import AUDIT_LOGGER_NAME
 from django_rls_tenants.tenants.context import admin_context, tenant_context
 from django_rls_tenants.tenants.state import (
     ADMIN_GUCS,
@@ -826,3 +828,60 @@ class TestTaskIsolation:
             headers={_TENANT_HEADER: None, _ADMIN_HEADER: True}
         ).get()
         assert result == ["Gadget B1", "Widget A1", "Widget A2"]
+
+
+# ---------------------------------------------------------------------------
+# Audit records (#48)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def audit_records(caplog):
+    """Return a function listing the audit records logged so far."""
+    caplog.set_level(logging.INFO, logger=AUDIT_LOGGER_NAME)
+
+    def records():
+        return [
+            (record.rls_event, record.rls_source, record.rls_tenant_id, record.rls_admin)
+            for record in caplog.records
+            if record.name == AUDIT_LOGGER_NAME
+        ]
+
+    return records
+
+
+@pytest.mark.django_db
+class TestAuditRecords:
+    """The worker's context is attributed to ``celery``; a refused task is denied."""
+
+    def test_rls_task_context_is_attributed_to_celery(self, audit_records, tenant_a):
+        assert report_context.apply(headers={_TENANT_HEADER: tenant_a.pk}).get() == (
+            tenant_a.pk,
+            True,
+        )
+        assert audit_records() == [
+            ("context.entered", "celery", tenant_a.pk, False),
+            ("context.exited", "celery", tenant_a.pk, False),
+        ]
+
+    def test_admin_task_context_is_attributed_to_celery(self, audit_records):
+        report_context.apply(headers={_TENANT_HEADER: None, _ADMIN_HEADER: True}).get()
+        assert audit_records() == [
+            ("context.entered", "celery", None, True),
+            ("context.exited", "celery", None, True),
+        ]
+
+    def test_required_context_refusal_is_denied(self, audit_records, caplog):
+        with pytest.raises(NoTenantContextError):
+            strict_task.apply().get()
+
+        assert audit_records() == [("context.denied", "celery", None, None)]
+        (record,) = [r for r in caplog.records if r.name == AUDIT_LOGGER_NAME]
+        assert record.rls_reason == "no_context"
+
+    def test_signal_path_is_attributed_to_celery(self, audit_records, installed, tenant_a):
+        plain_report_context.apply(headers={_TENANT_HEADER: tenant_a.pk}).get()
+        assert audit_records() == [
+            ("context.entered", "celery", tenant_a.pk, False),
+            ("context.exited", "celery", tenant_a.pk, False),
+        ]

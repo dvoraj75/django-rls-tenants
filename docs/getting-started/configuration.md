@@ -475,6 +475,11 @@ without one) skips these two database checks quietly, as `check` always has; the
 logged at `DEBUG` on the `django_rls_tenants` logger. Only a reachable database whose
 catalogue query fails produces `W013`.
 
+## Audit Logging
+
+Audit logging has no `RLS_TENANTS` key: configure the `django_rls_tenants.audit` logger
+in Django's `LOGGING` setting. See [Audit Logging](../guides/audit-logging.md).
+
 ## Typo Detection
 
 If you add an unrecognized key to `RLS_TENANTS`, the library emits a `UserWarning`

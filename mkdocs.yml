@@ -90,6 +90,7 @@ nav:
       - Celery Tasks: guides/celery-tasks.md
       - Django REST Framework: guides/drf.md
       - Admin: guides/admin.md
+      - Audit Logging: guides/audit-logging.md
       - Bypass Mode: guides/bypass-mode.md
       - Testing: guides/testing.md
       - Management Commands: guides/management-commands.md

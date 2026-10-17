@@ -33,6 +33,7 @@ from django_rls_tenants.management.commands.run_as_tenant import (
     _output_options,
     _tenant_model,
 )
+from django_rls_tenants.tenants import audit
 from django_rls_tenants.tenants.context import admin_context, tenant_context
 
 if TYPE_CHECKING:
@@ -83,7 +84,7 @@ def _run_for_tenant(
     trace: str | None = None
     started = time.monotonic()
     try:
-        with tenant_context(tenant, using=alias):
+        with audit.attributed(tenant_context(tenant, using=alias), source="command"):
             call_command(command_name, *args, **out)
     except SystemExit as exc:
         if exc.code not in (None, 0):
@@ -123,7 +124,7 @@ def _list_tenants(filters: dict[str, str], alias: str) -> list[tuple[int | str, 
     """
     model = _tenant_model()
     try:
-        with admin_context(using=alias):
+        with audit.silenced(admin_context(using=alias)):
             queryset = model._default_manager.using(alias).filter(**filters)  # noqa: SLF001
             return [(tenant.pk, str(tenant)) for tenant in queryset.order_by("pk")]
     except (FieldError, ValidationError, ValueError) as exc:

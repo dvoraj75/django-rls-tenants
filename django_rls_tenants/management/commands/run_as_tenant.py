@@ -26,6 +26,7 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db import DEFAULT_DB_ALIAS, connections
 from django.utils.connection import ConnectionDoesNotExist
 
+from django_rls_tenants.tenants import audit
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import admin_context, tenant_context
 
@@ -118,7 +119,7 @@ def _resolve_tenant(value: str, lookup: str, alias: str) -> models.Model:
     """
     model = _tenant_model()
     try:
-        with admin_context(using=alias):
+        with audit.silenced(admin_context(using=alias)):
             return model._default_manager.using(alias).get(**{lookup: value})  # noqa: SLF001
     except ObjectDoesNotExist as exc:
         msg = f"No {model.__name__} with {lookup}={value!r} on database {alias!r}."
@@ -203,5 +204,5 @@ class Command(BaseCommand):
 
         if options["verbosity"] >= 2:  # noqa: PLR2004  -- Django's verbose level
             self.stderr.write(f"Running {command_name} in {target} on database {alias!r}.")
-        with context:
+        with audit.attributed(context, source="command"):
             call_command(command_name, *inner, **_output_options(options))
