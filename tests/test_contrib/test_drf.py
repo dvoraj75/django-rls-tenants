@@ -117,7 +117,7 @@ def tenantless_user(db):
 
 @pytest.fixture
 def member_of(monkeypatch):
-    """Make a user a member of tenants in ``MemberHeaderStateView``, for one test."""
+    """Make a user a member of tenants in the ``MemberHeaderMixin`` views, for one test."""
 
     def add(user, *tenants):
         monkeypatch.setitem(TENANT_MEMBERSHIPS, user.username, {tenant.pk for tenant in tenants})
@@ -305,10 +305,12 @@ class TestEnteredContext:
         assert view._rls_entered_context is None
         _assert_context_closed()
 
-    def test_an_earlier_requests_context_is_not_trusted(self):
-        """DRF makes a view instance per request; a reused one does not trust the last one's.
+    def test_another_context_with_the_same_values_is_refused(self):
+        """The permission compares the holder, not the GUC values.
 
-        The second request enters nothing, in an enclosing context with the same values.
+        A reused view instance (DRF makes one per request) served a request that entered
+        ``tenant_context(4)``; the next one enters nothing, inside an enclosing context
+        with the same values, and is refused.
         """
         view = ChosenContextView(choose=lambda request: tenant_context(4))
         assert _serve(view, _scoped(None)).status_code == 200
@@ -321,6 +323,21 @@ class TestEnteredContext:
         assert response.status_code == 403
         assert view.seen is None
 
+    def test_the_record_is_cleared_when_the_handler_raises(self):
+        view = ChosenContextView(choose=lambda request: tenant_context(4))
+
+        def boom(request):
+            msg = "boom"
+            raise RuntimeError(msg)
+
+        view.get = boom
+
+        with pytest.raises(RuntimeError, match="boom"):
+            _serve(view, _scoped(None))
+
+        assert view._rls_entered_context is None
+        _assert_context_closed()
+
     def test_a_context_manager_that_sets_up_no_context_is_not_recorded(self):
         """The enclosing context stays current: not the view's choice."""
         view = ChosenContextView(choose=lambda request: nullcontext())
@@ -332,6 +349,7 @@ class TestEnteredContext:
         assert refused.status_code == 403
         assert own.status_code == 200, own.data
         assert view.seen["entered"] is None
+        assert view._rls_entered_context is None
 
     def test_an_admin_context_for_a_non_admin_is_refused(self):
         view = ChosenContextView(choose=lambda request: admin_context())
@@ -824,8 +842,9 @@ class TestTokenRequests:
 class TestTenantSelection:
     """``get_rls_context()`` enters a tenant the user selected; the permission accepts it (#150).
 
-    ``MemberHeaderStateView`` lists ``RLSTenantPermission`` and takes the tenant from
-    the ``X-Tenant`` header after a membership check.
+    ``MemberHeaderStateView``, ``MemberInvoiceViewSet`` and ``MemberOrderItemViewSet``
+    list ``RLSTenantPermission`` and take the tenant from the ``X-Tenant`` header after a
+    membership check.
     """
 
     def test_tenantless_member_selects_a_tenant(
@@ -870,6 +889,56 @@ class TestTenantSelection:
 
         assert response.status_code == 403
         assert response.json() == {"detail": "You are not a member of the selected tenant."}
+        _assert_context_closed()
+
+    def test_write_lands_in_the_selected_tenant(
+        self, enforce_rls, user_a, member_of, tenant_a, tenant_b
+    ):
+        """Not in ``user.rls_tenant_id``, and not in the ``tenant`` the payload names."""
+        member_of(user_a, tenant_a, tenant_b)
+
+        response = _token_client(user_a).post(
+            "/api/member-invoices/",
+            {"number": "INV-9", "tenant": tenant_a.pk},
+            format="json",
+            headers={"X-Tenant": str(tenant_b.pk)},
+        )
+
+        assert response.status_code == 201, response.content
+        assert response.json() == {"id": response.json()["id"], "number": "INV-9"}
+        with admin_context():
+            assert Invoice.objects.get(number="INV-9").tenant_id == tenant_b.pk
+        _assert_context_closed()
+
+    def test_own_tenants_object_is_not_found_in_the_selected_tenant(
+        self, enforce_rls, user_a, member_of, sample_invoices, tenant_a, tenant_b
+    ):
+        member_of(user_a, tenant_a, tenant_b)
+        client = _token_client(user_a)
+        headers = {"X-Tenant": str(tenant_b.pk)}
+
+        selected = client.get(f"/api/member-invoices/{sample_invoices['b'].pk}/", headers=headers)
+        own = client.get(f"/api/member-invoices/{sample_invoices['a'].pk}/", headers=headers)
+
+        assert selected.status_code == 200, selected.content
+        assert selected.json()["number"] == "INV-1"
+        assert own.status_code == 404
+        _assert_context_closed()
+
+    def test_browsable_api_renders_the_selected_tenants_form(
+        self, enforce_rls, user_a, member_of, sample_orders, tenant_a, tenant_b
+    ):
+        """The renderer calls ``check_permissions()`` again while the mixin renders."""
+        member_of(user_a, tenant_a, tenant_b)
+
+        response = _token_client(user_a).get(
+            "/api/member-order-items/",
+            headers={"Accept": "text/html", "X-Tenant": str(tenant_b.pk)},
+        )
+
+        assert response.status_code == 200
+        assert _order_option(sample_orders["b1"]) in response.content
+        assert _order_option(sample_orders["a1"]) not in response.content
         _assert_context_closed()
 
     def test_without_a_selection_the_users_own_context_applies(
@@ -1027,6 +1096,19 @@ class TestStrictMode:
 
         assert response.status_code == 403
 
+    def test_selected_tenant(
+        self, enforce_rls, tenantless_user, member_of, sample_orders, tenant_b
+    ):
+        member_of(tenantless_user, tenant_b)
+
+        response = _token_client(tenantless_user).get(
+            "/api/member-header/", headers={"X-Tenant": str(tenant_b.pk)}
+        )
+
+        assert response.status_code == 200, response.content
+        assert response.json()["products"] == ["Gadget B1"]
+        _assert_context_closed()
+
     def test_without_the_permission_an_unmixed_view_raises(self, enforce_rls, user_a):
         class Unprotected(APIView):
             permission_classes = (IsAuthenticated,)
@@ -1179,6 +1261,28 @@ class TestWithMiddleware:
 
         assert response.status_code == 200, response.content
         assert response.json()["database_products"] == ["Gadget B1"]
+        _assert_context_closed()
+
+    def test_session_user_selects_another_of_their_tenants(
+        self, enforce_rls, user_a, member_of, sample_orders, tenant_a, tenant_b, rls_middleware
+    ):
+        """The mixin nests the selected tenant inside the middleware's context for the user."""
+        client = APIClient()
+        client.force_login(user_a)
+        headers = {"X-Tenant": str(tenant_b.pk)}
+
+        member_of(user_a, tenant_a, tenant_b)
+        selected = client.get("/api/member-header/", headers=headers)
+        member_of(user_a, tenant_a)
+        refused = client.get("/api/member-header/", headers=headers)
+        own = client.get("/api/member-header/")
+
+        assert selected.status_code == 200, selected.content
+        assert selected.json()["database_products"] == ["Gadget B1"]
+        assert selected.json()["tenant_guc"] == str(tenant_b.pk)
+        assert refused.status_code == 403
+        assert own.status_code == 200, own.content
+        assert own.json()["database_products"] == ["Widget A1", "Widget A2"]
         _assert_context_closed()
 
     def test_session_user_browsable_api(self, enforce_rls, user_a, sample_orders, rls_middleware):

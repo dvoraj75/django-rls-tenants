@@ -157,7 +157,7 @@ class TenantHeaderStateView(StateView):
         return super().get_rls_context(request)
 
 
-class MemberHeaderStateView(StateView):
+class MemberHeaderMixin(RLSTenantAPIViewMixin):
     """Lets any user pick one of their tenants with the ``X-Tenant`` header (#150)."""
 
     permission_classes = _PERMISSIONS
@@ -171,6 +171,18 @@ class MemberHeaderStateView(StateView):
             msg = "You are not a member of the selected tenant."
             raise PermissionDenied(msg)
         return tenant_context(tenant_id)
+
+
+class MemberHeaderStateView(MemberHeaderMixin, StateView):
+    """``StateView`` with the ``X-Tenant`` selection."""
+
+
+class MemberInvoiceViewSet(MemberHeaderMixin, InvoiceViewSet):
+    """``InvoiceViewSet`` with the ``X-Tenant`` selection: writes and object lookups."""
+
+
+class MemberOrderItemViewSet(MemberHeaderMixin, OrderItemViewSet):
+    """``OrderItemViewSet`` with the ``X-Tenant`` selection: the browsable API's form."""
 
 
 class TokenOnlyOpenView(RLSTenantAPIViewMixin, APIView):

@@ -22,9 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`nullcontext()`, say) records nothing, and nothing is carried over to another request.
   Everything else is unchanged: a view without the mixin still gets a `403`,
   `has_object_permission()` still compares the object with the active tenant, and the
-  default `get_rls_context()` still enters the user's own tenant. The override is the
-  authorization point: validate the selection there (membership check) and raise
-  `PermissionDenied` for one the user may not make. See
+  default `get_rls_context()` still enters the user's own tenant. The trade-off: the
+  permission no longer catches an override that enters another tenant's context for a
+  non-admin user by mistake, so the override is the authorization point: validate the
+  selection there (membership check) and raise `PermissionDenied` for one the user may
+  not make. See
   [Choosing the context](https://dvoraj75.github.io/django-rls-tenants/guides/drf/#choosing-the-context-get_rls_context).
 
 ## [1.5.0] - 2026-10-17

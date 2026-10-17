@@ -11,6 +11,8 @@ from tests.drf_views import (
     InvoiceViewSet,
     LazyProductsView,
     MemberHeaderStateView,
+    MemberInvoiceViewSet,
+    MemberOrderItemViewSet,
     OrderItemViewSet,
     StateView,
     TenantHeaderStateView,
@@ -22,6 +24,8 @@ from tests.drf_views import (
 router = SimpleRouter()
 router.register("invoices", InvoiceViewSet, basename="invoice")
 router.register("order-items", OrderItemViewSet, basename="order-item")
+router.register("member-invoices", MemberInvoiceViewSet, basename="member-invoice")
+router.register("member-order-items", MemberOrderItemViewSet, basename="member-order-item")
 
 urlpatterns = [
     path("api/", include(router.urls)),

@@ -210,15 +210,21 @@ class SelectedTenantMixin(RLSTenantAPIViewMixin):
         selected = request.headers.get("X-Tenant")
         if selected is None or not request.user.is_authenticated:
             return super().get_rls_context(request)
-        # A plain model: an RLS-protected one needs admin_context() here, as no
-        # context is active yet.
-        member = selected.isdecimal() and Membership.objects.filter(
-            user=request.user, tenant_id=int(selected)
-        ).exists()
+        # A plain model: an RLS-protected one needs admin_context() here, where
+        # no context, or only the user's own (RLSTenantMiddleware's, for a
+        # session user), is active.
+        member = (
+            selected.isascii()
+            and selected.isdigit()
+            and Membership.objects.filter(user=request.user, tenant_id=int(selected)).exists()
+        )
         if not member:
             raise PermissionDenied("You are not a member of the selected tenant.")
         return tenant_context(int(selected))
 ```
+
+The example parses an integer primary key; validate the header the way the tenant
+model's key requires (a `UUIDField`, say) before it reaches the query and `tenant_context()`.
 
 [`RLSTenantPermission`](#rlstenantpermission) accepts the tenant context the override
 entered for the request (see what it checks there), so the view keeps it in its
