@@ -11,6 +11,7 @@ sdist, so ``pyproject.toml`` excludes this file from the sdist.
 
 from __future__ import annotations
 
+import itertools
 import re
 import tomllib
 from pathlib import Path
@@ -24,7 +25,7 @@ DJANGO = ("5.2", "6.0", "6.1")
 POSTGRES = ("15", "16", "17", "18")
 DEFAULT_POSTGRES = "16"
 COVERAGE_LEG = ("3.12", "6.1", "psycopg2")
-PSYCOPG3_LEG = ("3.12", "6.1")
+DRIVERS = ("psycopg2", "psycopg3")
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -95,6 +96,50 @@ def _gate_value(condition: str, axis: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _expand(rel: str, job: str, matrix: dict[str, Any]) -> list[dict[str, str]]:
+    """Expand a job's matrix into its legs, with GitHub's ``include`` rules.
+
+    An ``include`` row extends every original combination whose axis values it does not
+    overwrite (values added by an earlier row may be overwritten); a row that extends none
+    becomes a combination of its own, which later rows do not extend.
+    """
+    assert "exclude" not in matrix, f"{rel}: {job} has exclude rows, which _expand ignores"
+    axes = {key: values for key, values in matrix.items() if key != "include"}
+    originals = [
+        dict(zip(axes, combo, strict=True)) for combo in itertools.product(*axes.values())
+    ]
+    legs = [dict(combo) for combo in originals]
+    added = []
+    for row in matrix.get("include", []):
+        targets = [
+            leg
+            for original, leg in zip(originals, legs, strict=True)
+            if all(original[key] == value for key, value in row.items() if key in original)
+        ]
+        for leg in targets:
+            leg.update(row)
+        if not targets:
+            added.append(dict(row))
+    return legs + added
+
+
+def _substitute(template: str, leg: dict[str, str]) -> str:
+    """Replace each ``${{ matrix.<axis> }}`` in ``template`` with the leg's value."""
+    return re.sub(r"\$\{\{ matrix\.([\w-]+) \}\}", lambda m: leg[m.group(1)], template)
+
+
+def _test_legs(rel: str) -> list[dict[str, str]]:
+    """Every leg of the library test jobs, with the PostgreSQL major each one runs."""
+    jobs = _workflow(rel)["jobs"]
+    legs = []
+    for job in ("test", "test-postgres"):
+        image = jobs[job]["services"]["postgres"]["image"]
+        for leg in _expand(rel, job, jobs[job]["strategy"]["matrix"]):
+            postgres = _substitute(image, leg).removeprefix("postgres:")
+            legs.append({**leg, "job": job, "postgres": postgres})
+    return legs
+
+
 # --- pyproject.toml ---------------------------------------------------------------------
 
 
@@ -155,10 +200,16 @@ def test_ci_test_matrix():
         "no exclude rows"
     )
     assert matrix["driver"] == ["psycopg2"], f"{rel}: test driver axis must be ['psycopg2']"
-    psycopg3 = [inc for inc in matrix.get("include", []) if inc.get("driver") == "psycopg3"]
-    assert len(psycopg3) == 1, f"{rel}: expected exactly one psycopg3 include, found {psycopg3}"
-    leg = (psycopg3[0]["python-version"], psycopg3[0]["django-version"])
-    assert leg == PSYCOPG3_LEG, f"{rel}: psycopg3 leg is {leg}, expected {PSYCOPG3_LEG}"
+    psycopg3 = {
+        (inc["python-version"], inc["django-version"])
+        for inc in matrix.get("include", [])
+        if inc.get("driver") == "psycopg3"
+    }
+    expected = {(_min(PYTHON), _min(DJANGO)), (_min(PYTHON), _max(DJANGO))}
+    assert psycopg3 == expected, (
+        f"{rel}: test psycopg3 legs are {sorted(psycopg3)}, expected the oldest Python on the "
+        f"oldest and newest Django {sorted(expected)}"
+    )
 
 
 def test_ci_postgres_edges():
@@ -174,15 +225,90 @@ def test_ci_postgres_edges():
     assert matrix["django-version"] == django_edges, (
         f"{rel}: test-postgres Django {matrix['django-version']}, expected {django_edges}"
     )
-    for inc in matrix["include"]:
-        assert inc["python-version"] in PYTHON, (
-            f"{rel}: test-postgres include {inc} names an unsupported Python"
-        )
+    assert matrix.get("driver") == ["psycopg2"], (
+        f"{rel}: test-postgres driver axis must be ['psycopg2']"
+    )
     for job in ("test", "example-smoke", "test-plain-role"):
         image = jobs[job]["services"]["postgres"]["image"]
         assert image == f"postgres:{DEFAULT_POSTGRES}", (
             f"{rel}: {job} runs {image}, expected postgres:{DEFAULT_POSTGRES}"
         )
+
+
+def test_expand_follows_githubs_include_rules():
+    """The worked example of "Expanding or adding matrix configurations" in GitHub's docs."""
+    matrix = {
+        "fruit": ["apple", "pear"],
+        "animal": ["cat", "dog"],
+        "include": [
+            {"color": "green"},
+            {"color": "pink", "animal": "cat"},
+            {"fruit": "apple", "shape": "circle"},
+            {"fruit": "banana"},
+            {"fruit": "banana", "animal": "cat"},
+        ],
+    }
+    assert _expand("example", "job", matrix) == [
+        {"fruit": "apple", "animal": "cat", "color": "pink", "shape": "circle"},
+        {"fruit": "apple", "animal": "dog", "color": "green", "shape": "circle"},
+        {"fruit": "pear", "animal": "cat", "color": "pink"},
+        {"fruit": "pear", "animal": "dog", "color": "green"},
+        {"fruit": "banana"},
+        {"fruit": "banana", "animal": "cat"},
+    ]
+
+
+def test_ci_legs_name_supported_versions():
+    """Every leg of the library test jobs runs versions the matrix supports."""
+    for leg in _test_legs(".github/workflows/ci.yml"):
+        for key, supported in (
+            ("python-version", PYTHON),
+            ("django-version", DJANGO),
+            ("postgres", POSTGRES),
+            ("driver", DRIVERS),
+        ):
+            assert leg.get(key) in supported, (
+                f".github/workflows/ci.yml: {leg['job']} leg {leg} has {key} "
+                f"{leg.get(key)!r}, not one of {supported}"
+            )
+
+
+def test_ci_every_postgres_major_has_a_leg_on_the_oldest_django():
+    """No supported major is covered by inference (#151)."""
+    rel = ".github/workflows/ci.yml"
+    covered = {leg["postgres"] for leg in _test_legs(rel) if leg["django-version"] == _min(DJANGO)}
+    missing = sorted(set(POSTGRES) - covered, key=_key)
+    assert not missing, f"{rel}: PostgreSQL {missing} has no leg on Django {_min(DJANGO)}"
+
+
+def test_ci_psycopg3_runs_the_oldest_django_and_a_non_default_postgres():
+    """The connection-pool tests run only on psycopg 3, so its legs must reach the edges (#151)."""
+    rel = ".github/workflows/ci.yml"
+    legs = [leg for leg in _test_legs(rel) if leg["driver"] == "psycopg3"]
+    assert any(leg["django-version"] == _min(DJANGO) for leg in legs), (
+        f"{rel}: no psycopg3 leg runs the oldest supported Django {_min(DJANGO)}"
+    )
+    assert any(leg["postgres"] != DEFAULT_POSTGRES for leg in legs), (
+        f"{rel}: every psycopg3 leg runs PostgreSQL {DEFAULT_POSTGRES}; one must run another "
+        "supported major"
+    )
+
+
+@pytest.mark.parametrize("job", ["test", "test-postgres"])
+def test_ci_driver_legs_install_and_verify_the_driver(job):
+    """A leg's ``driver`` must be what it runs: psycopg 3 installed, the driver asserted."""
+    rel = ".github/workflows/ci.yml"
+    spec = _workflow(rel)["jobs"][job]
+    assert spec["env"]["DRIVER"] == "${{ matrix.driver }}", (
+        f"{rel}: {job} must pass matrix.driver to the driver check as DRIVER"
+    )
+    runs = "\n".join(step.get("run", "") for step in spec["steps"])
+    assert '"psycopg[binary,pool]"' in runs, (
+        f"{rel}: {job} must install psycopg[binary,pool] on its psycopg3 legs"
+    )
+    assert 'assert driver == os.environ["DRIVER"]' in runs, (
+        f"{rel}: {job} must assert that the active driver is the leg's"
+    )
 
 
 def test_ci_plain_role_leg():

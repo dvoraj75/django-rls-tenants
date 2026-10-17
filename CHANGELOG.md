@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **psycopg 3 on the oldest supported Django and on PostgreSQL 17 in CI** (#151). Two new
+  legs: Python 3.12 / Django 5.2 / psycopg 3 in the main matrix (PostgreSQL 16), and
+  PostgreSQL 17 / Django 5.2 / Python 3.12 / psycopg 3 in the `test-postgres` job. Before,
+  psycopg 3 and the connection-pool tests ran only on Django 6.1 and PostgreSQL 16, and no
+  leg ran PostgreSQL 17. Now every supported PostgreSQL major has a leg on the oldest
+  supported Django, and psycopg 3 runs on both Django edges and on a server other than 16.
+  The `test-postgres` job now installs the leg's driver and asserts it, as the main matrix
+  already did. `tests/test_support_matrix.py` expands both matrices and fails when a
+  supported major has no leg on the oldest Django, when psycopg 3 misses the oldest or
+  newest Django or runs only on the default PostgreSQL, or when a leg names an unsupported
+  version. The supported-versions policy in the installation guide now states the driver
+  coverage, and says that every listed PostgreSQL major is run.
+
 ## [1.5.0] - 2026-10-17
 
 ### Added

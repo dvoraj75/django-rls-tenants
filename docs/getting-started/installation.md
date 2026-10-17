@@ -6,7 +6,7 @@
 |------------|------------------|------------------------------------------|
 | Python     | 3.12, 3.13, 3.14 | Every version that all listed Django series support |
 | Django     | 5.2, 6.0, 6.1    | 5.2 is the current LTS                   |
-| PostgreSQL | 15, 16, 17, 18   | CI runs 15 and 18 as the edges and 16 as the default. Creating policies requires the table owner (or a superuser) |
+| PostgreSQL | 15, 16, 17, 18   | CI runs every listed major, with 16 as the default. Creating policies requires the table owner (or a superuser) |
 
 ## Supported versions
 
@@ -21,11 +21,17 @@ will be added or dropped.
   intersection), so every Python and Django pair is tested. A new Python version is
   added once every supported Django series supports it.
 - **PostgreSQL:** an explicit list of the majors that the PostgreSQL project supports
-  upstream and that are 15 or newer. The oldest and newest each have a CI leg, and the
-  default leg runs a version in between. A new major is added after its first minor
-  (`X.1`) release; a major is dropped after its upstream end of life.
+  upstream and that are 15 or newer. Every listed major has a CI leg on the oldest
+  supported Django, so none is covered by inference: the default (a version in between)
+  runs the full Python and Django matrix, the oldest and newest run the oldest and newest
+  supported Django, and every other major has a leg of its own. A new major is added
+  after its first minor (`X.1`) release; a major is dropped after its upstream end of
+  life.
 - **Driver:** psycopg 3 and psycopg2 both run in CI for as long as Django supports
-  both. The library has no driver-specific code.
+  both. The library has no driver-specific code. psycopg2 runs in most legs. psycopg 3,
+  the only driver that supports Django's connection pool, has legs on the oldest and the
+  newest supported Django and on at least one PostgreSQL major other than the default;
+  those legs also run the connection-pool tests.
 
 A weekly canary job runs the test suite against Django's development branch, the next
 Python and the next PostgreSQL, so new versions are checked before they are added.

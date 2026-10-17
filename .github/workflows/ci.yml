@@ -230,9 +230,14 @@ jobs:
         django-version: ["5.2", "6.0", "6.1"]
         driver: ["psycopg2"]
         include:
-          # Driver-neutrality leg: the library must behave identically on psycopg 3.
-          # Installed on top of the synced venv because Django prefers psycopg 3 whenever
-          # it is importable; putting it in a dependency group would flip every leg.
+          # Driver-neutrality legs: the library must behave identically on psycopg 3,
+          # and only these legs run the psycopg3_only connection-pool tests, so they
+          # cover the oldest and the newest supported Django (#151). Installed on top of
+          # the synced venv because Django prefers psycopg 3 whenever it is importable;
+          # putting it in a dependency group would flip every leg.
+          - python-version: "3.12"
+            django-version: "5.2"
+            driver: "psycopg3"
           - python-version: "3.12"
             django-version: "6.1"
             driver: "psycopg3"
@@ -333,8 +338,10 @@ jobs:
     # The README lists PostgreSQL 15, 16, 17 and 18; the main matrix runs 16.
     # Four extra legs prove the oldest and newest supported PostgreSQL against
     # the oldest and newest supported Django without widening the matrix above
-    # (16 stays the default everywhere else).
-    name: Test (PostgreSQL ${{ matrix.postgres }}, Django ${{ matrix.django-version }})
+    # (16 stays the default everywhere else). One more leg runs 17 on psycopg 3
+    # with the oldest Django (#151), so every supported major has a leg and the
+    # connection-pool tests run on a server other than 16.
+    name: Test (PostgreSQL ${{ matrix.postgres }}, Django ${{ matrix.django-version }}, ${{ matrix.driver }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -344,11 +351,18 @@ jobs:
       matrix:
         postgres: ["15", "18"]
         django-version: ["5.2", "6.1"]
+        driver: ["psycopg2"]
         include:
           - django-version: "5.2"
             python-version: "3.12"
           - django-version: "6.1"
             python-version: "3.14"
+          # A new combination (17 is not on the postgres axis), so every key is
+          # spelled out: GitHub does not apply the rows above to it.
+          - postgres: "17"
+            django-version: "5.2"
+            python-version: "3.12"
+            driver: "psycopg3"
 
     services:
       postgres:
@@ -368,6 +382,7 @@ jobs:
     env:
       UV_PYTHON: ${{ matrix.python-version }}
       DJANGO_VERSION: ${{ matrix.django-version }}
+      DRIVER: ${{ matrix.driver }}
       RLS_FAIL_ON_SKIPPED: "1"
 
     steps:
@@ -384,21 +399,31 @@ jobs:
         run: |
           uv sync --locked --no-default-groups --group test
           uv pip install --python .venv/bin/python "django~=${{ matrix.django-version }}.0"
+          if [ "${{ matrix.driver }}" = "psycopg3" ]; then
+            uv pip install --python .venv/bin/python "psycopg[binary,pool]"
+          fi
 
       - name: Verify matrix versions
         # Do not let uv re-sync Django to the lockfile version after the override.
+        # The driver check also proves the psycopg2 legs did not silently flip.
         run: |
           uv run --no-sync python - <<'EOF'
           import os
           import sys
 
           import django
+          from django.db.backends.postgresql.psycopg_any import is_psycopg3
 
           python_version = ".".join(map(str, sys.version_info[:2]))
           django_version = ".".join(map(str, django.VERSION[:2]))
-          print(f"Testing Python {sys.version.split()[0]}, Django {django.get_version()}")
+          driver = "psycopg3" if is_psycopg3 else "psycopg2"
+          print(
+              f"Testing Python {sys.version.split()[0]}, Django {django.get_version()}, "
+              f"driver {driver}"
+          )
           assert python_version == os.environ["UV_PYTHON"], python_version
           assert django_version == os.environ["DJANGO_VERSION"], django_version
+          assert driver == os.environ["DRIVER"], f"driver {driver}, expected {os.environ['DRIVER']}"
           EOF
 
       - name: Run tests
