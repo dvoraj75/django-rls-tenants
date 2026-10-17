@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`RLSTenantPermission` accepts the tenant context `get_rls_context()` chose** (#150).
+  `has_permission()` let a non-admin user through only in `tenant_context(user.rls_tenant_id)`,
+  so a view whose `RLSTenantAPIViewMixin.get_rls_context()` override let a user select one
+  of the tenants they belong to (a header, a URL segment, a session key) answered `403`
+  ("This request is not running in its user's RLS context."), even for a user with
+  `rls_tenant_id = None` whose selection the override had validated. The mixin now records
+  the RLS context it entered for the request, and the permission also passes a non-admin
+  user while that context is the active one and is a tenant context. The admin bypass
+  still needs `is_tenant_admin`: an override that enters `admin_context()` for any other
+  user gets a `403`. A context manager that sets up no RLS context of its own
+  (`nullcontext()`, say) records nothing, and nothing is carried over to another request.
+  Everything else is unchanged: a view without the mixin still gets a `403`,
+  `has_object_permission()` still compares the object with the active tenant, and the
+  default `get_rls_context()` still enters the user's own tenant. The trade-off: the
+  permission no longer catches an override that enters another tenant's context for a
+  non-admin user by mistake, so the override is the authorization point: validate the
+  selection there (membership check) and raise `PermissionDenied` for one the user may
+  not make. See
+  [Choosing the context](https://dvoraj75.github.io/django-rls-tenants/guides/drf/#choosing-the-context-get_rls_context).
+
 ## [1.5.0] - 2026-10-17
 
 ### Added
