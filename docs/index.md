@@ -65,7 +65,7 @@ the [Security Model](advanced/security.md) for what that does and does not cover
 | Test async code under a tenant context | [Async Tests](guides/testing.md#async-tests) |
 | Write raw SQL that stays tenant-scoped | [Raw SQL](guides/raw-sql.md) |
 | Let authentication or migrations bypass RLS | [Bypass Mode](guides/bypass-mode.md) |
-| Run behind PgBouncer, with Django's connection pool or with persistent connections | [Connection Pooling](guides/connection-pooling.md) |
+| Run behind PgBouncer or pgpool-II, with Django's connection pool or with persistent connections | [Connection Pooling](guides/connection-pooling.md) |
 | Deploy on an ASGI server (Uvicorn, Daphne, Hypercorn) | [Async Deployment](guides/async.md) |
 | Index tables so RLS stays fast | [Performance & Indexing](guides/performance.md) |
 | Verify the policies are really in the database | [`check_rls`](guides/management-commands.md#check_rls) |

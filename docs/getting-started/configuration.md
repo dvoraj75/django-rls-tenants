@@ -290,7 +290,8 @@ middleware only record the context (*changed in 1.5.0*: also inside
 
 **When to enable:**
 
-- You are using a connection pooler (PgBouncer, pgpool) in **transaction mode**.
+- You are using PgBouncer in **transaction mode** (pgpool-II pools per session and needs
+  no mode change; see [pgpool-II](../guides/connection-pooling.md#pgpool-ii)).
 - Transaction-local GUCs are automatically cleared at transaction end,
   preventing cross-request leaks through pooled connections.
 

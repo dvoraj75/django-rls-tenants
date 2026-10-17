@@ -127,8 +127,9 @@ The table lists the combinations and what each needs.
 | Direct to PostgreSQL, `CONN_MAX_AGE = 0` (Django's default) | **Safe.** The recommended starting point. Each request opens a connection and closes it at the end. | **Safe.** Each autocommit statement run under a context costs three extra round trips (see [below](#set-local-without-async-transactions)). |
 | Direct to PostgreSQL, `CONN_MAX_AGE > 0` | **Avoid under ASGI.** Django advises against it and the connections are not reused. `W004` warns about it. | **Avoid under ASGI**, for the same reason. |
 | Django's connection pool (`OPTIONS["pool"]`, psycopg 3) | **Safe.** The library clears every policy GUC on each checkout. Also set `"reset": reset_rls_gucs`, so idle connections hold nothing; `W010` asks for it. | **Safe.** The tenant and admin GUCs are transaction-local, and the checkout clear covers bypass flags left at session level. |
-| PgBouncer, transaction mode | **Unsafe.** Session GUCs travel with the server connection to the next client, and nothing in Django sees that hand-off. | **Safe, and the only safe choice.** Also set `DISABLE_SERVER_SIDE_CURSORS = True` on the alias, as Django requires for transaction pooling. |
+| PgBouncer, transaction mode | **Unsafe.** Session GUCs travel with the server connection to the next client, and nothing in Django sees that hand-off. | **Safe, and the only safe choice.** Also set `DISABLE_SERVER_SIDE_CURSORS = True` on the alias, as Django requires for transaction pooling, and a `server_reset_query` that clears the policy GUCs, with `server_reset_query_always = 1` (see [Clearing the GUCs After Every Transaction](connection-pooling.md#clearing-the-gucs-after-every-transaction)). |
 | PgBouncer, session mode | **Safe.** One client connection is one server session. The middleware clears the GUCs at the end of each request, and PgBouncer's `server_reset_query` (`DISCARD ALL` by default) resets the session when Django disconnects. | **Safe.** |
+| pgpool-II, `load_balance_mode = off` | **Safe.** pgpool pools per session: the middleware clears the GUCs at the end of each request, and `reset_query_list` (`ABORT; DISCARD ALL` by default) resets the session when Django disconnects. | **Safe.** |
 
 Notes on the rows:
 
@@ -143,6 +144,10 @@ Notes on the rows:
 - **PgBouncer in transaction mode** hands the server connection to another client at every
   transaction end. Only transaction-local GUCs are safe there. See
   [Transaction Mode](connection-pooling.md#transaction-mode-recommended).
+- **pgpool-II with load balancing on** sends the library's `set_config()` statement to the
+  primary and plain reads to a standby. With `USE_LOCAL_SET=False` reads in autocommit find
+  no rows; with `USE_LOCAL_SET=True` they work, but every statement run under a context
+  stays on the primary. See [Load Balancing](connection-pooling.md#load-balancing).
 - **Bypass flags** are session-scoped by default in both modes. Behind a transaction-mode
   pooler, set them with the sync `bypass_flag(..., is_local=True)` or
   `rls_context(..., is_local=True)` inside `transaction.atomic()`, in a synchronous
@@ -304,8 +309,10 @@ A few more consequences:
       serves your requests (the `django.request` `DEBUG` log above).
 - [ ] `CONN_MAX_AGE = 0`. Connection reuse comes from Django's pool with
       `"reset": reset_rls_gucs`, or from PgBouncer.
-- [ ] Behind PgBouncer in transaction mode: `USE_LOCAL_SET=True` and
-      `DISABLE_SERVER_SIDE_CURSORS = True`.
+- [ ] Behind PgBouncer in transaction mode: `USE_LOCAL_SET=True`,
+      `DISABLE_SERVER_SIDE_CURSORS = True`, and a `server_reset_query` that clears the
+      policy GUCs, with `server_reset_query_always = 1`.
+- [ ] Behind pgpool-II: `load_balance_mode = off`.
 - [ ] `RLS_TENANTS["DATABASES"]` lists every alias the application queries.
 - [ ] The pool's `max_size` covers one process's concurrent requests plus its executor
       threads, and `max_connections` covers that for every worker process. Without a pool,

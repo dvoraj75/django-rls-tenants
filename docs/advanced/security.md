@@ -324,7 +324,12 @@ Mitigations:
   persistent or pooled connection. Inside a context in autocommit, the guard's values
   override such a write, so it cannot narrow the context. An external pooler such as
   PgBouncer in transaction mode still needs this mode: with session GUCs the handler and
-  the guard do not see that pooler hand the server connection to another client.
+  the guard do not see that pooler hand the server connection to another client. Nor does
+  the clear above reach every server connection there: the client's next statement can run
+  on another one, so a session-level write stays where it was made, for every later client.
+  A PgBouncer `server_reset_query` that clears the policy GUCs after every transaction
+  covers it (see
+  [One Session-Level Write Reaches Every Later Client](../guides/connection-pooling.md#one-session-level-write-reaches-every-later-client)).
 
 See [Connection Pooling](../guides/connection-pooling.md) for details, and
 [Async Deployment](../guides/async.md#connections-and-pooling) for the safe combinations
