@@ -702,6 +702,7 @@ class Invoice(RLSProtectedModel):
 Then run `makemigrations` and `migrate`; `check_rls` confirms the policy.
 
 **See:** [Meta Class Inheritance](guides/protecting-models.md#meta-class-inheritance).
+
 ### W015: a `STRICT_MODE_EXCLUDE` entry exempts nothing
 
 **Symptom:** `(django_rls_tenants.W015) RLS_TENANTS['STRICT_MODE_EXCLUDE'] lists

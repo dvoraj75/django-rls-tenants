@@ -271,7 +271,7 @@ class TestParallel:
             )
         record = _json_lines(out.getvalue())[tenant_a.pk]
         assert record["status"] == "failed"
-        assert record["error"].startswith("the worker process died: ")
+        assert record["error"].startswith("the worker pool broke before this tenant finished")
 
     def test_needs_a_settings_module(self, tenant_a, settings):
         settings.SETTINGS_MODULE = None

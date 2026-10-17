@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from django.db import migrations
 from django.db.migrations.writer import MigrationWriter
@@ -87,6 +87,39 @@ class TestAddM2MRLSPolicyForwards:
         sql = schema_editor.execute.call_args[0][0]
         assert "WHERE id = project_id AND tenant_id" in sql
         assert "WHERE id = tag_id" not in sql
+
+
+class TestAddM2MRLSPolicyRouter:
+    """Both directions honour the database router, as Django's operations do."""
+
+    @staticmethod
+    def _op():
+        return AddM2MRLSPolicy(
+            m2m_table="myapp_project_users",
+            from_model="myapp.Project",
+            to_model="myapp.User",
+            from_fk="project_id",
+            to_fk="user_id",
+        )
+
+    def test_forwards_skips_a_database_the_router_refuses(self):
+        schema_editor = MagicMock()
+        schema_editor.connection.alias = "analytics"
+        to_state = MagicMock()
+        to_state.apps = _make_mock_apps()
+        with patch(
+            "django_rls_tenants.operations.router.allow_migrate", return_value=False
+        ) as allow:
+            self._op().database_forwards("myapp", schema_editor, MagicMock(), to_state)
+        allow.assert_called_once_with("analytics", "myapp")
+        schema_editor.execute.assert_not_called()
+
+    def test_backwards_skips_a_database_the_router_refuses(self):
+        schema_editor = MagicMock()
+        schema_editor.connection.alias = "analytics"
+        with patch("django_rls_tenants.operations.router.allow_migrate", return_value=False):
+            self._op().database_backwards("myapp", schema_editor, MagicMock(), MagicMock())
+        schema_editor.execute.assert_not_called()
 
 
 class TestAddM2MRLSPolicyBackwards:

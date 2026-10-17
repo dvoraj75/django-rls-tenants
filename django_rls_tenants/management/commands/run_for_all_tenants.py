@@ -267,7 +267,10 @@ class Command(BaseCommand):
                         tenant=pk,
                         label=label,
                         status=_FAILED,
-                        error=f"the worker process died: {exc}",
+                        error=(
+                            "the worker pool broke before this tenant finished (a worker "
+                            f"process died, or failed to start): {exc}"
+                        ),
                     )
                 self._report(run, record)
                 if run.status == _FAILED and options["fail_fast"] and not stopped:

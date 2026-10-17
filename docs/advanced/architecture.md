@@ -41,7 +41,7 @@ The upper layer builds Django multitenancy on top of `rls/`:
 | Module | Purpose |
 |--------|---------|
 | `tenants/conf.py` | `RLSTenantsConfig` -- reads `RLS_TENANTS` settings |
-| `tenants/models.py` | `RLSProtectedModel` -- abstract base with auto-FK and `RLSConstraint`. `register_m2m_rls()` -- auto-detection of M2M fields |
+| `tenants/models.py` | `RLSProtectedModel` -- abstract base with auto-FK and `RLSConstraint`. `register_m2m_rls()` -- auto-detection of M2M fields. `validate_cross_tenant_fks()` -- rejects a foreign key to another tenant's row (called from `clean_fields()`) |
 | `operations.py` | `AddM2MRLSPolicy` -- reversible migration operation for M2M RLS policies |
 | `pool.py` | `reset_rls_gucs()` -- `reset` callback for Django's psycopg connection pool. Also the single statement that clears every GUC the policies read, which the `connection_created` handler runs on each checkout from a pool. Importable from `settings.py` (no `tenants/` import at module level) |
 | `tenants/managers.py` | `TenantQuerySet`, `RLSManager` -- lazy GUC setting at query eval time |
@@ -53,6 +53,9 @@ The upper layer builds Django multitenancy on top of `rls/`:
 | `tenants/types.py` | `TenantUser` protocol |
 | `tenants/state.py` | `get_current_tenant_id()`, `set_current_tenant_id()`, `reset_current_tenant_id()` -- `ContextVar`-based tenant state for auto-scoping. Also `get_rls_context_active()`, `set_rls_context_active()`, `reset_rls_context_active()` -- tracks whether any RLS context is active (used by strict mode). A private third `ContextVar` holds the GUC values the library applied for the active context, for the GUC affinity guard |
 | `tenants/checks.py` | Django system checks (W001--W015, E001) |
+| `pytest_plugin.py` | The `rls_role`, `enforce_rls` and `enforce_rls_on_other_threads` fixtures, registered through the `pytest11` entry point; imports nothing from Django at module level |
+| `management/` | `check_rls` (with `--generate`, backed by `_rls_migrations.py`), `setup_m2m_rls`, `run_as_tenant` and `run_for_all_tenants` (`_worker.py` holds the `--parallel` worker entry points) |
+| `contrib/drf.py`, `contrib/celery.py` | Optional integrations behind the `drf` and `celery` extras; never imported by the core layers |
 
 ### Import Boundary
 

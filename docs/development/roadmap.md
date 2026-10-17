@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: 2026-10-16
+> Last updated: 2026-10-17
 >
 > Priorities may shift based on community feedback.
 > Have a suggestion? [Open an issue](https://github.com/dvoraj75/django-rls-tenants/issues).
@@ -321,9 +321,11 @@ See [1.4.0](changelog.md#140-2026-10-16).
 
 ## v1.5.0 — DRF Integration & Query Improvements
 
-First-class support for the most popular Django API framework.
+First-class support for the most popular Django API framework, the ORM-level gaps the
+1.4.0 cycle left open, and checks and tooling for the mistakes a project makes around a
+correct policy. See [1.5.0](changelog.md#150-2026-10-17).
 
-- [ ] **Django REST Framework integration** (`contrib/drf.py`) —
+- [x] **Django REST Framework integration** (#43, `contrib/drf.py`) —
   `RLSTenantAPIViewMixin` (opens the context after DRF authenticates, for any
   `APIView`, generic view or viewset), `RLSTenantPermission`,
   `RLSTenantSerializerMixin` / `RLSTenantModelSerializer` with
@@ -334,14 +336,14 @@ First-class support for the most popular Django API framework.
   *Why:* DRF is the dominant API framework for Django. Library-level
   integration removes boilerplate and prevents misconfiguration.
 
-- [ ] **`prefetch_related` tenant filter propagation** — Extend ORM-level
+- [x] **`prefetch_related` tenant filter propagation** (#44) — Extend ORM-level
   tenant filtering to prefetched querysets, matching the existing
   `select_related` behavior.
   *Why:* Completes defense-in-depth at the ORM layer. RLS still protects at
   the database level, but ORM filters enable composite index usage and make
   the isolation visible in query logs.
 
-- [ ] **Granular strict mode** — `RLS_TENANTS["STRICT_MODE_EXCLUDE"]`, a list
+- [x] **Granular strict mode** (#45) — `RLS_TENANTS["STRICT_MODE_EXCLUDE"]`, a list
   of `"app_label.ModelName"` labels that strict mode does not guard (a proxy
   follows its concrete model), with system check `W015` for an entry that names
   no installed RLS-protected model. Only the strict-mode check is skipped: the
@@ -364,6 +366,47 @@ First-class support for the most popular Django API framework.
   *Why:* The policy of an M2M through table came only from a hand-written
   migration or from `setup_m2m_rls`, so a fresh database built from the migrations
   had none, and a failing `check_rls` named the table without naming the cause.
+
+- [x] **Guard-only transaction-local mode inside `atomic()`** (#137) — With
+  `USE_LOCAL_SET=True`, context blocks, the `for_user()` scope and the middleware
+  write nothing inside a transaction either; the GUC affinity guard sets both GUCs in
+  one `set_config()` before the first statement that needs them and puts the enclosing
+  values back when a block exits. The middleware also sets and clears both GUCs in
+  one statement per alias in session mode.
+  *Why:* 1.4.0 made this the path outside `atomic()`; inside it each block still cost
+  six `SET LOCAL` / `current_setting()` statements.
+
+- [x] **Checks that fail loudly** (#108) — `E001` (the `W005` bypassing-role warning
+  becomes an error with `DEBUG` off), `W013` when a database check could not run, and
+  `W005` / `W011` on every alias in `RLS_TENANTS["DATABASES"]`.
+  *Why:* A superuser connection in production, or a check that swallowed its own
+  error, let a project believe it was protected.
+
+- [x] **`W012` and `UNIQUE_ACROSS_TENANTS`** (#98) — A warning for each unique field,
+  `unique_together` entry or `UniqueConstraint` on an RLS-protected model that omits
+  the tenant field, with an allowlist for intended cross-tenant uniqueness.
+  *Why:* PostgreSQL checks unique indexes outside the policies, so the
+  `IntegrityError` is a cross-tenant existence oracle.
+
+- [x] **Cross-tenant foreign key validation** (#107) — `validate_cross_tenant_fks()`,
+  called from `RLSProtectedModel.clean_fields()` and the DRF serializer mixin, rejects a
+  foreign key to a row of another tenant with Django's "not a valid choice" error. A
+  proxy of an `RLSProtectedModel` can now be defined.
+  *Why:* RLS checks a row's own tenant column; referential integrity runs outside row
+  security, so nothing stopped tenant A's row from pointing at tenant B's.
+
+- [x] **`enforce_rls` as a pytest plugin, `assert_rls_enforced()`** (#97) — The
+  `rls_role`, `enforce_rls` and `enforce_rls_on_other_threads` fixtures ship with the
+  package through the `pytest11` entry point, with `rls_role` / `rls_role_aliases` ini
+  options; the library suite and the example project use the shipped plugin.
+  *Why:* Isolation tests on a superuser connection pass whether or not the policies
+  work; every project had to copy the fixture from the docs.
+
+- [x] **`run_as_tenant` and `run_for_all_tenants`** (#111) — Run any management
+  command inside `tenant_context()` / `admin_context()`, or once per tenant with
+  `--filter`, `--fail-fast`, `--json` and `--parallel`.
+  *Why:* Nightly reports, re-indexes and backfills needed hand-written context
+  handling in every command.
 
 ---
 

@@ -13,10 +13,11 @@ point at rows of its own tenant (``validate_cross_tenant_fks()``).
 from __future__ import annotations
 
 import logging
+from contextlib import ExitStack
 from typing import TYPE_CHECKING
 
 from django.core.exceptions import FieldDoesNotExist, ValidationError
-from django.db import models, router
+from django.db import connections, models, router, transaction
 from django.db.models.signals import class_prepared
 
 if TYPE_CHECKING:
@@ -147,7 +148,8 @@ def register_m2m_rls() -> None:
 
             to_tenant_fk: str | None = None
             if issubclass(to_model, RLSProtectedModel):
-                to_tenant_fk = _get_tenant_fk_field(to_model)
+                # A proxy has no constraints of its own: read its concrete model's.
+                to_tenant_fk = _get_tenant_fk_field(to_model._meta.concrete_model or to_model)  # noqa: SLF001
                 if to_tenant_fk is None:
                     to_tenant_fk = rls_tenants_config.TENANT_FK_FIELD
 
@@ -247,6 +249,24 @@ def _invalid_target(field: models.ForeignKey[Any, Any], value: Any) -> Validatio
     )
 
 
+def _needs_own_transaction(alias: str) -> bool:
+    """Whether ``admin_context(using=alias)`` needs a transaction opened for it here.
+
+    With ``USE_LOCAL_SET=True`` a context block on an alias outside
+    ``RLS_TENANTS["DATABASES"]`` (a read replica a router returns, say) writes
+    ``SET LOCAL`` itself, which fails outside ``transaction.atomic()``; on a
+    configured alias the GUC affinity guard applies the values instead.
+    """
+    from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
+
+    conf = rls_tenants_config
+    return (
+        conf.USE_LOCAL_SET
+        and alias not in conf.DATABASES
+        and not connections[alias].in_atomic_block
+    )
+
+
 def _foreign_keys_of_other_tenants(
     tenant_id: Any,
     targets: Mapping[models.ForeignKey[Any, Any], Any],
@@ -273,7 +293,10 @@ def _foreign_keys_of_other_tenants(
         by_alias.setdefault(alias, []).append((field, value))
     mismatched: list[models.ForeignKey[Any, Any]] = []
     for alias, pairs in by_alias.items():
-        with admin_context(using=alias):
+        with ExitStack() as stack:
+            if _needs_own_transaction(alias):
+                stack.enter_context(transaction.atomic(using=alias))
+            stack.enter_context(admin_context(using=alias))
             for field, value in pairs:
                 target: type[models.Model] = field.related_model
                 target_tenant = _tenant_field(target)

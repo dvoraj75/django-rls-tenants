@@ -32,7 +32,8 @@ returns zero rows, never leaked data.
   It guards against omitted tenant scoping, not arbitrary SQL on the app connection --
   see the [security model](https://dvoraj75.github.io/django-rls-tenants/advanced/security/).
 - **Fail-closed by default** -- missing tenant context returns zero rows; optional
-  `STRICT_MODE` raises `NoTenantContextError` on unscoped `TenantQuerySet` evaluation.
+  `STRICT_MODE` raises `NoTenantContextError` on unscoped `TenantQuerySet` evaluation
+  (`STRICT_MODE_EXCLUDE` exempts listed models, such as the user model an auth backend reads).
 - **Automatic query scoping** -- `RLSProtectedModel` adds the tenant FK, the RLS policy,
   and a tenant-scoped manager.
 - **Index-friendly by design** -- the manager's `WHERE tenant_id = X` is what reaches the

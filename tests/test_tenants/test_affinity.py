@@ -2268,6 +2268,29 @@ class TestOtherAliasesOnExit:
         # The safety net's own clear, one statement; the guard adds none.
         assert len(_guard_statements(queries)) == len(queries) == 1
 
+    def test_safety_net_clears_the_other_aliases_when_one_fails(
+        self, with_replica, tenant_a_user, monkeypatch
+    ):
+        """A failure on the first alias (an unusable connection) does not skip the rest."""
+        middleware = RLSTenantMiddleware(get_response=lambda request: None)
+        middleware.process_request(_request_for(tenant_a_user))
+        # The handler imports write_gucs from affinity when it runs, so patch its source.
+        original = affinity.write_gucs
+
+        def failing_on_default(conn, values, **kwargs):
+            if conn.alias == DEFAULT_DB_ALIAS:
+                raise RuntimeError("boom")
+            return original(conn, values, **kwargs)
+
+        monkeypatch.setattr(affinity, "write_gucs", failing_on_default)
+        request_finished.disconnect(close_old_connections)
+        try:
+            request_finished.send(sender=self.__class__)  # the handler logs the failure
+        finally:
+            request_finished.connect(close_old_connections)
+
+        assert session_gucs(with_replica) == _NO_GUCS
+
 
 class TestRecordOnAClosedConnection:
     @pytest.mark.django_db(transaction=True)

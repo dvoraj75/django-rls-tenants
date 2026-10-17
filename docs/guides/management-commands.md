@@ -489,9 +489,11 @@ python manage.py run_for_all_tenants --parallel 4 --json my_report
 - Results are reported as they finish, in completion order rather than primary key
   order. Each worker's output is captured and printed under its tenant's header, so
   tenants' output never interleaves.
-- A worker process that dies (it is killed, or runs out of memory) fails the tenants it
-  was running with `the worker process died: ...`. The pool is broken then, so the
-  tenants that had not finished are reported as failed too.
+- A worker process that dies (it is killed, or runs out of memory), or one that fails to
+  start (a settings module the worker cannot import), breaks the pool: the tenant it was
+  running and every tenant that had not finished are reported as failed with
+  `the worker pool broke before this tenant finished (a worker process died, or failed to
+  start): ...`.
 - With `--fail-fast`, tenants not yet started are cancelled and reported as skipped;
   tenants already running finish.
 

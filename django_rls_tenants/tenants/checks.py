@@ -639,7 +639,8 @@ def _check_strict_mode_exclude() -> list[CheckWarning]:
         except (LookupError, ValueError):
             problem = "does not resolve to an installed model"
         else:
-            if model in guarded:
+            # A proxy follows its concrete model, as the strict-mode check does.
+            if (model._meta.concrete_model or model) in guarded:  # noqa: SLF001
                 continue
             problem = (
                 "names a model without an RLSConstraint, which strict mode never guards, "

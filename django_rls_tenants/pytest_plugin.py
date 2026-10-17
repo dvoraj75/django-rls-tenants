@@ -169,6 +169,13 @@ def _switch_role(conn: BaseDatabaseWrapper, role: str) -> bool:
     return bypasses
 
 
+def _in_failed_transaction(conn: BaseDatabaseWrapper) -> bool:
+    """Whether ``conn``'s open DB-API connection sits in an aborted transaction."""
+    from django_rls_tenants.tenants.affinity import _IN_ERROR, _status_reader  # noqa: PLC0415
+
+    return _status_reader(conn.connection)() == _IN_ERROR
+
+
 def _fail_inside_a_test_transaction(conn: BaseDatabaseWrapper) -> None:
     """Fail when ``rls_role`` would create the role inside a test transaction.
 
@@ -299,8 +306,12 @@ def enforce_rls(
         connection_created.disconnect(switch_reopened)
         for conn in switched:
             # A closed connection took its SET ROLE with it (a reopened one was switched
-            # again as it opened, and is reset here).
+            # again as it opened, and is reset here). In an aborted transaction RESET ROLE
+            # would only raise, and would hide the test's own error: the rollback that
+            # ends the transaction reverts the SET ROLE issued inside it.
             if conn.connection is None or conn.closed_in_transaction:
+                continue
+            if _in_failed_transaction(conn):
                 continue
             with conn.cursor() as cursor:
                 cursor.execute("RESET ROLE")

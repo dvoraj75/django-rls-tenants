@@ -1181,6 +1181,10 @@ class TestCheckStrictModeExclude:
         """RLS-protected models, the model name in any case, pass."""
         assert _w015(["test_app.Order", "test_app.protecteduser", "test_app.ORDERITEM"]) == []
 
+    def test_no_warning_for_a_proxy_of_a_protected_model(self):
+        """A proxy has no constraints of its own and follows its concrete model."""
+        assert _w015(["test_app.OrderProxy"]) == []
+
     @pytest.mark.parametrize(
         "label",
         ["test_app.Nope", "nope_app.Order", "Order", "test_app.Order.extra"],

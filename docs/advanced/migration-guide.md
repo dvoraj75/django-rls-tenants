@@ -250,6 +250,37 @@ warnings after the upgrade; nothing fails and no behaviour changes. For each one
 
 See [W014](../troubleshooting.md#w014-a-protected-model-has-no-rlsconstraint).
 
+#### Foreign keys to another tenant's row fail validation
+
+`RLSProtectedModel.clean_fields()` now calls `validate_cross_tenant_fks()` (#107): a
+`ForeignKey` or `OneToOneField` whose target model has an `RLSConstraint` must point at a
+row of the instance's own tenant, or `full_clean()`, a `ModelForm` and the Django admin
+report the field as invalid, with the same message Django gives a row that does not exist.
+`RLSTenantModelSerializer` / `RLSTenantSerializerMixin` run the same check in `validate()`.
+On a plain role the policy already hid such rows, so a form never accepted them. The
+difference shows on a connection that bypasses RLS (a superuser, `BYPASSRLS`, or a fixture
+load) and in the admin context: a write that used to be accepted there with a foreign key
+to another tenant's row now fails validation. `save()`, `create()`, `bulk_create()`,
+`update()` and raw SQL are unchanged; call `validate_cross_tenant_fks(obj)` before a
+`save()` that no form validated. A subclass that overrides `clean_fields()` must call
+`super().clean_fields(exclude)` for the check to run. `RLSTenantModelAdmin` now sets the
+implicit tenant on the form's object when it builds the form, not only in `save_model()`.
+See [Cross-Tenant Foreign Keys](../guides/protecting-models.md#cross-tenant-foreign-keys).
+
+#### The package registers a pytest plugin
+
+Installing 1.5.0 registers the `django_rls_tenants` pytest plugin through the `pytest11`
+entry point (#97), so every pytest run that has the package installed gets the `rls_role`,
+`enforce_rls` and `enforce_rls_on_other_threads` fixtures and the `rls_role` /
+`rls_role_aliases` ini options. The plugin imports nothing from Django at startup and does
+nothing until a test requests a fixture. A fixture of the same name in your own
+`conftest.py` takes precedence, so a hand-written `enforce_rls` keeps working; delete it
+to use the shipped one. The first test that
+requests `enforce_rls` on a connection that bypasses RLS creates the `rls_test_role` role
+(`NOLOGIN`) in the test database, which needs `CREATEROLE` or superuser on that connection.
+`-p no:django_rls_tenants` turns the plugin off. See
+[Enforcing RLS in Tests](../guides/testing.md#enforcing-rls-in-tests).
+
 ### From 1.3.4 to 1.4.0
 
 - **Django 4.2, 5.0 and 5.1 and Python 3.11 are no longer supported.** 1.4.0 needs

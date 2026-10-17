@@ -124,11 +124,19 @@ def _clear_finished_request_gucs() -> None:
     if conf.USE_LOCAL_SET:
         suspect_sessions()
         return
+    failed: list[str] = []
     for db_alias in conf.DATABASES:
         connection = connections[db_alias]
         if connection.connection is None:
             continue
-        write_gucs(connection, None)
+        try:
+            write_gucs(connection, None)
+        except Exception:
+            logger.debug("Safety net: clearing RLS GUCs on %r failed", db_alias, exc_info=True)
+            failed.append(db_alias)
+    if failed:
+        msg = f"clearing RLS GUCs failed on {', '.join(map(repr, failed))}"
+        raise RuntimeError(msg)
 
 
 def _guard_open_connections() -> None:

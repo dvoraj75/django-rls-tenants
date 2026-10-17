@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from django.db import migrations
+from django.db import migrations, router
 from django.db.migrations.operations.base import OperationCategory
 
 from django_rls_tenants.rls.constraints import (
@@ -112,12 +112,14 @@ class AddM2MRLSPolicy(migrations.operations.base.Operation):
 
     def database_forwards(
         self,
-        app_label: str,  # noqa: ARG002
+        app_label: str,
         schema_editor: BaseDatabaseSchemaEditor,
         from_state: ProjectState,  # noqa: ARG002
         to_state: ProjectState,
     ) -> None:
-        """Create the M2M RLS policy."""
+        """Create the M2M RLS policy, on a database the router lets ``app_label`` migrate to."""
+        if not router.allow_migrate(schema_editor.connection.alias, app_label):
+            return
         table = self.m2m_table
         admin_check = bool_flag_sql(self.guc_admin_var)
         subquery_clause = _build_m2m_conditions(
@@ -137,12 +139,14 @@ class AddM2MRLSPolicy(migrations.operations.base.Operation):
 
     def database_backwards(
         self,
-        app_label: str,  # noqa: ARG002
+        app_label: str,
         schema_editor: BaseDatabaseSchemaEditor,
         from_state: ProjectState,  # noqa: ARG002
         to_state: ProjectState,  # noqa: ARG002
     ) -> None:
-        """Drop the M2M RLS policy and disable RLS."""
+        """Drop the M2M RLS policy and disable RLS, where the router allows it."""
+        if not router.allow_migrate(schema_editor.connection.alias, app_label):
+            return
         schema_editor.execute(_build_m2m_drop_sql(table=self.m2m_table))
 
     def describe(self) -> str:

@@ -8,7 +8,7 @@ import pytest
 from django import forms
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db import connection, models
+from django.db import connection, connections, models
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 
@@ -373,6 +373,23 @@ class TestCrossTenantForeignKeys:
         with admin_context():
             form = DescriptionOnlyForm(data={"description": "x"}, instance=instance)
             assert form.is_valid(), form.errors
+
+    @pytest.mark.django_db(transaction=True)
+    def test_local_set_mode_on_a_router_alias_outside_databases(
+        self, replica, tenant_a, sample_orders
+    ):
+        """A read replica the router returns needs a transaction for the SET LOCAL writes."""
+        a1, b1 = sample_orders["a1"], sample_orders["b1"]
+        local_set = override_settings(RLS_TENANTS={**settings.RLS_TENANTS, "USE_LOCAL_SET": True})
+        with (
+            local_set,
+            patch("django_rls_tenants.tenants.models.router.db_for_read", return_value=replica),
+            tenant_context(tenant_a.pk),
+        ):
+            with pytest.raises(ValidationError):
+                validate_cross_tenant_fks(OrderItem(tenant=tenant_a, order=b1, description="x"))
+            validate_cross_tenant_fks(OrderItem(tenant=tenant_a, order=a1, description="x"))
+        assert connections[replica].in_atomic_block is False
 
     @pytest.mark.django_db(transaction=True)
     def test_local_set_mode(self, enforce_rls, tenant_a, sample_orders):

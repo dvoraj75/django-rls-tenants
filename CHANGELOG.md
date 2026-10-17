@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-17
+
 ### Added
 
 - **Granular strict mode: `STRICT_MODE_EXCLUDE`** (#45). A new setting,
@@ -189,6 +191,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that used to be accepted on a superuser or `BYPASSRLS` connection (or in the admin
   context) with a foreign key to another tenant's row now fails validation.** See
   [Cross-Tenant Foreign Keys](https://dvoraj75.github.io/django-rls-tenants/guides/protecting-models/#cross-tenant-foreign-keys).
+- **pytest plugin and `assert_rls_enforced()` for running tests as a role RLS applies to**
+  (#97). A superuser or `BYPASSRLS` connection skips every policy, so isolation tests on
+  it pass whether or not the policies work. Installing the package now registers a pytest
+  plugin through the `pytest11` entry point `django_rls_tenants` (it needs pytest-django
+  for the fixtures; `-p no:django_rls_tenants` turns it off) with three fixtures:
+  `rls_role` (session; creates a `NOLOGIN` role if missing and grants it `USAGE` on the
+  `search_path` schemas, `ALL` on their tables and sequences and default privileges for
+  later ones), `enforce_rls` (switches each configured alias that bypasses RLS to that
+  role with `SET ROLE` for the test, a connection the test reopens included; a no-op on a
+  plain role) and
+  `enforce_rls_on_other_threads` (does the same for connections opened on other threads,
+  such as ASGI error pages). Two ini options configure it: `rls_role` (default
+  `rls_test_role`) and `rls_role_aliases` (default `default`). `assert_rls_enforced()` and
+  `aassert_rls_enforced()` in `django_rls_tenants.tenants.testing` fail when the
+  connection's current role is a superuser or has `BYPASSRLS`. The example project's tests
+  now run as its Docker superuser too. See "Enforcing RLS in Tests" in the testing guide.
 
 ### Changed
 
@@ -212,24 +230,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pg_policies` query fails, it prints "Could not determine the RLS status of the protected
   tables on database 'x' ... Nothing was verified" to stderr and exits with status 1,
   instead of a traceback.
-- **pytest plugin and `assert_rls_enforced()` for running tests as a role RLS applies to**
-  (#97). A superuser or `BYPASSRLS` connection skips every policy, so isolation tests on
-  it pass whether or not the policies work. Installing the package now registers a pytest
-  plugin through the `pytest11` entry point `django_rls_tenants` (it needs pytest-django
-  for the fixtures; `-p no:django_rls_tenants` turns it off) with three fixtures:
-  `rls_role` (session; creates a `NOLOGIN` role if missing and grants it `USAGE` on the
-  `search_path` schemas, `ALL` on their tables and sequences and default privileges for
-  later ones), `enforce_rls` (switches each configured alias that bypasses RLS to that
-  role with `SET ROLE` for the test, a connection the test reopens included; a no-op on a
-  plain role) and
-  `enforce_rls_on_other_threads` (does the same for connections opened on other threads,
-  such as ASGI error pages). Two ini options configure it: `rls_role` (default
-  `rls_test_role`) and `rls_role_aliases` (default `default`). `assert_rls_enforced()` and
-  `aassert_rls_enforced()` in `django_rls_tenants.tenants.testing` fail when the
-  connection's current role is a superuser or has `BYPASSRLS`. The example project's tests
-  now run as its Docker superuser too. See "Enforcing RLS in Tests" in the testing guide.
-
-### Changed
 
 - **`USE_LOCAL_SET=True`: context blocks inside `transaction.atomic()` leave the GUC
   writes to the GUC affinity guard** (#137). On an alias in `RLS_TENANTS["DATABASES"]`,
@@ -311,6 +311,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model's tenant field and table policy: `STRICT_MODE`, the `prefetch_related()` tenant
   filter and the cross-tenant foreign key check treat it as RLS-protected, and `W009`
   reports the concrete model only (as `check_rls` does, above).
+- **`W015` no longer warns about a proxy model in `STRICT_MODE_EXCLUDE`** (pre-release
+  review). A proxy has no constraints of its own, so the check said the entry "names a
+  model without an RLSConstraint" although strict mode exempts the proxy through its
+  concrete model. The check now follows the concrete model too.
+- **`validate_cross_tenant_fks()` works with a read router under `USE_LOCAL_SET=True`**
+  (pre-release review). When the router sends the target model's reads to an alias that
+  is not in `RLS_TENANTS["DATABASES"]` (a read replica), the `admin_context()` the check
+  enters there writes `SET LOCAL` itself and raised `RuntimeError` outside
+  `transaction.atomic()`, so `full_clean()`, a `ModelForm` or the admin failed instead of
+  validating. The check now opens a transaction on such an alias for its one query.
+- **`register_m2m_rls()` resolves the tenant field of a proxy target through its concrete
+  model** (pre-release review). An auto-created many-to-many field that points at a proxy
+  of an RLS-protected model whose `RLSConstraint` names a field other than
+  `TENANT_FK_FIELD` got a through-table policy on the wrong column.
+- **`AddM2MRLSPolicy` honours the database router** (pre-release review). Like Django's
+  own operations, `database_forwards()` and `database_backwards()` now ask
+  `router.allow_migrate(alias, app_label)` and do nothing on a database the router keeps
+  the app off, so a `migrate --database=other` of a migration `check_rls --generate`
+  wrote no longer fails on a table that does not exist there.
+- **The `request_finished` safety net clears every configured alias even when one fails**
+  (pre-release review). A failure to clear the GUCs on one alias (an unusable connection,
+  say) skipped the remaining aliases; each alias is now cleared on its own and the
+  failures are reported together.
+- **`enforce_rls` teardown in an aborted transaction** (pre-release review). When a test
+  left its connection in a failed transaction, the fixture's `RESET ROLE` raised and hid
+  the test's own error. It is skipped there: the rollback that ends the transaction
+  reverts the `SET ROLE` issued inside it.
+- **`run_for_all_tenants --parallel` reports a broken worker pool as such** (pre-release
+  review). Tenants that never started were reported with "the worker process died"; the
+  message now reads "the worker pool broke before this tenant finished (a worker process
+  died, or failed to start)".
 
 ## [1.4.0] - 2026-10-16
 
@@ -1425,7 +1456,8 @@ Initial stable release of django-rls-tenants.
   and manager `_fetch_all` could clear GUCs with session scope while setting
   them with transaction scope, causing mismatched lifetimes.
 
-[Unreleased]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.3.4...v1.4.0
 [1.3.4]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.3.3...v1.3.4
 [1.3.3]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.3.2...v1.3.3
