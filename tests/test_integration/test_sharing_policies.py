@@ -302,6 +302,27 @@ class TestWriting:
                 combined.delete()
             assert not getattr(own, operator)(SharedNote.objects.all())._rls_including_shared
 
+    @pytest.mark.parametrize("operator", ["__or__", "__xor__"])
+    def test_combination_with_none_marks_a_clone_not_the_operand(self, notes, tenant_b, operator):
+        """Django returns the left operand itself when the right one is ``none()``."""
+        with tenant_context(tenant_b.pk):
+            own = SharedNote.objects.filter(title="B own")
+            combined = getattr(own, operator)(SharedNote.objects.including_shared().none())
+            assert combined._rls_including_shared
+            assert combined is not own
+            assert not own._rls_including_shared
+            assert own.update(title="B own") == 1
+
+    def test_empty_left_operand_is_not_marked(self, notes, tenant_b):
+        """``none() & shared``: Django returns the (empty) left operand itself."""
+        with tenant_context(tenant_b.pk):
+            empty = SharedNote.objects.filter(title="B own").none()
+            combined = empty & SharedNote.objects.including_shared()
+            assert combined._rls_including_shared
+            assert combined is not empty
+            assert not empty._rls_including_shared
+            assert list(combined) == []
+
     def test_writes_without_including_shared_still_work(self, notes, tenant_b):
         with tenant_context(tenant_b.pk):
             assert SharedNote.objects.filter(title="B own").update(title="B renamed") == 1

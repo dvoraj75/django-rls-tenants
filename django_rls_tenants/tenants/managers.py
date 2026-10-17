@@ -384,10 +384,15 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
 
         Django builds a ``&`` / ``|`` / ``^`` combination from a clone of the
         left operand, so without this the right operand's shared rows would
-        reach a queryset that does not refuse writes.
+        reach a queryset that does not refuse writes. When one side is
+        ``none()``, Django returns an operand itself instead: the flag then
+        goes on a clone, never on the caller's queryset.
         """
-        if getattr(other, "_rls_including_shared", False):
-            combined._rls_including_shared = True
+        if not getattr(other, "_rls_including_shared", False) or combined._rls_including_shared:
+            return combined
+        if combined is self:
+            combined = self._chain()  # type: ignore[attr-defined]
+        combined._rls_including_shared = True  # noqa: SLF001  -- a TenantQuerySet of this class
         return combined
 
     def __and__(self, other: Any) -> TenantQuerySet:

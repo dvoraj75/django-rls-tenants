@@ -317,7 +317,8 @@ tenant's own related rows while the shared row survives. Not blocked: `instance.
 a shared instance (the same cascade) and `instance.save()` (fails at the database). A
 new `TenantQuerySet` method that writes must call `_refuse_on_shared_rows()`. Django builds
 `&` / `|` / `^` from a clone of the left operand, so `__and__` / `__or__` / `__xor__` set the
-flag on the result when the right operand has it (`_combined()`). Relations of
+flag on the result when the right operand has it (`_combined()`; when a side is `none()`
+Django returns an operand itself, so the flag goes on a clone of it). Relations of
 a shared row are not shared (an auto-created through table still needs both sides in the
 tenant). An `EXTERNAL_MODELS` model keeps its own manager and has no `including_shared()`.
 
