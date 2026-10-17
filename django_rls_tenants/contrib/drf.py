@@ -14,8 +14,9 @@ where DRF knows the user:
   permission checks, the handler and the rendering of the response, and exits
   it before ``dispatch()`` returns.
 - :class:`RLSTenantPermission` -- a permission class that denies a request
-  served outside the context its user implies (a view without the mixin, say),
-  and an object of another tenant.
+  served outside the context its user implies (a view without the mixin, say)
+  or the tenant context the mixin entered for it, and an object of another
+  tenant.
 - :class:`RLSTenantSerializerMixin` / :class:`RLSTenantModelSerializer` -- a
   ``ModelSerializer`` that hides the tenant foreign key and fills it from the
   active context, and rejects a foreign key to another tenant's row;
@@ -67,6 +68,7 @@ from django_rls_tenants.tenants.errors import HINT_NO_CONTEXT, HINT_USER_NO_TENA
 from django_rls_tenants.tenants.state import (
     ADMIN_GUCS,
     ContextGucs,
+    _current_live,
     _get_context_gucs,
     get_current_tenant_id,
     get_rls_context_active,
@@ -80,6 +82,8 @@ if TYPE_CHECKING:
     from django.http.response import HttpResponseBase
     from rest_framework.request import Request
     from rest_framework.views import APIView
+
+    from django_rls_tenants.tenants.state import _Live
 
     # The mixins are combined with these classes; mypy checks them as subclasses.
     _APIViewBase = APIView
@@ -167,13 +171,17 @@ class RLSTenantAPIViewMixin(_APIViewBase):
     leaves the response to Django to render, inside that context.
 
     Override :meth:`get_rls_context` to choose the context differently, for
-    example to let an admin pick a tenant.
+    example to let an admin pick a tenant, or a user one of the tenants they
+    belong to. :class:`RLSTenantPermission` accepts the tenant context it
+    entered for the request.
     """
 
-    # Set by dispatch() for the request: where the context is entered, and
-    # whether it was.
+    # Set by dispatch() for the request: where the context is entered, whether
+    # it was, and the holder of the RLS context it entered (if the context
+    # manager set one up), which RLSTenantPermission accepts.
     _rls_exit_stack: ExitStack | None = None
     _rls_context_entered: bool = False
+    _rls_entered_context: _Live | None = None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Reject a class that lists the mixin after ``APIView``, which would bypass it.
@@ -200,6 +208,11 @@ class RLSTenantAPIViewMixin(_APIViewBase):
         ``None`` for an unauthenticated request and when the active context is
         already the one ``request.user`` implies, ``admin_context()`` for a
         tenant admin and ``tenant_context(user.rls_tenant_id)`` otherwise.
+
+        An override is where a selected tenant is validated:
+        :class:`RLSTenantPermission` accepts the tenant context it returns for
+        this request, whichever tenant that is (``admin_context()`` only for a
+        tenant admin).
 
         Args:
             request: The DRF request; ``request.user`` is authenticated.
@@ -236,8 +249,14 @@ class RLSTenantAPIViewMixin(_APIViewBase):
             return
         context = self.get_rls_context(request)
         if context is not None:
+            enclosing = _current_live()
             stack.enter_context(context)
             self._rls_context_entered = True
+            entered = _current_live()
+            # A context manager that sets up no RLS context (``nullcontext()``)
+            # leaves the enclosing one current: that is not the view's choice.
+            if entered is not enclosing:
+                self._rls_entered_context = entered
 
     def dispatch(self, request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponseBase:
         """Serve the request, and exit the RLS context ``perform_authentication()`` entered.
@@ -265,17 +284,21 @@ class RLSTenantAPIViewMixin(_APIViewBase):
             finally:
                 self._rls_exit_stack = None
                 self._rls_context_entered = False
+                self._rls_entered_context = None
 
 
 class RLSTenantPermission(BasePermission):
-    """Allow a request only inside the RLS context its user implies.
+    """Allow a request only inside the RLS context its user implies, or its view chose.
 
     ``has_permission`` grants an authenticated request when an RLS context is
-    active and, for a user who is not a tenant admin, it is exactly the
-    user's own tenant context (never another tenant's, never the admin
-    bypass). A tenant admin passes in any context. A view that forgot
-    :class:`RLSTenantAPIViewMixin`, served to a token client the middleware
-    saw as anonymous, so answers 401/403 instead of an empty result.
+    active and, for a user who is not a tenant admin, it is a tenant context
+    (never the admin bypass) that is either the one
+    :class:`RLSTenantAPIViewMixin` entered for this request (what
+    :meth:`~RLSTenantAPIViewMixin.get_rls_context` returned, such as a tenant
+    the user selected and the override validated) or the user's own
+    (``rls_tenant_id``). A tenant admin passes in any context. A view that
+    forgot the mixin, served to a token client the middleware saw as
+    anonymous, so answers 401/403 instead of an empty result.
 
     ``has_object_permission`` checks that the object's tenant foreign key
     (``RLS_TENANTS["TENANT_FK_FIELD"]``) is the active tenant; any object
@@ -295,8 +318,12 @@ class RLSTenantPermission(BasePermission):
 
     message = "This request is not running in its user's RLS context."
 
-    def has_permission(self, request: Request, view: APIView) -> bool:  # noqa: ARG002  -- DRF signature
-        """Return whether the active RLS context is the one ``request.user`` implies."""
+    def has_permission(self, request: Request, view: APIView) -> bool:
+        """Return whether the active RLS context is the view's or the one ``request.user`` implies.
+
+        The view's is the tenant context :class:`RLSTenantAPIViewMixin`
+        entered for this request, while it is the active one.
+        """
         user: Any = request.user
         if not _is_authenticated(user):
             return False
@@ -305,6 +332,12 @@ class RLSTenantPermission(BasePermission):
             return False
         if user.is_tenant_admin:
             return True
+        if active == ADMIN_GUCS:
+            return False  # the admin bypass is a tenant admin's only
+        if isinstance(view, RLSTenantAPIViewMixin):
+            entered = view._rls_entered_context  # noqa: SLF001  -- the mixin's per-request state
+            if entered is not None and entered is _current_live():
+                return True
         return active == _context_gucs_for(user)
 
     def has_object_permission(self, request: Request, view: APIView, obj: Any) -> bool:  # noqa: ARG002  -- DRF signature

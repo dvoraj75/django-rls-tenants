@@ -339,7 +339,7 @@ runs without a context reads zero rows (fail-closed). To serve such clients, use
 answers `401`/`403` instead of an empty list. See the
 [Django REST Framework guide](../guides/drf.md).
 
-Three properties of the DRF side are worth knowing:
+Properties of the DRF side worth knowing:
 
 - `RLSTenantModelSerializer` takes the tenant FK from the active context, ignores
   a `tenant` value in the payload and removes other writable fields that would write
@@ -350,6 +350,12 @@ Three properties of the DRF side are worth knowing:
   the mixin enters nothing and the view keeps the context `RLSTenantMiddleware` set
   for the session cookie's user. `RLSTenantPermission` refuses such a request; keep
   it in the default permission classes.
+- `RLSTenantPermission` lets a non-admin user through in their own tenant, or in the
+  tenant context that a `get_rls_context()` override entered for the request (a tenant
+  the user selected, say). It does not check that the user may access that tenant:
+  the override must (see
+  [A user who belongs to several tenants](../guides/drf.md#a-user-who-belongs-to-several-tenants)).
+  The admin bypass still needs `is_tenant_admin`.
 - DRF's `ModelSerializer` does not call `Model.full_clean()`, so model-level
   validation does not run on API writes. The caveats in
   [Referential Integrity and Unique Indexes](#referential-integrity-and-unique-indexes)
