@@ -199,8 +199,9 @@ nothing.
   that does not exist before the model's own check runs, and the library does not look
   the value up. Only the admin's forms and `PrimaryKeyRelatedField` are classified (see
   `fk.cross_tenant_rejected` above).
-- **`@with_rls_context` called with `None` as the user.** It runs the function without a
-  context (fail-closed) and logs a warning on the `django_rls_tenants` logger, as before.
+- **`@with_rls_context` called with `None` as the user.** It runs the function with no
+  context, whatever context encloses the call (fail-closed, #160), and logs a warning on
+  the `django_rls_tenants` logger.
 
 `RLSTenantPermission` logs a `context.denied` record each time it returns `False`. DRF can
 call it without refusing the request: a composed permission (`IsAdminUser |
