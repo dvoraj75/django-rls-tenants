@@ -303,7 +303,9 @@ See [Bypass Mode](bypass-mode.md) for more details.
 
 ## Many-to-Many Relationships
 
-M2M relationships between `RLSProtectedModel` subclasses are automatically detected.
+M2M fields on the models that declare their own RLS policy -- `RLSProtectedModel`
+subclasses and any model whose `Meta.constraints` list an `RLSConstraint` -- are
+automatically detected, and a related model of either kind counts as a protected side.
 When Django auto-generates a through table for an M2M field, `django-rls-tenants`
 registers an `RLSM2MConstraint` on it during `AppConfig.ready()`. The policy itself still
 has to be created: see [Automatic Protection](#automatic-protection) and
@@ -617,7 +619,9 @@ the database policy is the only isolation:
   outside the admin context, `WITH CHECK` rejects a row whose tenant is not the
   context's.
 - No coverage of the model's many-to-many through tables. `register_m2m_rls()` and the
-  `check_rls` M2M discovery look at `RLSProtectedModel` subclasses only. An M2M field from
+  `check_rls` M2M discovery look only at models that declare their own policy (an
+  `RLSProtectedModel` subclass or an `RLSConstraint`), never at an `EXTERNAL_MODELS`
+  entry. An M2M field from
   an `RLSProtectedModel` to an external model gets a policy that checks the protected side
   only.
 - `check_rls --generate` does not write `AddRLSPolicy` migrations, only M2M ones.

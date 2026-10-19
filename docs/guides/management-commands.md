@@ -2,8 +2,9 @@
 
 ## check_rls
 
-The `check_rls` management command verifies that all `RLSProtectedModel` subclasses, and
-the models listed in [`EXTERNAL_MODELS`](../getting-started/configuration.md#external_models),
+The `check_rls` management command verifies that every model declaring its own RLS policy
+(an `RLSProtectedModel` subclass, or any model whose `Meta.constraints` list an
+`RLSConstraint`), and the models listed in [`EXTERNAL_MODELS`](../getting-started/configuration.md#external_models),
 have the expected RLS policies applied in the database.
 
 ### Usage
@@ -99,8 +100,8 @@ a proxy of one is reported through its concrete model) and M2M through tables:
 
 2. **`pg_policies`**: verifies that at least one RLS policy exists for each protected table.
 
-M2M through tables are auto-discovered by scanning `RLSProtectedModel` subclasses for
-`ManyToManyField` definitions with auto-generated through tables.
+M2M through tables are auto-discovered by scanning the models that declare their own policy
+for `ManyToManyField` definitions with auto-generated through tables.
 
 It also compares the `AddRLSPolicy` operations on disk with
 [`EXTERNAL_MODELS`](../getting-started/configuration.md#external_models) (*added in
@@ -271,8 +272,8 @@ See [Sharing Rows Across Tenants](protecting-models.md#sharing-rows-across-tenan
   models: you add those yourself (see
   [Tables You Do Not Own](protecting-models.md#tables-you-do-not-own)), and the `How to fix:`
   line for such a table prints the operation.
-- M2M discovery looks at `RLSProtectedModel` subclasses only: the through tables of an
-  `EXTERNAL_MODELS` model are not checked.
+- M2M discovery looks only at the models that declare their own policy: the through tables
+  of an `EXTERNAL_MODELS` model are not checked.
 - The `How to fix:` lines reflect the migrations as the loader sees them. A policy
   created by hand (not by a migration) reads as "no migration adds it".
 
@@ -293,7 +294,8 @@ python manage.py setup_m2m_rls --database replica
 
 ### How It Works
 
-1. Discovers auto-generated M2M through tables on `RLSProtectedModel` subclasses.
+1. Discovers auto-generated M2M through tables on the models that declare their own policy
+   (`RLSProtectedModel` subclasses and models with an `RLSConstraint`).
 2. Checks which tables already have RLS policies (via `pg_policies`).
 3. For unprotected tables, generates and executes `EXISTS`-based subquery policies.
 4. Skips tables that already have policies applied.

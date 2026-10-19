@@ -231,7 +231,8 @@ Two further limits:
   `AddRLSPolicy` leaves the table unprotected; `check_rls` reports it
   (`no RLS policies found`) and prints the operation to add. Run it in CI.
 - The model's many-to-many through tables are not covered: `register_m2m_rls()` and the
-  `check_rls` M2M discovery only look at `RLSProtectedModel` subclasses.
+  `check_rls` M2M discovery only look at models that declare their own policy (an
+  `RLSProtectedModel` subclass or an `RLSConstraint`).
 
 The policy's GUC names and tenant type are read from `RLS_TENANTS` when the migration runs
 unless you pass them to the operation (`RLSConstraint` has the literal defaults instead), and
