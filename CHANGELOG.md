@@ -15,10 +15,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   context's values back on the other aliases and then marked them unknown, which the
   enclosing block's exit skips; so after that block had exited, SQL the guard does not see
   (a driver cursor, `callproc()`) on such an alias still ran with the enclosing context's
-  access (every row for an enclosing `admin_context()`) until its next guarded statement.
+  access (every row for an enclosing `admin_context()`; inside nested blocks, the inner
+  block's tenant while the outer block was current) until its next guarded statement.
   The exit now marks the sessions unknown first and puts the enclosing context back
   second, recording what it writes, so the enclosing block's exit takes it off again.
-  `USE_LOCAL_SET=True` and a single configured alias were not affected.
+  `USE_LOCAL_SET=True` and a single configured alias were not affected. Outside any
+  context and transaction, the exit now also clears the GUCs of every connected configured
+  alias right away, in both modes (one `set_config()` statement each, which the next
+  guarded statement outside a context there used to send), so a value the function wrote
+  for the session itself (`set_guc()`) no longer reaches SQL the guard does not see after
+  the call.
+- **The same leak when the call runs in a transaction on the other alias** (#163, since
+  1.6.1). With `USE_LOCAL_SET=False`, a `None`-user call inside `transaction.atomic()` on
+  another configured alias, itself inside a context block, left the enclosing context's
+  values on that alias once the transaction committed and the block exited: the commit
+  made them unknown, which the block's exit skips. In session mode the call's exit now
+  marks the values unknown right away, in a transaction too, so the values it puts back
+  stay known after the commit and the block's exit takes them off. A rollback was not
+  affected.
 
 ## [1.6.1] - 2026-10-21
 

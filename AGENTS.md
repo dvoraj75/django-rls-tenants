@@ -453,7 +453,10 @@ have written the GUCs for the session and nothing restores them. It runs from
 marks a connection's session the same way after a statement that ran under local values
 (in its own transaction, or in a transaction with `wrote_local`), which reaches
 connections of other threads that no block exit reaches. In a transaction the mark takes
-effect at the commit. With `USE_LOCAL_SET=True` the context managers, `_rls_scope()` and
+effect at the commit. `_settle_after_no_context()` calls it in both modes; in session
+mode with `under_local_values=False`, which makes the values `UNKNOWN` at once, in a
+transaction too, so the settle right after records what it writes and a commit keeps it
+known (#163). With `USE_LOCAL_SET=True` the context managers, `_rls_scope()` and
 the middleware write nothing on a configured alias, inside `transaction.atomic()` or not
 (#137; `context._writes_gucs()` is `not is_local or alias not in conf.DATABASES`, and
 `_rls_scope()` decides it before its own transaction opens): the guard applies the values
@@ -497,7 +500,10 @@ Rules for code that sets a context or writes the admin/tenant GUCs:
   first statement) and on exit suspects the sessions, then settles the configured aliases,
   unknown ones included (`_settle_after_no_context()`, in that order so the enclosing
   block's exit sees what the settle wrote, #163; the async wrapper repeats it in a hop,
-  since the event loop's thread holds no connections); the middleware keeps what
+  since the event loop's thread holds no connections). In session mode the suspect makes
+  the values unknown at once even in a transaction (`under_local_values=False`), so the
+  settle's session-level write is recorded and stays known after a commit, where the
+  transaction-local bookkeeping would leave it unknown. The middleware keeps what
   `_set_context_gucs()` returned on the request (`__acall__` too, for `process_exception`'s
   hop) and ends it first, with `_end_context_gucs()`. The context managers pass the
   enclosing holder (`state._current_live()`, read on entry) and the DB-API connection they

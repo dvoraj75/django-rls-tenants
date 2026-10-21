@@ -1387,6 +1387,46 @@ async def _decorated_touch_replica(as_user):
     await sync_to_async(_touch_replica)()
 
 
+@with_rls_context
+def _sync_decorated_call_touch_replica(as_user):
+    """Make a nested ``None``-user call, then touch ``replica`` again."""
+    _touch_replica()
+    _sync_decorated_touch_replica(as_user=None)
+    _touch_replica()
+
+
+@with_rls_context
+def _sync_decorated_touch_replica_and_raise(as_user):
+    """Run a statement on ``replica``, then fail."""
+    _touch_replica()
+    msg = "body failed"
+    raise ValueError(msg)
+
+
+@with_rls_context
+def _sync_decorated_set_admin_on_both(as_user):
+    """Write the admin GUC for the session on ``default`` and ``replica``, as other code might."""
+    set_guc("rls.is_admin", "true")
+    set_guc("rls.is_admin", "true", using="replica")
+
+
+@with_rls_context
+def _sync_decorated_set_admin_on_replica(as_user):
+    """Run a statement on ``replica``, then write its admin GUC for the session."""
+    _touch_replica()
+    set_guc("rls.is_admin", "true", using="replica")
+
+
+def _held_for(context_values, *, local):
+    """What a session holds for the enclosing context, as a driver cursor reads it.
+
+    The context's values in session mode. With ``USE_LOCAL_SET=True`` the
+    session holds none outside a transaction: the guard sets them
+    transaction-locally, in each statement's own transaction.
+    """
+    return (None, None) if local else context_values
+
+
 @pytest.mark.django_db(transaction=True)
 class TestNoneUserCallSettlesTheOtherAliases:
     """After a ``None``-user call, the enclosing block's exit settles the other aliases (#163).
@@ -1405,16 +1445,18 @@ class TestNoneUserCallSettlesTheOtherAliases:
         from django.db import DEFAULT_DB_ALIAS  # noqa: PLC0415
         from django.test import override_settings  # noqa: PLC0415
 
+        # guc_mode's override is in force here, so USE_LOCAL_SET is kept.
         databases = {**settings.RLS_TENANTS, "DATABASES": [DEFAULT_DB_ALIAS, replica]}
         with override_settings(RLS_TENANTS=databases):
             yield replica
 
-    def test_tenant_block_in_autocommit(self, with_replica):
+    def test_tenant_block_in_autocommit(self, with_replica, guc_mode):
         from tests.session_gucs import session_gucs  # noqa: PLC0415
 
         with tenant_context(101):
             _touch_replica()
             _sync_decorated_touch_replica(as_user=None)
+            assert session_gucs(with_replica) == _held_for(("101", "false"), local=guc_mode)
         assert session_gucs(with_replica) == (None, None)
 
     def test_admin_block_in_autocommit(self, with_replica):
@@ -1425,24 +1467,167 @@ class TestNoneUserCallSettlesTheOtherAliases:
             _sync_decorated_touch_replica(as_user=None)
         assert session_gucs(with_replica) == (None, None)
 
-    def test_async_call_in_autocommit(self, with_replica):
+    def test_async_call_in_autocommit(self, with_replica, guc_mode):
         """The async wrapper settles in a hop, on the thread that holds the connections."""
         from tests.session_gucs import session_gucs  # noqa: PLC0415
 
         with tenant_context(101):
             _touch_replica()
             async_to_sync(_decorated_touch_replica)(as_user=None)
+            assert session_gucs(with_replica) == _held_for(("101", "false"), local=guc_mode)
         assert session_gucs(with_replica) == (None, None)
 
-    def test_in_a_transaction_on_the_other_alias(self, with_replica):
+    def test_admin_block_in_a_transaction_on_default(self, with_replica):
+        """A transaction on ``default`` alone: ``replica`` is in autocommit."""
         from django.db import transaction  # noqa: PLC0415
 
         from tests.session_gucs import session_gucs  # noqa: PLC0415
 
-        with transaction.atomic(using=with_replica), tenant_context(101):
+        with transaction.atomic():
+            with admin_context():
+                _touch_replica()
+                _sync_decorated_touch_replica(as_user=None)
+            assert session_gucs(with_replica) == (None, None)
+            assert session_gucs() == (None, None)
+
+    def test_enclosing_block_exits_in_a_transaction_on_the_other_alias(self, with_replica):
+        """The enclosing exit's clear is in force on ``replica`` before the commit, and after."""
+        from django.db import transaction  # noqa: PLC0415
+
+        from tests.session_gucs import session_gucs  # noqa: PLC0415
+
+        with transaction.atomic(using=with_replica):
+            with tenant_context(101):
+                _touch_replica()
+                _sync_decorated_touch_replica(as_user=None)
+                assert session_gucs(with_replica) == ("101", "false")
+            assert session_gucs(with_replica) == (None, None)
+        assert session_gucs(with_replica) == (None, None)
+
+    def test_transaction_committed_inside_the_enclosing_block(self, with_replica, guc_mode):
+        """The settle's write is known after the commit, so the enclosing exit takes it off."""
+        from django.db import transaction  # noqa: PLC0415
+
+        from tests.session_gucs import session_gucs  # noqa: PLC0415
+
+        with tenant_context(101):
+            _touch_replica()
+            with transaction.atomic(using=with_replica):
+                _touch_replica()
+                _sync_decorated_touch_replica(as_user=None)
+                assert session_gucs(with_replica) == ("101", "false")
+            assert session_gucs(with_replica) == _held_for(("101", "false"), local=guc_mode)
+        assert session_gucs(with_replica) == (None, None)
+
+    def test_transaction_rolled_back_inside_the_enclosing_block(self, with_replica, guc_mode):
+        from django.db import transaction  # noqa: PLC0415
+
+        from tests.session_gucs import session_gucs  # noqa: PLC0415
+
+        def call_and_roll_back():
+            with transaction.atomic(using=with_replica):
+                _touch_replica()
+                _sync_decorated_touch_replica(as_user=None)
+                assert session_gucs(with_replica) == ("101", "false")
+                msg = "roll back"
+                raise ValueError(msg)
+
+        with tenant_context(101):
+            _touch_replica()
+            with pytest.raises(ValueError, match="roll back"):
+                call_and_roll_back()
+            assert session_gucs(with_replica) == _held_for(("101", "false"), local=guc_mode)
+        assert session_gucs(with_replica) == (None, None)
+
+    def test_session_write_in_the_body_in_a_committed_transaction(self, with_replica, guc_mode):
+        """In session mode the settle's write overrides the body's, and the commit keeps it.
+
+        With ``USE_LOCAL_SET=True`` the settle writes transaction-locally, so
+        the body's session-level write is what the session keeps after the
+        commit, through the enclosing block's exit, until the next statement
+        run outside any context clears it: the documented limit of that mode
+        for writes of the GUCs by other code, the same after any block.
+        """
+        from django.db import transaction  # noqa: PLC0415
+
+        from tests.session_gucs import session_gucs  # noqa: PLC0415
+
+        body_write = (None, "true")
+        with tenant_context(101):
+            _touch_replica()
+            with transaction.atomic(using=with_replica):
+                _touch_replica()
+                _sync_decorated_set_admin_on_replica(as_user=None)
+                assert session_gucs(with_replica) == ("101", "false")
+            assert session_gucs(with_replica) == (body_write if guc_mode else ("101", "false"))
+        assert session_gucs(with_replica) == (body_write if guc_mode else (None, None))
+        _touch_replica()
+        assert session_gucs(with_replica) == (None, None)
+
+    def test_nested_tenant_blocks(self, with_replica, guc_mode):
+        """After the inner block, ``replica`` holds the outer block's tenant, not the inner's."""
+        from tests.session_gucs import session_gucs  # noqa: PLC0415
+
+        with tenant_context(101):
+            with tenant_context(202):
+                _touch_replica()
+                _sync_decorated_touch_replica(as_user=None)
+            assert session_gucs(with_replica) == _held_for(("101", "false"), local=guc_mode)
+        assert session_gucs(with_replica) == (None, None)
+
+    def test_nested_calls(self, with_replica, guc_mode):
+        """The outer call's exit puts the enclosing block back, though the inner one suspected."""
+        from tests.session_gucs import session_gucs  # noqa: PLC0415
+
+        with tenant_context(101):
+            _touch_replica()
+            _sync_decorated_call_touch_replica(as_user=None)
+            expected = _held_for(("101", "false"), local=guc_mode)
+            assert session_gucs(with_replica) == expected
+            assert session_gucs() == expected
+        assert session_gucs(with_replica) == (None, None)
+
+    def test_body_that_raises(self, with_replica, guc_mode):
+        from tests.session_gucs import session_gucs  # noqa: PLC0415
+
+        with tenant_context(101):
+            _touch_replica()
+            with pytest.raises(ValueError, match="body failed"):
+                _sync_decorated_touch_replica_and_raise(as_user=None)
+            assert session_gucs(with_replica) == _held_for(("101", "false"), local=guc_mode)
+        assert session_gucs(with_replica) == (None, None)
+
+    def test_inside_a_for_user_scope(self, with_replica, tenant_a_user):
+        """A ``post_save`` receiver of ``for_user().create()`` runs inside the scope."""
+        from django.db.models.signals import post_save  # noqa: PLC0415
+
+        from tests.session_gucs import session_gucs  # noqa: PLC0415
+        from tests.test_app.models import Order  # noqa: PLC0415
+
+        def receiver(**kwargs):
             _touch_replica()
             _sync_decorated_touch_replica(as_user=None)
-            assert session_gucs(with_replica) == ("101", "false")
+
+        post_save.connect(receiver, sender=Order, dispatch_uid="test-163-for-user")
+        try:
+            Order.objects.for_user(tenant_a_user).create(
+                product="Widget", amount=1, tenant_id=tenant_a_user.rls_tenant_id
+            )
+        finally:
+            post_save.disconnect(sender=Order, dispatch_uid="test-163-for-user")
+        assert session_gucs(with_replica) == (None, None)
+
+    def test_session_write_in_the_body_is_cleared_at_the_exit(self, with_replica):
+        """Outside any context the exit clears a body's session-level write on every alias.
+
+        Right away, in both modes, not at the next guarded statement: a driver
+        cursor after the call would otherwise read the admin bypass.
+        """
+        from tests.session_gucs import session_gucs  # noqa: PLC0415
+
+        _touch_replica()
+        _sync_decorated_set_admin_on_both(as_user=None)
+        assert session_gucs() == (None, None)
         assert session_gucs(with_replica) == (None, None)
 
 
