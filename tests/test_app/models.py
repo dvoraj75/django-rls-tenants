@@ -275,6 +275,8 @@ class SelfRefModel(RLSProtectedModel):
 class Label(models.Model):
     """RLS-protected by its ``RLSConstraint`` alone, not by ``RLSProtectedModel`` (#159).
 
+    It keeps Django's default manager, so it has no auto-scope filter: the
+    policy is its only isolation, and a test filters on ``tenant`` itself.
     ``tags``: only this side is protected (Label <-> Tag).
     """
 

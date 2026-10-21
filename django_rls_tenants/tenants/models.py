@@ -86,9 +86,13 @@ def _declares_rls_policy(model: type[models.Model]) -> bool:
     """Return whether ``model`` declares its table's RLS policy itself.
 
     An ``RLSProtectedModel`` subclass, or any model whose ``Meta.constraints``
-    list an ``RLSConstraint``: the runtime protects both alike (auto-scope,
-    strict mode, the cross-tenant foreign key check), so :func:`register_m2m_rls`
-    covers their automatic M2M through tables and ``check_rls`` verifies both.
+    list an ``RLSConstraint``: the migration creates a policy for both alike, and
+    the runtime treats both as RLS-protected (``_rls_model_cache()``: the
+    ``select_related()`` and prefetch tenant filters, the cross-tenant foreign
+    key check on models that point at it), so :func:`register_m2m_rls` covers
+    their automatic M2M through tables and ``check_rls`` verifies both. The
+    auto-scope filter and strict mode come with ``RLSManager``, which a model
+    without the base class has only if it sets ``objects = RLSManager()``.
     A model ``RLS_TENANTS["EXTERNAL_MODELS"]`` lists does not count: its policy
     and the policies of its through tables come from the project's own
     migrations (#112). A proxy has no constraints of its own, so its concrete

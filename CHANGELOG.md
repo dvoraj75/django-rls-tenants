@@ -10,14 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **`check_rls` and the M2M auto-detection now cover models that carry an `RLSConstraint`
-  without inheriting `RLSProtectedModel`** (#159). The runtime already treated such a model as
-  protected (auto-scope, strict mode, the cross-tenant foreign key check, its own policy), but
-  `check_rls` verified only `RLSProtectedModel` subclasses and `register_m2m_rls()` /
+  without inheriting `RLSProtectedModel`** (#159). The migration already created such a
+  model's policy and the runtime already treated it as RLS-protected (the `select_related()`
+  and prefetch tenant filters, the cross-tenant foreign key check on models that point at
+  it; the auto-scope filter and strict mode need `objects = RLSManager()`), but `check_rls`
+  verified only `RLSProtectedModel` subclasses and `register_m2m_rls()` /
   `check_rls --generate` looked for automatic M2M through tables only on them: the through
   tables of a constraint-only model got no policy while `check_rls` reported every table
   verified. All three now use one predicate, `_declares_rls_policy()` (an `RLSProtectedModel`
   subclass, or a model whose `Meta.constraints` list an `RLSConstraint`), and a related model
-  of either kind counts as a protected side of an M2M policy. `EXTERNAL_MODELS` entries are
+  of either kind counts as a protected side of an M2M policy. The system checks `W001` /
+  `W002` (`GUC_PREFIX` mismatch) and `W009` (missing tenant field) use it too, so they now
+  cover such models. `EXTERNAL_MODELS` entries are
   still left out of M2M coverage, as documented. **Upgrading:** a project with such models
   will see `check_rls` fail on their through tables until it runs `check_rls --generate`
   and `migrate`. `_collect_m2m_tables()` also reads a proxy's concrete model for the related
@@ -28,7 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `admin_context()`, the other tenant's rows inside `tenant_context()`. It now enters a
   no-context block (auto-scope tenant cleared, strict-mode flag off, no GUCs for the
   affinity guard), sync and async alike, and the same holds for a function whose
-  signature lacks the user parameter. Outside any context nothing changes. **Upgrading:**
+  signature lacks the user parameter. On exit the enclosing context's values are put back
+  on the thread's configured connections, as every other block exit does, so SQL the guard
+  does not see (a driver cursor, `callproc()`) reads the enclosing context again at once.
+  Outside any context nothing changes. **Upgrading (a behaviour change):**
   code that relied on a `None` user inheriting the caller's context now reads no rows, or
   raises `NoTenantContextError` under `STRICT_MODE`; enter the context explicitly instead.
 

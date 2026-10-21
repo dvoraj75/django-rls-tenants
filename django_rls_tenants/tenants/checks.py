@@ -9,12 +9,14 @@ silent failures at runtime:
   RLS policies read, in force in every new session before any context is set.
 - Either of those two could not be determined on a reachable database (``W013``):
   silence from a check that could not run is not a pass.
-- ``GUC_PREFIX`` mismatch between runtime config and ``RLSConstraint`` defaults.
+- ``GUC_PREFIX`` mismatch between runtime config and ``RLSConstraint`` defaults, on
+  every model that declares a policy (an ``RLSProtectedModel`` subclass, or a model
+  whose ``Meta.constraints`` list an ``RLSConstraint``).
 - ``CONN_MAX_AGE > 0`` with ``USE_LOCAL_SET=False`` (connection-pool GUC leak risk).
 - Django's connection pool with ``USE_LOCAL_SET=False`` and no pool ``reset``.
 - ``DATABASES`` contains aliases not in ``settings.DATABASES``.
 - ``TENANT_MODEL`` does not resolve to an installed model.
-- ``TENANT_FK_FIELD`` missing on an ``RLSProtectedModel`` subclass.
+- The RLS policy's tenant field missing on a model that declares a policy (``W009``).
 - A unique field or constraint on an RLS-protected model that omits the tenant
   field (``W012``): unique indexes are checked outside the RLS policies, so the
   ``IntegrityError`` tells one tenant that a value exists in another.
@@ -338,14 +340,17 @@ def _check_guc_prefix_mismatch() -> list[CheckWarning]:
 
     from django_rls_tenants.rls.constraints import RLSConstraint  # noqa: PLC0415
     from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
-    from django_rls_tenants.tenants.models import RLSProtectedModel  # noqa: PLC0415
+    from django_rls_tenants.tenants.models import _declares_rls_policy  # noqa: PLC0415
 
     warnings: list[CheckWarning] = []
     runtime_tenant_guc = rls_tenants_config.GUC_CURRENT_TENANT
     runtime_admin_guc = rls_tenants_config.GUC_IS_ADMIN
 
     for model in apps.get_models():
-        if not issubclass(model, RLSProtectedModel) or model._meta.abstract:  # noqa: SLF001
+        # A model with an RLSConstraint but not the base class declares a policy
+        # too (#159); a proxy has no constraints of its own (its concrete model's
+        # are checked on that model).
+        if not _declares_rls_policy(model) or model._meta.proxy:  # noqa: SLF001
             continue
         for constraint in model._meta.constraints:  # noqa: SLF001
             if not isinstance(constraint, RLSConstraint):
@@ -529,7 +534,10 @@ def _check_tenant_model_resolves() -> list[CheckWarning]:
 
 
 def _check_tenant_fk_field_exists() -> list[CheckWarning]:
-    """Warn if a concrete ``RLSProtectedModel`` subclass lacks its tenant field.
+    """Warn if a concrete model that declares an RLS policy lacks its tenant field.
+
+    An ``RLSProtectedModel`` subclass, or a model whose ``Meta.constraints``
+    list an ``RLSConstraint`` (#159; ``_declares_rls_policy()``).
 
     Each model's ``RLSConstraint`` generates an RLS policy that filters on a
     tenant column. The referenced field name comes from the model's
@@ -552,14 +560,14 @@ def _check_tenant_fk_field_exists() -> list[CheckWarning]:
 
     from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
     from django_rls_tenants.tenants.models import (  # noqa: PLC0415
-        RLSProtectedModel,
+        _declares_rls_policy,
         _get_tenant_fk_field,
     )
 
     warnings: list[CheckWarning] = []
     default_fk_field = rls_tenants_config.TENANT_FK_FIELD
     for model in apps.get_models():
-        if not issubclass(model, RLSProtectedModel) or model._meta.abstract:  # noqa: SLF001
+        if not _declares_rls_policy(model):
             continue
         if model._meta.proxy:  # noqa: SLF001
             continue  # its policy is its concrete model's, checked on that model

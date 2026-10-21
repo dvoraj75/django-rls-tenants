@@ -142,7 +142,11 @@ def _no_rls_state() -> Iterator[None]:
     ``admin_context()``. Nothing is written on entry; the guard clears the
     GUCs before the block's first statement and applies the enclosing context
     again before the first statement after it. Reset newest first, like
-    :func:`_rls_state`.
+    :func:`_rls_state`, then :func:`_settle_after_no_context` puts the
+    enclosing context back on this thread's connections (a no-op on a thread
+    without connections, the event loop's: the async wrapper runs it in a hop).
+    Like the four context managers, it logs no audit event of its own: the
+    warning the decorator logs is the record of the call.
     """
     active_token = set_rls_context_active(False)
     tenant_token = set_current_tenant_id(None)
@@ -156,7 +160,33 @@ def _no_rls_state() -> Iterator[None]:
             try:
                 reset_current_tenant_id(tenant_token)
             finally:
-                reset_rls_context_active(active_token)
+                try:
+                    reset_rls_context_active(active_token)
+                finally:
+                    _settle_after_no_context()
+
+
+def _settle_after_no_context() -> None:
+    """Put the enclosing context back on this thread's configured connections.
+
+    The exit of :func:`_no_rls_state`, after its ``ContextVar`` reset. The
+    block wrote nothing on entry, so there is no snapshot to restore; as for a
+    block that wrote nothing (``_restore_tenant_gucs(previous=None)``), every
+    configured alias whose session still holds the block's cleared values gets
+    the enclosing context's values back, or none (``settle_other_aliases``,
+    with ``cleared=True``: the guard's clear is recorded as ``None``, which a
+    plain settle takes for a connection the block never touched),
+    so SQL past Django's cursor in the enclosing block (a driver cursor,
+    ``callproc()``, a server-side cursor's ``FETCH``) does not read as no
+    context until the block's next guarded statement. What the sessions hold
+    for themselves then counts as unknown (``suspect_sessions()``), in both
+    GUC modes: code in the block may have written the GUCs for the session
+    (``set_guc()``), and no snapshot restore undoes it here.
+    """
+    try:
+        settle_other_aliases(None, cleared=True)
+    finally:
+        suspect_sessions()
 
 
 def _writes_gucs(using: str, *, is_local: bool) -> bool:
@@ -891,8 +921,13 @@ def with_rls_context[**P, R](
             async def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> Any:
                 as_user = user_of(*args, **kwargs)
                 if as_user is None:
-                    with _no_rls_state():
-                        return await fn(*args, **kwargs)
+                    try:
+                        with _no_rls_state():
+                            return await fn(*args, **kwargs)
+                    finally:
+                        # The block's exit settled the event loop's thread, which
+                        # has no connections; the hops' thread holds them.
+                        await sync_to_async(_settle_after_no_context, thread_sensitive=True)()
                 tenant_id = _decorated_call_tenant_id(as_user, qualname)
                 ctx = (
                     async_admin_context() if tenant_id is None else async_tenant_context(tenant_id)

@@ -1323,6 +1323,50 @@ def test_none_user_call_inside_a_tenant_block_restores_it(guc_mode):
         assert get_current_tenant_id() == 101
 
 
+@with_rls_context
+def _sync_decorated_set_admin_for_the_session(as_user):
+    """Write the admin GUC for the session inside the body, as other code might."""
+    set_guc("rls.is_admin", "true")
+
+
+@pytest.mark.django_db(transaction=True)
+class TestNoneUserCallSettlesTheSession:
+    """The exit of a ``None``-user call puts the session right, like every other block exit.
+
+    Read with a driver cursor (``session_gucs()``): the guard does not see it, so
+    the values are what the session holds before the enclosing block's next
+    guarded statement, where a driver cursor, ``callproc()`` or a server-side
+    ``FETCH`` would read them.
+    """
+
+    def test_enclosing_block_is_back_on_the_session_in_a_transaction(self, guc_mode):
+        from django.db import transaction  # noqa: PLC0415
+
+        from tests.session_gucs import session_gucs  # noqa: PLC0415
+
+        with transaction.atomic(), tenant_context(101):
+            assert _sync_decorated_scope(as_user=None) == ((None, None), None, False)
+            assert session_gucs() == ("101", "false")
+            assert async_to_sync(_decorated_scope)(as_user=None) == ((None, None), None, False)
+            assert session_gucs() == ("101", "false")
+
+    def test_enclosing_block_is_back_on_the_session_in_autocommit(self):
+        """Session mode, no transaction: the block's values are session-level too."""
+        from tests.session_gucs import session_gucs  # noqa: PLC0415
+
+        with tenant_context(101):
+            assert _sync_decorated_scope(as_user=None) == ((None, None), None, False)
+            assert session_gucs() == ("101", "false")
+            assert async_to_sync(_decorated_scope)(as_user=None) == ((None, None), None, False)
+            assert session_gucs() == ("101", "false")
+
+    def test_session_write_inside_the_body_does_not_outlive_the_call(self, guc_mode):
+        """A session-level GUC write in the body counts as unknown after it, in both modes."""
+        _sync_decorated_set_admin_for_the_session(as_user=None)
+        # The guard applies "no context" again before this statement.
+        assert get_guc("rls.is_admin") is None
+
+
 @pytest.mark.django_db(transaction=True)
 def test_async_decorated_call_restores_outer_scope(guc_mode):
     """A decorated coroutine narrows an outer tenant block and restores it, in both modes."""

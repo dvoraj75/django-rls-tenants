@@ -307,6 +307,29 @@ class TestCheckGucPrefixMismatch:
             warnings = _check_guc_prefix_mismatch()
         assert all(isinstance(w, CheckWarning) for w in warnings)
 
+    def test_reports_a_model_with_a_constraint_but_not_the_base_class(self):
+        """W001/W002 cover a model protected by its ``RLSConstraint`` alone (#159).
+
+        ``Label`` has the constraint without inheriting ``RLSProtectedModel``;
+        its policy reads the default GUC names, so a changed prefix breaks its
+        isolation like any other model's.
+        """
+        with (
+            override_settings(
+                RLS_TENANTS={
+                    "TENANT_MODEL": "test_app.Tenant",
+                    "GUC_PREFIX": "other",
+                },
+            ),
+            patch(_CONF_PATCH, RLSTenantsConfig()),
+        ):
+            warnings = _check_guc_prefix_mismatch()
+        by_model = {(w.id, w.msg.split(" ")[2]) for w in warnings}
+        assert ("django_rls_tenants.W001", "Label") in by_model
+        assert ("django_rls_tenants.W002", "Label") in by_model
+        # A proxy has no constraints of its own: its concrete model is reported.
+        assert not any(name == "OrderProxy" for _, name in by_model)
+
 
 class TestCheckConnMaxAgeWithSessionGucs:
     """Tests for _check_conn_max_age_with_session_gucs."""
@@ -1314,6 +1337,15 @@ class TestCheckTenantFkFieldExists:
         assert "nonexistent" in warnings[0].hint
         assert warnings[0].obj is not None
         assert isinstance(warnings[0], CheckWarning)
+
+    def test_w009_reports_a_model_with_a_constraint_but_not_the_base_class(self):
+        """W009 covers a model protected by its ``RLSConstraint`` alone (#159)."""
+        from tests.test_app.models import Label, OrderProxy  # noqa: PLC0415
+
+        with patch(self._RESOLVER_PATCH, return_value="nonexistent"):
+            reported = {w.obj for w in _check_tenant_fk_field_exists()}
+        assert Label in reported
+        assert OrderProxy not in reported  # a proxy's policy is its concrete model's
 
 
 @pytest.fixture

@@ -491,7 +491,12 @@ Rules for code that sets a context or writes the admin/tenant GUCs:
 
 - Every library entry point that sets the tenant `ContextVar`s sets the guard's too, to
   exactly the values it writes: the context managers and `_rls_scope()` use
-  `context._rls_state()`, which sets and resets all three; the middleware keeps what
+  `context._rls_state()`, which sets and resets all three; `@with_rls_context` with a `None`
+  user (or a signature without the user parameter) uses `context._no_rls_state()` (#160),
+  which sets all three to no context, writes nothing (the guard clears before the body's
+  first statement) and on exit settles the configured aliases and suspects the sessions
+  (`_settle_after_no_context()`; the async wrapper repeats it in a hop, since the event
+  loop's thread holds no connections); the middleware keeps what
   `_set_context_gucs()` returned on the request (`__acall__` too, for `process_exception`'s
   hop) and ends it first, with `_end_context_gucs()`. The context managers pass the
   enclosing holder (`state._current_live()`, read on entry) and the DB-API connection they
@@ -587,7 +592,8 @@ Rules:
 - The four context managers log their own entry and exit through `context_event()`, with
   the `Origin` read from a private `ContextVar` on entry (`current_origin()`); the exit is
   logged in a `finally` only when the entry was, so it pairs with it even when the restore
-  raises. The default origin is `context_manager`.
+  raises. The default origin is `context_manager`. The decorator's no-context block
+  (`_no_rls_state()`, #160) logs no audit event: the `as_user is None` warning is its record.
 - An integration that enters a context block wraps it in `audit.attributed(context,
   source=..., user=...)` (`async_attributed()` for `async with`): the attribution is set
   only while the block is entered, so blocks nested in it are the code's own. The admin

@@ -306,6 +306,9 @@ See [Bypass Mode](bypass-mode.md) for more details.
 M2M fields on the models that declare their own RLS policy -- `RLSProtectedModel`
 subclasses and any model whose `Meta.constraints` list an `RLSConstraint` -- are
 automatically detected, and a related model of either kind counts as a protected side.
+(A model that carries the constraint without the base class gets its policy and the
+`select_related()` / prefetch tenant filters, but the auto-scope filter and strict mode
+come with `RLSManager`: give it `objects = RLSManager()` to have them too.)
 When Django auto-generates a through table for an M2M field, `django-rls-tenants`
 registers an `RLSM2MConstraint` on it during `AppConfig.ready()`. The policy itself still
 has to be created: see [Automatic Protection](#automatic-protection) and

@@ -312,7 +312,8 @@ python manage.py setup_m2m_rls --database replica
 
 - **After upgrading** to a version with M2M RLS support, if your existing M2M tables
   don't have policies yet.
-- **After adding M2M fields** to existing `RLSProtectedModel` subclasses without
+- **After adding M2M fields** to existing RLS-protected models (an `RLSProtectedModel`
+  subclass, or a model whose `Meta.constraints` list an `RLSConstraint`) without
   creating a migration with `AddM2MRLSPolicy`.
 - **For an app without migrations.** `check_rls --generate` skips those.
 

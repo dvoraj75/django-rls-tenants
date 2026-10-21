@@ -663,7 +663,7 @@ def apply_active_context(connection: BaseDatabaseWrapper) -> None:
         _apply_if_stale(connection, tracker)
 
 
-def settle_other_aliases(using: str | None) -> None:
+def settle_other_aliases(using: str | None, *, cleared: bool = False) -> None:
     """Take a context's values off this thread's other connections once the context has ended.
 
     Called when a context block exits: the guard may have applied the block's
@@ -671,14 +671,19 @@ def settle_other_aliases(using: str | None) -> None:
     guard does not see (``callproc()``, a driver cursor) would find it there
     until their next statement. A connection that holds a context's values
     other than the active context's gets the active one's (or none) now;
-    one that holds none is left alone. With ``USE_LOCAL_SET=True`` that only
-    happens in a transaction still open (``transaction.atomic()``, say): a
-    transaction-local value is gone once its transaction has ended.
+    one that holds none is left alone, unless ``cleared``. With
+    ``USE_LOCAL_SET=True`` that only happens in a transaction still open
+    (``transaction.atomic()``, say): a transaction-local value is gone once
+    its transaction has ended.
 
     Args:
         using: The alias the block restored itself, or ``None`` for a block
             that wrote nothing on entry (``USE_LOCAL_SET=True`` on a
             configured alias), so every configured alias is settled.
+        cleared: The block held no context (``context._no_rls_state()``), so
+            the guard cleared the GUCs of the connections it saw, which the
+            tracker records as ``None``: a connection that holds none gets the
+            active context's values too, where there is an active context.
     """
     for alias in rls_tenants_config.DATABASES:
         if alias == using:
@@ -693,7 +698,8 @@ def settle_other_aliases(using: str | None) -> None:
         unknown_in_transaction = (
             using is None and held is UNKNOWN and _observe(connection, tracker) != _IDLE
         )
-        if not isinstance(held, tuple) and not unknown_in_transaction:
+        cleared_by_the_block = cleared and held is None
+        if not isinstance(held, tuple) and not unknown_in_transaction and not cleared_by_the_block:
             continue
         try:
             _apply_if_stale(connection, tracker)
