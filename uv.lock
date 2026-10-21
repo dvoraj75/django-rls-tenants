@@ -472,7 +472,7 @@ wheels = [
 
 [[package]]
 name = "django-rls-tenants"
-version = "1.6.1"
+version = "1.6.2"
 source = { editable = "." }
 dependencies = [
     { name = "django" },

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.2] - 2026-10-22
+
+One regression fix in two parts, both to the GUC affinity guard's handling of a `None`-user
+`@with_rls_context` call on a second configured alias, found by an outside read of 1.6.1
+(#163, PR #164 by @dvorakj31; its sibling case, found in review, PR #169). Session-mode deployments with more than one alias
+in `RLS_TENANTS["DATABASES"]` should upgrade; read the **Fixed** entries. The rest is tests
+and community material: the ASGI error-page tests follow Django 6.2 (#165), and the bug
+report template asks for the diagnostics up front (#166).
+
 ### Fixed
 
 - **A `None`-user `@with_rls_context` call no longer leaves the enclosing context's GUCs
@@ -1799,7 +1808,8 @@ Initial stable release of django-rls-tenants.
   and manager `_fetch_all` could clear GUCs with session scope while setting
   them with transaction scope, causing mismatched lifetimes.
 
-[Unreleased]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.6.1...HEAD
+[Unreleased]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.6.2...HEAD
+[1.6.2]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.6.1...v1.6.2
 [1.6.1]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.4.0...v1.5.0

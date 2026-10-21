@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: 2026-10-21
+> Last updated: 2026-10-22
 >
 > Priorities may shift based on community feedback.
 > Have a suggestion? [Open an issue](https://github.com/dvoraj75/django-rls-tenants/issues).
@@ -487,6 +487,17 @@ item are in the [changelog](changelog.md).
   `RLSProtectedModel`, its automatic M2M through tables included (#159). Both were found
   by an independent read of 1.6.0. See [1.6.1](changelog.md#161-2026-10-21).
   *Why:* The documentation promised fail-closed in both places; the code did not deliver it.
+- [x] **1.6.2 — The `None`-user exit on other aliases** — in session mode with more than
+  one configured alias, a `None`-user `@with_rls_context` call left the enclosing
+  context's GUCs on the other alias after the enclosing block had exited, in autocommit
+  (#163, PR #164) and after a transaction committed on that alias (PR #169); outside any
+  context the call's exit now clears every connected alias at once. Found by an outside
+  reader (#164); the transaction case by its review (#169). Also: the ASGI error-page tests follow Django 6.2's thread-sensitive
+  error pages and `aiterator(chunk_size=None)` (#165), and the bug report template asks
+  for `check_rls` output, the role and the deployment shape, with a `SUPPORT.md` (#166).
+  See [1.6.2](changelog.md#162-2026-10-22).
+  *Why:* A second alias is where SQL the guard does not see runs with a context that has
+  ended; the exit must leave what the enclosing block's exit can take off again.
 
 ---
 

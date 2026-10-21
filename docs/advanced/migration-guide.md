@@ -123,6 +123,24 @@ migration that assigns the correct tenant to each existing record.
 
 ## Upgrading django-rls-tenants
 
+### From 1.6.1 to 1.6.2
+
+A **drop-in upgrade** -- no settings, data or code change is required. One behaviour is
+tightened, for `@with_rls_context` called with a `None` user (or on a function whose
+signature lacks the user parameter) when `RLS_TENANTS["DATABASES"]` lists more than one
+alias and `USE_LOCAL_SET` is `False` (#163):
+
+- After the enclosing block exits, the other aliases no longer hold that block's GUCs for
+  SQL the GUC affinity guard does not see (a driver cursor, `callproc()`, a server-side
+  cursor's `FETCH`); before, they kept them until the alias's next guarded statement, also
+  after a transaction on that alias had committed inside the block.
+- Outside any context, the call's exit now clears every connected configured alias right
+  away, in both GUC modes: one `set_config()` statement per alias, which the next guarded
+  statement outside a context used to send. A value the function wrote for the session
+  itself with `set_guc()` no longer survives the call.
+
+Nothing else changes; the test suite and the issue templates grew (#165, #166).
+
 ### From 1.6.0 to 1.6.1
 
 A **drop-in upgrade** for most projects -- no settings or data change is required. Two
