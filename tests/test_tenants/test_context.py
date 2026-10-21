@@ -1445,6 +1445,84 @@ class TestNoneUserCallSettlesTheOtherAliases:
             assert session_gucs(with_replica) == ("101", "false")
         assert session_gucs(with_replica) == (None, None)
 
+    def test_nested_calls(self, with_replica, guc_mode):
+        """The outer call's exit puts the enclosing block back, though the inner one suspected."""
+        from tests.session_gucs import session_gucs  # noqa: PLC0415
+
+        with tenant_context(101):
+            _touch_replica()
+            _sync_decorated_call_touch_replica(as_user=None)
+            # With USE_LOCAL_SET=True no session holds a context's values.
+            expected = (None, None) if guc_mode else ("101", "false")
+            assert session_gucs(with_replica) == expected
+            assert session_gucs() == expected
+        assert session_gucs(with_replica) == (None, None)
+
+    def test_body_that_raises(self, with_replica):
+        from tests.session_gucs import session_gucs  # noqa: PLC0415
+
+        with tenant_context(101):
+            _touch_replica()
+            with pytest.raises(ValueError, match="body failed"):
+                _sync_decorated_touch_replica_and_raise(as_user=None)
+        assert session_gucs(with_replica) == (None, None)
+
+    def test_inside_a_for_user_scope(self, with_replica, tenant_a_user):
+        """A ``post_save`` receiver of ``for_user().create()`` runs inside the scope."""
+        from django.db.models.signals import post_save  # noqa: PLC0415
+
+        from tests.session_gucs import session_gucs  # noqa: PLC0415
+        from tests.test_app.models import Order  # noqa: PLC0415
+
+        def receiver(**kwargs):
+            _touch_replica()
+            _sync_decorated_touch_replica(as_user=None)
+
+        post_save.connect(receiver, sender=Order, dispatch_uid="test-163-for-user")
+        try:
+            Order.objects.for_user(tenant_a_user).create(
+                product="Widget", amount=1, tenant_id=tenant_a_user.rls_tenant_id
+            )
+        finally:
+            post_save.disconnect(sender=Order, dispatch_uid="test-163-for-user")
+        assert session_gucs(with_replica) == (None, None)
+
+    def test_session_write_in_the_body_is_cleared_at_the_exit(self, with_replica):
+        """Outside any context the exit clears a body's session-level write on every alias.
+
+        Right away, in both modes, not at the next guarded statement: a driver
+        cursor after the call would otherwise read the admin bypass.
+        """
+        from tests.session_gucs import session_gucs  # noqa: PLC0415
+
+        _touch_replica()
+        _sync_decorated_set_admin_on_both(as_user=None)
+        assert session_gucs() == (None, None)
+        assert session_gucs(with_replica) == (None, None)
+
+
+@with_rls_context
+def _sync_decorated_call_touch_replica(as_user):
+    """Make a nested ``None``-user call, then touch ``replica`` again."""
+    _touch_replica()
+    _sync_decorated_touch_replica(as_user=None)
+    _touch_replica()
+
+
+@with_rls_context
+def _sync_decorated_touch_replica_and_raise(as_user):
+    """Run a statement on ``replica``, then fail."""
+    _touch_replica()
+    msg = "body failed"
+    raise ValueError(msg)
+
+
+@with_rls_context
+def _sync_decorated_set_admin_on_both(as_user):
+    """Write the admin GUC for the session on ``default`` and ``replica``, as other code might."""
+    set_guc("rls.is_admin", "true")
+    set_guc("rls.is_admin", "true", using="replica")
+
 
 @pytest.mark.django_db(transaction=True)
 def test_async_decorated_call_restores_outer_scope(guc_mode):

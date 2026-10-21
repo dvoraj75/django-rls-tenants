@@ -18,7 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   access (every row for an enclosing `admin_context()`) until its next guarded statement.
   The exit now marks the sessions unknown first and puts the enclosing context back
   second, recording what it writes, so the enclosing block's exit takes it off again.
-  `USE_LOCAL_SET=True` and a single configured alias were not affected.
+  `USE_LOCAL_SET=True` and a single configured alias were not affected. Outside any
+  context and transaction, the exit now also clears the GUCs of every connected configured
+  alias right away, in both modes (one `set_config()` statement each, which the next
+  guarded statement there used to send), so a value the function wrote for the session
+  itself (`set_guc()`) no longer reaches SQL the guard does not see after the call.
 
 ## [1.6.1] - 2026-10-21
 
