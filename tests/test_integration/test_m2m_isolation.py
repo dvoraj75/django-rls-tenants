@@ -13,7 +13,7 @@ from django.core.management import call_command
 from django.db import connection
 
 from django_rls_tenants.tenants.context import admin_context, tenant_context
-from tests.test_app.models import Project, ProtectedUser, SelfRefModel
+from tests.test_app.models import Board, Label, Project, ProtectedUser, SelfRefModel, Tag
 
 pytestmark = pytest.mark.django_db
 
@@ -166,6 +166,59 @@ class TestM2MWriteIsolation:
             proj = Project.objects.get(name="Project A")
             with pytest.raises((InternalError, ProgrammingError)):
                 proj.members.add(b_user)
+
+
+# ---------------------------------------------------------------------------
+# M2M isolation -- a model protected by its RLSConstraint alone (#159)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def sample_labels(db, tenant_a, tenant_b):
+    """A label per tenant, each tagged and on a board of its tenant."""
+    with admin_context():
+        tag = Tag.objects.create(name="shared tag")
+        for tenant in (tenant_a, tenant_b):
+            label = Label.objects.create(name=f"Label {tenant.name}", tenant=tenant)
+            label.tags.add(tag)
+            Board.objects.create(name=f"Board {tenant.name}", tenant=tenant).labels.add(label)
+
+
+def _raw_count(table):
+    with connection.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM {table}")
+        count: int = cur.fetchone()[0]
+    return count
+
+
+class TestM2MConstraintOnlyModelIsolation:
+    """The through tables of a constraint-only model get policies that isolate."""
+
+    @pytest.mark.parametrize("table", ["test_label_tags", "test_board_labels"])
+    def test_tenant_sees_only_its_links(self, sample_labels, tenant_a, table):
+        with tenant_context(tenant_a.pk):
+            assert _raw_count(table) == 1
+
+    @pytest.mark.parametrize("table", ["test_label_tags", "test_board_labels"])
+    def test_no_context_sees_no_links(self, sample_labels, table):
+        assert _raw_count(table) == 0
+
+    @pytest.mark.parametrize("table", ["test_label_tags", "test_board_labels"])
+    def test_admin_sees_every_link(self, sample_labels, table):
+        with admin_context():
+            assert _raw_count(table) == 2
+
+    @pytest.mark.django_db(transaction=True)
+    def test_cannot_link_another_tenants_label(self, sample_labels, tenant_a, tenant_b):
+        """WITH CHECK refuses a link whose Label side belongs to another tenant."""
+        from django.db.utils import InternalError, ProgrammingError  # noqa: PLC0415
+
+        with admin_context():
+            b_label = Label.objects.get(tenant=tenant_b)
+        with tenant_context(tenant_a.pk):
+            board = Board.objects.get()
+            with pytest.raises((InternalError, ProgrammingError)):
+                board.labels.add(b_label)
 
 
 # ---------------------------------------------------------------------------

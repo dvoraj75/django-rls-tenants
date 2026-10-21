@@ -57,15 +57,16 @@ class _Issue(NamedTuple):
 def _collect_rls_models() -> dict[str, type[Model]]:
     """Return ``{db_table: model}`` for the concrete RLS-protected models.
 
-    Those are the ``RLSProtectedModel`` subclasses and the models
-    ``RLS_TENANTS["EXTERNAL_MODELS"]`` lists. A proxy model shares its concrete
-    model's table (and holds no constraints of its own), so the concrete model
-    stands for the table.
+    Those are the models that declare their own policy (``RLSProtectedModel``
+    subclasses and models with an ``RLSConstraint``, the set the runtime
+    protects) and the models ``RLS_TENANTS["EXTERNAL_MODELS"]`` lists. A proxy
+    model shares its concrete model's table (and holds no constraints of its
+    own), so the concrete model stands for the table.
     """
     from django.apps import apps  # noqa: PLC0415
 
     from django_rls_tenants.tenants.models import (  # noqa: PLC0415
-        RLSProtectedModel,
+        _declares_rls_policy,
         _external_model_fields,
     )
 
@@ -75,7 +76,7 @@ def _collect_rls_models() -> dict[str, type[Model]]:
         meta = model._meta  # noqa: SLF001
         if meta.abstract or meta.proxy:
             continue
-        if not issubclass(model, RLSProtectedModel) and meta.label_lower not in external:
+        if not _declares_rls_policy(model) and meta.label_lower not in external:
             continue
         table_to_model[model._meta.db_table] = model  # noqa: SLF001
     return table_to_model
@@ -109,13 +110,13 @@ def _collect_m2m_tables() -> dict[str, dict[str, Any]]:
 
     from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
     from django_rls_tenants.tenants.models import (  # noqa: PLC0415
-        RLSProtectedModel,
+        _declares_rls_policy,
         _get_tenant_fk_field,
     )
 
     m2m_tables: dict[str, dict[str, Any]] = {}
     for model in apps.get_models():
-        if not issubclass(model, RLSProtectedModel) or model._meta.abstract:  # noqa: SLF001
+        if not _declares_rls_policy(model) or model._meta.abstract:  # noqa: SLF001
             continue
         for m2m_field in model._meta.local_many_to_many:  # noqa: SLF001
             through = m2m_field.remote_field.through
@@ -135,8 +136,10 @@ def _collect_m2m_tables() -> dict[str, dict[str, Any]]:
                 from_tenant_fk = rls_tenants_config.TENANT_FK_FIELD
 
             to_tenant_fk: str | None = None
-            if issubclass(to_model_ref, RLSProtectedModel):
-                to_tenant_fk = _get_tenant_fk_field(to_model_ref)
+            if _declares_rls_policy(to_model_ref):
+                # A proxy has no constraints of its own: read its concrete model's.
+                concrete = to_model_ref._meta.concrete_model or to_model_ref  # noqa: SLF001
+                to_tenant_fk = _get_tenant_fk_field(concrete)
                 if to_tenant_fk is None:
                     to_tenant_fk = rls_tenants_config.TENANT_FK_FIELD
 

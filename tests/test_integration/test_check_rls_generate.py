@@ -45,7 +45,7 @@ from django_rls_tenants.operations import AddM2MRLSPolicy
 from django_rls_tenants.rls.constraints import RLSConstraint, _build_m2m_drop_sql
 from django_rls_tenants.tenants.conf import RLSTenantsConfig
 from tests.test_app import migrations as test_app_migrations
-from tests.test_app.models import Order, Project
+from tests.test_app.models import Label, Order, Project
 
 pytestmark = pytest.mark.django_db
 
@@ -108,6 +108,31 @@ def _operations(module_name):
     return {
         operation.m2m_table: operation.deconstruct() for operation in module.Migration.operations
     }
+
+
+class TestConstraintOnlyModels:
+    """A model with an ``RLSConstraint`` and no ``RLSProtectedModel`` base is checked (#159)."""
+
+    def test_its_table_and_its_m2m_tables_are_collected(self):
+        assert _collect_rls_models()["test_label"] is Label
+        tables = _collect_m2m_tables()
+        assert tables["test_label_tags"]["from_tenant_fk"] == "tenant"
+        assert tables["test_label_tags"]["to_tenant_fk"] is None
+        assert tables["test_board_labels"]["to_tenant_fk"] == "tenant"
+
+    def test_its_missing_policy_fails_the_run(self):
+        _execute('DROP POLICY "test_label_tenant_isolation_policy" ON "test_label"')
+        code, _, err = _check_rls()
+        assert code == 1
+        assert "  Label (test_label): no RLS policies found" in err
+
+    def test_its_m2m_table_without_a_policy_fails_the_run(self):
+        """Before #159 the run was green while ``test_label_tags`` had no policy."""
+        _drop_m2m_policies("test_label_tags")
+        code, out, err = _check_rls()
+        assert code == 1
+        assert "verified" not in out
+        assert "Label.tags (auto M2M) (test_label_tags): no RLS policies found" in err
 
 
 class TestGenerate:
