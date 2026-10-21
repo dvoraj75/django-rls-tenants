@@ -152,7 +152,8 @@ Something not working? Start with the
 ## Used in Production
 
 Are you using `django-rls-tenants` in production? We'd love to hear about it.
-[Open a discussion →](https://github.com/dvoraj75/django-rls-tenants/discussions)
+[Used in production? Tell us →](https://github.com/dvoraj75/django-rls-tenants/discussions/categories/show-and-tell)
+<!-- TODO(#166): replace with the pinned discussion URL -->
 
 ## Requirements
 
@@ -168,7 +169,8 @@ for how these lists change.
 ## Contributing
 
 Contributions are welcome! See the [contributing guide](.github/CONTRIBUTING.md) to get
-started. This project is governed by the
+started. Questions and bug reports have their own places: see [SUPPORT.md](SUPPORT.md).
+This project is governed by the
 [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License

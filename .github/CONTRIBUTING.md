@@ -141,10 +141,19 @@ tests/
 Write concise commit messages that explain **why**, not just **what**. Use imperative
 mood (e.g., "Add bypass flag for pre-auth requests" not "Added bypass flag...").
 
+## Questions and Support
+
+Questions go to [Discussions](https://github.com/dvoraj75/django-rls-tenants/discussions),
+not the issue tracker. [`SUPPORT.md`](../SUPPORT.md) lists where each kind of request
+belongs.
+
 ## Reporting Bugs
 
 Use the [bug report template](https://github.com/dvoraj75/django-rls-tenants/issues/new?template=bug_report.yml)
-on GitHub Issues.
+on GitHub Issues. It asks for the output of `python manage.py check_rls --verbose` and
+`python manage.py check`, your `RLS_TENANTS` setting (secrets redacted), whether the database
+role bypasses RLS, and your deployment shape (WSGI or ASGI, server, driver, connection
+pooling). Report security problems privately, as described in [`SECURITY.md`](../SECURITY.md).
 
 ## Requesting Features
 

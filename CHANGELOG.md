@@ -51,6 +51,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request). The `aiterator()` chunk-size test follows Django 6.2's `chunk_size=None`
   default ([ticket #37143](https://code.djangoproject.com/ticket/37143)), which resolves to
   the same 2000 rows per fetch, and now also checks the number of rows each scope pulls.
+- **The bug report template asks for the diagnostics the first reply always needs** (#166).
+  New fields: whether the database role is a superuser or has `BYPASSRLS` and the output of
+  `check_rls --verbose` (both required), plus the output of `manage.py check`, the
+  `RLS_TENANTS` setting, WSGI or ASGI, the driver, and the server and connection pooling
+  (all optional but strongly recommended). A new root `SUPPORT.md` routes questions to
+  Discussions, bugs to the template and vulnerabilities to `SECURITY.md`; the README and the
+  docs index ask people who run the library in production to say how in a "Who uses
+  django-rls-tenants?" discussion. No library change.
 
 ## [1.6.1] - 2026-10-21
 
