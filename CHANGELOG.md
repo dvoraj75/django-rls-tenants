@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A `None`-user `@with_rls_context` call no longer leaves the enclosing context's GUCs
+  on another alias** (#163, a regression in 1.6.1). With `USE_LOCAL_SET=False` and more
+  than one alias in `RLS_TENANTS["DATABASES"]`, the call's exit put the enclosing
+  context's values back on the other aliases and then marked them unknown, which the
+  enclosing block's exit skips; so after that block had exited, SQL the guard does not see
+  (a driver cursor, `callproc()`) on such an alias still ran with the enclosing context's
+  access (every row for an enclosing `admin_context()`) until its next guarded statement.
+  The exit now marks the sessions unknown first and puts the enclosing context back
+  second, recording what it writes, so the enclosing block's exit takes it off again.
+  `USE_LOCAL_SET=True` and a single configured alias were not affected.
+
 ## [1.6.1] - 2026-10-21
 
 Two fixes to what the documentation already promised, both found by an independent read of

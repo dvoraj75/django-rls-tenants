@@ -494,9 +494,10 @@ Rules for code that sets a context or writes the admin/tenant GUCs:
   `context._rls_state()`, which sets and resets all three; `@with_rls_context` with a `None`
   user (or a signature without the user parameter) uses `context._no_rls_state()` (#160),
   which sets all three to no context, writes nothing (the guard clears before the body's
-  first statement) and on exit settles the configured aliases and suspects the sessions
-  (`_settle_after_no_context()`; the async wrapper repeats it in a hop, since the event
-  loop's thread holds no connections); the middleware keeps what
+  first statement) and on exit suspects the sessions, then settles the configured aliases,
+  unknown ones included (`_settle_after_no_context()`, in that order so the enclosing
+  block's exit sees what the settle wrote, #163; the async wrapper repeats it in a hop,
+  since the event loop's thread holds no connections); the middleware keeps what
   `_set_context_gucs()` returned on the request (`__acall__` too, for `process_exception`'s
   hop) and ends it first, with `_end_context_gucs()`. The context managers pass the
   enclosing holder (`state._current_live()`, read on entry) and the DB-API connection they
