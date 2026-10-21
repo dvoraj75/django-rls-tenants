@@ -2173,10 +2173,20 @@ class TestForUserIterators:
             )
 
     def test_default_chunk_size_matches_django(self):
-        """The scope's chunk follows Django's own default, so one scope covers one fetch."""
-        assert f"chunk_size or {_ITERATOR_CHUNK_SIZE}" in inspect.getsource(QuerySet._iterator)
+        """The scope's chunk follows Django's own default, so one scope covers one fetch.
+
+        ``iterator()`` resolves ``chunk_size=None`` in ``QuerySet._iterator()``.
+        ``aiterator()`` defaults to the same number up to Django 6.1; from Django
+        6.2 (ticket #37143) it defaults to ``None`` and resolves it itself, the
+        same way.
+        """
+        resolved_from_none = f"chunk_size or {_ITERATOR_CHUNK_SIZE}"
+        assert resolved_from_none in inspect.getsource(QuerySet._iterator)
         default = inspect.signature(QuerySet.aiterator).parameters["chunk_size"].default
-        assert default == _ITERATOR_CHUNK_SIZE
+        if default is None:
+            assert resolved_from_none in inspect.getsource(QuerySet.aiterator)
+        else:
+            assert default == _ITERATOR_CHUNK_SIZE
 
     @pytest.mark.usefixtures("_strict_mode")
     @pytest.mark.parametrize(

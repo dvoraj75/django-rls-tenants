@@ -642,7 +642,9 @@ inside `_rls_scope()` (`for_write=True` for writes, so the router's write alias 
 which pins that alias on the queryset for the call, sets the GUCs that differ from the
 user's values and the tenant `ContextVar`s, then restores the previous values. A new
 override that runs SQL must use it. `iterator()` / `aiterator()` enter it once per chunk
-and never across a `yield`; `_scoped_chunks()` calls `apply_active_context()` inside each
+(`_ITERATOR_CHUNK_SIZE`, Django's default: `aiterator()` keeps it as an explicit default,
+while Django 6.2 defaults to `None` and resolves that to the same 2000, warning after
+`prefetch_related()`, ticket #37143) and never across a `yield`; `_scoped_chunks()` calls `apply_active_context()` inside each
 scope because the server-side cursor's `FETCH` runs past Django's cursor, where the guard
 cannot set the user's values (in a transaction the previous chunk's exit took them off; in
 autocommit the `WITH HOLD` cursor is computed when it opens, so nothing is written). A
@@ -686,7 +688,15 @@ under ASGI, because Django builds the error response on another thread and conne
 Errors Django builds without calling `process_exception` (an unresolvable URL, for one) are
 not ended by it: the `connection_created` thread check clears a connection opened for them,
 and the GUC affinity guard applies the copied context to their statements and takes it off
-the connection before the next statement run without it (#130, #41).
+the connection before the next statement run without it (#130, #41). That is Django 5.2 -
+6.1, which build ASGI error responses in a `thread_sensitive=False` hop. Django 6.2 (ticket
+#36027, #165) builds them on the request's thread-sensitive thread, with the request's
+connection, which the request's own cleanup clears; the worker-thread handling stays for
+5.2 - 6.1 and for any other `thread_sensitive=False` hop. `TestErrorPages` in
+`tests/test_integration/test_middleware_asgi.py` therefore reads where Django built a page
+from the probe's `on_request_thread` (`_were_gucs_set_on_this_thread()`), never from the
+Django version, and `/rls/async-worker-probe/` (a view that runs the probe in a
+`thread_sensitive=False` hop) keeps the worker-thread case covered on every version.
 A subclass that overrides `process_request` or `process_response` is detected in `__init__`
 and served by `_acall_through_sync_hooks` (`MiddlewareMixin.__acall__`), so changes to the
 sync hooks must keep that path working too. That path clears the GUCs itself when the

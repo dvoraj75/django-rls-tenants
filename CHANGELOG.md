@@ -34,6 +34,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stay known after the commit and the block's exit takes them off. A rollback was not
   affected.
 
+### Changed
+
+- **The ASGI error-page tests no longer assume a worker thread** (#165). Django 6.2
+  ([ticket #36027](https://code.djangoproject.com/ticket/36027)) builds ASGI error responses
+  on the request's thread instead of in a `thread_sensitive=False` hop, which turned the
+  weekly canary's Django `main` leg red. The library needs no change: on Django `main`, on all
+  three middleware paths and with `USE_LOCAL_SET` on or off, the error page sees the
+  request's context (none after a block the view left open) and the connection the next
+  request uses holds no RLS GUC, read with a driver cursor. The tests now read where Django
+  built the page from the page itself, check that property on every version, and keep the
+  worker-thread case covered with a view that runs its probe in a `thread_sensitive=False`
+  hop. The `aiterator()` chunk-size test follows Django 6.2's `chunk_size=None` default
+  ([ticket #37143](https://code.djangoproject.com/ticket/37143)), which resolves to the same
+  2000 rows per fetch.
+
 ## [1.6.1] - 2026-10-21
 
 Two fixes to what the documentation already promised, both found by an independent read of

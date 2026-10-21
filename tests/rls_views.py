@@ -21,9 +21,13 @@ from django.http import (
 
 from django_rls_tenants.rls.guc import aget_guc, get_guc, set_guc
 from django_rls_tenants.tenants.context import async_admin_context, async_tenant_context
-from django_rls_tenants.tenants.middleware import RLSTenantMiddleware
+from django_rls_tenants.tenants.middleware import (
+    RLSTenantMiddleware,
+    _were_gucs_set_on_this_thread,
+)
 from django_rls_tenants.tenants.selection import clear_tenant_selection, switch_tenant
 from django_rls_tenants.tenants.state import get_current_tenant_id, get_rls_context_active
+from tests.session_gucs import session_gucs
 from tests.test_app.models import Order, Tenant
 
 try:
@@ -185,36 +189,55 @@ def database_404_handler(request: HttpRequest, exception: Exception) -> JsonResp
 def guc_probe_404_handler(request: HttpRequest, exception: Exception) -> JsonResponse:
     """Report the context an error page runs with: its thread, connection, GUCs and rows.
 
-    Under ASGI, Django builds this page in a ``thread_sensitive=False`` hop, on a
-    worker thread with a connection of its own and a copy of the request's
-    ``ContextVar``s (#130).
+    Under ASGI, Django 5.2 - 6.1 build this page in a ``thread_sensitive=False``
+    hop, on a worker thread with a connection of its own and a copy of the
+    request's ``ContextVar``s (#130). Django 6.2 builds it on the request's
+    thread-sensitive thread, with the request's connection (Django ticket
+    #36027).
     """
-    return _guc_probe(status=404)
+    return JsonResponse(_guc_probe(), status=404)
 
 
 def guc_probe_500_handler(request: HttpRequest) -> JsonResponse:
     """``guc_probe_404_handler`` for 500 pages."""
-    return _guc_probe(status=500)
+    return JsonResponse(_guc_probe(), status=500)
 
 
-def _guc_probe(*, status: int) -> JsonResponse:
+async def async_worker_probe_view(request: HttpRequest) -> JsonResponse:
+    """Run ``_guc_probe`` in a ``thread_sensitive=False`` hop, as Django 6.1 runs error pages.
+
+    The hop runs on a worker thread of the event loop's default executor, with a
+    connection of its own and a copy of the request's ``ContextVar``s (#130), on
+    every Django version.
+    """
+    return JsonResponse(await sync_to_async(_guc_probe, thread_sensitive=False)())
+
+
+def _guc_probe() -> dict[str, object]:
+    """Report this thread's connection: what the session held, then what a statement sees.
+
+    ``session_gucs_before`` is read with a driver cursor before any statement of
+    the probe's own, so the GUC affinity guard has not applied the active context
+    yet: it is what the request (or an earlier one) left on the connection.
+    """
+    session_gucs_before = list(session_gucs(connection))
     with connection.cursor() as cursor:
         cursor.execute(
             "SELECT pg_backend_pid(), current_setting('rls.current_tenant', true), "
             "current_setting('rls.is_admin', true)"
         )
         pid, tenant_guc, is_admin_guc = cursor.fetchone()
-    return JsonResponse(
-        {
-            "thread": threading.get_ident(),
-            "pid": pid,
-            "tenant_guc": tenant_guc or None,
-            "is_admin_guc": is_admin_guc or None,
-            "database_products": _database_products(),
-            "rls_context_active": get_rls_context_active(),
-        },
-        status=status,
-    )
+    return {
+        "thread": threading.get_ident(),
+        # True on the thread that set the request's GUCs (the request's thread).
+        "on_request_thread": _were_gucs_set_on_this_thread(),
+        "pid": pid,
+        "session_gucs_before": session_gucs_before,
+        "tenant_guc": tenant_guc or None,
+        "is_admin_guc": is_admin_guc or None,
+        "database_products": _database_products(),
+        "rls_context_active": get_rls_context_active(),
+    }
 
 
 def reconnect_view(request: HttpRequest) -> JsonResponse:
