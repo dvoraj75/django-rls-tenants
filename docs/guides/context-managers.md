@@ -342,7 +342,10 @@ def process_order(request, as_user):
    (`async_admin_context()` for an `async def`).
 4. If the user is a **tenant user**: wraps in `tenant_context(user.rls_tenant_id)`
    (`async_tenant_context()` for an `async def`).
-5. If the user is **`None`**: logs a warning and proceeds without context (fail-closed).
+5. If the user is **`None`**: logs a warning and runs the function with **no** RLS
+   context, whatever context encloses the call -- inside `admin_context()` or another
+   tenant's `tenant_context()` too. RLS returns no protected row and `STRICT_MODE`
+   raises (fail-closed). Before #160 the function ran in the enclosing context.
 
 ### Async Functions
 
@@ -442,7 +445,8 @@ def my_function(data, current_user):
 ### Signature Mismatch Warning
 
 If the parameter is not found in the function signature, the decorator logs a warning
-at decoration time and the function will always run without RLS context (fail-closed):
+at decoration time and every call runs with no RLS context, whatever encloses it
+(fail-closed):
 
 ```python
 @with_rls_context

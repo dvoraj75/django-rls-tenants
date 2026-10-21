@@ -132,6 +132,33 @@ def _rls_state(tenant_id: int | str | None, gucs: ContextGucs) -> Iterator[None]
                 reset_rls_context_active(active_token)
 
 
+@contextmanager
+def _no_rls_state() -> Iterator[None]:
+    """Run a block with no RLS context, whatever context encloses it (fail-closed).
+
+    The auto-scope tenant is cleared, the strict-mode flag is off and the GUC
+    affinity guard applies no context, so the block reads no protected row
+    (and ``STRICT_MODE`` raises) even inside ``tenant_context()`` or
+    ``admin_context()``. Nothing is written on entry; the guard clears the
+    GUCs before the block's first statement and applies the enclosing context
+    again before the first statement after it. Reset newest first, like
+    :func:`_rls_state`.
+    """
+    active_token = set_rls_context_active(False)
+    tenant_token = set_current_tenant_id(None)
+    entered = _set_context_gucs(None)
+    try:
+        yield
+    finally:
+        try:
+            _reset_context_gucs(entered)
+        finally:
+            try:
+                reset_current_tenant_id(tenant_token)
+            finally:
+                reset_rls_context_active(active_token)
+
+
 def _writes_gucs(using: str, *, is_local: bool) -> bool:
     """Whether a context block entered on ``using`` writes the admin and tenant GUCs itself.
 
@@ -812,8 +839,11 @@ def with_rls_context[**P, R](
         NoTenantContextError: At call time (when awaited, for ``async def``),
             if a non-admin user has ``rls_tenant_id=None``.
 
-    When the user argument is ``None``, logs a warning and proceeds
-    without context (fail-closed: RLS blocks all access).
+    When the user argument is ``None`` (or the signature has no such
+    parameter), logs a warning and runs the function with no RLS context,
+    whatever context encloses the call: RLS returns no protected row and
+    ``STRICT_MODE`` raises (fail-closed). Before #160 it ran in the enclosing
+    context instead, admin included.
     """
 
     def decorator(fn: Callable[P, R]) -> Callable[P, R]:
@@ -837,7 +867,7 @@ def with_rls_context[**P, R](
         if param_name not in sig.parameters:
             logger.warning(
                 "with_rls_context: parameter %r not found in signature of %s. "
-                "RLS context will never be set (fail-closed). "
+                "Every call runs with no RLS context (fail-closed). "
                 "Use @with_rls_context(user_param='your_param') to specify explicitly.",
                 param_name,
                 qualname,
@@ -848,7 +878,8 @@ def with_rls_context[**P, R](
             as_user: TenantUser | None = _get_arg_from_signature(sig, param_name, *args, **kwargs)
             if as_user is None:
                 logger.warning(
-                    "with_rls_context: %s is None in call to %s, no RLS context set (fail-closed)",
+                    "with_rls_context: %s is None in call to %s, running it with no RLS context "
+                    "(fail-closed)",
                     param_name,
                     qualname,
                 )
@@ -860,7 +891,8 @@ def with_rls_context[**P, R](
             async def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> Any:
                 as_user = user_of(*args, **kwargs)
                 if as_user is None:
-                    return await fn(*args, **kwargs)
+                    with _no_rls_state():
+                        return await fn(*args, **kwargs)
                 tenant_id = _decorated_call_tenant_id(as_user, qualname)
                 ctx = (
                     async_admin_context() if tenant_id is None else async_tenant_context(tenant_id)
@@ -875,7 +907,8 @@ def with_rls_context[**P, R](
         def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
             as_user = user_of(*args, **kwargs)
             if as_user is None:
-                return _reject_coroutine(fn(*args, **kwargs), qualname)
+                with _no_rls_state():
+                    return _reject_coroutine(fn(*args, **kwargs), qualname)
             tenant_id = _decorated_call_tenant_id(as_user, qualname)
             ctx = admin_context() if tenant_id is None else tenant_context(tenant_id)
             with audit.attributed(ctx, source="decorator", user=as_user):

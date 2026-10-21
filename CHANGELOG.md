@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   will see `check_rls` fail on their through tables until it runs `check_rls --generate`
   and `migrate`. `_collect_m2m_tables()` also reads a proxy's concrete model for the related
   side's tenant field, as `register_m2m_rls()` already did.
+- **`@with_rls_context` with a `None` user now runs the function with no RLS context**
+  (#160). The docstring and both warnings promised fail-closed, but the wrapper called the
+  function directly, so it ran in whatever context enclosed the call: every row inside
+  `admin_context()`, the other tenant's rows inside `tenant_context()`. It now enters a
+  no-context block (auto-scope tenant cleared, strict-mode flag off, no GUCs for the
+  affinity guard), sync and async alike, and the same holds for a function whose
+  signature lacks the user parameter. Outside any context nothing changes. **Upgrading:**
+  code that relied on a `None` user inheriting the caller's context now reads no rows, or
+  raises `NoTenantContextError` under `STRICT_MODE`; enter the context explicitly instead.
 
 ## [1.6.0] - 2026-10-18
 

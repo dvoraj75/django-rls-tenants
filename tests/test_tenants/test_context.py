@@ -1236,6 +1236,93 @@ class TestWithRlsContextNarrowsOuterContext:
         assert async_to_sync(run)() == ((2, 2), (("true", None), None))
 
 
+@with_rls_context
+def _sync_decorated_scope(as_user):
+    """Report the GUCs and tenant state the decorated sync body runs under."""
+    gucs = (get_guc("rls.is_admin"), get_guc("rls.current_tenant"))
+    return gucs, get_current_tenant_id(), get_rls_context_active()
+
+
+@with_rls_context
+def _sync_decorated_raw_count(as_user):
+    return _raw_order_count()
+
+
+def _no_user_param_raw_count():
+    return _raw_order_count()
+
+
+class TestWithRlsContextNoneUserFailsClosed:
+    """Regression for #160: a ``None`` user runs the body with no context, whatever encloses it.
+
+    Before #160 the wrapper called the function directly, so it ran in the
+    caller's context: all rows inside ``admin_context()``, the enclosing
+    tenant's rows inside ``tenant_context()``. Raw SQL proves the database scope.
+    """
+
+    def test_sync_inside_admin_context_reads_nothing(self, sample_orders, enforce_rls):
+        with admin_context():
+            assert _sync_decorated_raw_count(as_user=None) == 0
+            assert _raw_order_count() == 3  # the admin context is back
+
+    def test_sync_inside_tenant_context_reads_nothing(self, sample_orders, enforce_rls, tenant_a):
+        with tenant_context(tenant_a.pk):
+            assert _sync_decorated_raw_count(as_user=None) == 0
+            assert _raw_order_count() == 2
+
+    def test_sync_body_sees_no_context_state(self, tenant_a):
+        with tenant_context(tenant_a.pk):
+            assert _sync_decorated_scope(as_user=None) == ((None, None), None, False)
+            assert get_guc("rls.current_tenant") == str(tenant_a.pk)
+            assert get_current_tenant_id() == tenant_a.pk
+            assert get_rls_context_active() is True
+
+    def test_missing_user_param_inside_admin_context_reads_nothing(
+        self, sample_orders, enforce_rls, caplog
+    ):
+        with caplog.at_level(logging.WARNING, logger="django_rls_tenants"):
+            decorated = with_rls_context(_no_user_param_raw_count)
+        with admin_context():
+            assert decorated() == 0
+            assert _raw_order_count() == 3
+
+    def test_strict_mode_raises_inside_an_enclosing_context(
+        self, sample_orders, tenant_a, settings
+    ):
+        from tests.test_app.models import Order  # noqa: PLC0415
+
+        @with_rls_context
+        def count(as_user):
+            return Order.objects.count()
+
+        settings.RLS_TENANTS = {"TENANT_MODEL": "test_app.Tenant", "STRICT_MODE": True}
+        with tenant_context(tenant_a.pk), pytest.raises(NoTenantContextError):
+            count(as_user=None)
+
+    def test_async_inside_admin_context_reads_nothing(self, sample_orders, enforce_rls):
+        with admin_context():
+            assert async_to_sync(_decorated_order_counts)(as_user=None) == (0, 0)
+            assert _raw_order_count() == 3
+
+    def test_async_body_sees_no_context_state(self, tenant_a):
+        with tenant_context(tenant_a.pk):
+            assert async_to_sync(_decorated_scope)(as_user=None) == ((None, None), None, False)
+            assert get_current_tenant_id() == tenant_a.pk
+
+
+@pytest.mark.django_db(transaction=True)
+def test_none_user_call_inside_a_tenant_block_restores_it(guc_mode):
+    """#160 in both GUC modes, inside a transaction: no context in the call, the block after it."""
+    from django.db import transaction  # noqa: PLC0415
+
+    with transaction.atomic(), tenant_context(101):
+        assert _sync_decorated_scope(as_user=None) == ((None, None), None, False)
+        assert async_to_sync(_decorated_scope)(as_user=None) == ((None, None), None, False)
+        assert get_guc("rls.is_admin") == "false"
+        assert get_guc("rls.current_tenant") == "101"
+        assert get_current_tenant_id() == 101
+
+
 @pytest.mark.django_db(transaction=True)
 def test_async_decorated_call_restores_outer_scope(guc_mode):
     """A decorated coroutine narrows an outer tenant block and restores it, in both modes."""
