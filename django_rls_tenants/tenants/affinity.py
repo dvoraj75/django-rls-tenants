@@ -683,7 +683,9 @@ def settle_other_aliases(using: str | None, *, cleared: bool = False) -> None:
         cleared: The block held no context (``context._no_rls_state()``), so
             the guard cleared the GUCs of the connections it saw, which the
             tracker records as ``None``: a connection that holds none gets the
-            active context's values too, where there is an active context.
+            active context's values too, where there is an active context, and
+            so does one whose values are unknown (the block's exit suspects
+            the sessions first, #163).
     """
     for alias in rls_tenants_config.DATABASES:
         if alias == using:
@@ -698,7 +700,7 @@ def settle_other_aliases(using: str | None, *, cleared: bool = False) -> None:
         unknown_in_transaction = (
             using is None and held is UNKNOWN and _observe(connection, tracker) != _IDLE
         )
-        cleared_by_the_block = cleared and held is None
+        cleared_by_the_block = cleared and (held is None or held is UNKNOWN)
         if not isinstance(held, tuple) and not unknown_in_transaction and not cleared_by_the_block:
             continue
         try:

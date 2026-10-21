@@ -170,23 +170,28 @@ def _settle_after_no_context() -> None:
     """Put the enclosing context back on this thread's configured connections.
 
     The exit of :func:`_no_rls_state`, after its ``ContextVar`` reset. The
-    block wrote nothing on entry, so there is no snapshot to restore; as for a
-    block that wrote nothing (``_restore_tenant_gucs(previous=None)``), every
-    configured alias whose session still holds the block's cleared values gets
-    the enclosing context's values back, or none (``settle_other_aliases``,
-    with ``cleared=True``: the guard's clear is recorded as ``None``, which a
-    plain settle takes for a connection the block never touched),
-    so SQL past Django's cursor in the enclosing block (a driver cursor,
-    ``callproc()``, a server-side cursor's ``FETCH``) does not read as no
-    context until the block's next guarded statement. What the sessions hold
-    for themselves then counts as unknown (``suspect_sessions()``), in both
-    GUC modes: code in the block may have written the GUCs for the session
-    (``set_guc()``), and no snapshot restore undoes it here.
+    block wrote nothing on entry, so there is no snapshot to restore. What the
+    sessions hold for themselves first counts as unknown
+    (``suspect_sessions()``), in both GUC modes: code in the block may have
+    written the GUCs for the session (``set_guc()``), and no snapshot restore
+    undoes it here. Then, as for a block that wrote nothing
+    (``_restore_tenant_gucs(previous=None)``), every configured alias whose
+    session holds the block's cleared values, or values now unknown, gets the
+    enclosing context's values back, or none (``settle_other_aliases``, with
+    ``cleared=True``: the guard's clear is recorded as ``None``, which a plain
+    settle takes for a connection the block never touched), so SQL past
+    Django's cursor in the enclosing block (a driver cursor, ``callproc()``, a
+    server-side cursor's ``FETCH``) does not read as no context until the
+    block's next guarded statement. Suspect first, settle second (#163): the
+    settle records what it writes, so the enclosing block's own exit takes
+    those values off the other aliases again; written after it, the suspect
+    would leave them unknown, which that exit skips in session mode, and the
+    enclosing context's values would outlive it.
     """
     try:
-        settle_other_aliases(None, cleared=True)
-    finally:
         suspect_sessions()
+    finally:
+        settle_other_aliases(None, cleared=True)
 
 
 def _writes_gucs(using: str, *, is_local: bool) -> bool:

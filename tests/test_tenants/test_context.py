@@ -1367,6 +1367,85 @@ class TestNoneUserCallSettlesTheSession:
         assert get_guc("rls.is_admin") is None
 
 
+def _touch_replica():
+    """Run a statement on the ``replica`` alias through Django's cursor, so the guard sees it."""
+    from django.db import connections  # noqa: PLC0415
+
+    with connections["replica"].cursor() as cursor:
+        cursor.execute("SELECT 1")
+
+
+@with_rls_context
+def _sync_decorated_touch_replica(as_user):
+    """Run a statement on ``replica`` in the decorated body."""
+    _touch_replica()
+
+
+@with_rls_context
+async def _decorated_touch_replica(as_user):
+    """Run a statement on ``replica`` in the decorated coroutine (in a hop)."""
+    await sync_to_async(_touch_replica)()
+
+
+@pytest.mark.django_db(transaction=True)
+class TestNoneUserCallSettlesTheOtherAliases:
+    """After a ``None``-user call, the enclosing block's exit settles the other aliases (#163).
+
+    With ``replica`` configured too, the call's exit puts the enclosing context
+    back on it; the enclosing block's exit must then take it off again, as it
+    does when there was no call. Before #163 the call's exit left the values it
+    wrote unknown, which that exit skips in session mode, so a driver cursor on
+    ``replica`` read the enclosing context's values outside any context. Read
+    with a driver cursor (``session_gucs()``), as above.
+    """
+
+    @pytest.fixture
+    def with_replica(self, replica, guc_mode):
+        from django.conf import settings  # noqa: PLC0415
+        from django.db import DEFAULT_DB_ALIAS  # noqa: PLC0415
+        from django.test import override_settings  # noqa: PLC0415
+
+        databases = {**settings.RLS_TENANTS, "DATABASES": [DEFAULT_DB_ALIAS, replica]}
+        with override_settings(RLS_TENANTS=databases):
+            yield replica
+
+    def test_tenant_block_in_autocommit(self, with_replica):
+        from tests.session_gucs import session_gucs  # noqa: PLC0415
+
+        with tenant_context(101):
+            _touch_replica()
+            _sync_decorated_touch_replica(as_user=None)
+        assert session_gucs(with_replica) == (None, None)
+
+    def test_admin_block_in_autocommit(self, with_replica):
+        from tests.session_gucs import session_gucs  # noqa: PLC0415
+
+        with admin_context():
+            _touch_replica()
+            _sync_decorated_touch_replica(as_user=None)
+        assert session_gucs(with_replica) == (None, None)
+
+    def test_async_call_in_autocommit(self, with_replica):
+        """The async wrapper settles in a hop, on the thread that holds the connections."""
+        from tests.session_gucs import session_gucs  # noqa: PLC0415
+
+        with tenant_context(101):
+            _touch_replica()
+            async_to_sync(_decorated_touch_replica)(as_user=None)
+        assert session_gucs(with_replica) == (None, None)
+
+    def test_in_a_transaction_on_the_other_alias(self, with_replica):
+        from django.db import transaction  # noqa: PLC0415
+
+        from tests.session_gucs import session_gucs  # noqa: PLC0415
+
+        with transaction.atomic(using=with_replica), tenant_context(101):
+            _touch_replica()
+            _sync_decorated_touch_replica(as_user=None)
+            assert session_gucs(with_replica) == ("101", "false")
+        assert session_gucs(with_replica) == (None, None)
+
+
 @pytest.mark.django_db(transaction=True)
 def test_async_decorated_call_restores_outer_scope(guc_mode):
     """A decorated coroutine narrows an outer tenant block and restores it, in both modes."""
