@@ -8,6 +8,15 @@ body:
         Thank you for reporting a bug. Please fill out the sections below so we can
         reproduce and fix the issue.
 
+        - **A question, or "is this the right design for my app"?** Ask it in
+          [Discussions](https://github.com/dvoraj75/django-rls-tenants/discussions/categories/q-a)
+          instead.
+        - **A security problem?** Do not open an issue. Follow the
+          [security policy](https://github.com/dvoraj75/django-rls-tenants/blob/main/SECURITY.md).
+        - **Nothing is filtered, or every query returns zero rows?** The
+          [Troubleshooting page](https://dvoraj75.github.io/django-rls-tenants/troubleshooting/)
+          covers the usual causes, and the fields below ask for the output that tells them apart.
+
   - type: textarea
     id: description
     attributes:
@@ -45,12 +54,113 @@ body:
     validations:
       required: true
 
+  - type: dropdown
+    id: db-role-bypasses-rls
+    attributes:
+      label: Does the database role bypass RLS?
+      description: |
+        Is the role your application connects as a superuser, or does it have `BYPASSRLS`?
+        PostgreSQL does not apply row-level security to such a role, so this is the first
+        cause of "RLS does not filter" and the first thing we would ask. Check it as the
+        application's role (after any `SET ROLE`):
+        `SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user;`
+        The `django_rls_tenants.W005` / `E001` system checks report it too.
+      options:
+        - "No (rolsuper and rolbypassrls are both false)"
+        - "Yes (rolsuper or rolbypassrls is true)"
+        - "Don't know"
+    validations:
+      required: true
+
+  - type: textarea
+    id: check-rls
+    attributes:
+      label: Output of `python manage.py check_rls --verbose`
+      description: |
+        Run it with the settings and the database role your application uses, and paste the
+        whole output. It shows whether the policies exist in the database and their `USING` /
+        `WITH CHECK` SQL. If the command fails or cannot run, paste that error instead.
+        Redact table names if they are sensitive.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: manage-check
+    attributes:
+      label: Output of `python manage.py check`
+      description: |
+        Strongly recommended. The library registers the system checks `django_rls_tenants.W0xx`
+        (warnings) and `django_rls_tenants.E001`, which flag the usual misconfigurations (a
+        superuser role, connection pooling without `reset_rls_gucs`, a policy GUC with a
+        database-level default, and more). Run it with the same settings and database role as
+        the application, and paste the whole output, including "no issues".
+      render: shell
+
+  - type: textarea
+    id: rls-tenants-setting
+    attributes:
+      label: The `RLS_TENANTS` setting
+      description: |
+        Strongly recommended. Paste the `RLS_TENANTS` dict from your settings, with secrets
+        redacted. The keys that matter most are `USE_LOCAL_SET`, `DATABASES`, `STRICT_MODE`
+        (and `STRICT_MODE_EXCLUDE`) and `EXTERNAL_MODELS`.
+      render: python
+      placeholder: |
+        RLS_TENANTS = {
+            "TENANT_MODEL": "myapp.Tenant",
+            "USE_LOCAL_SET": False,
+            "DATABASES": ["default"],
+            "STRICT_MODE": False,
+        }
+
+  - type: dropdown
+    id: server-mode
+    attributes:
+      label: WSGI or ASGI
+      description: |
+        Strongly recommended. How the failing code is served. The middleware, the GUC cleanup
+        and the connection handling differ between the two.
+      options:
+        - "WSGI"
+        - "ASGI"
+        - "Both"
+        - "Not a web request (management command, Celery task, test, script)"
+        - "Don't know"
+
+  - type: dropdown
+    id: driver
+    attributes:
+      label: PostgreSQL driver
+      description: |
+        Strongly recommended. The Python driver Django uses (`pip show psycopg psycopg2 psycopg2-binary`).
+        Django's own connection pool (`OPTIONS["pool"]`) needs psycopg 3.
+      options:
+        - "psycopg 3"
+        - "psycopg 2"
+        - "Don't know"
+
+  - type: textarea
+    id: deployment
+    attributes:
+      label: Server and connection pooling
+      description: |
+        Strongly recommended. The application server (gunicorn, uvicorn, daphne, hypercorn, ...)
+        and its worker type, and every layer that pools or reuses connections: Django's
+        `OPTIONS["pool"]` or `CONN_MAX_AGE`, PgBouncer and its pool mode (session or
+        transaction), pgpool-II. Write "none" if there is no pooling. Redact credentials.
+      placeholder: |
+        Server: uvicorn (4 workers), ASGI
+        Django pool: OPTIONS["pool"] = True
+        PgBouncer: transaction mode
+        pgpool-II: none
+
   - type: input
     id: version
     attributes:
       label: Version
       description: django-rls-tenants version (run `pip show django-rls-tenants`).
-      placeholder: "0.1.0"
+      placeholder: "1.6.1"
     validations:
       required: true
 
@@ -58,6 +168,7 @@ body:
     id: django-version
     attributes:
       label: Django Version
+      description: Supported series are 5.2, 6.0 and 6.1.
       placeholder: "6.1"
     validations:
       required: true
@@ -66,6 +177,7 @@ body:
     id: pg-version
     attributes:
       label: PostgreSQL Version
+      description: Supported majors are 15, 16, 17 and 18 (`SELECT version();`).
       placeholder: "16.2"
     validations:
       required: true
@@ -74,6 +186,7 @@ body:
     id: python-version
     attributes:
       label: Python Version
+      description: Supported versions are 3.12, 3.13 and 3.14.
       placeholder: "3.12"
     validations:
       required: true
@@ -82,4 +195,7 @@ body:
     id: context
     attributes:
       label: Additional Context
-      description: Any other context (connection pooling setup, async usage, etc.).
+      description: |
+        Any other context: which integrations are involved (DRF, Celery, the admin,
+        `MultiTenantUser`, `extra_predicates`, `AddRLSPolicy`), async usage, a minimal project
+        or failing test, etc.

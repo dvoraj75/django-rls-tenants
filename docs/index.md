@@ -152,6 +152,14 @@ See the full [Quick Start tutorial](getting-started/quickstart.md) for a complet
     [example project](https://github.com/dvoraj75/django-rls-tenants/tree/main/example).
     `cd example && docker compose up`, and explore tenant isolation in under 5 minutes.
 
+## Community
+
+Used in production? [Tell us in the discussion](https://github.com/dvoraj75/django-rls-tenants/discussions/categories/show-and-tell):
+which deployment shapes and features people run decides what gets built next.
+<!-- TODO(#166): replace with the pinned discussion URL -->
+Questions, bug reports and security reports each have their own place; see
+[SUPPORT.md](https://github.com/dvoraj75/django-rls-tenants/blob/main/SUPPORT.md).
+
 ## License
 
 [MIT](https://github.com/dvoraj75/django-rls-tenants/blob/main/LICENSE)
