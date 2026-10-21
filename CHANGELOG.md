@@ -7,8 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-10-21
+
+Two fixes to what the documentation already promised, both found by an independent read of
+1.6.0. The `@with_rls_context` one closes an isolation gap; read its **Upgrading** note.
+
 ### Fixed
 
+- **`@with_rls_context` with a `None` user now runs the function with no RLS context**
+  (#160). The docstring and both warnings promised fail-closed, but the wrapper called the
+  function directly, so it ran in whatever context enclosed the call: every row inside
+  `admin_context()`, the other tenant's rows inside `tenant_context()`. It now enters a
+  no-context block (auto-scope tenant cleared, strict-mode flag off, no GUCs for the
+  affinity guard), sync and async alike, and the same holds for a function whose
+  signature lacks the user parameter. On exit the enclosing context's values are put back
+  on the thread's configured connections, as every other block exit does, so SQL the guard
+  does not see (a driver cursor, `callproc()`) reads the enclosing context again at once.
+  Outside any context nothing changes. **Upgrading (a behaviour change):**
+  code that relied on a `None` user inheriting the caller's context now reads no rows, or
+  raises `NoTenantContextError` under `STRICT_MODE`; enter the context explicitly instead.
 - **`check_rls` and the M2M auto-detection now cover models that carry an `RLSConstraint`
   without inheriting `RLSProtectedModel`** (#159). The migration already created such a
   model's policy and the runtime already treated it as RLS-protected (the `select_related()`
@@ -26,18 +43,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   will see `check_rls` fail on their through tables until it runs `check_rls --generate`
   and `migrate`. `_collect_m2m_tables()` also reads a proxy's concrete model for the related
   side's tenant field, as `register_m2m_rls()` already did.
-- **`@with_rls_context` with a `None` user now runs the function with no RLS context**
-  (#160). The docstring and both warnings promised fail-closed, but the wrapper called the
-  function directly, so it ran in whatever context enclosed the call: every row inside
-  `admin_context()`, the other tenant's rows inside `tenant_context()`. It now enters a
-  no-context block (auto-scope tenant cleared, strict-mode flag off, no GUCs for the
-  affinity guard), sync and async alike, and the same holds for a function whose
-  signature lacks the user parameter. On exit the enclosing context's values are put back
-  on the thread's configured connections, as every other block exit does, so SQL the guard
-  does not see (a driver cursor, `callproc()`) reads the enclosing context again at once.
-  Outside any context nothing changes. **Upgrading (a behaviour change):**
-  code that relied on a `None` user inheriting the caller's context now reads no rows, or
-  raises `NoTenantContextError` under `STRICT_MODE`; enter the context explicitly instead.
 
 ## [1.6.0] - 2026-10-18
 
@@ -1741,7 +1746,8 @@ Initial stable release of django-rls-tenants.
   and manager `_fetch_all` could clear GUCs with session scope while setting
   them with transaction scope, causing mismatched lifetimes.
 
-[Unreleased]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.6.1...HEAD
+[1.6.1]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.3.4...v1.4.0

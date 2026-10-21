@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: 2026-10-18
+> Last updated: 2026-10-21
 >
 > Priorities may shift based on community feedback.
 > Have a suggestion? [Open an issue](https://github.com/dvoraj75/django-rls-tenants/issues).
@@ -472,6 +472,21 @@ inheritance design could not reach. See [1.6.0](changelog.md#160-2026-10-18).
   leg on Django 5.2 and one on PostgreSQL 17, and the support-matrix test requires a
   leg for every supported PostgreSQL major.
   *Why:* The supported-versions policy promised combinations no leg ran.
+
+---
+
+## v1.6.x — Patch cycle
+
+No new library features; each patch tightens what v1.6.0 shipped. Details for every
+item are in the [changelog](changelog.md).
+
+- [x] **1.6.1 — Two fail-closed fixes** — `@with_rls_context` with a `None` user (or a
+  signature without the user parameter) runs the function with no RLS context instead of
+  the caller's (#160), and `check_rls`, `register_m2m_rls()` and the `W001` / `W002` /
+  `W009` checks cover a model protected by an `RLSConstraint` without inheriting
+  `RLSProtectedModel`, its automatic M2M through tables included (#159). Both were found
+  by an independent read of 1.6.0. See [1.6.1](changelog.md#161-2026-10-21).
+  *Why:* The documentation promised fail-closed in both places; the code did not deliver it.
 
 ---
 

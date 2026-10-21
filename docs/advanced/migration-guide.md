@@ -123,6 +123,27 @@ migration that assigns the correct tenant to each existing record.
 
 ## Upgrading django-rls-tenants
 
+### From 1.6.0 to 1.6.1
+
+A **drop-in upgrade** for most projects -- no settings or data change is required. Two
+behaviours change, both to what the documentation already promised:
+
+- `@with_rls_context` called with a `None` user (or on a function whose signature lacks
+  the user parameter) now runs the function with **no** RLS context, whatever encloses the
+  call: no rows inside `admin_context()` or `tenant_context()`, and `NoTenantContextError`
+  under `STRICT_MODE` (#160). Before, such a call inherited the caller's context, so inside
+  `admin_context()` it read every row. Code that relied on that must enter the context
+  explicitly (`with admin_context(): ...`) or pass a user. The call still logs the
+  `as_user is None` warning; see
+  [Context managers](../guides/context-managers.md#with_rls_context-decorator).
+- A model that carries an `RLSConstraint` without inheriting `RLSProtectedModel` is now
+  covered by `check_rls`, `register_m2m_rls()` and the `W001` / `W002` / `W009` system
+  checks (#159). If such a model has automatic M2M fields, `check_rls` fails on their
+  through tables until you run `check_rls --generate` and `migrate`, and `manage.py check`
+  may report a mismatch it never looked at before. Such a model gets its policy and the
+  join-time tenant filters; add `objects = RLSManager()` to it for the auto-scope filter
+  and strict mode.
+
 ### From 1.5.0 to 1.6.0
 
 Nothing needs to change for a project that does not set `RLS_TENANTS["EXTERNAL_MODELS"]` or
