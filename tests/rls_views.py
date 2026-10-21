@@ -6,10 +6,12 @@ tenant context set by ``RLSTenantMiddleware`` is in force while the view runs.
 
 from __future__ import annotations
 
+import contextvars
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
-from asgiref.sync import sync_to_async
+from asgiref.sync import iscoroutinefunction, markcoroutinefunction, sync_to_async
 from django.db import DEFAULT_DB_ALIAS, connection, connections
 from django.http import (
     Http404,
@@ -203,6 +205,54 @@ def guc_probe_500_handler(request: HttpRequest) -> JsonResponse:
     return JsonResponse(_guc_probe(), status=500)
 
 
+# One thread, kept for the test session, like the long-lived worker threads of an
+# ASGI server's default executor. The ``*_on_worker`` handlers build their page on it.
+ERROR_PAGE_WORKER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="error-page")
+
+
+def _guc_probe_on_worker() -> dict[str, object]:
+    """Run ``_guc_probe`` on ``ERROR_PAGE_WORKER`` with a copy of the caller's context.
+
+    The same copy semantics as Django 5.2 - 6.1's ``thread_sensitive=False``
+    error-page hop, on every Django version: Django 6.2 builds the page on the
+    request's thread, and this hands it to another thread from there.
+    """
+    return ERROR_PAGE_WORKER.submit(contextvars.copy_context().run, _guc_probe).result()
+
+
+def guc_probe_404_on_worker_handler(request: HttpRequest, exception: Exception) -> JsonResponse:
+    """``guc_probe_404_handler``, with the probe run on ``ERROR_PAGE_WORKER``."""
+    return JsonResponse(_guc_probe_on_worker(), status=404)
+
+
+def guc_probe_500_on_worker_handler(request: HttpRequest) -> JsonResponse:
+    """``guc_probe_500_handler``, with the probe run on ``ERROR_PAGE_WORKER``."""
+    return JsonResponse(_guc_probe_on_worker(), status=500)
+
+
+def static_500_handler(request: HttpRequest) -> JsonResponse:
+    """A 500 page that runs no statement through Django's cursor, like a static ``500.html``.
+
+    The GUC affinity guard never runs for it, so whatever is left on its
+    connection afterwards is left by the request's own cleanup, or not cleared
+    at all. Reports what the session held, read with a driver cursor.
+    """
+    session_gucs_before = list(session_gucs(connection))
+    with connection.connection.cursor() as cursor:
+        cursor.execute("SELECT pg_backend_pid()")
+        (pid,) = cursor.fetchone()
+    return JsonResponse(
+        {
+            "thread": threading.get_ident(),
+            "on_request_thread": _were_gucs_set_on_this_thread(),
+            "pid": pid,
+            "session_gucs_before": session_gucs_before,
+            "rls_context_active": get_rls_context_active(),
+        },
+        status=500,
+    )
+
+
 async def async_worker_probe_view(request: HttpRequest) -> JsonResponse:
     """Run ``_guc_probe`` in a ``thread_sensitive=False`` hop, as Django 6.1 runs error pages.
 
@@ -211,6 +261,15 @@ async def async_worker_probe_view(request: HttpRequest) -> JsonResponse:
     every Django version.
     """
     return JsonResponse(await sync_to_async(_guc_probe, thread_sensitive=False)())
+
+
+async def async_request_thread_probe_view(request: HttpRequest) -> JsonResponse:
+    """Run ``_guc_probe`` in a thread-sensitive hop, as Django 6.2 runs error pages.
+
+    The hop runs on the request's thread, with the request's connection, on
+    every Django version.
+    """
+    return JsonResponse(await sync_to_async(_guc_probe)())
 
 
 def _guc_probe() -> dict[str, object]:
@@ -315,6 +374,34 @@ class SyncOnlyMiddleware:
 
     def __call__(self, request):
         return self.get_response(request)
+
+
+# What ``SessionGucsAfterRequestMiddleware`` read, one ``(path, gucs)`` per request.
+SESSION_GUCS_AFTER_REQUEST: list[tuple[str, list[str | None]]] = []
+
+
+class SessionGucsAfterRequestMiddleware:
+    """Record what the request's own connection holds once the request is done.
+
+    Listed before ``RLSTenantMiddleware``: after the RLS middleware has cleaned
+    up, it reads the session's GUCs with a driver cursor, in a thread-sensitive
+    hop, so on the request's thread and connection. Under ``ASGIHandler`` that
+    connection is the request's alone, and this is the only read of it.
+    """
+
+    sync_capable = False
+    async_capable = True
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+        if iscoroutinefunction(get_response):
+            markcoroutinefunction(self)
+
+    async def __call__(self, request):
+        response = await self.get_response(request)
+        gucs = await sync_to_async(session_gucs)(connection)
+        SESSION_GUCS_AFTER_REQUEST.append((request.path, list(gucs)))
+        return response
 
 
 class TaggingRLSTenantMiddleware(RLSTenantMiddleware):

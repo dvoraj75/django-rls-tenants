@@ -43,11 +43,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   three middleware paths and with `USE_LOCAL_SET` on or off, the error page sees the
   request's context (none after a block the view left open) and the connection the next
   request uses holds no RLS GUC, read with a driver cursor. The tests now read where Django
-  built the page from the page itself, check that property on every version, and keep the
-  worker-thread case covered with a view that runs its probe in a `thread_sensitive=False`
-  hop. The `aiterator()` chunk-size test follows Django 6.2's `chunk_size=None` default
-  ([ticket #37143](https://code.djangoproject.com/ticket/37143)), which resolves to the same
-  2000 rows per fetch.
+  built the page from the page itself and check that property on every version; both the
+  worker-thread case and the request-thread case run in every CI leg, with error pages and
+  views that run their probe on another thread or in a thread-sensitive hop, and the
+  request's own cleanup is checked with driver-cursor reads the GUC affinity guard cannot
+  satisfy (a 500 page that runs no query, a middleware that reads the connection after the
+  request). The `aiterator()` chunk-size test follows Django 6.2's `chunk_size=None`
+  default ([ticket #37143](https://code.djangoproject.com/ticket/37143)), which resolves to
+  the same 2000 rows per fetch, and now also checks the number of rows each scope pulls.
 
 ## [1.6.1] - 2026-10-21
 

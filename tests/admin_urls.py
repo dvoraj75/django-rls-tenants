@@ -13,6 +13,7 @@ from django.urls import path
 from tests.rls_views import (
     async_left_open_view,
     async_orders_view,
+    async_request_thread_probe_view,
     async_stream_view,
     async_widen_to_admin_view,
     async_worker_probe_view,
@@ -37,6 +38,11 @@ urlpatterns = [
     path("rls/async-stream/", async_stream_view, name="rls-async-stream"),
     path("rls/async-left-open/", async_left_open_view, name="rls-async-left-open"),
     path("rls/async-worker-probe/", async_worker_probe_view, name="rls-async-worker-probe"),
+    path(
+        "rls/async-request-thread-probe/",
+        async_request_thread_probe_view,
+        name="rls-async-request-thread-probe",
+    ),
     path("rls/boom/", boom_view, name="rls-boom"),
     path("rls/select-tenant/", select_tenant_view, name="rls-select-tenant"),
     path("rls/task-headers/", task_headers_view, name="rls-task-headers"),

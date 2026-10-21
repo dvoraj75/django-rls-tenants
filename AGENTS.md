@@ -644,19 +644,19 @@ user's values and the tenant `ContextVar`s, then restores the previous values. A
 override that runs SQL must use it. `iterator()` / `aiterator()` enter it once per chunk
 (`_ITERATOR_CHUNK_SIZE`, Django's default: `aiterator()` keeps it as an explicit default,
 while Django 6.2 defaults to `None` and resolves that to the same 2000, warning after
-`prefetch_related()`, ticket #37143) and never across a `yield`; `_scoped_chunks()` calls `apply_active_context()` inside each
-scope because the server-side cursor's `FETCH` runs past Django's cursor, where the guard
-cannot set the user's values (in a transaction the previous chunk's exit took them off; in
-autocommit the `WITH HOLD` cursor is computed when it opens, so nothing is written). A
-queryset with cached results must skip both the scope and
-`_check_strict_mode()`. Methods Django runs in a transaction of their own pass
+`prefetch_related()`, ticket #37143) and never across a `yield`; `_scoped_chunks()` calls
+`apply_active_context()` inside each scope because the server-side cursor's `FETCH` runs
+past Django's cursor, where the guard cannot set the user's values (in a transaction the
+previous chunk's exit took them off; in autocommit the `WITH HOLD` cursor is computed when
+it opens, so nothing is written). A queryset with cached results must skip both the scope
+and `_check_strict_mode()`. Methods Django runs in a transaction of their own pass
 `own_transaction=True`, so their `SET LOCAL` lands in that transaction (on a configured
 alias with `USE_LOCAL_SET=True` the scope writes nothing in it and the guard sets the
 values there, one `set_config()`, and takes them off at the scope's exit). With
 `USE_LOCAL_SET=True` on a configured alias, inside `transaction.atomic()` or not (#137),
 the scope only sets the `ContextVar`s, and the GUC affinity guard applies the user's values
-per statement (autocommit) or once per transaction and context change. Only an alias outside
-`conf.DATABASES` still snapshots, writes `SET LOCAL` and restores.
+per statement (autocommit) or once per transaction and context change. Only an alias
+outside `conf.DATABASES` still snapshots, writes `SET LOCAL` and restores.
 
 ### `prefetch_related()` Tenant Filter
 
@@ -695,8 +695,14 @@ connection, which the request's own cleanup clears; the worker-thread handling s
 5.2 - 6.1 and for any other `thread_sensitive=False` hop. `TestErrorPages` in
 `tests/test_integration/test_middleware_asgi.py` therefore reads where Django built a page
 from the probe's `on_request_thread` (`_were_gucs_set_on_this_thread()`), never from the
-Django version, and `/rls/async-worker-probe/` (a view that runs the probe in a
-`thread_sensitive=False` hop) keeps the worker-thread case covered on every version.
+Django version, and covers both cases in every CI leg: the `page_thread="worker"` arm runs
+the 404 / 500 probe on `rls_views.ERROR_PAGE_WORKER` with a copy of the context, and the
+views `/rls/async-worker-probe/` and `/rls/async-request-thread-probe/` run it in a
+`thread_sensitive=False` and a thread-sensitive hop. A probe that runs a statement through
+Django's cursor lets the guard clear the connection, so tests of the request's own cleanup
+read with a driver cursor before any such statement (`session_gucs_before`,
+`static_500_handler`) or after the request (`SessionGucsAfterRequestMiddleware`, listed
+before the RLS middleware, for `ASGIHandler`'s per-request threads).
 A subclass that overrides `process_request` or `process_response` is detected in `__init__`
 and served by `_acall_through_sync_hooks` (`MiddlewareMixin.__acall__`), so changes to the
 sync hooks must keep that path working too. That path clears the GUCs itself when the
