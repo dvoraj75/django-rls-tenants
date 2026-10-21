@@ -272,6 +272,36 @@ class SelfRefModel(RLSProtectedModel):
         db_table = "test_selfref"
 
 
+class Label(models.Model):
+    """RLS-protected by its ``RLSConstraint`` alone, not by ``RLSProtectedModel`` (#159).
+
+    ``tags``: only this side is protected (Label <-> Tag).
+    """
+
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE)
+    name = models.CharField(max_length=100)
+    tags = models.ManyToManyField(Tag)
+
+    class Meta:
+        db_table = "test_label"
+        constraints = [  # noqa: RUF012  -- Django Meta convention
+            RLSConstraint(field="tenant", name="%(app_label)s_%(class)s_rls_constraint"),
+        ]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class Board(RLSProtectedModel):
+    """``labels``: both sides protected, the to side by a constraint alone (#159)."""
+
+    name = models.CharField(max_length=100)
+    labels = models.ManyToManyField(Label)
+
+    class Meta(RLSProtectedModel.Meta):
+        db_table = "test_board"
+
+
 class Invoice(RLSProtectedModel):
     """RLS-protected model with a per-tenant unique number.
 

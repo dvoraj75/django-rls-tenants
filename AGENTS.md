@@ -95,6 +95,11 @@ FK `owner`) and its proxy `BookProxy`. `tests/test_app/migrations/0010_loan_book
 protects `Book` with `AddRLSPolicy` (and creates `Loan`, an `RLSProtectedModel` with an FK to
 `Book`), and `tests/settings.py` lists it in `EXTERNAL_MODELS`.
 
+`Label` (`tests/test_app/models.py`, migrations `0013_label_board.py` and
+`0014_label_board_m2m_rls_policies.py`; #159) carries an `RLSConstraint` without inheriting
+`RLSProtectedModel`; `Label.tags` (to the plain `Tag`) and `Board.labels` (from an
+`RLSProtectedModel`) are its automatic M2M tables.
+
 `SharedNote` and `NoteShare` (`tests/test_app/models.py`, migration `0011_shared_note.py`;
 #59) carry `extra_predicates`: `SharedNote` has `SharedWith` (through `NoteShare`) and
 `TenantField("partner")`, `NoteShare` has `TenantField("shared_with")`.
@@ -211,7 +216,10 @@ cooperate:
 
 - `RLSM2MConstraint` (in `rls/constraints.py`) — constraint for `Meta.constraints`
 - `AddM2MRLSPolicy` (in `operations.py`) — reversible migration operation
-- `register_m2m_rls()` (in `tenants/models.py`) — auto-detection in `AppConfig.ready()`
+- `register_m2m_rls()` (in `tenants/models.py`) — auto-detection in `AppConfig.ready()`, over
+  the models `_declares_rls_policy()` accepts (`RLSProtectedModel` subclasses and models with
+  an `RLSConstraint`, #159; `check_rls._collect_rls_models()` / `_collect_m2m_tables()` use the
+  same predicate)
 
 `register_m2m_rls()` adds the constraint to the runtime through model only, outside the
 migration state, so `migrate` never creates an auto-created through table's policy: it comes
@@ -310,7 +318,9 @@ latest; `_rls_migrations.MigrationFacts.rls_policy_migrations()` /
 `How to fix:` line. `--generate` writes no `AddRLSPolicy`. **Not given:** the auto-scope filter,
 `for_user()` and the strict-mode guard on queries of the external model itself (it keeps its
 own manager, so the policy is the only isolation), and M2M coverage of its through tables
-(`register_m2m_rls()` and `check_rls` discovery look at `RLSProtectedModel` subclasses only).
+(`register_m2m_rls()` and `check_rls` discovery look only at the models that declare their
+own policy, `_declares_rls_policy()` in `tenants/models.py`: an `RLSProtectedModel` subclass or
+a model with an `RLSConstraint`, never an `EXTERNAL_MODELS` entry; #159).
 
 Extra predicates (#59): `RLSConstraint(extra_predicates=[...])` and
 `AddRLSPolicy(extra_predicates=[...])` take `Predicate` instances from

@@ -82,6 +82,24 @@ def _get_tenant_fk_field(model: type[models.Model]) -> str | None:
     return _external_model_fields().get(meta.label_lower)
 
 
+def _declares_rls_policy(model: type[models.Model]) -> bool:
+    """Return whether ``model`` declares its table's RLS policy itself.
+
+    An ``RLSProtectedModel`` subclass, or any model whose ``Meta.constraints``
+    list an ``RLSConstraint``: the runtime protects both alike (auto-scope,
+    strict mode, the cross-tenant foreign key check), so :func:`register_m2m_rls`
+    covers their automatic M2M through tables and ``check_rls`` verifies both.
+    A model ``RLS_TENANTS["EXTERNAL_MODELS"]`` lists does not count: its policy
+    and the policies of its through tables come from the project's own
+    migrations (#112). A proxy has no constraints of its own, so its concrete
+    model is read.
+    """
+    concrete = model._meta.concrete_model or model  # noqa: SLF001
+    if issubclass(concrete, RLSProtectedModel):
+        return True
+    return any(isinstance(c, RLSConstraint) for c in concrete._meta.constraints)  # noqa: SLF001
+
+
 def _external_model_fields() -> Mapping[str, str]:
     """Return ``RLS_TENANTS["EXTERNAL_MODELS"]`` keyed by ``Options.label_lower``."""
     from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
@@ -108,8 +126,9 @@ def register_m2m_rls() -> None:
     """Discover M2M fields on all RLS-protected models and add constraints.
 
     Iterates over all registered models, finds auto-generated M2M through
-    tables on ``RLSProtectedModel`` subclasses, and adds an
-    ``RLSM2MConstraint`` to each one.
+    tables on the models that declare their own RLS policy
+    (:func:`_declares_rls_policy`: ``RLSProtectedModel`` subclasses and models
+    with an ``RLSConstraint``), and adds an ``RLSM2MConstraint`` to each one.
 
     Called from ``DjangoRlsTenantsConfig.ready()`` when the app registry
     is fully populated. Can also be called manually for testing.
@@ -124,9 +143,7 @@ def register_m2m_rls() -> None:
     from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
 
     for model in apps.get_models():
-        if not issubclass(model, RLSProtectedModel) or model is RLSProtectedModel:
-            continue
-        if model._meta.abstract:  # noqa: SLF001
+        if not _declares_rls_policy(model) or model._meta.abstract:  # noqa: SLF001
             continue
 
         for m2m_field in model._meta.local_many_to_many:  # noqa: SLF001
@@ -178,7 +195,7 @@ def register_m2m_rls() -> None:
                 from_tenant_fk = rls_tenants_config.TENANT_FK_FIELD
 
             to_tenant_fk: str | None = None
-            if issubclass(to_model, RLSProtectedModel):
+            if _declares_rls_policy(to_model):
                 # A proxy has no constraints of its own: read its concrete model's.
                 to_tenant_fk = _get_tenant_fk_field(to_model._meta.concrete_model or to_model)  # noqa: SLF001
                 if to_tenant_fk is None:

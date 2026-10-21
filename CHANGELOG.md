@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`check_rls` and the M2M auto-detection now cover models that carry an `RLSConstraint`
+  without inheriting `RLSProtectedModel`** (#159). The runtime already treated such a model as
+  protected (auto-scope, strict mode, the cross-tenant foreign key check, its own policy), but
+  `check_rls` verified only `RLSProtectedModel` subclasses and `register_m2m_rls()` /
+  `check_rls --generate` looked for automatic M2M through tables only on them: the through
+  tables of a constraint-only model got no policy while `check_rls` reported every table
+  verified. All three now use one predicate, `_declares_rls_policy()` (an `RLSProtectedModel`
+  subclass, or a model whose `Meta.constraints` list an `RLSConstraint`), and a related model
+  of either kind counts as a protected side of an M2M policy. `EXTERNAL_MODELS` entries are
+  still left out of M2M coverage, as documented. **Upgrading:** a project with such models
+  will see `check_rls` fail on their through tables until it runs `check_rls --generate`
+  and `migrate`. `_collect_m2m_tables()` also reads a proxy's concrete model for the related
+  side's tenant field, as `register_m2m_rls()` already did.
 - **`@with_rls_context` with a `None` user now runs the function with no RLS context**
   (#160). The docstring and both warnings promised fail-closed, but the wrapper called the
   function directly, so it ran in whatever context enclosed the call: every row inside

@@ -18,6 +18,7 @@ from django_rls_tenants.tenants.managers import RLSManager
 from django_rls_tenants.tenants.models import (
     RLSProtectedModel,
     _add_tenant_fk,
+    _declares_rls_policy,
     _get_tenant_fk_field,
     _tenant_field,
     validate_cross_tenant_fks,
@@ -25,6 +26,7 @@ from django_rls_tenants.tenants.models import (
 from tests.test_app.models import (
     Assignment,
     Document,
+    Label,
     Loan,
     NoteRevision,
     Order,
@@ -78,6 +80,29 @@ class TestDynamicTenantFK:
         field_names = [f.name for f in Tenant._meta.local_fields]
         # Tenant has "id" and "name", no "tenant" FK
         assert "tenant" not in field_names
+
+
+class TestDeclaresRLSPolicy:
+    """``_declares_rls_policy()``: the models whose M2M tables the library covers (#159)."""
+
+    def test_rls_protected_model_subclass(self):
+        assert _declares_rls_policy(Order)
+
+    def test_model_with_an_rls_constraint_and_no_base(self):
+        assert not issubclass(Label, RLSProtectedModel)
+        assert _declares_rls_policy(Label)
+
+    def test_proxy_reads_its_concrete_model(self):
+        assert _declares_rls_policy(OrderProxy)
+
+    def test_plain_model(self):
+        assert not _declares_rls_policy(Tag)
+
+    def test_external_model_does_not_declare_its_policy(self):
+        """An ``EXTERNAL_MODELS`` entry is protected, but its policy is the project's migration."""
+        assert _get_tenant_fk_field(Book) == "owner"
+        assert not _declares_rls_policy(Book)
+        assert not _declares_rls_policy(BookProxy)
 
 
 class TestProxyModel:

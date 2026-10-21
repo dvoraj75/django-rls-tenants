@@ -493,7 +493,9 @@ WITH CHECK (...same...);
 planner more optimisation flexibility (semi-join vs nested loop).
 
 The auto-detection in `register_m2m_rls()` runs during `AppConfig.ready()` and
-discovers all auto-generated through tables on `RLSProtectedModel` subclasses.
+discovers all auto-generated through tables on the models that declare their own policy:
+`RLSProtectedModel` subclasses and any model whose `Meta.constraints` list an
+`RLSConstraint` (`_declares_rls_policy()`; not an `EXTERNAL_MODELS` entry).
 Explicit through models are skipped -- users manage those via standard
 `RLSProtectedModel` inheritance.
 
