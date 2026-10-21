@@ -280,17 +280,27 @@ class _SessionGUCs:
         """Record that the values are not known, as after a change for the session."""
         self.set_values(UNKNOWN)
 
-    def suspect_session(self) -> None:
+    def suspect_session(self, *, under_local_values: bool = True) -> None:
         """Record that the session's own values may have changed unseen (see ``suspect_sessions``).
 
-        Outside a transaction they are unknown now. In one, a commit leaves
-        them unknown and a rollback undoes the change, as for a session-level
-        write under the transaction's local ones.
+        Outside a transaction they are unknown now. In one, with
+        ``under_local_values``, a commit leaves them unknown and a rollback
+        undoes the change, as for a session-level write under the
+        transaction's local ones: ``values`` stays what the statements see.
+
+        Args:
+            under_local_values: The transaction may hold transaction-local
+                values on top of the session's (``USE_LOCAL_SET=True``).
+                ``False`` in session mode, where the library writes no local
+                value: the values are unknown now, in a transaction too, so the
+                next write records what the session really holds, a commit
+                keeps it and a rollback restores the values the transaction
+                started with.
         """
-        if self.in_transaction:
+        if self.in_transaction and under_local_values:
             self.wrote_session = self.wrote_local = True
         else:
-            self.values = UNKNOWN
+            self.forget()
 
     def end_transaction(self, *, committed: bool | None) -> None:
         """Follow the end of the transaction, and what it leaves on the session.
@@ -716,7 +726,7 @@ def settle_other_aliases(using: str | None, *, cleared: bool = False) -> None:
             )
 
 
-def suspect_sessions() -> None:
+def suspect_sessions(*, under_local_values: bool = True) -> None:
     """Treat what this thread's configured connections hold for the session as unknown.
 
     Called with ``USE_LOCAL_SET=True`` when a context ends (a block exits, a
@@ -726,6 +736,16 @@ def suspect_sessions() -> None:
     value would outlast the context, unlike in session mode, where the
     context's exit restores the GUCs. The next statement run outside any
     context in autocommit clears them first. No statement runs here.
+
+    Also called in both modes by the exit of a ``None``-user
+    ``@with_rls_context`` call (``context._settle_after_no_context()``),
+    right before it settles the configured aliases.
+
+    Args:
+        under_local_values: Passed to :meth:`_SessionGUCs.suspect_session`:
+            ``False`` makes the values unknown in a transaction too, which
+            session mode needs so that the settle that follows records what it
+            writes, and a commit keeps it known (#163).
     """
     for alias in rls_tenants_config.DATABASES:
         connection = _connection_of(alias)
@@ -739,7 +759,7 @@ def suspect_sessions() -> None:
             # values are unknown either way. Called while unwinding a block,
             # so nothing is raised here.
             logger.debug("GUC affinity guard: could not read alias %r", alias, exc_info=True)
-        tracker.suspect_session()
+        tracker.suspect_session(under_local_values=under_local_values)
 
 
 # ---- Following the SQL that runs ----

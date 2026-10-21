@@ -174,12 +174,17 @@ def _settle_after_no_context() -> None:
     sessions hold for themselves first counts as unknown
     (``suspect_sessions()``), in both GUC modes: code in the block may have
     written the GUCs for the session (``set_guc()``), and no snapshot restore
-    undoes it here. Then, as for a block that wrote nothing
-    (``_restore_tenant_gucs(previous=None)``), every configured alias whose
-    session holds the block's cleared values, or values now unknown, gets the
-    enclosing context's values back, or none (``settle_other_aliases``, with
-    ``cleared=True``: the guard's clear is recorded as ``None``, which a plain
-    settle takes for a connection the block never touched), so SQL past
+    undoes it here. In session mode that holds in a transaction too
+    (``under_local_values=False``): the settle's session-level write is then
+    recorded and stays known after the commit, so the enclosing block's exit
+    still takes it off; with the transaction-local mode's bookkeeping a commit
+    would leave it unknown, which that exit skips (#163). Then, as for a block
+    that wrote nothing (``_restore_tenant_gucs(previous=None)``), every
+    configured alias whose session holds the block's cleared values, or values
+    now unknown, gets the enclosing context's values back, or none
+    (``settle_other_aliases``, with ``cleared=True``: the guard's clear is
+    recorded as ``None``, which a plain settle takes for a connection the block
+    never touched), so SQL past
     Django's cursor in the enclosing block (a driver cursor, ``callproc()``, a
     server-side cursor's ``FETCH``) does not read as no context until the
     block's next guarded statement. Suspect first, settle second (#163): the
@@ -189,7 +194,7 @@ def _settle_after_no_context() -> None:
     enclosing context's values would outlive it.
     """
     try:
-        suspect_sessions()
+        suspect_sessions(under_local_values=rls_tenants_config.USE_LOCAL_SET)
     finally:
         settle_other_aliases(None, cleared=True)
 
