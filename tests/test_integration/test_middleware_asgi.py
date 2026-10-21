@@ -10,8 +10,9 @@ these requests on its own async path; ``TestNativeAsyncPath`` covers it with asy
 
 ``AsyncClientHandler`` fires ``request_finished`` on a throwaway connection, so the
 "nothing left behind" assertions below check the middleware's own cleanup, not the
-``request_finished`` safety net. ``TestErrorPageOnWorkerThread`` covers the error pages
-Django builds on a worker thread while the request context is active (#130, #41).
+``request_finished`` safety net. ``TestErrorPages`` covers the error pages Django builds
+while the request context is active: on a worker thread up to Django 6.1, on the
+request's thread from Django 6.2 (#130, #41, #165).
 """
 
 from __future__ import annotations
@@ -35,6 +36,8 @@ from django_rls_tenants.rls.guc import get_guc
 from django_rls_tenants.tenants.middleware import RLSTenantMiddleware
 from django_rls_tenants.tenants.state import get_current_tenant_id, get_rls_context_active
 from tests import admin_urls
+from tests.rls_views import ERROR_PAGE_WORKER, SESSION_GUCS_AFTER_REQUEST
+from tests.session_gucs import session_gucs
 from tests.test_app.models import AdminUser
 
 pytestmark = pytest.mark.django_db
@@ -390,26 +393,67 @@ class TestTransactionLocalMode:
 
 
 @pytest.fixture
-def guc_probe_404(monkeypatch):
-    """Serve 404 pages with ``guc_probe_404_handler``."""
+def page_thread():
+    """Where the probe error pages run: ``"django"``, wherever Django builds them.
+
+    Tests parametrize it with ``"worker"`` too: the page then runs on
+    ``rls_views.ERROR_PAGE_WORKER`` with a copy of the context, as Django 5.2 -
+    6.1 build it, on every Django version.
+    """
+    return "django"
+
+
+def _probe_handler(kind, page_thread):
+    suffix = "_on_worker" if page_thread == "worker" else ""
+    return f"tests.rls_views.guc_probe_{kind}{suffix}_handler"
+
+
+@pytest.fixture
+def _close_error_page_worker_connections(page_thread):
+    yield
+    if page_thread == "worker":
+        # Django never closes that thread's connection; the test does.
+        ERROR_PAGE_WORKER.submit(connections.close_all).result()
+
+
+@pytest.fixture
+def guc_probe_404(monkeypatch, page_thread, _close_error_page_worker_connections):
+    """Serve 404 pages with ``guc_probe_404_handler`` (or its ``page_thread`` variant)."""
     monkeypatch.setattr(
-        admin_urls, "handler404", "tests.rls_views.guc_probe_404_handler", raising=False
+        admin_urls, "handler404", _probe_handler("404", page_thread), raising=False
     )
 
 
 @pytest.fixture
-def guc_probe_500(monkeypatch):
-    """Serve 500 pages with ``guc_probe_500_handler``."""
+def static_500(monkeypatch):
+    """Serve 500 pages with ``static_500_handler``, which runs no Django-cursor statement."""
     monkeypatch.setattr(
-        admin_urls, "handler500", "tests.rls_views.guc_probe_500_handler", raising=False
+        admin_urls, "handler500", "tests.rls_views.static_500_handler", raising=False
     )
+
+
+@pytest.fixture
+def guc_probe_500(monkeypatch, page_thread, _close_error_page_worker_connections):
+    """Serve 500 pages with ``guc_probe_500_handler`` (or its ``page_thread`` variant)."""
+    monkeypatch.setattr(
+        admin_urls, "handler500", _probe_handler("500", page_thread), raising=False
+    )
+
+
+@pytest.fixture
+def session_gucs_after_request():
+    """What ``SessionGucsAfterRequestMiddleware`` records, emptied before and after."""
+    SESSION_GUCS_AFTER_REQUEST.clear()
+    yield SESSION_GUCS_AFTER_REQUEST
+    SESSION_GUCS_AFTER_REQUEST.clear()
 
 
 async def _on_one_worker(*fetches):
     """Await each fetch in turn with a one-thread default executor; return the results.
 
-    Django builds error pages in ``thread_sensitive=False`` hops, i.e. on the default
-    executor. With one worker, the same thread and connection serve every page, as
+    ``thread_sensitive=False`` hops run on the default executor: Django 5.2 - 6.1
+    build error pages in them, and ``/rls/async-worker-probe/`` runs its probe in
+    one. With one worker, the same thread and connection serve every such hop, as
     the long-lived worker threads of an ASGI server do.
     """
     loop = asyncio.get_running_loop()
@@ -486,24 +530,74 @@ _ASGI_MIDDLEWARE_PATHS = {
 }
 
 
+def _with_recorder(middleware):
+    """``middleware`` with ``SessionGucsAfterRequestMiddleware`` right before the RLS one."""
+    at = next(i for i, path in enumerate(middleware) if path in {_RLS, _HOOK_SUBCLASS})
+    recorder = "tests.rls_views.SessionGucsAfterRequestMiddleware"
+    return [*middleware[:at], recorder, *middleware[at:]]
+
+
+def _test_thread_pid():
+    """The backend pid of the test thread's connection, which runs the requests' hops.
+
+    ``AsyncClient`` driven from the test thread runs the request's thread-sensitive
+    hops on it, so this is the connection the middleware sets the GUCs on.
+    """
+    connections["default"].ensure_connection()
+    with connections["default"].connection.cursor() as cursor:
+        cursor.execute("SELECT pg_backend_pid()")
+        return cursor.fetchone()[0]
+
+
+_NO_GUCS = [None, None]
+
+
 @pytest.mark.integration
 @pytest.mark.django_db(transaction=True)
-class TestErrorPageOnWorkerThread:
-    """#130, #41: an error page built on a worker thread runs in the request's context.
+class TestErrorPages:
+    """#130, #41, #165: an error page runs in the request's context and leaves none behind.
 
-    The worker thread's connection gets the request's GUCs from the GUC affinity
-    guard, so the page sees what the request may see, and keeps them only until
-    its next statement: the anonymous page built after it on the same thread and
-    connection sees nothing.
+    Where Django builds it depends on the version, so each test reads it from the
+    page (``on_request_thread``) instead of assuming it:
+
+    - Django 5.2 - 6.1 build ASGI error pages in a ``thread_sensitive=False`` hop:
+      on a worker thread with a connection of its own, which the request's cleanup
+      never reaches. The GUC affinity guard gives that connection the request's
+      GUCs, so the page sees what the request may see, and keeps them only until
+      its next statement: the anonymous page built after it on the same thread and
+      connection sees nothing.
+    - Django 6.2 builds them on the request's thread-sensitive thread (ticket
+      #36027), with the request's connection, which the request's own cleanup
+      clears: the next request finds no GUC on it, read with a driver cursor.
+
+    Neither case depends on the Django version the suite runs on: ``page_thread``
+    ``"worker"`` builds the 404 and 500 pages on a worker thread with a copy of the
+    context, and two views run the probe in a ``thread_sensitive=False`` hop and in
+    a thread-sensitive one, so both cases run in every CI leg.
 
     ``transaction=True``: the worker thread's connection is not the test's, so it
     sees committed rows only.
     """
 
+    @staticmethod
+    def _assert_built_where_the_page_says(page):
+        """Check the thread and connection ``page`` reports against ``on_request_thread``."""
+        if page["on_request_thread"]:
+            # Django >= 6.2: the request's thread (here the test thread, which
+            # serves the request's thread-sensitive hops) and its connection.
+            assert page["thread"] == threading.get_ident()
+            assert page["pid"] == _test_thread_pid()
+        else:
+            # Django <= 6.1: a worker thread with a connection of its own.
+            assert page["thread"] != threading.get_ident()
+            assert page["pid"] != _test_thread_pid()
+
+    @pytest.mark.parametrize("page_thread", ["django", "worker"])
     @pytest.mark.parametrize("middleware_path", list(_ASGI_MIDDLEWARE_PATHS))
     @pytest.mark.parametrize("first_user", ["scoped", "admin"])
     def test_unresolved_url_inherits_the_context_and_leaves_none_behind(
         self,
+        page_thread,
         first_user,
         middleware_path,
         scoped_web_user,
@@ -523,10 +617,16 @@ class TestErrorPageOnWorkerThread:
                 partial(_client_get_json, AsyncClient(), "/no-such-page/"),
             )
 
-        # One worker thread and connection built both pages, not the test thread, and
-        # the first one ran in a copy of the live request context.
-        assert first["thread"] == second["thread"] != threading.get_ident()
+        # One thread and connection built both pages, and the first one ran in (a
+        # copy of) the live request context.
+        assert first["thread"] == second["thread"]
         assert first["pid"] == second["pid"]
+        self._assert_built_where_the_page_says(first)
+        if page_thread == "worker":
+            assert first["on_request_thread"] is False
+        if first["on_request_thread"]:
+            # The request's cleanup cleared the connection before the next request.
+            assert second["session_gucs_before"] == _NO_GUCS
         assert [page["rls_context_active"] for page in (first, second)] == [True, False]
         expected_first = {
             "scoped": (str(tenant_a.pk), "false", ["Widget A1", "Widget A2"]),
@@ -542,15 +642,20 @@ class TestErrorPageOnWorkerThread:
             None,
             [],
         )
+        # The connection the next request's middleware and views use holds nothing.
+        assert list(session_gucs()) == _NO_GUCS
         _assert_request_left_nothing_behind()
 
+    @pytest.mark.parametrize("page_thread", ["django", "worker"])
     @pytest.mark.parametrize("middleware_path", list(_ASGI_MIDDLEWARE_PATHS))
     def test_500_page_runs_without_a_block_the_view_left_open(
         self,
+        page_thread,
         middleware_path,
         scoped_web_user,
         sample_orders,
         enforce_rls_on_other_threads,
+        guc_probe_404,
         guc_probe_500,
     ):
         """No ``process_exception`` here: ``got_request_exception`` ends the block (#41)."""
@@ -558,16 +663,162 @@ class TestErrorPageOnWorkerThread:
         client.force_login(scoped_web_user)
 
         with override_settings(MIDDLEWARE=_ASGI_MIDDLEWARE_PATHS[middleware_path]):
-            (page,) = async_to_sync(_on_one_worker)(
+            page, after = async_to_sync(_on_one_worker)(
                 partial(_client_get_json, client, "/rls/async-left-open/"),
+                partial(_client_get_json, AsyncClient(), "/no-such-page/"),
             )
 
-        assert page["thread"] != threading.get_ident()
+        self._assert_built_where_the_page_says(page)
+        if page_thread == "worker":
+            assert page["on_request_thread"] is False
+            assert after["thread"] == page["thread"]
+            assert after["pid"] == page["pid"]
         assert (page["tenant_guc"], page["is_admin_guc"], page["database_products"]) == (
             None,
             None,
             [],
         )
+        assert (after["tenant_guc"], after["is_admin_guc"], after["database_products"]) == (
+            None,
+            None,
+            [],
+        )
+
+    @pytest.mark.parametrize("middleware_path", list(_ASGI_MIDDLEWARE_PATHS))
+    def test_500_page_without_a_query_leaves_no_gucs_behind(
+        self,
+        middleware_path,
+        scoped_web_user,
+        sample_orders,
+        enforce_rls_on_other_threads,
+        guc_probe_404,
+        static_500,
+    ):
+        """The request's cleanup, not the guard, clears the connection after the error page.
+
+        The page runs no statement through Django's cursor, so the guard never
+        takes the request's values, or the left-open block's, off its connection.
+        Read with a driver cursor before the next request's first statement, that
+        connection must hold no GUC.
+        """
+        client = AsyncClient(raise_request_exception=False)
+        client.force_login(scoped_web_user)
+
+        with override_settings(MIDDLEWARE=_ASGI_MIDDLEWARE_PATHS[middleware_path]):
+            page, after = async_to_sync(_on_one_worker)(
+                partial(_client_get_json, client, "/rls/async-left-open/"),
+                partial(_client_get_json, AsyncClient(), "/no-such-page/"),
+            )
+
+        self._assert_built_where_the_page_says(page)
+        if page["on_request_thread"]:
+            # Django >= 6.2: the page used the request's connection, the next
+            # request's error page uses it again.
+            assert after["pid"] == page["pid"]
+            assert after["session_gucs_before"] == _NO_GUCS
+        # The connection the request set its GUCs on (the test thread's), which the
+        # next request's middleware and views use on every version.
+        assert list(session_gucs()) == _NO_GUCS
+        assert (after["tenant_guc"], after["is_admin_guc"], after["database_products"]) == (
+            None,
+            None,
+            [],
+        )
+
+    @pytest.mark.parametrize("middleware_path", list(_ASGI_MIDDLEWARE_PATHS))
+    @pytest.mark.parametrize("first_user", ["scoped", "admin"])
+    def test_worker_thread_hop_inherits_the_context_and_leaves_none_behind(
+        self,
+        first_user,
+        middleware_path,
+        scoped_web_user,
+        admin_web_user,
+        sample_orders,
+        tenant_a,
+        enforce_rls_on_other_threads,
+    ):
+        """A ``thread_sensitive=False`` hop under a live context, on every Django version.
+
+        What Django 5.2 - 6.1 do with error pages (#130), done by the view itself.
+        """
+        authenticated = AsyncClient()
+        authenticated.force_login({"scoped": scoped_web_user, "admin": admin_web_user}[first_user])
+
+        with override_settings(MIDDLEWARE=_ASGI_MIDDLEWARE_PATHS[middleware_path]):
+            first, second = async_to_sync(_on_one_worker)(
+                partial(_client_get_json, authenticated, "/rls/async-worker-probe/"),
+                partial(_client_get_json, AsyncClient(), "/rls/async-worker-probe/"),
+            )
+
+        assert first["thread"] == second["thread"] != threading.get_ident()
+        assert first["pid"] == second["pid"] != _test_thread_pid()
+        assert first["on_request_thread"] is False
+        assert [page["rls_context_active"] for page in (first, second)] == [True, False]
+        expected_first = {
+            "scoped": (str(tenant_a.pk), "false", ["Widget A1", "Widget A2"]),
+            "admin": (None, "true", ["Gadget B1", "Widget A1", "Widget A2"]),
+        }[first_user]
+        assert (
+            first["tenant_guc"],
+            first["is_admin_guc"],
+            first["database_products"],
+        ) == expected_first
+        assert (second["tenant_guc"], second["is_admin_guc"], second["database_products"]) == (
+            None,
+            None,
+            [],
+        )
+        assert list(session_gucs()) == _NO_GUCS
+        _assert_request_left_nothing_behind()
+
+    @pytest.mark.parametrize("middleware_path", list(_ASGI_MIDDLEWARE_PATHS))
+    @pytest.mark.parametrize("first_user", ["scoped", "admin"])
+    def test_request_thread_hop_sees_the_context_and_the_cleanup_clears_it(
+        self,
+        first_user,
+        middleware_path,
+        scoped_web_user,
+        admin_web_user,
+        sample_orders,
+        tenant_a,
+        enforce_rls_on_other_threads,
+    ):
+        """A thread-sensitive hop under a live context, on every Django version.
+
+        What Django 6.2 does with error pages (#165), done by the view itself: the
+        probe runs on the request's thread and connection, and the next request
+        on that connection finds no GUC, read with a driver cursor.
+        """
+        authenticated = AsyncClient()
+        authenticated.force_login({"scoped": scoped_web_user, "admin": admin_web_user}[first_user])
+
+        with override_settings(MIDDLEWARE=_ASGI_MIDDLEWARE_PATHS[middleware_path]):
+            first, second = async_to_sync(_on_one_worker)(
+                partial(_client_get_json, authenticated, "/rls/async-request-thread-probe/"),
+                partial(_client_get_json, AsyncClient(), "/rls/async-request-thread-probe/"),
+            )
+
+        assert first["on_request_thread"] is True
+        assert first["thread"] == second["thread"] == threading.get_ident()
+        assert first["pid"] == second["pid"] == _test_thread_pid()
+        assert [page["rls_context_active"] for page in (first, second)] == [True, False]
+        expected_first = {
+            "scoped": (str(tenant_a.pk), "false", ["Widget A1", "Widget A2"]),
+            "admin": (None, "true", ["Gadget B1", "Widget A1", "Widget A2"]),
+        }[first_user]
+        assert (
+            first["tenant_guc"],
+            first["is_admin_guc"],
+            first["database_products"],
+        ) == expected_first
+        assert second["session_gucs_before"] == _NO_GUCS
+        assert (second["tenant_guc"], second["is_admin_guc"], second["database_products"]) == (
+            None,
+            None,
+            [],
+        )
+        assert list(session_gucs()) == _NO_GUCS
+        _assert_request_left_nothing_behind()
 
     @pytest.mark.parametrize("middleware_path", list(_ASGI_MIDDLEWARE_PATHS))
     def test_through_asgi_handler(
@@ -578,17 +829,21 @@ class TestErrorPageOnWorkerThread:
         tenant_a,
         enforce_rls_on_other_threads,
         guc_probe_404,
+        session_gucs_after_request,
     ):
         """The same through ``ASGIHandler``, which serves each request on a thread of its own.
 
         That thread sets the GUCs, so a connection it reopens mid-request gets them.
+        ``SessionGucsAfterRequestMiddleware`` reads each request's own connection
+        once the RLS middleware has cleaned up: on such a server it is the only
+        read of that connection.
         """
         client = Client()
         client.force_login(scoped_web_user)
         session = client.cookies[django_settings.SESSION_COOKIE_NAME].value
         cookie = f"{django_settings.SESSION_COOKIE_NAME}={session}"
 
-        with override_settings(MIDDLEWARE=_ASGI_MIDDLEWARE_PATHS[middleware_path]):
+        with override_settings(MIDDLEWARE=_with_recorder(_ASGI_MIDDLEWARE_PATHS[middleware_path])):
             reopened, first, second = _serve_like_an_asgi_server(
                 ASGIHandler(),
                 [
@@ -604,7 +859,22 @@ class TestErrorPageOnWorkerThread:
             "database_products": ["Widget A1", "Widget A2"],
         }
         assert reopened == tenant_a_view
-        assert first["pid"] == second["pid"]
+        # The request's cleanup cleared its own connection, the error page's included.
+        assert session_gucs_after_request == [
+            ("/rls/reconnect/", _NO_GUCS),
+            ("/no-such-page/", _NO_GUCS),
+            ("/no-such-page/", _NO_GUCS),
+        ]
+        if first["on_request_thread"]:
+            # Django >= 6.2: each page on its own request's thread, so the next
+            # request has a new connection, which starts clean. The case of one
+            # connection shared by consecutive requests is covered for 6.2 by the
+            # AsyncClient tests above, whose requests all use the test thread's.
+            assert second["pid"] != first["pid"]
+            assert second["session_gucs_before"] == _NO_GUCS
+        else:
+            # Django <= 6.1: one worker thread and connection built both pages.
+            assert (first["thread"], first["pid"]) == (second["thread"], second["pid"])
         assert [page["rls_context_active"] for page in (first, second)] == [True, False]
         assert {key: first[key] for key in tenant_a_view} == tenant_a_view
         assert (second["tenant_guc"], second["is_admin_guc"], second["database_products"]) == (
@@ -615,11 +885,11 @@ class TestErrorPageOnWorkerThread:
         _assert_request_left_nothing_behind()
 
 
-class TestErrorPageOnWorkerThreadInLocalMode(TestErrorPageOnWorkerThread):
+class TestErrorPagesInLocalMode(TestErrorPages):
     """The same with ``USE_LOCAL_SET=True`` (#96): the guard applies them transaction-locally.
 
-    The worker thread's statements each run in a transaction of their own with
-    the request's values, and nothing stays on its connection.
+    The statements of a thread other than the request's each run in a transaction
+    of their own with the request's values, and nothing stays on its connection.
     """
 
     @pytest.fixture(autouse=True)
@@ -639,6 +909,7 @@ class TestErrorPageOnWorkerThreadInLocalMode(TestErrorPageOnWorkerThread):
         tenant_a,
         enforce_rls_on_other_threads,
         guc_probe_404,
+        session_gucs_after_request,
     ):
         super().test_through_asgi_handler(
             middleware_path,
@@ -647,4 +918,5 @@ class TestErrorPageOnWorkerThreadInLocalMode(TestErrorPageOnWorkerThread):
             tenant_a,
             enforce_rls_on_other_threads,
             guc_probe_404,
+            session_gucs_after_request,
         )

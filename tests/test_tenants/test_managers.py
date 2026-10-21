@@ -16,6 +16,7 @@ from asgiref.sync import async_to_sync
 from django.core.exceptions import FieldError
 from django.db import DatabaseError, DataError, NotSupportedError, connection, transaction
 from django.db.models import Count, F, Prefetch, QuerySet, Sum
+from django.db.models.query import BaseIterable
 from django.db.models.signals import pre_delete
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext, isolate_apps
@@ -2173,10 +2174,64 @@ class TestForUserIterators:
             )
 
     def test_default_chunk_size_matches_django(self):
-        """The scope's chunk follows Django's own default, so one scope covers one fetch."""
-        assert f"chunk_size or {_ITERATOR_CHUNK_SIZE}" in inspect.getsource(QuerySet._iterator)
+        """The scope's chunk follows Django's own default, so one scope covers one fetch.
+
+        ``iterator()`` resolves ``chunk_size=None`` in ``QuerySet._iterator()``.
+        ``aiterator()`` defaults to the same number up to Django 6.1; from Django
+        6.2 (ticket #37143) it defaults to ``None`` and resolves it itself, the
+        same way.
+        """
+        resolved_from_none = f"chunk_size or {_ITERATOR_CHUNK_SIZE}"
+        assert resolved_from_none in inspect.getsource(QuerySet._iterator), (
+            "QuerySet._iterator() no longer resolves chunk_size=None to "
+            f"{_ITERATOR_CHUNK_SIZE}; update _ITERATOR_CHUNK_SIZE"
+        )
         default = inspect.signature(QuerySet.aiterator).parameters["chunk_size"].default
-        assert default == _ITERATOR_CHUNK_SIZE
+        if default is None:
+            assert resolved_from_none in inspect.getsource(QuerySet.aiterator), (
+                "QuerySet.aiterator() no longer resolves chunk_size=None to "
+                f"{_ITERATOR_CHUNK_SIZE}; update _ITERATOR_CHUNK_SIZE"
+            )
+        else:
+            assert default == _ITERATOR_CHUNK_SIZE, (
+                f"QuerySet.aiterator() defaults to {default}, not {_ITERATOR_CHUNK_SIZE}"
+            )
+
+    def test_default_chunk_pulls_what_django_fetches(self, tenant_a_user, monkeypatch):
+        """With no ``chunk_size``, each scope pulls the number of rows Django fetches at once.
+
+        Django's number is read from the iterable its own ``iterator()`` and
+        ``aiterator()`` build for a plain queryset; the library's from the chunks
+        ``_scoped_chunks()`` and ``aiterator()`` pull.
+        """
+        django_sizes = []
+        original_init = BaseIterable.__init__
+
+        def recording_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            django_sizes.append(self.chunk_size)
+
+        monkeypatch.setattr(BaseIterable, "__init__", recording_init)
+        list(QuerySet(Tenant).iterator())
+        async_to_sync(_collect)(QuerySet(Tenant).aiterator())
+        assert len(django_sizes) == 2
+
+        pulled = []
+        original_next_chunk = managers._next_chunk
+
+        def recording_next_chunk(rows, size):
+            pulled.append(size)
+            return original_next_chunk(rows, size)
+
+        monkeypatch.setattr(managers, "_next_chunk", recording_next_chunk)
+        list(Order.objects.for_user(tenant_a_user).iterator())
+        iterator_pulls, pulled[:] = list(pulled), []
+        async_to_sync(_collect)(Order.objects.for_user(tenant_a_user).aiterator())
+
+        assert iterator_pulls
+        assert set(iterator_pulls) == {django_sizes[0]}
+        assert pulled
+        assert set(pulled) == {django_sizes[1]}
 
     @pytest.mark.usefixtures("_strict_mode")
     @pytest.mark.parametrize(

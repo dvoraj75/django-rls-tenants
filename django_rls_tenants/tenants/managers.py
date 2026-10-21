@@ -85,8 +85,9 @@ else:
 logger = logging.getLogger("django_rls_tenants")
 
 # QuerySet.iterator()'s default chunk size, hard-coded in QuerySet._iterator(),
-# and QuerySet.aiterator()'s default. TenantQuerySet._scoped_chunks() pulls the
-# same number of rows per scope, so each scope covers one cursor fetch.
+# and QuerySet.aiterator()'s (its default up to Django 6.1; from 6.2 it defaults
+# to None and resolves it to this number itself). TenantQuerySet._scoped_chunks()
+# pulls the same number of rows per scope, so each scope covers one cursor fetch.
 _ITERATOR_CHUNK_SIZE = 2000
 
 # The fetch mode a fresh queryset starts in (query.DEFAULT_FETCH_MODE, Django

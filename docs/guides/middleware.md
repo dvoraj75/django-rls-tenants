@@ -232,7 +232,9 @@ included, sees nothing (#130). Before 1.4.0 the worker thread's connection got t
 GUCs only if it opened during that request, and then kept them for the life of the thread.
 Under WSGI, and for an exception from a synchronous-only middleware listed after
 `RLSTenantMiddleware`, Django builds the error response on the request's own thread, inside
-its context.
+its context. Django 6.2, not yet supported, builds every ASGI error response there too
+([ticket #36027](https://code.djangoproject.com/ticket/36027)): the page runs on the
+request's connection, which the request's own cleanup clears (#165).
 
 The same applies to database work handed to another thread with a copy of the request's
 context, under ASGI or WSGI: `sync_to_async(..., thread_sensitive=False)`,
