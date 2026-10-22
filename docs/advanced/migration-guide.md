@@ -123,6 +123,12 @@ migration that assigns the correct tenant to each existing record.
 
 ## Upgrading django-rls-tenants
 
+### From 1.6.2 to 1.6.3
+
+A **drop-in upgrade** -- the library code is identical to 1.6.2. The release only refreshes
+the development lockfile (`certifi`, an indirect dependency of the `docs` group; #177).
+Nothing to do.
+
 ### From 1.6.1 to 1.6.2
 
 A **drop-in upgrade** -- no settings, data or code change is required. One behaviour is

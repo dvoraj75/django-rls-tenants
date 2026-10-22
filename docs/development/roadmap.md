@@ -498,6 +498,10 @@ item are in the [changelog](changelog.md).
   See [1.6.2](changelog.md#162-2026-10-22).
   *Why:* A second alias is where SQL the guard does not see runs with a context that has
   ended; the exit must leave what the enclosing block's exit can take off again.
+- [x] **1.6.3 — Lockfile refresh** — `certifi` 2026.7.22 → 2026.10.19 in the development
+  lockfile (#177, Dependabot PR #176); an indirect dependency of the `docs` group, so the
+  library code is identical to 1.6.2. See [1.6.3](changelog.md#163-2026-10-22).
+  *Why:* Dependabot bumps ride along with the next release instead of waiting for one.
 
 ---
 

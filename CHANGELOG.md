@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.3] - 2026-10-22
+
+A maintenance release with no change to the library: the wheel built from 1.6.3 holds the
+same code as 1.6.2. It refreshes the development lockfile.
+
+### Changed
+
+- **Development lockfile: `certifi` 2026.7.22 → 2026.10.19** (#177, Dependabot PR #176).
+  `certifi` is an indirect dependency of the `docs` group only (`mkdocs-material` →
+  `requests` → `certifi`); the package's own dependencies are unchanged.
+
 ## [1.6.2] - 2026-10-22
 
 One regression fix in two parts, both to the GUC affinity guard's handling of a `None`-user
@@ -1808,7 +1819,8 @@ Initial stable release of django-rls-tenants.
   and manager `_fetch_all` could clear GUCs with session scope while setting
   them with transaction scope, causing mismatched lifetimes.
 
-[Unreleased]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.6.2...HEAD
+[Unreleased]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.6.3...HEAD
+[1.6.3]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.6.2...v1.6.3
 [1.6.2]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.6.1...v1.6.2
 [1.6.1]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.5.0...v1.6.0
