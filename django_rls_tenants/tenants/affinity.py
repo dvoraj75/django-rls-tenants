@@ -188,6 +188,9 @@ _IDENTIFIER_PATTERN: Final = r'(?:"(?:[^"]|"")*"|[^\W\d][\w$]*)'
 _SETTING_NAME_RE: Final = re.compile(
     rf"{_IDENTIFIER_PATTERN}(?:\s*\.\s*{_IDENTIFIER_PATTERN})*",
 )
+# What ends a whole setting name. Anything else (nothing, or a dot before a part
+# the head cut off) leaves the name unread.
+_AFTER_SETTING_NAME_RE: Final = re.compile(r"\s*(?:=|(?:TO|FROM)(?![\w$]))", re.IGNORECASE)
 
 
 class _WriteDepth(threading.local):
@@ -953,10 +956,22 @@ def _clear_session_values(connection: BaseDatabaseWrapper, status: int) -> None:
     session with no open transaction outside ``atomic()``, the statement
     opens one: it is committed at once, as ``pool._clear_policy_gucs()``
     commits its clear, so the clear sticks and the session is left with no
-    transaction (a ``SET TRANSACTION`` must come first in the next one).
+    transaction (a ``SET TRANSACTION`` must come first in the next one). If
+    the clear fails there, that transaction is rolled back (it holds nothing
+    else) before the error propagates, so the session is not left in a failed
+    transaction.
     """
     if status == _IDLE and not connection.get_autocommit() and not connection.in_atomic_block:
-        write_gucs(connection, None)
+        try:
+            write_gucs(connection, None)
+        except DatabaseError:
+            try:
+                # Through Django's connection, so the wrapped _rollback follows it.
+                connection.rollback()
+            except Exception:
+                # The clear's own error is the one to report (a lost connection, say).
+                logger.debug("GUC affinity guard: could not roll back the clear", exc_info=True)
+            raise
         # Through Django's connection, so the wrapped _commit follows it.
         connection.commit()
         return
@@ -996,6 +1011,7 @@ class _Statement(NamedTuple):
     command: str  # first word, upper-cased
     words: list[str]  # the first words, as written
     compound: bool  # more than one statement
+    head: str  # the text the words come from (see _statement_head())
 
 
 def _refused_in_a_transaction(statement: _Statement | None) -> bool:
@@ -1106,16 +1122,33 @@ def _read_statement(sql: str | None) -> _Statement | None:
     """The part of :func:`_parse` that reads the text :func:`_sql_text` returned."""
     if sql is None:
         return None
-    text = _skip_leading_comments(sql[:_SQL_HEAD])
-    if not text and len(sql) > _SQL_HEAD:
-        # A leading comment that runs past the head: skip it on the whole text.
-        text = _skip_leading_comments(sql)[:_SQL_HEAD]
+    text = _statement_head(sql)
     words = text.split()
     if not words:
-        return None if sql.strip() else _Statement("", [], compound=False)
+        return None if sql.strip() else _Statement("", [], compound=False, head="")
     semicolon = sql.find(";")
     compound = semicolon >= 0 and bool(sql[semicolon:].strip("; \t\r\n"))
-    return _Statement(words[0].rstrip(";").upper(), words, compound)
+    return _Statement(words[0].rstrip(";").upper(), words, compound, text)
+
+
+def _statement_head(sql: str) -> str:
+    """Return the first ``_SQL_HEAD`` characters of ``sql`` after its leading comments.
+
+    The comments are skipped on the first ``_SQL_HEAD`` characters; the text
+    after them is then taken from ``sql`` itself, so a command that starts
+    near the end of those characters is not cut. The whole text is skipped
+    only when they end inside a leading comment or on its opener (a ``-`` or
+    ``/`` whose second character is cut off), which would otherwise be read
+    as the command.
+    """
+    head = sql[:_SQL_HEAD]
+    text = _skip_leading_comments(head)
+    if len(sql) <= _SQL_HEAD or len(text) == len(head):
+        return text
+    start = len(head) - len(text)  # the skip returns a suffix of the head
+    if not text or sql.startswith(("--", "/*"), start):
+        return _skip_leading_comments(sql)[:_SQL_HEAD]
+    return sql[start : start + _SQL_HEAD]
 
 
 def _identifier(word: str) -> str:
@@ -1249,7 +1282,7 @@ def _writes_policy_gucs_for_the_session(
         return False
     if statement.command.startswith("SET") and not statement.compound:
         # startswith: a comment or a quote may follow SET with no space.
-        writes = _set_writes_a_policy_guc(text, _lowered_policy_guc_names())
+        writes = _set_writes_a_policy_guc(statement.head, text, _lowered_policy_guc_names())
         if writes is not None:
             return writes
     lowered = text.lower()
@@ -1266,7 +1299,7 @@ def _lowered_policy_guc_names() -> frozenset[str]:
     return frozenset(name.lower() for name in _policy_guc_names())
 
 
-def _set_writes_a_policy_guc(text: str, names: frozenset[str]) -> bool | None:
+def _set_writes_a_policy_guc(head: str, text: str, names: frozenset[str]) -> bool | None:
     """Whether a ``SET`` statement writes one of ``names`` for the session.
 
     ``SET [SESSION] name {TO | =} value``, also ``name=value`` with no
@@ -1275,11 +1308,14 @@ def _set_writes_a_policy_guc(text: str, names: frozenset[str]) -> bool | None:
     the name (``SET /* c */ SESSION -- c`` and a newline before it). False
     for ``SET LOCAL``, ``SET TRANSACTION``, ``SET SESSION CHARACTERISTICS``
     and ``SET SESSION AUTHORIZATION``, which write no setting for the session.
-    When no whole name can be read (one cut off by the head of the statement
-    that is read, say), any of ``names`` in the text counts, as for a compound
-    statement.
+    When the head holds no whole name followed by ``=``, ``TO`` or ``FROM``
+    (the head cut it, also inside a quoted part), the whole text is read
+    instead; when that holds none either, any of ``names`` in the text
+    counts, as for a compound statement.
 
     Args:
+        head: The start of the statement, from :func:`_statement_head`
+            (``_Statement.head``).
         text: The statement's text, from :func:`_sql_text`.
         names: The policy GUCs, lower-cased.
 
@@ -1287,15 +1323,11 @@ def _set_writes_a_policy_guc(text: str, names: frozenset[str]) -> bool | None:
         Whether it writes one, or ``None`` if ``text`` does not start with
         the keyword ``SET``.
     """
-    head = _skip_leading_comments(text[:_SQL_HEAD])
-    if not head and len(text) > _SQL_HEAD:
-        # A leading comment that runs past the head, as in _read_statement().
-        head = _skip_leading_comments(text)[:_SQL_HEAD]
-    head = _without_comments(head)
-    keyword = _SET_KEYWORD_RE.match(head)
+    read = _without_comments(head)
+    keyword = _SET_KEYWORD_RE.match(read)
     if keyword is None:
         return None
-    rest = head[keyword.end() :]
+    rest = read[keyword.end() :]
     first = _KEYWORD_RE.match(rest)
     if first is not None:
         word = first.group(1).upper()
@@ -1307,8 +1339,11 @@ def _set_writes_a_policy_guc(text: str, names: frozenset[str]) -> bool | None:
             if second is not None and second.group(1).upper() in _SET_SESSION_NOT_A_SETTING:
                 return False
     match = _SETTING_NAME_RE.match(rest)
-    if match is None or not rest[match.end() :].strip():
-        # No name, or nothing after it in the head: it may be cut off.
+    if match is None or _AFTER_SETTING_NAME_RE.match(rest, match.end()) is None:
+        # No whole name: the head may have cut it (or a keyword before it).
+        whole = _skip_leading_comments(text)
+        if len(whole) > len(head):
+            return _set_writes_a_policy_guc(whole, text, names)
         lowered = text.lower()
         return any(name in lowered for name in names)
     return "".join(match.group(0).split()).replace('"', "").lower() in names

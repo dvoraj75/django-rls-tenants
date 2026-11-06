@@ -1300,6 +1300,11 @@ class TestStatementsAtTheExit:
             assert _tracker().session_written is True
 
 
+def _padded(start, sql):
+    """Return ``sql`` after a block comment of ``start`` characters (it starts at ``start``)."""
+    return "/*" + "c" * (start - 4) + "*/" + sql
+
+
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.usefixtures("settled")
 class TestWhatTheGuardFlags:
@@ -1504,6 +1509,33 @@ class TestWhatTheGuardFlags:
             cursor.execute("SET /* c */ rls.is_admin = 'true'")
         assert session_gucs() == _NO_GUCS
 
+    @pytest.mark.parametrize("start", [254, 255, 256], ids=["char255", "char256", "char257"])
+    @pytest.mark.parametrize("after", ["-- c\n", "/* c */", ""], ids=["line", "block", "none"])
+    def test_a_set_after_a_comment_that_ends_near_the_head_is_flagged(self, start, after):
+        """What follows a leading comment starts at ``start``, around the head's end (256)."""
+        assert self._run(_padded(start, after + "SET rls.is_admin = 'true'")) is True
+
+    @pytest.mark.parametrize("spaces", [240, 243], ids=["cut-in-the-name", "cut-after-the-quote"])
+    def test_a_quoted_name_the_head_cuts_is_flagged(self, spaces):
+        assert self._run("SET " + " " * spaces + '"rls" . "is_admin" = \'true\'') is True
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            _padded(255, "/* c */SET LOCAL rls.is_admin = 'true'"),
+            _padded(252, "SET LOCAL rls.is_admin = 'true'"),
+            "SET " + " " * 250 + "LOCAL rls.is_admin = 'true'",
+        ],
+        ids=["comment-at-the-cut", "local-at-the-cut", "local-cut"],
+    )
+    def test_a_set_local_around_the_heads_end_is_not_flagged(self, sql):
+        assert self._run(sql, in_atomic=True) is False
+
+    def test_a_set_after_a_comment_cut_at_its_opener_is_cleared_at_the_exit(self, tenant_a):
+        with tenant_context(tenant_a.pk), connection.cursor() as cursor:
+            cursor.execute(_padded(255, "-- c\nSET rls.is_admin = 'true'"))
+        assert session_gucs() == _NO_GUCS
+
     @pytest.mark.parametrize("flagged", ["before", "inside"])
     def test_prepare_transaction_keeps_the_flag(self, flagged):
         """The test server allows no prepared transactions: ``_follow()`` is called directly."""
@@ -1680,6 +1712,35 @@ class TestExitEdgeCases:
         monkeypatch.undo()
         assert _gucs() == _NO_GUCS  # the guard clears the session before this statement
         assert session_gucs() == _NO_GUCS
+
+    def test_a_failing_clear_with_autocommit_off_leaves_no_failed_transaction(
+        self,
+        tenant_a,
+        monkeypatch,
+    ):
+        def fail(conn, values, **kwargs):
+            # Past the guard, as the clear runs: it opens the transaction and fails it.
+            with conn.connection.cursor() as cursor:
+                try:
+                    cursor.execute("SELECT 1 / 0")
+                except Exception as error:
+                    raise DatabaseError("clear failed") from error
+
+        connection.set_autocommit(False)
+        try:
+            with tenant_context(tenant_a.pk):
+                set_guc("rls.current_tenant", _WRITTEN)
+                connection.commit()
+                monkeypatch.setattr(affinity, "write_gucs", fail)
+            monkeypatch.undo()
+            assert _status() == _IDLE
+            assert _tracker().values is affinity.UNKNOWN
+            assert _gucs() == _NO_GUCS  # the next statement runs; the guard clears first
+            connection.commit()
+            assert session_gucs() == _NO_GUCS
+        finally:
+            connection.rollback()
+            connection.set_autocommit(True)
 
     def test_a_bad_connection_status_gets_no_statement_and_stays_flagged(self, monkeypatch):
         set_guc("rls.current_tenant", _WRITTEN)
