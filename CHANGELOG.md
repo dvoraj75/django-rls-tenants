@@ -20,16 +20,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes a policy GUC at session level, and every such exit clears the admin and tenant
   GUCs of flagged sessions at once, one statement per open, flagged alias in
   `RLS_TENANTS["DATABASES"]` on the exiting thread's connections (at once in autocommit,
-  at the commit in a transaction). A session the guard did not see written gets no
-  statement, so request ends and `for_user()` calls cost nothing more. The guard sees
-  `SET [SESSION]`, a statement that calls `set_config()` and names a policy GUC in its
-  text or as a parameter (what `set_guc()` sends), a compound statement naming one, and a
-  `DO` block that spells `set_config` and the name. A write inside a function or procedure
-  (`CALL`, a function the statement calls), inside a `DO` block that builds the name
-  dynamically, through a raw driver cursor, `callproc()` or the driver's `copy` methods,
-  or with the name passed in a way the guard does not read, stays lazy as before. Only the
-  admin and tenant GUCs are cleared; a bypass flag written for the session stays set. A
-  session in a failed transaction is skipped until the next exit or the lazy clear.
+  and with `AUTOCOMMIT=False` outside `atomic()`, where the clear is committed at once; at
+  the commit in a transaction). A session the guard did not see written gets no statement,
+  so request ends and `for_user()` calls cost nothing more. The guard sees `SET [SESSION]`
+  (with comments anywhere before the name), a statement that calls `set_config()` and names
+  a policy GUC in its text or as a parameter (what `set_guc()` sends), a compound statement
+  naming one, and a `DO` block that spells `set_config` and the name, also when a compound
+  statement then fails (it can commit the write before the part that fails). A write inside a function or procedure (`CALL`, a function the statement calls),
+  inside a `DO` block that builds the name dynamically, through a raw driver cursor,
+  `callproc()` or the driver's `copy` methods, or with the name passed in a way the guard
+  does not read, stays lazy as before, and so does a write on another thread's connection
+  (`set_guc()` in a `sync_to_async()` hop with `thread_sensitive=False`), which the exiting
+  thread's clear does not reach. Only the admin and tenant GUCs are cleared; a bypass flag
+  written for the session stays set. A session in a failed transaction is skipped until the
+  next exit or the lazy clear.
 
 ## [1.6.3] - 2026-10-22
 

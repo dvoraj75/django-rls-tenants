@@ -59,8 +59,11 @@ statement calling ``set_config()`` that names one), and the exit of a
 context (a block, a request, a ``for_user()`` call) clears the admin and
 tenant GUCs of such a session at once, in one statement, so SQL past
 Django's cursor (a driver cursor, ``callproc()``, a server-side cursor's
-``FETCH``) does not read the write after the context. Other sessions keep
-the lazy clear and get no statement at the exit.
+``FETCH``) does not read the write after the context. A statement that
+raises counts too, since a compound one may commit such a write before it
+fails. Other sessions keep the lazy clear and get no statement at the exit;
+so does a session another thread wrote (a ``thread_sensitive=False`` hop),
+which the exiting thread's clear does not reach.
 
 PostgreSQL undoes a ``set_config()`` made in a transaction or savepoint that
 is rolled back, and a transaction-local one at the end of its transaction,
@@ -168,9 +171,16 @@ _DDL_COMMANDS: Final = frozenset({"ALTER", "CREATE", "DROP"})
 _ASCII_LOWER: Final = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 
 # What follows SET when it writes no setting for the session (the first after
-# SET, or after SET SESSION); see _set_session_target().
+# SET, or after SET SESSION); see _set_writes_a_policy_guc().
 _SET_NOT_FOR_THE_SESSION: Final = frozenset({"LOCAL", "TRANSACTION"})
 _SET_SESSION_NOT_A_SETTING: Final = frozenset({"AUTHORIZATION", "CHARACTERISTICS"})
+
+# SET as a keyword at the start of a statement without comments: what follows
+# need not be a space (SET"rls".x, or SET/* c */rls.x once the comment is out).
+_SET_KEYWORD_RE: Final = re.compile(r"SET(?![\w$])\s*", re.IGNORECASE)
+# A keyword after SET (LOCAL, SESSION, ...): a word not followed by a dot,
+# which would make it the first part of a setting name (session.x).
+_KEYWORD_RE: Final = re.compile(r"([A-Za-z_]+)(?![\w$])(?!\s*\.)\s*")
 
 # A setting name as SET takes it: identifiers, plain or double-quoted, joined by
 # dots (spaces around a dot allowed). What follows (TO, =, FROM) ends it.
@@ -248,13 +258,16 @@ class _SessionGUCs:
         savepoints: The transaction's savepoints, oldest first: each name with
             ``values`` when it was set.
         session_written: With ``USE_LOCAL_SET=True``, a statement the guard
-            ran wrote a GUC the RLS policies read for the session (``set_guc()``,
-            ``SET``), and the library has not cleared the admin and tenant GUCs
-            for the session since (#173): :func:`clear_session_writes` clears
-            them when a context ends.
+            ran (or a compound one that raised) may have written a GUC the RLS policies
+            read for the session (``set_guc()``, ``SET``), and the library has
+            not cleared the admin and tenant GUCs for the session since (#173):
+            :func:`clear_session_writes` clears them when a context ends. A
+            ``PREPARE TRANSACTION`` keeps it, as PostgreSQL keeps the
+            transaction's session-level writes.
         session_written_base: ``session_written`` when the transaction started.
         cleared_in_transaction: The library cleared the admin and tenant GUCs
-            for the session during the transaction.
+            for the session during the transaction while it was recorded as
+            written (``session_written``).
     """
 
     __slots__ = (
@@ -375,11 +388,15 @@ class _SessionGUCs:
         In a transaction the clear takes effect at the commit: a rollback
         restores the record the transaction started with
         (:meth:`end_transaction`), and a ``ROLLBACK TO`` a savepoint may undo
-        the clear (:meth:`rolled_back_to_savepoint`).
+        the clear (:meth:`rolled_back_to_savepoint`). Only the clear of a
+        session recorded as written counts for that: the guard's own clear of
+        values it does not know, say, is undone by a ``ROLLBACK TO`` too, but
+        it took off no write the guard saw, so it must not cost a statement
+        at every later exit.
         """
-        self.session_written = False
-        if self.in_transaction:
+        if self.in_transaction and self.session_written:
             self.cleared_in_transaction = True
+        self.session_written = False
 
     def rolled_back_to_savepoint(self) -> None:
         """Follow a ``ROLLBACK TO`` a savepoint, which may undo a clear made after it.
@@ -874,7 +891,8 @@ def clear_session_writes() -> None:
     :func:`suspect_sessions` (#173). A statement the guard ran during the
     context may have written a GUC the RLS policies read for the session
     (``set_guc()``, ``rls_context()`` without ``is_local=True``, a ``SET``
-    without ``LOCAL``: see :attr:`_SessionGUCs.session_written`). Such a
+    without ``LOCAL``, comments in it or not, also in a statement that then
+    failed: see :attr:`_SessionGUCs.session_written`). Such a
     session, on an open connection of an alias in ``RLS_TENANTS["DATABASES"]``,
     gets one statement now, instead of the guard's clear before its next
     statement, so SQL past Django's cursor (a driver cursor, ``callproc()``,
@@ -883,11 +901,13 @@ def clear_session_writes() -> None:
 
     The statement clears both GUCs for the session. In autocommit, or with no
     active context, that is a plain clear: at once in autocommit, at the
-    commit in a transaction, as the guard's clear outside a context does. In
-    a transaction with an active context (the block's enclosing one), the
-    same statement sets the context's values again transaction-locally: they
-    are what the transaction's statements see until it ends, and a commit
-    leaves the cleared session values.
+    commit in a transaction, as the guard's clear outside a context does.
+    With ``AUTOCOMMIT=False`` and no transaction open outside ``atomic()``,
+    the clear is committed right away, so it sticks and leaves no
+    transaction open. In a transaction with an active context (the block's
+    enclosing one), the same statement sets the context's values again
+    transaction-locally: they are what the transaction's statements see
+    until it ends, and a commit leaves the cleared session values.
 
     Only the admin and tenant GUCs are cleared, the two the guard covers: a
     bypass flag or another policy GUC written for the session stays. A
@@ -929,8 +949,17 @@ def _clear_session_values(connection: BaseDatabaseWrapper, status: int) -> None:
     """Clear the admin and tenant GUCs of ``connection`` for the session, in one statement.
 
     The part of :func:`clear_session_writes` for one connection; ``status``
-    is the session's transaction status.
+    is the session's transaction status. With ``AUTOCOMMIT=False``, on a
+    session with no open transaction outside ``atomic()``, the statement
+    opens one: it is committed at once, as ``pool._clear_policy_gucs()``
+    commits its clear, so the clear sticks and the session is left with no
+    transaction (a ``SET TRANSACTION`` must come first in the next one).
     """
+    if status == _IDLE and not connection.get_autocommit() and not connection.in_atomic_block:
+        write_gucs(connection, None)
+        # Through Django's connection, so the wrapped _commit follows it.
+        connection.commit()
+        return
     context_gucs = _get_context_gucs()
     if context_gucs is None or not _will_run_in_transaction(connection, status):
         write_gucs(connection, None)
@@ -1129,8 +1158,12 @@ def _follow(
         tracker.end_transaction(committed=status_before != _IN_ERROR)
     elif statement.command == "PREPARE" and argument == "TRANSACTION":
         # The transaction is no longer this session's; what it leaves is unclear.
+        # PostgreSQL keeps its session-level SETs as a commit would, so a
+        # session write it held stays recorded (#173).
+        session_written = tracker.session_written or tracker.session_written_base
         tracker.end_transaction(committed=False)
         tracker.forget()
+        tracker.session_written = session_written
     # Picks up a transaction this statement opened or closed.
     _observe(connection, tracker)
     if statement.command == "SAVEPOINT":
@@ -1195,7 +1228,8 @@ def _writes_policy_gucs_for_the_session(
     returns, compared lower-cased (PostgreSQL compares setting names without
     regard to case). True for:
 
-    - ``SET [SESSION] name ...`` of one (see :func:`_set_session_target`);
+    - ``SET [SESSION] name ...`` of one, comments anywhere before the name
+      (see :func:`_set_writes_a_policy_guc`);
     - a statement whose text calls ``set_config`` and names one, in the text
       or as a string parameter (see :func:`_names_a_policy_guc`), whatever
       its third argument: a transaction-local ``set_config()`` counts too;
@@ -1213,9 +1247,11 @@ def _writes_policy_gucs_for_the_session(
     """
     if statement is None or text is None:
         return False
-    if statement.command == "SET" and not statement.compound:
-        target = _set_session_target(statement.words)
-        return target is not None and target in _lowered_policy_guc_names()
+    if statement.command.startswith("SET") and not statement.compound:
+        # startswith: a comment or a quote may follow SET with no space.
+        writes = _set_writes_a_policy_guc(text, _lowered_policy_guc_names())
+        if writes is not None:
+            return writes
     lowered = text.lower()
     if statement.compound:
         return any(name in lowered for name in _lowered_policy_guc_names())
@@ -1230,32 +1266,103 @@ def _lowered_policy_guc_names() -> frozenset[str]:
     return frozenset(name.lower() for name in _policy_guc_names())
 
 
-def _set_session_target(words: list[str]) -> str | None:
-    """Return the setting a ``SET`` statement writes for the session, lower-cased.
+def _set_writes_a_policy_guc(text: str, names: frozenset[str]) -> bool | None:
+    """Whether a ``SET`` statement writes one of ``names`` for the session.
 
     ``SET [SESSION] name {TO | =} value``, also ``name=value`` with no
     space and ``name FROM CURRENT``; the parts of a dotted name may be
-    double-quoted, and the quotes are dropped. ``None`` for ``SET LOCAL``,
-    ``SET TRANSACTION``, ``SET SESSION CHARACTERISTICS`` and
-    ``SET SESSION AUTHORIZATION``, which write no setting for the session,
-    and for a statement with no name to read.
+    double-quoted. Comments are taken out first, wherever they sit before
+    the name (``SET /* c */ SESSION -- c`` and a newline before it). False
+    for ``SET LOCAL``, ``SET TRANSACTION``, ``SET SESSION CHARACTERISTICS``
+    and ``SET SESSION AUTHORIZATION``, which write no setting for the session.
+    When no whole name can be read (one cut off by the head of the statement
+    that is read, say), any of ``names`` in the text counts, as for a compound
+    statement.
 
     Args:
-        words: The statement's first words, as ``_parse()`` read them,
-            ``SET`` first.
+        text: The statement's text, from :func:`_sql_text`.
+        names: The policy GUCs, lower-cased.
+
+    Returns:
+        Whether it writes one, or ``None`` if ``text`` does not start with
+        the keyword ``SET``.
     """
-    rest = words[1:]
-    first = rest[0].upper() if rest else ""
-    if first in _SET_NOT_FOR_THE_SESSION:
+    head = _skip_leading_comments(text[:_SQL_HEAD])
+    if not head and len(text) > _SQL_HEAD:
+        # A leading comment that runs past the head, as in _read_statement().
+        head = _skip_leading_comments(text)[:_SQL_HEAD]
+    head = _without_comments(head)
+    keyword = _SET_KEYWORD_RE.match(head)
+    if keyword is None:
         return None
-    if first == "SESSION":
-        rest = rest[1:]
-        if rest and rest[0].upper() in _SET_SESSION_NOT_A_SETTING:
-            return None
-    match = _SETTING_NAME_RE.match(" ".join(rest))
-    if match is None:
-        return None
-    return "".join(match.group(0).split()).replace('"', "").lower()
+    rest = head[keyword.end() :]
+    first = _KEYWORD_RE.match(rest)
+    if first is not None:
+        word = first.group(1).upper()
+        if word in _SET_NOT_FOR_THE_SESSION:
+            return False
+        if word == "SESSION":
+            rest = rest[first.end() :]
+            second = _KEYWORD_RE.match(rest)
+            if second is not None and second.group(1).upper() in _SET_SESSION_NOT_A_SETTING:
+                return False
+    match = _SETTING_NAME_RE.match(rest)
+    if match is None or not rest[match.end() :].strip():
+        # No name, or nothing after it in the head: it may be cut off.
+        lowered = text.lower()
+        return any(name in lowered for name in names)
+    return "".join(match.group(0).split()).replace('"', "").lower() in names
+
+
+def _without_comments(sql: str) -> str:
+    """Return ``sql`` with each ``--`` and ``/* */`` comment (nested) replaced by a space.
+
+    Quoted identifiers and string constants are kept as they are, so a
+    comment marker inside one stays. A backslash escape in an ``E''`` string
+    is not read: the text after such a string may be misread, which only
+    matters past a ``SET`` statement's setting name.
+    """
+    parts: list[str] = []
+    index, length = 0, len(sql)
+    while index < length:
+        if sql[index] in "'\"":
+            end = _end_of_quoted(sql, index)
+            parts.append(sql[index:end])
+            index = end
+        elif sql.startswith("--", index):
+            end = sql.find("\n", index)
+            index = length if end < 0 else end + 1
+            parts.append(" ")
+        elif sql.startswith("/*", index):
+            depth, index = 1, index + 2
+            while depth and index < length:
+                if sql.startswith("/*", index):
+                    depth, index = depth + 1, index + 2
+                elif sql.startswith("*/", index):
+                    depth, index = depth - 1, index + 2
+                else:
+                    index += 1
+            parts.append(" ")
+        else:
+            parts.append(sql[index])
+            index += 1
+    return "".join(parts)
+
+
+def _end_of_quoted(sql: str, start: int) -> int:
+    """Return the index right after the quoted text that starts at ``sql[start]``.
+
+    The quote character is ``sql[start]``; a doubled one stays inside. An
+    unterminated one runs to the end of ``sql``.
+    """
+    quote, index = sql[start], start + 1
+    while True:
+        index = sql.find(quote, index)
+        if index < 0:
+            return len(sql)
+        if not sql.startswith(quote, index + 1):
+            return index + 1
+        index += 2
 
 
 def _names_a_policy_guc(params: Any, many: bool, names: frozenset[str]) -> bool:  # Any: as _guard
@@ -1420,11 +1527,11 @@ def _guard(
 ) -> Any:
     """Execute wrapper: apply the active context's GUCs before the statement if needed.
 
-    With ``USE_LOCAL_SET=True``, after a statement that ran and may have
-    written a policy GUC for the session (see
+    With ``USE_LOCAL_SET=True``, after a statement that ran (or a compound one that raised) and
+    may have written a policy GUC for the session (see
     :func:`_writes_policy_gucs_for_the_session`), the session is noted as
     written, for :func:`clear_session_writes` (#173); not for the library's
-    own writes, inside :func:`writing`.
+    own writes, inside :func:`writing` (see :func:`_note_session_write`).
     """
     connection: BaseDatabaseWrapper = context["connection"]
     tracker = _tracker_of(connection)
@@ -1451,6 +1558,10 @@ def _guard(
         if statement is None or statement.command in _FOLLOWED:
             # A failed transaction-control statement leaves the GUCs undetermined.
             tracker.forget()
+        # A compound statement can commit a write before the part that fails; a
+        # single statement that fails leaves nothing it wrote.
+        if statement is not None and statement.compound:
+            _note_session_write(connection, tracker, statement, text, params, many, failed=True)
         raise
     if statement is None or statement.compound:
         # It may have changed the transaction or the GUCs in ways not followed.
@@ -1465,15 +1576,59 @@ def _guard(
     elif tracker.wrote_local and tracker.in_transaction and not _writes.depth:
         # The same in a transaction holding local values: unknown after a commit.
         tracker.suspect_session()
-    if (
-        not _writes.depth
-        and rls_tenants_config.USE_LOCAL_SET
-        and _is_guarded(connection)
-        and _writes_policy_gucs_for_the_session(statement, text, params, many)
-    ):
-        # Noted for the context's exit, which clears the session at once
-        # (#173). The transaction the statement may have opened is picked up
-        # first, so a rollback of it also undoes the note.
-        _observe(connection, tracker)
-        tracker.saw_session_write()
+    _note_session_write(connection, tracker, statement, text, params, many, failed=False)
     return result
+
+
+def _note_session_write(
+    connection: BaseDatabaseWrapper,
+    tracker: _SessionGUCs,
+    statement: _Statement | None,
+    text: str | None,
+    params: Any,  # Any: Django's execute-wrapper signature
+    many: bool,
+    *,
+    failed: bool,
+) -> None:
+    """Note, for the context's exit, a statement that may have written a policy GUC (#173).
+
+    The part of :func:`_guard` after a statement ran, with
+    ``USE_LOCAL_SET=True``, on a guarded connection, outside :func:`writing`.
+    A session already noted is not read again. A compound statement that
+    raised is noted too (:func:`_guard` passes only those), since it may have
+    committed the write before the part that failed: a write a rollback undid
+    only costs one statement at the exit. A single statement that fails
+    leaves nothing it wrote, so it is not noted.
+
+    Args:
+        connection: The connection the statement ran on.
+        tracker: Its tracker.
+        statement: The statement, as ``_read_statement()`` read ``text``.
+        text: Its text, from :func:`_sql_text`.
+        params: Its parameters, as Django's execute wrappers get them.
+        many: It ran with ``executemany()``.
+        failed: It raised; the exception propagates after this call.
+    """
+    if (
+        tracker.session_written
+        or _writes.depth
+        or not rls_tenants_config.USE_LOCAL_SET
+        or not _is_guarded(connection)
+        or not _writes_policy_gucs_for_the_session(statement, text, params, many)
+    ):
+        return
+    # The transaction the statement may have opened is picked up first, so a
+    # rollback of it also undoes the note. A session already noted needs no
+    # look: whenever its transaction is picked up, it starts out noted.
+    try:
+        _observe(connection, tracker)
+    except Exception:
+        if not failed:
+            raise
+        # Must not hide the statement's own error; noted all the same.
+        logger.debug(
+            "GUC affinity guard: could not read alias %r",
+            connection.alias,
+            exc_info=True,
+        )
+    tracker.saw_session_write()

@@ -332,16 +332,20 @@ on a persistent connection. That clear is for the session, so once its transacti
 it sticks. Inside a transaction the mark itself takes effect at the commit; a rollback
 undoes such a write anyway.
 
-A session the guard saw written at session level (`SET`, `set_config()`, `set_guc()`) is
-flagged (*1.7.0+*, #173), and a context's exit clears its admin and tenant GUCs at once
-with one statement (`clear_session_writes()`, after `suspect_sessions()`); an unflagged
-session gets none. A write the guard cannot see stays until that lazy clear: one inside a
-function or procedure (`CALL`, a function a statement calls) or inside a `DO` block that
-does not spell `set_config` and the name in its text, one through a raw driver cursor,
-`callproc()` or the driver's `copy` methods, a name passed in a way the guard does not read
-(from a table column, built inside a computed string), or a statement it cannot read. Only
-the admin and tenant GUCs are cleared: a bypass flag or another policy GUC written for the
-session stays set.
+A session the guard saw written at session level (`SET`, comments in it or not,
+`set_config()`, `set_guc()`; also by a statement that then failed) is flagged (*1.7.0+*,
+#173), and a context's exit clears its admin and tenant GUCs at once with one statement
+(`clear_session_writes()`, after `suspect_sessions()`); an unflagged session gets none. A
+write the guard cannot see stays until that lazy clear: one inside a function or procedure
+(`CALL`, a function a statement calls) or inside a `DO` block that does not spell
+`set_config` and the name in its text, one through a raw driver cursor, `callproc()` or the
+driver's `copy` methods, a name passed in a way the guard does not read (from a table
+column, built inside a computed string), or a statement it cannot read. A write on another
+thread's connection (`set_guc()` run in a `sync_to_async()` hop with
+`thread_sensitive=False` inside a block) flags that connection, but the exit clears only
+the exiting thread's connections: the write stays until the worker thread's next statement
+run outside a context. Only the admin and tenant GUCs are cleared: a bypass flag or another
+policy GUC written for the session stays set.
 
 The library's own entry points cooperate. In this mode, on an alias in
 `RLS_TENANTS["DATABASES"]`, the context managers, the `for_user()` scope and

@@ -457,44 +457,56 @@ effect at the commit. `_settle_after_no_context()` calls it in both modes; in se
 mode with `under_local_values=False`, which makes the values `UNKNOWN` at once, in a
 transaction too, so the settle right after records what it writes and a commit keeps it
 known (#163). With `USE_LOCAL_SET=True` an exit also clears at once the sessions the guard
-saw written at session level (#173): `_guard` sets `_SessionGUCs.session_written` after a
-statement succeeds, outside `writing()`, on a configured alias, in local mode, when
-`_writes_policy_gucs_for_the_session()` reads a write (`SET [SESSION]` of a policy GUC,
-never `SET LOCAL`; a statement with `set_config` naming one in its text or as a parameter,
+saw written at session level (#173). `_guard` calls `_note_session_write()` after a
+statement, also a compound one that raised (it can commit a write before the part that
+fails; a single failed statement leaves nothing), outside `writing()`, on a configured alias, in local mode, unless the session
+is already flagged. It sets `_SessionGUCs.session_written` when
+`_writes_policy_gucs_for_the_session()` reads a write: `SET [SESSION]` of a policy GUC,
+never `SET LOCAL` (`_set_writes_a_policy_guc()` takes comments out first,
+`_without_comments()`, and falls back to the compound rule when it cannot read a whole
+name); a statement with `set_config` naming one in its text or as a parameter,
 `set_config(..., true)` counted too; a compound statement naming one; a `DO` block holding
-`set_config` and the name; names compared case-insensitively against
-`pool._policy_guc_names()`). `session_written_base` / `cleared_in_transaction` follow it
-through transactions: a rollback restores it, `ROLLBACK TO` flags again after a clear, a
-library session-level clear of the pair resets it. `affinity.clear_session_writes()` sends
-one statement per open, flagged alias in `conf.DATABASES` on the exiting thread's
-connections (in autocommit at once; in a transaction at the commit, and the same statement
-sets the enclosing context's values again transaction-locally); an unflagged session gets no
+`set_config` and the name. Names are compared case-insensitively against
+`pool._policy_guc_names()`. `session_written_base` / `cleared_in_transaction` follow the
+flag through transactions: a rollback restores it, `ROLLBACK TO` flags again after a clear
+of a flagged session in the transaction, a library session-level clear of the pair resets
+it, and `PREPARE TRANSACTION` keeps it (PostgreSQL keeps the transaction's session-level
+writes). `affinity.clear_session_writes()` sends one statement per open, flagged alias in
+`conf.DATABASES` on the exiting thread's connections: in autocommit at once; with
+`AUTOCOMMIT=False` and no transaction open outside `atomic()`, committed at once
+(`connection.commit()`); in a transaction at the commit, and the same statement sets the
+enclosing context's values again transaction-locally. An unflagged session gets no
 statement (no cost on request ends or `for_user()` calls), and a failed or `needs_rollback`
-transaction is skipped and stays flagged. Callers: `suspect_sessions()` first,
-`clear_session_writes()` second (the other order leaves the clear's values unknown), from
-`_restore_tenant_gucs(previous=None)`, `_settle_after_no_context()`,
-`middleware._clear_request_gucs()` and `apps._clear_finished_request_gucs()`; the restore
-runs suspect, clear, settle, so the settle writes nothing more. Not seen, so lazy (cleared
-before the next statement run outside a context): a write inside a function, a procedure
-(`CALL`) or a `DO` block that does not spell `set_config` and the name, one through a raw
-driver cursor, `callproc()` or `copy`, a name the guard does not read (a table column, a
-computed string), a statement it cannot read. Only the admin and tenant GUCs are cleared; a
-bypass flag or other policy GUC stays (a write of one still flags the session, so the exit
-clears the pair). With `USE_LOCAL_SET=True` the context managers, `_rls_scope()` and
-the middleware write nothing on a configured alias, inside `transaction.atomic()` or not
-(#137; `context._writes_gucs()` is `not is_local or alias not in conf.DATABASES`, and
-`_rls_scope()` decides it before its own transaction opens): the guard applies the values
-(one `set_config()`, both GUCs) before the first statement that needs them, and again
-only when the context changes. The restore then gets `previous=None` and only settles:
-`settle_other_aliases(None)` puts the enclosing context's values back (transaction-local),
-or clears for the session when there is none, with one `set_config()` on each configured
-alias whose session still holds the block's values, while a transaction is open. So SQL
-past Django's cursor never sees a block's values after the block, but inside a block,
-until its first cursor statement, it sees the enclosing values (or none); and a
-session-level write of the GUCs inside a block in `atomic()` does not survive a block
-with no enclosing context. The middleware's async path opens no request transaction; the
-sync path's (#95) holds no writes of the middleware's. `ready()` calls
-`_guard_open_connections()` so connections opened earlier get the guard
+transaction is skipped and stays flagged. Callers run `suspect_sessions()` first and
+`clear_session_writes()` second (the other order leaves the clear's values unknown):
+`_restore_tenant_gucs()` (with `previous=None`: suspect, clear, then settle, so the settle
+writes nothing more; after `_restore_snapshot()`, for `is_local` on an alias outside
+`conf.DATABASES`: suspect and clear last), `_settle_after_no_context()`,
+`middleware._clear_request_gucs()` and `apps._clear_finished_request_gucs()`. Not seen, so
+lazy (cleared before the next statement run outside a context): a write inside a function,
+a procedure (`CALL`) or a `DO` block that does not spell `set_config` and the name, one
+through a raw driver cursor, `callproc()` or `copy`, a name the guard does not read (a
+table column, a computed string), a statement it cannot read. Nor is a write on another
+thread's connection cleared at the exit (`sync_to_async(..., thread_sensitive=False)`
+inside a block flags that thread's tracker, but the exit reaches only the exiting thread's
+connections): it stays until that thread's next statement run outside a context. Only the
+admin and tenant GUCs are cleared; a bypass flag or other policy GUC stays (a write of one
+still flags the session, so the exit clears the pair). With `USE_LOCAL_SET=True` the
+context managers, `_rls_scope()` and the middleware write nothing on a configured alias,
+inside `transaction.atomic()` or not (#137; `context._writes_gucs()` is `not is_local or
+alias not in conf.DATABASES`, and `_rls_scope()` decides it before its own transaction
+opens): the guard applies the values (one `set_config()`, both GUCs) before the first
+statement that needs them, and again only when the context changes. The restore then gets
+`previous=None`: after the suspect and the eager clear above, `settle_other_aliases(None)`
+puts the enclosing context's values back (transaction-local), or clears for the session
+when there is none, with one `set_config()` on each configured alias whose session still
+holds the block's values, while a transaction is open. So SQL past Django's cursor never
+sees a block's values after the block, but inside a block, until its first cursor
+statement, it sees the enclosing values (or none); and a session-level write of the GUCs
+inside a block in `atomic()` does not survive a block with no enclosing context. The
+middleware's async path opens no request transaction; the sync path's (#95) holds no writes
+of the middleware's. `ready()` calls `_guard_open_connections()` so connections opened
+earlier get the guard
 (`guard_open_connection()`). The `ContextVar` holds a
 `_Live` holder that `_reset_context_gucs()` / `_clear_context_gucs()` end for every copy,
 so a hop or task inherits a context only while its block is live. `_reset_context_gucs()`
