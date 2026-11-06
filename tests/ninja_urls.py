@@ -9,6 +9,8 @@ from tests.ninja_views import (
     api,
     guarded_stream_api,
     key_api,
+    key_open_api,
+    key_owner_api,
     open_api,
     pick_api,
     plain_api,
@@ -24,4 +26,6 @@ urlpatterns = [
     path("stream/", stream_api.urls),
     path("guarded-stream/", guarded_stream_api.urls),
     path("key/", key_api.urls),
+    path("key-open/", key_open_api.urls),
+    path("key-owner/", key_owner_api.urls),
 ]

@@ -60,7 +60,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
-from contextlib import AsyncExitStack, ExitStack
+from contextlib import AsyncExitStack, ExitStack, asynccontextmanager
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 try:
@@ -89,6 +89,8 @@ from django_rls_tenants.exceptions import NoTenantContextError, RLSConfiguration
 from django_rls_tenants.tenants import audit
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import (
+    _no_rls_state,
+    _settle_after_no_context,
     admin_context,
     async_admin_context,
     async_tenant_context,
@@ -112,7 +114,7 @@ from django_rls_tenants.tenants.state import (
 from django_rls_tenants.tenants.types import TenantUser
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import AsyncIterator, Callable, Mapping
     from contextlib import AbstractAsyncContextManager, AbstractContextManager
 
     from django.http import HttpRequest
@@ -164,10 +166,36 @@ class _RequestState:
 
 
 class _Choice(NamedTuple):
-    """The context a request runs in: the admin bypass, or the tenant ``tenant_id``."""
+    """The context a request runs in: the admin bypass, the tenant ``tenant_id``, or none.
+
+    ``no_context`` is the no-context block (``admin`` and ``tenant_id`` unused):
+    no RLS context at all, whatever context encloses the request.
+    """
 
     admin: bool
     tenant_id: Any
+    no_context: bool = False
+
+
+# The choice for a client an ``auth=`` callback authenticated that is no user.
+_NO_CONTEXT = _Choice(admin=False, tenant_id=None, no_context=True)
+
+
+@asynccontextmanager
+async def _async_no_rls_state() -> AsyncIterator[None]:
+    """``_no_rls_state()`` for an ``async def`` operation, entered in its coroutine.
+
+    The block's ``ContextVar`` values are set and reset in the coroutine. Its
+    exit settles the configured connections of the event loop's thread, which
+    holds none, so the settle runs again in a thread-sensitive hop after the
+    reset, as ``@with_rls_context``'s async wrapper does (the hop sets no
+    ``ContextVar``, #58).
+    """
+    try:
+        with _no_rls_state():
+            yield
+    finally:
+        await sync_to_async(_settle_after_no_context, thread_sensitive=True)()
 
 
 def _state_of(request: HttpRequest) -> _RequestState | None:
@@ -185,7 +213,10 @@ def _default_rls_user(request: HttpRequest) -> Any:
     ``request.auth`` only to a callback's truthy result (its test client sets
     it to ``None``). Fail-closed: the client a callback authenticated (an API
     key, say) is not the user of the session cookie a cross-site request
-    carries along, and Ninja runs no CSRF check for such a callback.
+    carries along, and Ninja runs no CSRF check for such a callback. For that
+    ``None``, :class:`RLSTenantNinjaAPI` runs the operation with no RLS
+    context, also inside one ``RLSTenantMiddleware`` set for the session's
+    user.
     """
     auth = getattr(request, "auth", None)
     if not auth:
@@ -248,9 +279,12 @@ async def _evaluated(result: Any) -> Any:
     everything its evaluation does (``for_user()``'s scope, the prefetches
     with their tenant filter, ``STRICT_MODE``), and Ninja serializes the
     cached rows. A queryset in a ``Status`` (or Ninja's deprecated
-    ``(status, body)`` tuple) is evaluated too. A relation the serialization
-    reaches lazily (not in ``select_related()`` / ``prefetch_related()``)
-    still raises.
+    ``(status, body)`` tuple) is evaluated too. Anything else is returned as
+    it is, so these still raise ``SynchronousOnlyOperation`` (a 500, with no
+    row read): a relation the serialization reaches lazily (not in
+    ``select_related()`` / ``prefetch_related()``), a returned ``Manager``
+    (return ``.all()``), a ``RawQuerySet``, and a queryset nested in a dict,
+    a list or a schema (evaluate it in the operation).
     """
     body = result
     if _STATUS is not None and isinstance(result, _STATUS):
@@ -294,12 +328,16 @@ class RLSTenantNinjaAPI(NinjaAPI):
     ``TenantUser``, nobody when it returned anything else (an API key
     object: override :meth:`get_rls_user` to map it to its user), and
     ``request.user`` only for an operation without ``auth=``
-    (:meth:`get_rls_user`). For an
-    unauthenticated request the API enters nothing: the operation runs in
-    whatever context encloses it, which is none (fail-closed) unless
-    ``RLSTenantMiddleware`` set one for the user of the session cookie.
-    :class:`RLSTenantGuard` refuses such a request. A request whose ``auth=``
-    callback fails gets Ninja's 401 before anything is entered.
+    (:meth:`get_rls_user`). When an ``auth=`` callback authenticated the
+    request but :meth:`get_rls_user` names no authenticated user, the API
+    runs the operation with no RLS context, whatever context encloses it (one
+    ``RLSTenantMiddleware`` set for the user of the session cookie included):
+    it reads no protected row, and ``STRICT_MODE`` raises (fail-closed). For
+    a request no ``auth=`` callback authenticated and no session user, the
+    API enters nothing: the operation runs in whatever context encloses it,
+    which is none unless other code set one. :class:`RLSTenantGuard` refuses
+    both. A request whose ``auth=`` callback fails gets Ninja's 401 before
+    anything is entered.
 
     When the active context already is the user's (``RLSTenantMiddleware``
     set it for a session-authenticated user), the API enters nothing.
@@ -333,9 +371,10 @@ class RLSTenantNinjaAPI(NinjaAPI):
         """Return the user to choose the request's context for.
 
         ``request.auth`` when the ``auth=`` callback returned an object that
-        satisfies the ``TenantUser`` protocol. ``None`` (no context, which
-        :class:`RLSTenantGuard` refuses) when it returned anything else:
-        override this method to map such a result (a token or API key
+        satisfies the ``TenantUser`` protocol. ``None`` when it returned
+        anything else: the operation then runs with no RLS context, whatever
+        context encloses it, and :class:`RLSTenantGuard` refuses it.
+        Override this method to map such a result (a token or API key
         object) to its user. The default never falls back to the session's
         user then, because a cross-site request carries the victim's session
         cookie along with an attacker's key, and Ninja checks CSRF only for
@@ -354,9 +393,13 @@ class RLSTenantNinjaAPI(NinjaAPI):
         """Return the context to run a ``def`` operation in, or ``None`` to enter none.
 
         Called once per request, after Ninja authenticated it. The default
-        returns ``None`` for an unauthenticated request and when the active
-        context is already the one the user implies, ``admin_context()`` for
-        a tenant admin and ``tenant_context(user.rls_tenant_id)`` otherwise.
+        returns a no-context block when an ``auth=`` callback authenticated
+        the request but :meth:`get_rls_user` names no authenticated user (the
+        operation runs with no RLS context, whatever context encloses it:
+        fail-closed), ``None`` for a request no ``auth=`` callback
+        authenticated and no session user, and when the active context is
+        already the one the user implies, ``admin_context()`` for a tenant
+        admin and ``tenant_context(user.rls_tenant_id)`` otherwise.
         For a :class:`~django_rls_tenants.tenants.types.MultiTenantUser` who
         is not a tenant admin, the tenant is the one the request selects (the
         ``RLS_TENANTS["TENANT_HEADER"]`` header, then the session's
@@ -379,6 +422,8 @@ class RLSTenantNinjaAPI(NinjaAPI):
         choice = self._rls_choice(request)
         if choice is None:
             return None
+        if choice.no_context:
+            return _no_rls_state()
         if choice.admin:
             return admin_context()
         return tenant_context(choice.tenant_id)
@@ -391,9 +436,10 @@ class RLSTenantNinjaAPI(NinjaAPI):
 
         The same choice as :meth:`get_rls_context`, made in one thread-sensitive
         ``sync_to_async`` hop (the user lookup, the session and
-        ``rls_tenant_ids`` may query), returning ``async_admin_context()`` or
-        ``async_tenant_context()``, which the API enters in the request's
-        coroutine.
+        ``rls_tenant_ids`` may query), returning ``async_admin_context()``,
+        ``async_tenant_context()`` or the async no-context block (its exit
+        puts the enclosing context back in a thread-sensitive hop), which the
+        API enters in the request's coroutine.
 
         Raises:
             ninja.errors.HttpError: As :meth:`get_rls_context`.
@@ -401,6 +447,8 @@ class RLSTenantNinjaAPI(NinjaAPI):
         choice = await sync_to_async(self._rls_choice)(request)
         if choice is None:
             return None
+        if choice.no_context:
+            return _async_no_rls_state()
         if choice.admin:
             return async_admin_context()
         return async_tenant_context(choice.tenant_id)
@@ -419,7 +467,10 @@ class RLSTenantNinjaAPI(NinjaAPI):
         if state is not None:
             state.user = user
         if not _is_authenticated(user):
-            return None
+            # A client an auth= callback authenticated that is no user (an API key
+            # get_rls_user() does not map): never the enclosing context, which
+            # RLSTenantMiddleware may have set for the session cookie's user.
+            return _NO_CONTEXT if getattr(request, "auth", None) else None
         if _selects_tenants(user):
             try:
                 tenant_id = _request_tenant_id(request, user, source="ninja")
@@ -476,10 +527,12 @@ class RLSTenantNinjaAPI(NinjaAPI):
             # Called outside run(), whose wrapper owns the context's exit.
             return
         context = self.get_rls_context(request)
-        if context is None:
-            return
+        # The guard reads the user get_rls_user() names, also when an override
+        # of get_rls_context() enters nothing without looking it up.
         if state.user is _UNRESOLVED:
             state.user = self.get_rls_user(request)
+        if context is None:
+            return
         enclosing = _current_live()
         state.stack.enter_context(audit.attributed(context, source="ninja", user=state.user))
         entered = _current_live()
@@ -495,10 +548,10 @@ class RLSTenantNinjaAPI(NinjaAPI):
             # Called outside run(), whose wrapper owns the context's exit.
             return
         context = await self.aget_rls_context(request)
-        if context is None:
-            return
         if state.user is _UNRESOLVED:
             state.user = await sync_to_async(self.get_rls_user)(request)
+        if context is None:
+            return
         enclosing = _current_live()
         await state.stack.enter_async_context(
             audit.async_attributed(context, source="ninja", user=state.user),

@@ -224,11 +224,19 @@ no context (consumed after `run()` returns), also behind a `functools.wraps` dec
 plain function); decorators added later wrap the library's. An `async def` view's returned
 queryset (also in `Status` / a `(status, body)` tuple) is evaluated in the context by
 `_evaluated()` (async iteration fills its result cache), since Ninja serializes it in the
-event loop. `get_rls_context()` / `aget_rls_context()` (override both) and `get_rls_user()`
+event loop (a `Manager`, a `RawQuerySet` or a nested queryset is not: a 500).
+`get_rls_context()` / `aget_rls_context()` (override both) and `get_rls_user()`
 are the override points; the default user (`_default_rls_user()`, the guard's too) is
 `request.auth` if a `TenantUser`, `None` for any other truthy `request.auth` (fail-closed:
 never the session's user once an `auth=` callback authenticated, a CSRF vector), and
-`request.user` only when none did.
+`request.user` only when none did. When `request.auth` is truthy and `get_rls_user()`
+names no authenticated user, the defaults return the no-context block (`_NO_CONTEXT`:
+`context._no_rls_state()`, or `_async_no_rls_state()`, which repeats
+`_settle_after_no_context()` in a thread-sensitive hop after the `ContextVar` reset, as
+`@with_rls_context`'s async wrapper does), so the operation never runs in an enclosing
+context (`RLSTenantMiddleware`'s for the session cookie); it logs no audit record. The
+enter methods resolve `_RequestState.user` before an override's `None` returns, so the
+guard reads the overridden `get_rls_user()`.
 `RLSTenantGuard` applies the #150 rule with `_RequestState.entered`. Every
 `RLSTenantModelSchema` subclass, built or not, refuses a field named or aliased like the
 tenant field (`RLSConfigurationError`). `rls_save()` reuses

@@ -102,6 +102,20 @@ class OrderWithTenantOut(Schema):
         return obj.tenant.name
 
 
+class OrderShipmentOut(Schema):
+    """Reads the prefetched ``shipment``; a filtered-out one is ``None``."""
+
+    product: str
+    carrier: str | None = None
+
+    @staticmethod
+    def resolve_carrier(obj):
+        # A prefetch that found no row caches the miss: the descriptor raises
+        # RelatedObjectDoesNotExist (an AttributeError) without a query.
+        shipment = getattr(obj, "shipment", None)
+        return None if shipment is None else shipment.carrier
+
+
 class ItemIn(RLSTenantModelSchema):
     """An ``OrderItem`` payload: no ``id``, and the tenant is never part of it."""
 
@@ -187,14 +201,22 @@ async def alazy_status(request):
     return Status(200, Order.objects.order_by("product"))
 
 
+@api.get("/alazy-tuple", response={200: list[OrderOut]})
+async def alazy_tuple(request):
+    # Ninja's deprecated ``(status, body)`` form.
+    return 200, Order.objects.order_by("product")
+
+
 @api.get("/alazy-for-user", response=list[OrderOut])
 async def alazy_for_user(request):
     return Order.objects.for_user(request.auth).order_by("product")
 
 
-@api.get("/alazy-prefetch", response=list[OrderOut])
+@api.get("/alazy-prefetch", response=list[OrderShipmentOut])
 async def alazy_prefetch(request):
-    return Order.objects.prefetch_related("tenant").order_by("product")
+    # ``shipment`` is a reverse one-to-one hop onto an RLS-protected model, which Django
+    # prefetches through the base manager: the #44 tenant filter applies to it.
+    return Order.objects.prefetch_related("shipment").order_by("product")
 
 
 @api.get("/alazy-relation", response=list[OrderWithTenantOut])
@@ -429,4 +451,47 @@ def key_state(request):
 
 @key_api.get("/astate")
 async def key_astate(request):
+    return await arequest_state()
+
+
+# The same ``auth=`` without a guard: the operation must not run in the context that
+# encloses the request (``RLSTenantMiddleware``'s for the session cookie's user, say).
+key_open_api = RLSTenantNinjaAPI(auth=ObjectKey(), urls_namespace="rls_ninja_key_open")
+
+
+@key_open_api.get("/state")
+def key_open_state(request):
+    return request_state()
+
+
+@key_open_api.get("/astate")
+async def key_open_astate(request):
+    return await arequest_state()
+
+
+# An API that maps the key object to its owner and enters no context itself (other
+# code sets it): the guard must read the user ``get_rls_user()`` names.
+class KeyOwnerAPI(RLSTenantNinjaAPI):
+    def get_rls_user(self, request):
+        return AdminUser.objects.filter(username=str(request.auth)).first()
+
+    def get_rls_context(self, request):
+        return None
+
+    async def aget_rls_context(self, request):
+        return None
+
+
+key_owner_api = KeyOwnerAPI(
+    auth=ObjectKey(), rls_guard=RLSTenantGuard(), urls_namespace="rls_ninja_key_owner"
+)
+
+
+@key_owner_api.get("/state")
+def key_owner_state(request):
+    return request_state()
+
+
+@key_owner_api.get("/astate")
+async def key_owner_astate(request):
     return await arequest_state()

@@ -110,11 +110,16 @@ throttling and input parsing, right before the view function:
 - any other user gets `tenant_context(user.rls_tenant_id)`;
 - a non-admin user without a tenant gets a 403 (`"Your account is not assigned to a
   tenant."`; the hint naming the `TenantUser` attributes goes to the log);
-- a request without a user (unauthenticated, or one whose `auth=` callback returned
-  something that is not a `TenantUser`; see [The user](#the-user)) enters nothing:
-  the operation runs in whatever context encloses it, none unless
-  `RLSTenantMiddleware` set one for the session cookie (`RLSTenantGuard` refuses it).
-  A request whose `auth=` callback fails gets Ninja's 401 before anything is entered.
+- a request an `auth=` callback authenticated, but for which `get_rls_user()` names no
+  user (the callback returned something that is not a `TenantUser`; see
+  [The user](#the-user)), runs with **no RLS context**, whatever context encloses it,
+  `RLSTenantMiddleware`'s for the session cookie included: it reads no protected row,
+  and `STRICT_MODE` raises (`RLSTenantGuard` refuses it with a 401);
+- a request no `auth=` callback authenticated and without a session user enters
+  nothing: the operation runs in whatever context encloses it, none unless other code
+  set one (`RLSTenantGuard` refuses it with a 401).
+
+A request whose `auth=` callback fails gets Ninja's 401 before anything is entered.
 
 The context stays active for the operation, the serialization of what it returns (a
 lazy queryset included) and the rendering of an error, and is exited before the
@@ -128,7 +133,8 @@ coroutine; the user lookup and the session read run in one thread-sensitive
 view, serialization) in one thread-sensitive `sync_to_async` hop, and the API enters
 the synchronous context there.
 
-An `async def` operation may return a queryset (also in `Status(code, queryset)`).
+An `async def` operation may return a queryset (also in `Status(code, queryset)` or
+Ninja's deprecated `(code, queryset)` tuple).
 Ninja serializes the result of an `async def` operation in the event loop, where
 evaluating a queryset raises `SynchronousOnlyOperation`, so the API evaluates the
 returned queryset inside the context first, through Django's async iteration (one
@@ -146,14 +152,24 @@ async def list_orders(request):
     return Order.objects.select_related("customer")
 ```
 
+Only a queryset returned as it is, or as the body of a `Status` / `(code, body)`, is
+evaluated. A returned manager (`Order.objects`: return `Order.objects.all()`), a
+`RawQuerySet` and a queryset nested in a dict, a list or a schema are left to Ninja's
+serialization in the event loop, where they raise `SynchronousOnlyOperation`: a 500
+that reads no row (fail-closed). Evaluate those in the operation (`[o async for o in
+qs]`, inside the context) before returning them.
+
 ### The user
 
 The user (`get_rls_user()`) is:
 
 - `request.auth` when the `auth=` callback returned a `TenantUser`;
 - **nobody** when it returned anything else, such as an API key or token object:
-  no context is entered, and `RLSTenantGuard` refuses the request with a 401.
-  Override `get_rls_user()` to map such a result to its user:
+  the operation runs with no RLS context, whatever context encloses the request (the
+  one `RLSTenantMiddleware` set for a session cookie included), and `RLSTenantGuard`
+  refuses the request with a 401. The same holds for an override that returns `None`
+  (or any user who is not authenticated) for such a request. Override
+  `get_rls_user()` to map such a result to its user:
 
     ```python
     class MyAPI(RLSTenantNinjaAPI):
@@ -173,7 +189,8 @@ user is the cookie's, whoever sent the request; give such operations `auth=djang
 when they act for the session user.
 
 `get_rls_user()` is synchronous; an `async def` operation calls it in a `sync_to_async`
-hop. `RLSTenantGuard` checks the user it returned for the request.
+hop. `RLSTenantGuard` checks the user it returned for the request, also when an
+overridden `get_rls_context()` / `aget_rls_context()` enters nothing.
 
 ### Choosing the context
 
@@ -188,8 +205,12 @@ class MyAPI(RLSTenantNinjaAPI):
 
 `get_rls_context()` serves `def` operations and `aget_rls_context()` serves
 `async def` ones: **override both** to keep them in step. They run once per request,
-after Ninja authenticated it. The defaults return `None` for an unauthenticated
-request and when the active context is already the user's. An override is where a
+after Ninja authenticated it. The defaults return a no-context block (sync or async)
+when an `auth=` callback authenticated the request but `get_rls_user()` names no
+user, and `None` for a request without `auth=` and without a session user and when the
+active context is already the user's. An override decides for itself: when it
+returns `None`, the operation runs in whatever context encloses the request, so call
+`super()` for the requests it does not handle. An override is where a
 selected tenant is validated: `RLSTenantGuard` accepts the tenant context it returns
 for the request, whichever tenant that is (`admin_context()` only for a tenant admin).
 

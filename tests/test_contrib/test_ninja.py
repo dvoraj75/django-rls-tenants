@@ -30,6 +30,7 @@ from django.conf import settings
 from django.contrib.auth.models import AnonymousUser
 from django.db import IntegrityError, transaction
 from django.test import AsyncClient, Client, RequestFactory, override_settings
+from ninja.errors import HttpError
 from ninja.errors import ValidationError as NinjaValidationError
 
 from django_rls_tenants.contrib.ninja import (
@@ -43,6 +44,7 @@ from django_rls_tenants.tenants.audit import AUDIT_LOGGER_NAME
 from django_rls_tenants.tenants.context import admin_context, tenant_context
 from django_rls_tenants.tenants.selection import NOT_SELECTABLE_MESSAGE
 from django_rls_tenants.tenants.state import (
+    ContextGucs,
     _get_context_gucs,
     get_current_tenant_id,
     get_rls_context_active,
@@ -50,7 +52,14 @@ from django_rls_tenants.tenants.state import (
 from tests import ninja_views
 from tests.ninja_views import ItemIn, api, guard
 from tests.session_gucs import session_gucs
-from tests.test_app.models import AdminUser, Membership, Order, OrderItem, Tenant
+from tests.test_app.models import (
+    AdminUser,
+    Membership,
+    Order,
+    OrderItem,
+    OrderShipment,
+    Tenant,
+)
 from tests.test_external_app.models import Book
 
 pytestmark = [pytest.mark.django_db, pytest.mark.urls("tests.ninja_urls")]
@@ -234,7 +243,20 @@ class TestTenantIsolation:
         assert all(item["seen_tenant"] == tenant_a.pk for item in response.json())
         _assert_context_closed()
 
-    @pytest.mark.parametrize("operation", ["lazy-status", "lazy-for-user", "lazy-prefetch"])
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            "lazy-status",
+            pytest.param(
+                "lazy-tuple",
+                # Ninja 1.7 deprecates the (status, body) form it still serves.
+                marks=pytest.mark.filterwarnings(
+                    "ignore:Returning tuple \\(status_code, response\\):DeprecationWarning"
+                ),
+            ),
+            "lazy-for-user",
+        ],
+    )
     def test_an_async_operation_may_return_other_unevaluated_querysets(
         self, enforce_rls, user_a, sample_orders, operation
     ):
@@ -244,6 +266,30 @@ class TestTenantIsolation:
 
         assert response.status_code == 200, response.content
         assert _products(response) == ["Widget A1", "Widget A2"]
+        _assert_context_closed()
+
+    def test_an_async_prefetch_of_a_protected_relation_keeps_the_tenant_filter(
+        self, user_a, sample_orders, tenant_a, tenant_b
+    ):
+        # Without enforce_rls on a superuser connection, only the #44 prefetch filter
+        # can hide tenant B's shipment, which points at an order of tenant A.
+        with admin_context():
+            OrderShipment.objects.create(
+                order=sample_orders["a1"], carrier="carrier-a", tenant=tenant_a
+            )
+            OrderShipment.objects.create(
+                order=sample_orders["a2"], carrier="carrier-b", tenant=tenant_b
+            )
+        send = Flavour("async", is_async=True, via_asgi=True)
+
+        response = send.call("get", "/api/alazy-prefetch", user=user_a)
+
+        assert response.status_code == 200, response.content
+        assert response.json() == [
+            {"product": "Widget A1", "carrier": "carrier-a"},
+            {"product": "Widget A2", "carrier": None},
+        ]
+        assert b"carrier-b" not in response.content
         _assert_context_closed()
 
     def test_a_relation_the_async_serialization_reaches_lazily_is_a_500(
@@ -520,6 +566,91 @@ class TestAuthentication:
         assert any(
             "not a tenant admin and has no tenant" in r.getMessage() for r in caplog.records
         )
+
+
+_MIDDLEWARE_WITH_RLS = [
+    *settings.MIDDLEWARE,
+    "django_rls_tenants.tenants.middleware.RLSTenantMiddleware",
+]
+
+
+def _assert_sees_no_context(response):
+    """The operation ran with no RLS context: no row, no tenant, strict-mode flag off."""
+    assert response.status_code == 200, response.content
+    body = response.json()
+    assert body["products"] == []
+    assert body["database_products"] == []
+    assert body["tenant_id"] is None
+    assert body["context_active"] is False
+
+
+def _assert_enclosing_context_intact(tenant):
+    """``tenant_context(tenant.pk)`` around the request is still active, on the session too."""
+    assert get_current_tenant_id() == tenant.pk
+    assert get_rls_context_active() is True
+    assert _get_context_gucs() == ContextGucs.for_tenant(tenant.pk)
+    assert session_gucs() == (str(tenant.pk), "false")
+    assert sorted(Order.objects.values_list("product", flat=True)) == ["Widget A1", "Widget A2"]
+
+
+@pytest.mark.integration
+class TestNonUserAuth:
+    """An ``auth=`` result that names no user runs the operation in no context (fail-closed).
+
+    The ``/key-open`` API has no guard: the operation must not inherit the context that
+    encloses the request, such as the one ``RLSTenantMiddleware`` set for the user of a
+    session cookie a cross-site request carries along with an attacker's key.
+    """
+
+    def test_the_enclosing_context_does_not_reach_the_operation(
+        self, enforce_rls, twin, user_a, user_b, sample_orders, tenant_a, audit_records
+    ):
+        with tenant_context(tenant_a.pk):
+            response = twin.get("state", user_b, base="/key-open")
+
+            _assert_sees_no_context(response)
+            _assert_enclosing_context_intact(tenant_a)
+        assert [r for r in audit_records() if r.rls_source == "ninja"] == []
+        _assert_context_closed()
+
+    def test_the_middlewares_session_context_does_not_reach_the_operation(
+        self, enforce_rls, twin, user_a, user_b, sample_orders
+    ):
+        # Logged in as A (the victim's cookie), with B's key (the attacker's).
+        client = (AsyncClient if twin.via_asgi else Client)(raise_request_exception=False)
+        client.force_login(user_a)
+        send = async_to_sync(client.get) if twin.via_asgi else client.get
+
+        with override_settings(MIDDLEWARE=_MIDDLEWARE_WITH_RLS):
+            response = send(twin.path("state", "/key-open"), headers={"X-User": user_b.username})
+
+        _assert_sees_no_context(response)
+        _assert_context_closed()
+
+    def test_the_session_user_still_gets_the_middlewares_context_without_a_key(
+        self, enforce_rls, user_a, sample_orders, tenant_a
+    ):
+        client = Client()
+        client.force_login(user_a)
+
+        with override_settings(MIDDLEWARE=_MIDDLEWARE_WITH_RLS):
+            response = client.get("/open/state")
+
+        assert response.status_code == 200, response.content
+        assert response.json()["database_products"] == ["Widget A1", "Widget A2"]
+        _assert_context_closed()
+
+    def test_the_guard_reads_the_user_an_override_names_when_nothing_is_entered(
+        self, enforce_rls, twin, user_a, sample_orders, tenant_a
+    ):
+        # get_rls_context() / aget_rls_context() return None: the owner's context, set
+        # by other code, is the one the guard must accept, not refuse with a 401.
+        with tenant_context(tenant_a.pk):
+            response = twin.get("state", user_a, base="/key-owner")
+
+            assert response.status_code == 200, response.content
+            assert response.json()["database_products"] == ["Widget A1", "Widget A2"]
+        _assert_context_closed()
 
 
 # ---------------------------------------------------------------------------
@@ -1177,7 +1308,7 @@ class TestStreaming:
         assert _denials(audit_records()) == [("ninja", "no_context", None, None, user_a.pk)]
         _assert_context_closed()
 
-    def test_a_guarded_async_stream_enters_no_context(
+    def test_a_guarded_async_stream_is_refused_once_it_starts(
         self, enforce_rls, user_a, sample_orders, audit_records
     ):
         async def fetch():
@@ -1185,14 +1316,18 @@ class TestStreaming:
             response = await client.get(
                 "/guarded-stream/astream", headers={"X-User": user_a.username}
             )
-            try:
-                return [chunk async for chunk in response.streaming_content]
-            except Exception:  # the guard ends the stream with an error
-                return None
+            with pytest.raises(HttpError) as refused:
+                [chunk async for chunk in response.streaming_content]
+            return response, refused.value
 
-        async_to_sync(fetch)()
+        response, refused = async_to_sync(fetch)()
 
+        # The response has started (200) when the generator, and the guard in it, runs.
+        assert response.status_code == 200
+        assert response.streaming
+        assert (refused.status_code, str(refused)) == (403, RLSTenantGuard.message)
         assert [r for r in audit_records() if r.rls_event == "context.entered"] == []
+        assert _denials(audit_records()) == [("ninja", "no_context", None, None, user_a.pk)]
         _assert_context_closed()
 
 

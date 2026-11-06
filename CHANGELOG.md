@@ -19,9 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returned; `get_rls_user()`, `get_rls_context()` and `aget_rls_context()` are the
   override points, and a `MultiTenantUser` selects its tenant by header or session as
   elsewhere. The user is `request.auth` when it is a `TenantUser`; an `auth=` result
-  that is not one gets no context (override `get_rls_user()` to map it), never the
-  session's user, which only an operation without `auth=` uses. An `async def`
-  operation may return a queryset: it is evaluated inside the context.
+  that is not one runs the operation with no RLS context, whatever context encloses it
+  (override `get_rls_user()` to map it), never the session's user or the context
+  `RLSTenantMiddleware` set for it, which only an operation without `auth=` uses. An
+  `async def` operation may return a queryset (also in `Status` or a `(code, body)`
+  tuple): it is evaluated inside the context.
   `RLSTenantGuard` refuses a request outside its user's context (`rls_guard=`
   or `@guard`), `RLSTenantModelSchema` leaves the tenant field out, and `rls_save()` /
   `arls_save()` write a payload in the active tenant and reject a foreign key to a row
