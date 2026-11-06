@@ -40,10 +40,14 @@ library's ``tenants`` package do.
 
 **Limitation: streaming.** A streaming operation (``response=JSONL[...]`` or
 ``SSE[...]``, a generator or async generator view) is consumed after
-``run()`` returns, outside any context ``run()`` could keep open. The API
-passes such a view through without a context, so it reads zero rows unless
-an enclosing context (``RLSTenantMiddleware`` for a session user) covers the
-streaming.
+``run()`` returns, outside any context ``run()`` could keep open (and after
+``RLSTenantMiddleware``'s has ended). The API passes such a view through
+without a context, so it reads zero rows unless the generator opens a
+context itself. Do not put a streaming operation under
+:class:`RLSTenantGuard`: it refuses a ``def`` one with a 403 before the
+response starts, and an ``async def`` one only when the stream starts (the
+response has begun). Mount streaming operations on a router or API without
+``rls_guard=``.
 
 This is an **optional** integration. It imports :mod:`ninja`, which is not a
 dependency of the core library; install it with ``pip install
@@ -61,6 +65,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 try:
     from ninja import ModelSchema, NinjaAPI
+    from ninja import responses as ninja_responses
     from ninja.errors import HttpError
     from ninja.errors import ValidationError as NinjaValidationError
     from ninja.orm.metaclass import ModelSchemaMetaclass
@@ -77,7 +82,7 @@ from django.apps import apps
 from django.core.exceptions import FieldDoesNotExist
 from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db.models import ForeignKey, Model
+from django.db.models import ForeignKey, Model, QuerySet
 from pydantic import BaseModel
 
 from django_rls_tenants.exceptions import NoTenantContextError, RLSConfigurationError
@@ -135,6 +140,10 @@ _STATE_ATTRIBUTE = "_rls_ninja_state"
 # _RequestState.user before the API has looked the user up.
 _UNRESOLVED: Any = object()
 
+# ninja.responses.Status (an operation's ``Status(code, body)`` result); older
+# Ninja releases only take a ``(code, body)`` tuple.
+_STATUS: type | None = getattr(ninja_responses, "Status", None)
+
 
 class _RequestState:
     """What :class:`RLSTenantNinjaAPI` keeps on a request while ``run()`` serves it.
@@ -168,11 +177,20 @@ def _state_of(request: HttpRequest) -> _RequestState | None:
 
 
 def _default_rls_user(request: HttpRequest) -> Any:
-    """Return ``request.auth`` if it is a ``TenantUser``, else ``request.user`` (or ``None``)."""
+    """Return the user an ``auth=`` callback authenticated, else the session's.
+
+    ``request.auth`` if it is a ``TenantUser``, ``None`` if it is anything
+    else, and ``request.user`` (``None`` without ``AuthenticationMiddleware``)
+    only when no ``auth=`` callback authenticated the request. Ninja sets
+    ``request.auth`` only to a callback's truthy result (its test client sets
+    it to ``None``). Fail-closed: the client a callback authenticated (an API
+    key, say) is not the user of the session cookie a cross-site request
+    carries along, and Ninja runs no CSRF check for such a callback.
+    """
     auth = getattr(request, "auth", None)
-    if isinstance(auth, TenantUser):
-        return auth
-    return getattr(request, "user", None)
+    if not auth:
+        return getattr(request, "user", None)
+    return auth if isinstance(auth, TenantUser) else None
 
 
 def _rls_user_of(request: HttpRequest) -> Any:
@@ -208,8 +226,41 @@ def _context_gucs_for(user: Any, tenant_id: Any = None) -> ContextGucs | None:
 
 
 def _is_streaming(view_func: Callable[..., Any]) -> bool:
-    """Return whether ``view_func`` is a generator view, which Ninja consumes after ``run()``."""
-    return inspect.isgeneratorfunction(view_func) or inspect.isasyncgenfunction(view_func)
+    """Return whether ``view_func`` is a generator view, which Ninja consumes after ``run()``.
+
+    Looks through ``functools.wraps`` wrappers (``__wrapped__``): a decorator
+    such as :class:`RLSTenantGuard` turns a ``def`` generator view into a
+    plain function that returns the generator.
+    """
+    view = inspect.unwrap(view_func)
+    return inspect.isgeneratorfunction(view) or inspect.isasyncgenfunction(view)
+
+
+async def _evaluated(result: Any) -> Any:
+    """Evaluate the queryset an ``async def`` operation returned, in the active context.
+
+    Ninja serializes an ``async def`` operation's result synchronously, in the
+    event loop, where evaluating a queryset raises ``SynchronousOnlyOperation``.
+    Django's async iteration of a queryset runs its own ``_fetch_all()`` in
+    one thread-sensitive hop, which copies the coroutine's ``ContextVar`` values
+    (the context the API entered, or the one enclosing it), and keeps the
+    rows in the queryset's result cache. Returning the same queryset keeps
+    everything its evaluation does (``for_user()``'s scope, the prefetches
+    with their tenant filter, ``STRICT_MODE``), and Ninja serializes the
+    cached rows. A queryset in a ``Status`` (or Ninja's deprecated
+    ``(status, body)`` tuple) is evaluated too. A relation the serialization
+    reaches lazily (not in ``select_related()`` / ``prefetch_related()``)
+    still raises.
+    """
+    body = result
+    if _STATUS is not None and isinstance(result, _STATUS):
+        body = cast("Any", result).value
+    elif isinstance(result, tuple) and len(result) == 2:  # noqa: PLR2004  -- (status, body)
+        body = result[1]
+    if isinstance(body, QuerySet):
+        async for _row in body:
+            pass
+    return result
 
 
 class RLSTenantNinjaAPI(NinjaAPI):
@@ -240,7 +291,10 @@ class RLSTenantNinjaAPI(NinjaAPI):
     :data:`~django_rls_tenants.tenants.selection.NOT_SELECTABLE_MESSAGE`.
 
     The user is ``request.auth`` when the ``auth=`` callback returned a
-    ``TenantUser``, else ``request.user`` (:meth:`get_rls_user`). For an
+    ``TenantUser``, nobody when it returned anything else (an API key
+    object: override :meth:`get_rls_user` to map it to its user), and
+    ``request.user`` only for an operation without ``auth=``
+    (:meth:`get_rls_user`). For an
     unauthenticated request the API enters nothing: the operation runs in
     whatever context encloses it, which is none (fail-closed) unless
     ``RLSTenantMiddleware`` set one for the user of the session cookie.
@@ -279,10 +333,20 @@ class RLSTenantNinjaAPI(NinjaAPI):
         """Return the user to choose the request's context for.
 
         ``request.auth`` when the ``auth=`` callback returned an object that
-        satisfies the ``TenantUser`` protocol, else ``request.user`` (``None``
-        without ``AuthenticationMiddleware``). Synchronous: an ``async def``
-        operation calls it in a ``sync_to_async`` hop, since ``request.user``
-        may query the session.
+        satisfies the ``TenantUser`` protocol. ``None`` (no context, which
+        :class:`RLSTenantGuard` refuses) when it returned anything else:
+        override this method to map such a result (a token or API key
+        object) to its user. The default never falls back to the session's
+        user then, because a cross-site request carries the victim's session
+        cookie along with an attacker's key, and Ninja checks CSRF only for
+        cookie authentication (``APIKeyCookie``, ``django_auth``). Only an
+        operation without ``auth=`` gets ``request.user`` (``None`` without
+        ``AuthenticationMiddleware``), served without a CSRF check (Ninja's
+        views are ``csrf_exempt``).
+
+        Synchronous: an ``async def`` operation calls it in a
+        ``sync_to_async`` hop, since ``request.user`` may query the session.
+        The guard reads the user this method returned for the request.
         """
         return _default_rls_user(request)
 
@@ -381,8 +445,11 @@ class RLSTenantNinjaAPI(NinjaAPI):
     def _rls_enter(self, view_func: Callable[..., Any]) -> Callable[..., Any]:
         """Wrap an operation's view function to enter its RLS context first (``mode="operation"``).
 
-        A generator view (a streaming operation) is returned as it is: Ninja
-        consumes it after ``run()`` returns, when no context it entered is open.
+        A generator view (a streaming operation), also one a decorator such as
+        :class:`RLSTenantGuard` wraps, is returned as it is: Ninja consumes it
+        after ``run()`` returns, when no context it entered is open. A queryset
+        an ``async def`` view returns is evaluated before the wrapper returns
+        it (:func:`_evaluated`).
         """
         if _is_streaming(view_func):
             return view_func
@@ -391,7 +458,7 @@ class RLSTenantNinjaAPI(NinjaAPI):
             @functools.wraps(view_func)
             async def async_view(request: HttpRequest, *args: Any, **kwargs: Any) -> Any:
                 await self._aenter_rls_context(request)
-                return await view_func(request, *args, **kwargs)
+                return await _evaluated(await view_func(request, *args, **kwargs))
 
             return async_view
 
@@ -500,18 +567,34 @@ class RLSTenantGuard:
     empty result when it is served outside its user's context (a plain
     ``NinjaAPI`` a token client reached as an anonymous user of the
     middleware, say). In an ``async def`` operation the check runs in a
-    ``sync_to_async`` hop. On a streaming operation, which gets no context
-    from the API, an ``async`` generator is checked when the response
-    starts streaming, so a refusal there ends the stream with an error.
+    ``sync_to_async`` hop.
 
-    The user is the one :class:`RLSTenantNinjaAPI` chose the context for,
-    else ``request.auth`` if it is a ``TenantUser``, else ``request.user``.
+    Do not apply it to a streaming operation: such an operation runs in no
+    context (see the module documentation), so the guard refuses it, a
+    ``def`` generator view with a clean 403 when Ninja calls it, an
+    ``async`` generator only when the response starts streaming, which a
+    refusal ends with an error. Mount streaming operations on a router or
+    API without ``rls_guard=``.
+
+    The user is the one :class:`RLSTenantNinjaAPI` chose the context for;
+    without one, the same default as
+    :meth:`RLSTenantNinjaAPI.get_rls_user`: ``request.auth`` if it is a
+    ``TenantUser``, nobody (a 401) if an ``auth=`` callback returned
+    anything else, ``request.user`` if none authenticated the request.
     """
 
     message = "This request is not running in its user's RLS context."
 
     def __call__[F: Callable[..., Any]](self, view_func: F) -> F:
-        """Return ``view_func`` wrapped with the check, of the same kind (async, generator)."""
+        """Return ``view_func`` wrapped with the check.
+
+        An ``async def`` view stays a coroutine function and an ``async``
+        generator view an ``async`` generator function (Ninja picks the
+        async operation from the view's kind). Any ``def`` view, a generator
+        view included, becomes a plain function that checks, then calls it;
+        :class:`RLSTenantNinjaAPI` still finds a generator view through
+        ``__wrapped__``.
+        """
         if inspect.isasyncgenfunction(view_func):
 
             @functools.wraps(view_func)
@@ -532,7 +615,8 @@ class RLSTenantGuard:
 
         @functools.wraps(view_func)
         def view(request: HttpRequest, *args: Any, **kwargs: Any) -> Any:
-            # A generator view's generator is returned once the check passed.
+            # A generator view's generator is created only once the check passed:
+            # Ninja calls this before the streaming response starts.
             self._check(request)
             return view_func(request, *args, **kwargs)
 
@@ -676,26 +760,59 @@ class _RLSTenantModelSchemaMetaclass(ModelSchemaMetaclass):
             # RLSTenantModelSchema itself, which has no Meta: no schema to build.
             return ResolverMetaclass.__new__(mcs, name, bases, namespace, **kwargs)
         if _rls_model_schema not in bases:
-            # A subclass of a built schema, or the class Ninja generates for one.
-            return super().__new__(mcs, name, bases, namespace, **kwargs)
+            # A subclass of a built schema, or the class Ninja generates for one:
+            # Ninja does not rebuild it, but its body could declare the tenant field.
+            schema = super().__new__(mcs, name, bases, namespace, **kwargs)
+            meta = _inherited_meta(schema)
+            model = None if meta is None else _schema_model(meta)
+            if model is not None:
+                _refuse_declared_tenant_field(name, schema, _model_tenant_field(model))
+            return schema
         meta = namespace.get("Meta")
         model = None if meta is None else _schema_model(meta)
         tenant_field = None if model is None else _model_tenant_field(model)
         if meta is not None and tenant_field is not None:
             namespace = {**namespace, "Meta": _meta_without(meta, tenant_field)}
         schema = super().__new__(mcs, name, (*bases, ModelSchema), namespace, **kwargs)
-        if tenant_field is not None:
-            declared = {tenant_field.name, tenant_field.attname} & _schema_keys(schema)
-            if declared:
-                msg = (
-                    f"{name} declares {sorted(declared)}, which would write or show the tenant "
-                    f"field {tenant_field.name!r} of {tenant_field.model.__name__}. "
-                    f"RLSTenantModelSchema never reads it from a payload: remove the field "
-                    f"(rls_save() sets the tenant from the active context), or use a plain "
-                    f"ModelSchema for an admin-only schema."
-                )
-                raise RLSConfigurationError(msg)
+        _refuse_declared_tenant_field(name, schema, tenant_field)
         return schema
+
+
+def _inherited_meta(schema: type) -> Any:
+    """Return the ``Meta`` of the nearest base of ``schema`` that declares one, else ``None``.
+
+    The ``Meta`` Ninja built the schema from: one in the subclass's own body is
+    not read (Ninja builds only a direct ``ModelSchema`` subclass).
+    """
+    for base in schema.__mro__[1:]:
+        meta = vars(base).get("Meta")
+        if meta is not None:
+            return meta
+    return None
+
+
+def _refuse_declared_tenant_field(
+    name: str,
+    schema: type[BaseModel],
+    tenant_field: ForeignKey[Any, Any] | None,
+) -> None:
+    """Refuse a schema with a field named, or aliased, like the model's tenant field.
+
+    Raises:
+        RLSConfigurationError: If ``schema`` has such a field.
+    """
+    if tenant_field is None:
+        return
+    declared = {tenant_field.name, tenant_field.attname} & _schema_keys(schema)
+    if declared:
+        msg = (
+            f"{name} declares {sorted(declared)}, which would write or show the tenant "
+            f"field {tenant_field.name!r} of {tenant_field.model.__name__}. "
+            f"RLSTenantModelSchema never reads it from a payload: remove the field "
+            f"(rls_save() sets the tenant from the active context), or use a plain "
+            f"ModelSchema for an admin-only schema."
+        )
+        raise RLSConfigurationError(msg)
 
 
 def _model_tenant_field(model: type[Model]) -> ForeignKey[Any, Any] | None:
@@ -736,7 +853,9 @@ class RLSTenantModelSchema(ModelSchema, metaclass=_RLSTenantModelSchemaMetaclass
     foreign keys (Ninja checks their type, not that the row exists).
 
     Only a direct subclass is built from its ``Meta``, as with
-    ``ModelSchema``.
+    ``ModelSchema``. A subclass of a built schema keeps its fields, and
+    declaring the tenant field in its body raises
+    :class:`RLSConfigurationError` too.
     """
 
 

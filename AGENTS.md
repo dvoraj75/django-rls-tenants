@@ -219,10 +219,19 @@ context on the `ExitStack` / `AsyncExitStack` kept in a per-request `_RequestSta
 `_rls_own_exit` with `mode="view"` (wraps `run()`, owns the exit and `Vary`). Ninja's
 docstring has the two mode names inverted; the code relies on the observed behaviour,
 pinned by tests. Input parsing runs before the context. A generator view (streaming) gets
-no context (consumed after `run()` returns); decorators added later wrap the library's.
-`get_rls_context()` / `aget_rls_context()` (override both) and `get_rls_user()`
-(`request.auth` if a `TenantUser`, else `request.user`) are the override points;
-`RLSTenantGuard` applies the #150 rule with `_RequestState.entered`. `rls_save()` reuses
+no context (consumed after `run()` returns), also behind a `functools.wraps` decorator
+(`_is_streaming()` looks at `inspect.unwrap()`: the guard makes a `def` generator view a
+plain function); decorators added later wrap the library's. An `async def` view's returned
+queryset (also in `Status` / a `(status, body)` tuple) is evaluated in the context by
+`_evaluated()` (async iteration fills its result cache), since Ninja serializes it in the
+event loop. `get_rls_context()` / `aget_rls_context()` (override both) and `get_rls_user()`
+are the override points; the default user (`_default_rls_user()`, the guard's too) is
+`request.auth` if a `TenantUser`, `None` for any other truthy `request.auth` (fail-closed:
+never the session's user once an `auth=` callback authenticated, a CSRF vector), and
+`request.user` only when none did.
+`RLSTenantGuard` applies the #150 rule with `_RequestState.entered`. Every
+`RLSTenantModelSchema` subclass, built or not, refuses a field named or aliased like the
+tenant field (`RLSConfigurationError`). `rls_save()` reuses
 `_checked_foreign_keys()` / `_foreign_keys_of_other_tenants()` (#107): the same 422 for a
 missing and another tenant's target. Audit `source="ninja"`.
 

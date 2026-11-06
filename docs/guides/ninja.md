@@ -110,8 +110,10 @@ throttling and input parsing, right before the view function:
 - any other user gets `tenant_context(user.rls_tenant_id)`;
 - a non-admin user without a tenant gets a 403 (`"Your account is not assigned to a
   tenant."`; the hint naming the `TenantUser` attributes goes to the log);
-- an unauthenticated request enters nothing: the operation runs in whatever context
-  encloses it, none unless `RLSTenantMiddleware` set one for the session cookie.
+- a request without a user (unauthenticated, or one whose `auth=` callback returned
+  something that is not a `TenantUser`; see [The user](#the-user)) enters nothing:
+  the operation runs in whatever context encloses it, none unless
+  `RLSTenantMiddleware` set one for the session cookie (`RLSTenantGuard` refuses it).
   A request whose `auth=` callback fails gets Ninja's 401 before anything is entered.
 
 The context stays active for the operation, the serialization of what it returns (a
@@ -126,18 +128,52 @@ coroutine; the user lookup and the session read run in one thread-sensitive
 view, serialization) in one thread-sensitive `sync_to_async` hop, and the API enters
 the synchronous context there.
 
-An `async def` operation cannot return an unevaluated queryset: Ninja serializes the
-result in the event loop, where Django raises `SynchronousOnlyOperation` when the
-queryset is evaluated. Evaluate it in the operation (`[obj async for obj in qs]`);
-the serialization of the returned objects (schema resolvers included) still runs
-inside the context.
+An `async def` operation may return a queryset (also in `Status(code, queryset)`).
+Ninja serializes the result of an `async def` operation in the event loop, where
+evaluating a queryset raises `SynchronousOnlyOperation`, so the API evaluates the
+returned queryset inside the context first, through Django's async iteration (one
+thread-sensitive hop), and Ninja serializes the rows it fetched. The evaluation is the
+queryset's own: a `for_user()` queryset keeps its scope, `prefetch_related()` its
+prefetches (with their tenant filter) and `STRICT_MODE` applies. The serialization
+itself (schema resolvers included) runs inside the context, but still in the event
+loop: a relation it reaches lazily (`order.customer.name` for a foreign key that was
+not fetched) raises `SynchronousOnlyOperation`. Fetch what the schema shows with
+`select_related()` / `prefetch_related()`:
+
+```python
+@router.get("/orders/", response=list[OrderOut])
+async def list_orders(request):
+    return Order.objects.select_related("customer")
+```
 
 ### The user
 
-The user is `request.auth` when the `auth=` callback returned a `TenantUser`, else
-`request.user` (`None` without `AuthenticationMiddleware`). Override `get_rls_user()`
-to choose otherwise. It is synchronous; an `async def` operation calls it in a
-`sync_to_async` hop.
+The user (`get_rls_user()`) is:
+
+- `request.auth` when the `auth=` callback returned a `TenantUser`;
+- **nobody** when it returned anything else, such as an API key or token object:
+  no context is entered, and `RLSTenantGuard` refuses the request with a 401.
+  Override `get_rls_user()` to map such a result to its user:
+
+    ```python
+    class MyAPI(RLSTenantNinjaAPI):
+        def get_rls_user(self, request):
+            return request.auth.owner  # the user the API key belongs to
+    ```
+
+- `request.user` (`None` without `AuthenticationMiddleware`) only for an operation
+  without `auth=`.
+
+The default never falls back to the session's user once an `auth=` callback
+authenticated the request: a cross-site request can carry an attacker's API key
+alongside the victim's session cookie, and Ninja checks CSRF only for cookie
+authentication (`APIKeyCookie`, `django_auth`). An operation without `auth=` is
+served without a CSRF check too (Ninja's views are `csrf_exempt`), so its session
+user is the cookie's, whoever sent the request; give such operations `auth=django_auth`
+when they act for the session user.
+
+`get_rls_user()` is synchronous; an `async def` operation calls it in a `sync_to_async`
+hop. `RLSTenantGuard` checks the user it returned for the request.
 
 ### Choosing the context
 
@@ -206,7 +242,8 @@ admin context); call it in the operation.
 `Meta.fields` / `Meta.exclude` say: a payload never sets it and a response never shows
 it. Declaring the field in the class body raises `RLSConfigurationError`. A model
 without a tenant field is left alone. As with `ModelSchema`, only a direct subclass is
-built from its `Meta`.
+built from its `Meta`; a subclass of a built schema keeps its fields, and declaring
+the tenant field in its body raises `RLSConfigurationError` too.
 
 `rls_save(request, instance, payload, exclude_unset=False, loc=...)` writes the payload
 to the instance and saves it:
@@ -236,12 +273,14 @@ for the context the API enters, `context.denied` from the guard and the 403s abo
 
 - **Streaming.** A streaming operation (`response=JSONL[...]` or `SSE[...]`, a
   generator or async generator view) is consumed by Ninja after `run()` returns,
-  outside any context the API could keep open. The API passes such a view through
-  without a context, so it reads zero rows unless an enclosing context
-  (`RLSTenantMiddleware` for a session user) covers the streaming. With the guard, a
-  `def` generator view is checked when the view is called, before the generator
-  runs; an `async` generator is checked when the response starts streaming, so a
-  refusal there ends the stream with an error.
+  outside any context the API could keep open, and after `RLSTenantMiddleware`'s has
+  ended. The API passes such a view through without a context, so it reads zero rows
+  unless the generator opens a context itself (`tenant_context()` around its body).
+  Do not put a streaming operation under `RLSTenantGuard`: with no context it refuses
+  a `def` generator view with a 403 before the response starts, and an `async`
+  generator view only when the stream starts, after the response has begun, which the
+  refusal ends with an error. Mount streaming operations on a router or an API
+  without `rls_guard=`.
 - **Decorators added later.** `api.add_decorator()` and `router.add_decorator()`
   wrap the library's decorators: they run before the context is entered and after it
   is exited, so they see no context.
