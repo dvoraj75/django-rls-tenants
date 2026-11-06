@@ -139,6 +139,10 @@ Django multitenancy built on top of the `rls/` primitives.
 
 ### Configuration
 
+`STRICT_MODE`, `STRICT_MODE_EXCLUDE` and `AUDIT_NO_CONTEXT_QUERIES` (the opt-in
+`context.denied` record of a query that runs with no context in non-strict mode) are
+described in [Configuration](../getting-started/configuration.md).
+
 ::: django_rls_tenants.tenants.conf.RLSTenantsConfig
 
 ### Models
@@ -148,6 +152,10 @@ Django multitenancy built on top of the `rls/` primitives.
 ::: django_rls_tenants.tenants.models.validate_cross_tenant_fks
 
 ### Managers
+
+`TenantQuerySet.rls_skip_strict()` and `RLSManager.rls_skip_strict()` exempt one
+query from the `STRICT_MODE` guard; the auto-scope filter and the RLS policies still
+apply (see [Configuration](../getting-started/configuration.md#rls_skip_strict_per-query)).
 
 ::: django_rls_tenants.tenants.managers.TenantQuerySet
 

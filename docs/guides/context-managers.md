@@ -512,6 +512,11 @@ context), can be listed in `RLS_TENANTS["STRICT_MODE_EXCLUDE"]`. That removes on
 strict-mode check; the database still returns only what the policy allows. See
 [`STRICT_MODE_EXCLUDE`](../getting-started/configuration.md#strict_mode_exclude).
 
+For a single query, `Order.objects.rls_skip_strict()` skips the check for that queryset
+only (and querysets chained from it), instead of an `admin_context()` the code does not
+need. It is not an admin bypass: the database still returns only what the policy allows.
+See [`rls_skip_strict()`](../getting-started/configuration.md#rls_skip_strict_per-query).
+
 See [Configuration](../getting-started/configuration.md#strict_mode) for setup
 instructions.
 

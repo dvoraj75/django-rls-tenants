@@ -31,6 +31,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `source="ninja"`. A streaming operation gets no context (keep it out of the guard).
   See the
   [Django Ninja guide](https://dvoraj75.github.io/django-rls-tenants/guides/ninja/).
+### Fixed
+
+- **`USE_LOCAL_SET=True`: a session-level write of the admin or tenant GUC inside a context
+  no longer outlives the context's exit** (#173). With `USE_LOCAL_SET=True`, application
+  code inside a block (`set_guc("rls.is_admin", "true")`, `rls_context()` without
+  `is_local=True`) could leave the value on the session after the block, a `for_user()`
+  call, a request or the `request_finished` safety net ended: the exit only marked the
+  session's values unknown and the guard cleared them before the next statement run outside
+  a context, so a driver cursor, `callproc()` or a server-side cursor's `FETCH` in between
+  read the write. The GUC affinity guard now flags a session when a statement it sees
+  writes a policy GUC at session level, and every such exit clears the admin and tenant
+  GUCs of flagged sessions at once, one statement per open, flagged alias in
+  `RLS_TENANTS["DATABASES"]` on the exiting thread's connections (at once in autocommit,
+  and with `AUTOCOMMIT=False` outside `atomic()`, where the clear is committed at once; at
+  the commit in a transaction). A session the guard did not see written gets no statement,
+  so request ends and `for_user()` calls cost nothing more. The guard sees `SET [SESSION]`
+  (with comments anywhere before the name), a statement that calls `set_config()` and names
+  a policy GUC in its text or as a parameter (what `set_guc()` sends), a compound statement
+  naming one, and a `DO` block that spells `set_config` and the name, also when a compound
+  statement then fails (it can commit the write before the part that fails). A write inside a function or procedure (`CALL`, a function the statement calls),
+  inside a `DO` block that builds the name dynamically, through a raw driver cursor,
+  `callproc()` or the driver's `copy` methods, or with the name passed in a way the guard
+  does not read, stays lazy as before, and so does a write on another thread's connection
+  (`set_guc()` in a `sync_to_async()` hop with `thread_sensitive=False`), which the exiting
+  thread's clear does not reach. Only the admin and tenant GUCs are cleared; a bypass flag
+  written for the session stays set. A session in a failed transaction is skipped until the
+  next exit or the lazy clear.
+### Added
+
+- **`rls_skip_strict()`: a per-query override of the `STRICT_MODE` guard** (#168).
+  `Order.objects.rls_skip_strict().count()` (on `RLSManager` and `TenantQuerySet`) does not
+  raise `NoTenantContextError` without a context. The flag survives `filter()` and the like
+  and `&` / `|` / `^`. It is Python-side only, not an admin bypass: the auto-scope filter,
+  `for_user()` and the RLS policies are unchanged, so with no context the query still fails
+  closed at the database. Querysets Django builds itself are not covered. A `DEBUG` message
+  on `django_rls_tenants` records each refusal it skips; the `NoTenantContextError` hint
+  now names both `STRICT_MODE_EXCLUDE` and `rls_skip_strict()`.
+- **`RLS_TENANTS["AUDIT_NO_CONTEXT_QUERIES"]`** (#178; `bool`, default `False`). With
+  `STRICT_MODE=False`, evaluating a queryset of an RLS-protected model with no active
+  context logs `context.denied` (`WARNING`, source `queryset`, reason `no_context`) on
+  `django_rls_tenants.audit`; the query still runs. Models in `STRICT_MODE_EXCLUDE`,
+  `rls_skip_strict()` querysets, `for_user()` and active contexts log nothing. Off by
+  default: with `STRICT_MODE` and this setting both off, the guard returns after reading
+  the two settings, with no other work.
+
+### Changed
+
+- Combining an `including_shared()` queryset with `none()` (`shared & Note.objects.none()`,
+  and `|` / `^` with `none()` on either side) now returns a queryset that keeps the
+  `including_shared()` flag (it refuses writes and adds no tenant filter); before, Django
+  could hand back the unflagged `none()` operand. The result is still empty (#59, changed
+  while adding #168).
 
 ## [1.6.3] - 2026-10-22
 

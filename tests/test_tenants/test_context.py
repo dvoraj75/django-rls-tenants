@@ -1543,24 +1543,24 @@ class TestNoneUserCallSettlesTheOtherAliases:
         """In session mode the settle's write overrides the body's, and the commit keeps it.
 
         With ``USE_LOCAL_SET=True`` the settle writes transaction-locally, so
-        the body's session-level write is what the session keeps after the
-        commit, through the enclosing block's exit, until the next statement
-        run outside any context clears it: the documented limit of that mode
-        for writes of the GUCs by other code, the same after any block.
+        the body's session-level write would be what the session keeps after the
+        commit. The guard saw that write, so the call's exit clears it (#173):
+        after the commit a driver cursor reads nothing, inside the enclosing
+        block too, where before the write stayed until the next statement run
+        outside any context.
         """
         from django.db import transaction  # noqa: PLC0415
 
         from tests.session_gucs import session_gucs  # noqa: PLC0415
 
-        body_write = (None, "true")
         with tenant_context(101):
             _touch_replica()
             with transaction.atomic(using=with_replica):
                 _touch_replica()
                 _sync_decorated_set_admin_on_replica(as_user=None)
                 assert session_gucs(with_replica) == ("101", "false")
-            assert session_gucs(with_replica) == (body_write if guc_mode else ("101", "false"))
-        assert session_gucs(with_replica) == (body_write if guc_mode else (None, None))
+            assert session_gucs(with_replica) == _held_for(("101", "false"), local=guc_mode)
+        assert session_gucs(with_replica) == (None, None)
         _touch_replica()
         assert session_gucs(with_replica) == (None, None)
 

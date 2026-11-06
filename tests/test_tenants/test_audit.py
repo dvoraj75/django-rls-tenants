@@ -6,7 +6,7 @@ The DRF and Celery sources are covered in ``tests/test_contrib``.
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -17,6 +17,7 @@ from django.core.exceptions import PermissionDenied, ValidationError
 from django.core.management import call_command
 from django.core.signals import request_finished
 from django.db import DatabaseError, connection, transaction
+from django.db.models.signals import pre_delete
 from django.test import AsyncClient, Client, override_settings
 from django.test.utils import CaptureQueriesContext
 
@@ -32,6 +33,7 @@ from django_rls_tenants.tenants.context import (
     tenant_context,
     with_rls_context,
 )
+from django_rls_tenants.tenants.managers import TenantQuerySet
 from django_rls_tenants.tenants.middleware import RLSTenantMiddleware, _mark_gucs_set
 from django_rls_tenants.tenants.models import (
     _audit_rejected_values,
@@ -862,6 +864,243 @@ class TestQueryset:
         assert [(r.rls_event, r.rls_source, r.rls_reason, r.rls_user_id) for r in records()] == [
             ("context.denied", "for_user", "user_without_tenant", 6),
         ]
+
+
+def _audit_settings(*, strict=False, audit_queries=True, exclude=()):
+    return override_settings(
+        RLS_TENANTS={
+            "TENANT_MODEL": "test_app.Tenant",
+            "STRICT_MODE": strict,
+            "AUDIT_NO_CONTEXT_QUERIES": audit_queries,
+            "STRICT_MODE_EXCLUDE": list(exclude),
+        }
+    )
+
+
+class TestNoContextQueries:
+    """``AUDIT_NO_CONTEXT_QUERIES`` logs a no-context query of a protected model (#178)."""
+
+    def test_no_context_query_logs_one_denied_record_and_still_runs(
+        self, records, sample_orders, enforce_rls
+    ):
+        with _audit_settings():
+            assert list(Order.objects.all()) == []
+
+        assert [
+            (r.levelno, r.rls_event, r.rls_source, r.rls_reason, r.rls_model) for r in records()
+        ] == [(logging.WARNING, "context.denied", "queryset", "no_context", "test_app.Order")]
+
+    def test_a_count_logs_once(self, records, sample_orders, enforce_rls):
+        with _audit_settings():
+            assert Order.objects.count() == 0
+
+        assert [(r.rls_event, r.rls_reason) for r in records()] == [
+            ("context.denied", "no_context")
+        ]
+
+    def test_setting_off_logs_nothing(self, records, sample_orders, enforce_rls):
+        with _audit_settings(audit_queries=False):
+            assert list(Order.objects.all()) == []
+
+        assert records() == []
+
+    def test_default_setting_logs_nothing(self, records, sample_orders, enforce_rls):
+        with override_settings(RLS_TENANTS={"TENANT_MODEL": "test_app.Tenant"}):
+            assert list(Order.objects.all()) == []
+
+        assert records() == []
+
+    def test_both_settings_off_does_no_further_work(self, sample_orders, enforce_rls):
+        """The guard returns before it looks at the model or the context."""
+        with (
+            _audit_settings(audit_queries=False),
+            patch("django_rls_tenants.tenants.managers._is_rls_protected") as protected,
+            patch("django_rls_tenants.tenants.managers.get_rls_context_active") as active,
+        ):
+            assert list(Order.objects.all()) == []
+
+        protected.assert_not_called()
+        active.assert_not_called()
+
+    def test_excluded_model_logs_nothing(self, records, sample_orders, enforce_rls):
+        with _audit_settings(exclude=["test_app.Order"]):
+            assert list(Order.objects.all()) == []
+
+        assert records() == []
+
+    def test_tenant_context_logs_no_denial(self, records, sample_orders, tenant_a):
+        with _audit_settings(), tenant_context(tenant_a.pk):
+            assert Order.objects.count() == 2
+
+        assert [r.rls_event for r in records()] == ["context.entered", "context.exited"]
+
+    def test_admin_context_logs_no_denial(self, records, sample_orders):
+        with _audit_settings(), admin_context():
+            assert Order.objects.count() == 3
+
+        assert [r.rls_event for r in records()] == ["context.entered", "context.exited"]
+
+    def test_for_user_logs_nothing(self, records, sample_orders, tenant_a_user, enforce_rls):
+        with _audit_settings():
+            assert len(list(Order.objects.for_user(tenant_a_user))) == 2
+
+        assert records() == []
+
+    def test_rls_skip_strict_logs_nothing(self, records, sample_orders, enforce_rls):
+        with _audit_settings():
+            assert Order.objects.rls_skip_strict().count() == 0
+
+        assert records() == []
+
+    def test_unprotected_model_logs_nothing(self, records, enforce_rls):
+        """A ``TenantQuerySet`` on an unprotected model reaches the guard and returns early."""
+        with _audit_settings():
+            assert TenantQuerySet(model=Tenant).count() == 0
+            assert list(TenantQuerySet(model=Tenant).all()) == []
+
+        assert records() == []
+
+    def test_unprotected_model_never_reaches_the_context_check(self, enforce_rls):
+        with (
+            _audit_settings(),
+            patch("django_rls_tenants.tenants.managers.get_rls_context_active") as active,
+        ):
+            TenantQuerySet(model=Tenant).count()
+
+        active.assert_not_called()
+
+    def test_plain_manager_model_logs_nothing(self, records, enforce_rls):
+        with _audit_settings():
+            assert Tag.objects.count() == 0
+
+        assert records() == []
+
+    def test_rls_skip_strict_logs_nothing_under_strict_mode(
+        self, records, sample_orders, enforce_rls
+    ):
+        with _audit_settings(strict=True):
+            assert Order.objects.rls_skip_strict().count() == 0
+
+        assert records() == []
+
+    def test_strict_mode_logs_the_refusal_not_a_no_context_record(self, records, sample_orders):
+        with _audit_settings(strict=True), pytest.raises(NoTenantContextError):
+            list(Order.objects.all())
+
+        assert [(r.rls_event, r.rls_source, r.rls_reason) for r in records()] == [
+            ("context.denied", "queryset", "strict_mode")
+        ]
+
+
+def _reasons(records):
+    return [r.rls_reason for r in records() if r.rls_event == "context.denied"]
+
+
+def _call_get(orders):
+    with pytest.raises(Order.DoesNotExist):  # the row exists, RLS hides it
+        Order.objects.get(pk=orders["b1"].pk)
+
+
+def _call_latest(orders):
+    with pytest.raises(Order.DoesNotExist):
+        Order.objects.latest("pk")
+
+
+_ONE_RECORD_CALLS = {
+    "get": _call_get,
+    "first": lambda orders: Order.objects.first(),
+    "last": lambda orders: Order.objects.last(),
+    "latest": _call_latest,
+    "delete": lambda orders: Order.objects.all().delete(),
+    "bulk_update": lambda orders: Order.objects.bulk_update([orders["a1"]], ["product"]),
+}
+
+
+class TestNoContextRecordsOncePerCall:
+    """Each public call logs exactly one ``no_context`` record (#178)."""
+
+    @pytest.mark.parametrize("name", list(_ONE_RECORD_CALLS))
+    def test_one_record(self, name, records, sample_orders, enforce_rls):
+        with _audit_settings():
+            _ONE_RECORD_CALLS[name](sample_orders)
+
+        assert _reasons(records) == ["no_context"]
+        assert len(records()) == 1
+
+    def test_aget_logs_once(self, records, sample_orders, enforce_rls):
+        async def run():
+            with pytest.raises(Order.DoesNotExist):
+                await Order.objects.aget(pk=sample_orders["b1"].pk)
+
+        with _audit_settings():
+            async_to_sync(run)()
+
+        assert _reasons(records) == ["no_context"]
+
+    def test_delete_on_the_collector_path_logs_once(self, records, sample_orders, enforce_rls):
+        def receiver(**kwargs):
+            pass
+
+        pre_delete.connect(receiver, sender=Order, weak=False)
+        try:
+            with _audit_settings():
+                assert Order.objects.all().delete() == (0, {})
+        finally:
+            pre_delete.disconnect(receiver, sender=Order)
+
+        assert _reasons(records) == ["no_context"]
+
+    def test_delete_marks_the_queryset_only_for_the_call(
+        self, records, sample_orders, enforce_rls
+    ):
+        qs = Order.objects.all()
+        with _audit_settings():
+            qs.delete()
+            assert qs._rls_no_context_recorded is False
+            assert _reasons(records) == ["no_context"]
+            assert list(qs) == []
+
+        assert _reasons(records) == ["no_context", "no_context"]
+
+    def test_empty_bulk_update_logs_nothing(self, records, sample_orders, enforce_rls):
+        with _audit_settings():
+            Order.objects.bulk_update([], ["product"])
+
+        assert records() == []
+
+    @pytest.mark.parametrize("method", ["get_or_create", "update_or_create"])
+    def test_create_helpers_log_the_lookup_once(self, method, records, sample_orders, enforce_rls):
+        """The lookup is the checked read; ``create()`` is not guarded (the database refuses)."""
+        # On a plain role the INSERT fails the policy's WITH CHECK.
+        with _audit_settings(), suppress(DatabaseError):
+            getattr(Order.objects, method)(product="nope", defaults={"amount": 1})
+
+        assert _reasons(records) == ["no_context"]
+
+
+@pytest.mark.parametrize("audit_queries", [True, False])
+class TestStrictModeRecordsOnce:
+    """Strict mode is unchanged: one ``strict_mode`` record, never a ``no_context`` one."""
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda o: Order.objects.get(pk=o["a1"].pk),
+            lambda o: Order.objects.first(),
+            lambda o: Order.objects.last(),
+            lambda o: Order.objects.bulk_update([o["a1"]], ["product"]),
+            lambda o: Order.objects.all().delete(),
+        ],
+        ids=["get", "first", "last", "bulk_update", "delete"],
+    )
+    def test_raises_and_logs_one_strict_record(self, audit_queries, call, records, sample_orders):
+        with (
+            _audit_settings(strict=True, audit_queries=audit_queries),
+            pytest.raises(NoTenantContextError),
+        ):
+            call(sample_orders)
+
+        assert _reasons(records) == ["strict_mode"]
 
 
 # ---------------------------------------------------------------------------

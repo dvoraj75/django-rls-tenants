@@ -41,6 +41,7 @@ line):
 context.entered source=middleware tenant_id=42 admin=False user_id=7
 context.exited source=middleware tenant_id=42 admin=False user_id=7
 context.denied source=queryset reason=strict_mode model=billing.Invoice
+context.denied source=queryset reason=no_context model=billing.Invoice
 ```
 
 Without such an entry, and unless the root logger (or `django_rls_tenants`) already allows
@@ -107,12 +108,12 @@ And, depending on the event:
 |-----------|--------|-------|
 | `rls_using` | `context.entered`, `context.exited`, except from `middleware` | The alias the block was entered on (`using=`). Every alias in `RLS_TENANTS["DATABASES"]` follows the context anyway. |
 | `rls_reason` | `context.denied` | Why the context was refused, see [Events](#events). |
-| `rls_model` | `context.denied` (`strict_mode`, `object_of_other_tenant`), `fk.cross_tenant_rejected` | The model label, `"app_label.ModelName"`. |
+| `rls_model` | `context.denied` (`strict_mode`, `no_context` from `queryset`, `object_of_other_tenant`), `fk.cross_tenant_rejected` | The model label, `"app_label.ModelName"`. |
 | `rls_fields` | `fk.cross_tenant_rejected` | The names of the foreign keys whose target belongs to another tenant. |
 | `rls_selected` | `context.denied` (`tenant_not_selectable`, `cross_site_selection`) | The raw value the client sent as the tenant selection, cut to its first 64 characters (followed by `...`) when longer. A string with whitespace, `=` or a non-printable character is quoted in the message. |
 | `rls_via` | `context.denied` (`tenant_not_selectable`, `cross_site_selection`) | Where the selection came from: `header`, `session`, `query` (the admin switcher's query parameter) or `switch` (a `switch_tenant()` call). |
 | `rls_previous` | `tenant.switched` | The selection the session held before (a string), `None` if it held none. |
-| `rls_databases` | `gucs.cleared` | The aliases the safety net covered (`RLS_TENANTS["DATABASES"]`). It skips a closed connection, and with `USE_LOCAL_SET=True` it writes nothing: it marks the sessions for the GUC affinity guard, which clears them before their next statement. |
+| `rls_databases` | `gucs.cleared` | The aliases the safety net covered (`RLS_TENANTS["DATABASES"]`). It skips a closed connection, and with `USE_LOCAL_SET=True` it marks the sessions for the GUC affinity guard, which clears them before their next statement; a session the guard saw written at session level gets one clearing statement at once. |
 
 The user is identified by primary key only. No username, email address or other personal
 data is logged, so the trail stays pseudonymous; resolve a primary key in a system with
@@ -139,6 +140,7 @@ handler.
 | `user_without_tenant` | `middleware`, `drf`, `admin`, `decorator`, `for_user` | A user who is not a tenant admin has `rls_tenant_id=None` (`NoTenantContextError`, or `PermissionDenied` / a 403 in the admin and DRF; the admin only while `rls_deny_without_tenant` is `True`, the default). |
 | `tenant_id_none` | the block's source | `tenant_context(None)` / `async_tenant_context(None)`. |
 | `strict_mode` | `queryset` | `STRICT_MODE` refused a query with no context (`rls_model` names the model). |
+| `no_context` | `queryset` | `AUDIT_NO_CONTEXT_QUERIES=True` with `STRICT_MODE=False`: a queryset of an RLS-protected model was evaluated with no active context (`rls_model` names the model). The query still runs and returns no tenant rows. Nothing is logged for a model in `STRICT_MODE_EXCLUDE`, a `rls_skip_strict()` queryset, an active context, `for_user()` or a model without RLS protection. |
 | `no_context` | `drf`, `celery` | `RLSTenantPermission` found no context for an authenticated user (a view without `RLSTenantAPIViewMixin`), an `RLSTask` with `rls_require_context = True` arrived without one, or `CurrentTenantDefault` was called outside a tenant context (`rls_admin=True` in the admin context, `None` with no context). |
 | `context_mismatch` | `drf` | `RLSTenantPermission.has_permission()`: the active context is not the user's (`rls_tenant_id` / `rls_admin` describe the active one). |
 | `tenant_not_selectable` | `middleware`, `drf`, `admin`, `selection` | A user who belongs to several tenants selected a tenant that is not one of theirs (a malformed or unknown value included), by header, session, the admin switcher's query parameter or a `switch_tenant()` call; also a `switch_tenant()` call by an anonymous user, a tenant admin or a user who is not a `MultiTenantUser`, or by a user the session is not logged in as (a DRF token client). The request is refused with a 403 (`PermissionDenied`); `rls_selected` and `rls_via` describe the selection. |
@@ -158,7 +160,7 @@ handler.
 | `celery` | `RLSTask` and the `install()` signal handlers, on the worker | no |
 | `command` | `run_as_tenant`, `run_for_all_tenants` (one entry per tenant; with `--parallel` the records come from the worker processes, so a file handler must be safe for several processes) | no |
 | `context_manager` | `tenant_context()`, `admin_context()` and the async forms, called by your code (including blocks nested inside any of the above) | no |
-| `queryset` | `STRICT_MODE` | no |
+| `queryset` | `STRICT_MODE`, `AUDIT_NO_CONTEXT_QUERIES` | no |
 | `for_user` | `for_user()` with a tenantless user | yes |
 | `validation` | `validate_cross_tenant_fks()` and `RLSProtectedModel.clean_fields()` (`full_clean()`, a `ModelForm`, the admin) | no |
 | `safety_net` | the `request_finished` receiver | no |
@@ -174,6 +176,10 @@ nothing.
 - **`for_user()` scopes.** A `for_user()` queryset sets its user's context for each SQL
   statement it runs, so a record per scope would flood the log. Only its refusal
   (`user_without_tenant`) is logged.
+- **Queries with no context unless you opt in.** With `STRICT_MODE=False`, a query on a
+  protected model with no context logs nothing by default; set
+  `AUDIT_NO_CONTEXT_QUERIES = True` to log `no_context` (source `queryset`). Models in
+  `STRICT_MODE_EXCLUDE` and `rls_skip_strict()` querysets are never logged.
 - **The library's own lookups.** Reading the tenant of a foreign key's target during
   validation, and the tenants `run_as_tenant` / `run_for_all_tenants` resolve or list,
   run in `admin_context()` blocks that are not logged. The context the command then runs
@@ -239,6 +245,11 @@ LOGGING = {
     },
 }
 ```
+
+`AUDIT_NO_CONTEXT_QUERIES` writes one `WARNING` per query call with no context (each
+`count()`, iteration, `get()`, `delete()` and so on; `bulk_update()` one per batch), so a project that reads protected tables without a
+context on purpose should list those models in `STRICT_MODE_EXCLUDE` or use
+`rls_skip_strict()`.
 
 The logger checks its level before it builds a record, so with the audit logger at
 `WARNING` or above the `INFO` events cost one level check each.

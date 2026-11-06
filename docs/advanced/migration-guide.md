@@ -123,6 +123,23 @@ migration that assigns the correct tenant to each existing record.
 
 ## Upgrading django-rls-tenants
 
+### From 1.6.3 to 1.7.0
+
+No breaking change; nothing to do. Two additions:
+
+- **`AUDIT_NO_CONTEXT_QUERIES`** (#178). In production, where `STRICT_MODE` is usually off,
+  a code path that lost its context answers with an empty result and nothing to alert on.
+  Consider setting `RLS_TENANTS["AUDIT_NO_CONTEXT_QUERIES"] = True` (with
+  `STRICT_MODE=False`) and alerting on `context.denied` records with reason `no_context`
+  from source `queryset`. It writes one `WARNING` per query with no context, so first list
+  models read without a context on purpose in `STRICT_MODE_EXCLUDE`. See
+  [Audit Logging](../guides/audit-logging.md).
+- **`rls_skip_strict()`** (#168). With `STRICT_MODE=True`, a one-off query that runs
+  without a context can use `Model.objects.rls_skip_strict()` instead of an
+  `admin_context()` wrapper it does not need. It is Python-side only; the database still
+  fails closed. See
+  [Configuration](../getting-started/configuration.md#rls_skip_strict_per-query).
+
 ### From 1.6.2 to 1.6.3
 
 A **drop-in upgrade** -- the library code is identical to 1.6.2. The release only refreshes
