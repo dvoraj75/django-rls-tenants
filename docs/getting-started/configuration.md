@@ -11,6 +11,7 @@ RLS_TENANTS = {
     "DATABASES": ["default"],
     "STRICT_MODE": False,
     "STRICT_MODE_EXCLUDE": [],
+    "AUDIT_NO_CONTEXT_QUERIES": False,
     "TENANT_FK_FIELD": "tenant",
     "GUC_PREFIX": "rls",
     "USER_PARAM_NAME": "as_user",
@@ -113,6 +114,9 @@ RLS_TENANTS = {
 }
 ```
 
+To skip the guard for one query, see [`rls_skip_strict()`](#rls_skip_strict_per-query)
+under `STRICT_MODE_EXCLUDE`.
+
 !!! note
     Strict mode does **not** change the database-level behavior. RLS policies
     continue to enforce fail-closed isolation regardless of this setting. Strict
@@ -174,9 +178,8 @@ before the middleware and can live with fail-closed results.
     connection role bypasses RLS). A query that should see a tenant's rows still needs a
     context.
 
-It is not a per-query escape hatch: the setting applies to every query on the model, in
-every code path. A per-query override is on the
-[roadmap](../development/roadmap.md).
+The setting applies to every query on the model, in every code path. For one query, use
+`rls_skip_strict()` (below).
 
 Models without an `RLSConstraint` (shared lookup tables, the tenant model) are never
 guarded by strict mode and never need listing. The value must be a list of strings;
@@ -184,6 +187,52 @@ anything else raises `RLSConfigurationError` when the setting is read. A label t
 no installed model (a typo, an unknown app, no dot), or a model without an `RLSConstraint`,
 is reported as `W015`, whether or not `STRICT_MODE` is on. The strict-mode error's hint
 names the label to list.
+
+#### `rls_skip_strict()` (per query) { #rls_skip_strict_per-query }
+
+`Order.objects.rls_skip_strict()` (on `RLSManager` and `TenantQuerySet`) skips the guard
+for one queryset and the querysets chained from it (`filter()`, `&` / `|` / `^`, also with
+`none()`), without listing the whole model:
+
+```python
+Order.objects.rls_skip_strict().count()  # no NoTenantContextError without a context
+```
+
+Use it for a one-off maintenance query, startup check, health probe or data-migration
+helper that intentionally runs with no context, instead of an `admin_context()` it does not
+need (which widens what the code can read). With `STRICT_MODE` on, a use that skips a
+refusal (the query has no context) logs a `DEBUG` message on `django_rls_tenants`. With `for_user()` the flag is moot, the user's context applies.
+
+!!! warning "Python-side only, not an admin bypass"
+    `rls_skip_strict()` removes only the application-level guard for that queryset. The
+    auto-scope filter, `for_user()`, the context managers and the database RLS policies
+    behave exactly as before, so with no context the query still fails closed at the
+    database: it returns no tenant rows unless a bypass flag is set. Querysets Django
+    builds itself (prefetches, related managers of the rows you fetched) are not covered.
+
+### `AUDIT_NO_CONTEXT_QUERIES`
+
+| | |
+|---|---|
+| **Type** | `bool` |
+| **Default** | `False` |
+
+With `STRICT_MODE=False`, a query on an RLS-protected model with no active context
+silently returns no tenant rows, which looks like "no data". When this is `True`,
+evaluating such a queryset also logs a `context.denied` record at `WARNING` on
+`django_rls_tenants.audit` (source `queryset`, reason `no_context`, `rls_model` the model
+label). The query still runs and returns what it returned before. A non-bool value raises
+`RLSConfigurationError`.
+
+No record is written for a model in `STRICT_MODE_EXCLUDE`, a `rls_skip_strict()` queryset,
+an active context (`tenant_context()`, `admin_context()`, the middleware), `for_user()`, or
+a model without RLS protection. With the setting off nothing changes and no other work is
+done. With `STRICT_MODE=True` it has no effect: strict mode refuses the query and logs
+`strict_mode`.
+
+One record is written per query call (each `count()`, iteration, `get()` and so on;
+`bulk_update()` one per batch), so list models that are read without a context on purpose in `STRICT_MODE_EXCLUDE` or use
+`rls_skip_strict()`. See [Audit Logging](../guides/audit-logging.md).
 
 ### `TENANT_FK_FIELD`
 

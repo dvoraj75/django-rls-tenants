@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`rls_skip_strict()`: a per-query override of the `STRICT_MODE` guard** (#168).
+  `Order.objects.rls_skip_strict().count()` (on `RLSManager` and `TenantQuerySet`) does not
+  raise `NoTenantContextError` without a context. The flag survives `filter()` and the like
+  and `&` / `|` / `^`. It is Python-side only, not an admin bypass: the auto-scope filter,
+  `for_user()` and the RLS policies are unchanged, so with no context the query still fails
+  closed at the database. Querysets Django builds itself are not covered. A `DEBUG` message
+  on `django_rls_tenants` records each refusal it skips; the `NoTenantContextError` hint
+  now names both `STRICT_MODE_EXCLUDE` and `rls_skip_strict()`.
+- **`RLS_TENANTS["AUDIT_NO_CONTEXT_QUERIES"]`** (#178; `bool`, default `False`). With
+  `STRICT_MODE=False`, evaluating a queryset of an RLS-protected model with no active
+  context logs `context.denied` (`WARNING`, source `queryset`, reason `no_context`) on
+  `django_rls_tenants.audit`; the query still runs. Models in `STRICT_MODE_EXCLUDE`,
+  `rls_skip_strict()` querysets, `for_user()` and active contexts log nothing. Off by
+  default: with `STRICT_MODE` and this setting both off, the guard returns after reading
+  the two settings, with no other work.
+
+### Changed
+
+- Combining an `including_shared()` queryset with `none()` (`shared & Note.objects.none()`,
+  and `|` / `^` with `none()` on either side) now returns a queryset that keeps the
+  `including_shared()` flag (it refuses writes and adds no tenant filter); before, Django
+  could hand back the unflagged `none()` operand. The result is still empty (#59, changed
+  while adding #168).
+
 ## [1.6.3] - 2026-10-22
 
 A maintenance release with no change to the library: the wheel built from 1.6.3 holds the

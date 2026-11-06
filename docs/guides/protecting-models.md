@@ -154,6 +154,11 @@ The following queryset methods are guarded: iteration (`_fetch_all()`), `count()
 `exists()`, `aggregate()`, `update()`, `delete()`, `iterator()`, `aiterator()`,
 `bulk_create()`, `bulk_update()`, `get()`, `first()`, `last()`.
 
+To skip the guard for one query that intentionally runs without a context, use
+`Order.objects.rls_skip_strict().count()`. It removes only the Python-side check; the
+database still fails closed (see
+[`rls_skip_strict()`](../getting-started/configuration.md#rls_skip_strict_per-query)).
+
 Queryset *construction* (e.g., `Order.objects.filter(...)`) does not trigger the
 check -- only evaluation does. This matches Django's lazy queryset philosophy. Reading a
 queryset whose results are already cached runs no query and is not checked either.
@@ -255,7 +260,8 @@ What this means in practice:
    [Use Case: Authentication](bypass-mode.md#use-case-authentication). Auth writes such
    as `last_login` updates also need a tenant or admin context; a read bypass does not
    allow them. With `STRICT_MODE=True`, also list the user model in
-   [`STRICT_MODE_EXCLUDE`](../getting-started/configuration.md#strict_mode_exclude).
+   [`STRICT_MODE_EXCLUDE`](../getting-started/configuration.md#strict_mode_exclude)
+   (or `rls_skip_strict()` for one query).
 2. **Group and permission lookups need a tenant or admin context.** `RLSM2MConstraint`
    has no `extra_bypass_flags` option; its policy only passes for the admin GUC or when
    the referenced user belongs to the current tenant. Fresh database queries for group
