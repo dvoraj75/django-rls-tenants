@@ -95,14 +95,21 @@ keep it on the request's thread with `thread_sensitive=True` (the default for
 
 | Hint starts with | Cause | Fix |
 |---|---|---|
-| `Establish an RLS context before the query` | `STRICT_MODE=True` and a query ran with no context | Wrap the code in `tenant_context()` / `admin_context()`, use `.for_user()`, or run it under the middleware. If the model is meant to be read without a context (an auth backend under `bypass_flag()`), list it in [`STRICT_MODE_EXCLUDE`](getting-started/configuration.md#strict_mode_exclude), as the hint says |
+| `Establish an RLS context before the query` | `STRICT_MODE=True` and a query ran with no context | Wrap the code in `tenant_context()` / `admin_context()`, use `.for_user()`, or run it under the middleware. If the model is meant to be read without a context (an auth backend under `bypass_flag()`), list it in [`STRICT_MODE_EXCLUDE`](getting-started/configuration.md#strict_mode_exclude), or skip the guard for one query with [`rls_skip_strict()`](getting-started/configuration.md#rls_skip_strict_per-query), as the hint says |
 | `Assign the user to a tenant (set rls_tenant_id)` | A non-admin `TenantUser` has `rls_tenant_id=None`: a `createsuperuser` account, a user not yet attached to a tenant | Give the user a tenant, or set `is_tenant_admin=True`. In a request, a user who belongs to several tenants (`MultiTenantUser`) may instead select one: see [Users in Several Tenants](guides/multi-tenant-users.md) |
 | `Pass a concrete tenant primary key` | `tenant_context(None)` was called | Pass a real tenant PK, or use `admin_context()` for cross-tenant access |
 
 For the first hint, the full text continues: `If Order is meant to be read without a
-context, list 'app.Order' in RLS_TENANTS['STRICT_MODE_EXCLUDE']; to disable this guard
-for every model, set STRICT_MODE=False in RLS_TENANTS.` The exclusion removes only this
+context, list 'app.Order' in RLS_TENANTS['STRICT_MODE_EXCLUDE'], or call
+rls_skip_strict() on a single query that is meant to run without one (RLS still filters
+it at the database); to disable this guard for every model, set STRICT_MODE=False in
+RLS_TENANTS.` Both `STRICT_MODE_EXCLUDE` (a whole model) and `rls_skip_strict()` (one query) remove only this
 check; the query still returns just the rows the database policy allows without a context.
+
+With `STRICT_MODE=False`, the same mistake gives an empty result instead of an error. Set
+`AUDIT_NO_CONTEXT_QUERIES = True` to log a `context.denied` record (source `queryset`,
+reason `no_context`, `rls_model`) for each such query; see
+[Audit Logging](guides/audit-logging.md).
 
 The first hint also appears when a Celery task with `rls_require_context=True`
 arrives without propagated context. Enqueue it **inside** a tenant or admin context;

@@ -233,10 +233,15 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
     tenant filters, and ``for_user()`` adds none either: the RLS policies
     decide which rows it reads. It refuses ``update()``, ``delete()``,
     ``bulk_update()``, ``update_or_create()`` and ``select_for_update()``.
+
+    ``rls_skip_strict()`` marks a queryset that the ``STRICT_MODE`` guard
+    does not check.
     """
 
     _rls_user: TenantUser | None
     _rls_including_shared: bool
+    _rls_skip_strict: bool
+    _rls_no_context_recorded: bool
 
     # Internal QuerySet attributes this class reads or pins; django-stubs
     # does not declare them.
@@ -249,6 +254,8 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         super().__init__(*args, **kwargs)
         self._rls_user = None
         self._rls_including_shared = False
+        self._rls_skip_strict = False
+        self._rls_no_context_recorded = False
 
     def for_user(self, as_user: TenantUser) -> TenantQuerySet:
         """Scope this queryset to the given user's tenant.
@@ -372,33 +379,42 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         return None
 
     def _clone(self) -> TenantQuerySet:
-        """Propagate ``_rls_user`` and ``_rls_including_shared`` to cloned querysets."""
+        """Propagate ``_rls_user`` and the ``_rls_*`` flags (not combined by ``_combined()``)."""
         # Type ignore explanation: _clone() is an internal Django API not typed in
         # django-stubs; return type is QuerySet, not TenantQuerySet.
         clone: TenantQuerySet = super()._clone()  # type: ignore[misc]
         clone._rls_user = self._rls_user
         clone._rls_including_shared = self._rls_including_shared
+        clone._rls_skip_strict = self._rls_skip_strict
+        clone._rls_no_context_recorded = self._rls_no_context_recorded
         return clone
 
     def _combined(self, combined: TenantQuerySet, other: Any) -> TenantQuerySet:
-        """Mark ``combined`` as ``including_shared()`` when ``other`` is one.
+        """Carry both operands' ``including_shared()`` and ``rls_skip_strict()`` flags.
 
         Django builds a ``&`` / ``|`` / ``^`` combination from a clone of the
-        left operand, so without this the right operand's shared rows would
-        reach a queryset that does not refuse writes. When one side is
-        ``none()``, Django returns an operand itself instead: the flag then
-        goes on a clone, never on the caller's queryset.
+        left operand, so the left operand's flags survive; without this the
+        right operand's would be lost (shared rows would reach a queryset that
+        does not refuse writes). When one side is ``none()``, Django returns
+        an operand itself instead (``flagged & none()`` returns the ``none()``
+        one): the flags of either operand then go on a clone, never on the
+        caller's queryset.
         """
-        if not getattr(other, "_rls_including_shared", False) or getattr(
-            combined, "_rls_including_shared", False
-        ):
+        missing = [
+            flag
+            for flag in ("_rls_including_shared", "_rls_skip_strict")
+            if (getattr(self, flag, False) or getattr(other, flag, False))
+            and not getattr(combined, flag, False)
+        ]
+        if not missing:
             return combined
-        if combined is self:
-            combined = self._chain()  # type: ignore[attr-defined]
+        if combined is self or combined is other:
+            combined = combined._chain()  # type: ignore[attr-defined]
         if isinstance(combined, TenantQuerySet):
             # A sliced left operand gives a plain QuerySet of the base manager
-            # (Django's own loss of the class), which has no shared rows to mark.
-            combined._rls_including_shared = True  # noqa: SLF001  -- a TenantQuerySet
+            # (Django's own loss of the class), which has nothing to mark.
+            for flag in missing:
+                setattr(combined, flag, True)
         return combined
 
     def __and__(self, other: Any) -> TenantQuerySet:
@@ -499,24 +515,61 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
 
     # ---- Strict mode guard ----
 
-    def _check_strict_mode(self) -> None:
-        """Raise if strict mode is on and no RLS context is active.
+    def rls_skip_strict(self) -> TenantQuerySet:
+        """Return a queryset the ``STRICT_MODE`` guard does not check.
 
-        Only applies to RLS-protected models (those with an
-        ``RLSConstraint``). Non-protected models that happen to use
-        ``TenantQuerySet`` (e.g., via inheritance) are not guarded, and
-        neither are the models listed in ``STRICT_MODE_EXCLUDE`` (or their
-        proxies). The exclusion is read only on the way to raising, so it
-        costs nothing when a context is active.
+        A Python-side override of the guard for this one queryset and the
+        querysets chained from it, for a query that is meant to run without
+        an RLS context: ``Order.objects.rls_skip_strict().count()``. It is
+        not an admin bypass: the auto-scope filter, ``for_user()``, the
+        context managers and the RLS policies are unchanged, so with no
+        context it still reads only the rows the policy lets through (none,
+        unless a bypass flag is set).
 
-        The check reads two ``ContextVar`` values -- negligible cost.
+        It does not reach querysets Django builds itself for this queryset,
+        such as its prefetches or the related managers of its rows; those
+        are guarded as usual. With ``for_user()`` the scope sets a context,
+        so the flag is moot (no error). It logs no audit event, only a
+        ``DEBUG`` message on ``django_rls_tenants`` when strict mode would
+        have refused.
+        """
+        qs: TenantQuerySet = self._chain()  # type: ignore[attr-defined]
+        qs._rls_skip_strict = True
+        return qs
+
+    def _check_strict_mode(self, *, record: bool = True) -> None:  # noqa: PLR0911  -- ordered early returns, cheapest first
+        """Raise (strict mode) or log (``AUDIT_NO_CONTEXT_QUERIES``) a no-context query.
+
+        Does nothing while both ``STRICT_MODE`` and ``AUDIT_NO_CONTEXT_QUERIES``
+        are off. Only applies to RLS-protected models (those with an
+        ``RLSConstraint``). In order, it returns for: a model that is not
+        protected, an active context (``tenant_context()``,
+        ``admin_context()``, middleware), a ``for_user()`` queryset, a model
+        in ``STRICT_MODE_EXCLUDE`` (or a proxy of one) and a queryset marked
+        by ``rls_skip_strict()`` (which logs a ``DEBUG`` message under strict
+        mode). The exclusion is read only after the cheap checks, so it costs
+        nothing when a context is active. Otherwise, with ``STRICT_MODE`` off
+        it logs a ``context.denied`` audit record (reason ``no_context``) and
+        lets the query run; with it on, it logs the ``strict_mode`` record
+        and raises.
+
+        Args:
+            record: ``False`` skips only the ``no_context`` audit record, for
+                a caller whose SQL runs through another checked method on a
+                clone (``get()``, ``first()``, ``last()``, ``bulk_update()``),
+                which records it, so a call logs one record. The strict-mode
+                refusal and its ``strict_mode`` record are unchanged. A
+                queryset marked ``_rls_no_context_recorded`` (``delete()``,
+                whose inner evaluation runs on a clone of it) behaves as
+                ``record=False``.
 
         Raises:
             NoTenantContextError: If ``STRICT_MODE=True`` and neither a
                 context manager/middleware nor ``for_user()`` has
                 established an RLS context.
         """
-        if not rls_tenants_config.STRICT_MODE:
+        conf = rls_tenants_config
+        if not conf.STRICT_MODE and not conf.AUDIT_NO_CONTEXT_QUERIES:
             return
         if not _is_rls_protected(self.model):
             return  # not an RLS-protected model; skip guard
@@ -526,14 +579,24 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
             return  # for_user() was called
         if _is_strict_mode_excluded(self.model):
             return  # listed in STRICT_MODE_EXCLUDE; RLS still filters at the database
-        model_name = self.model.__name__
         label = self.model._meta.label  # noqa: SLF001
+        if self._rls_skip_strict:
+            if conf.STRICT_MODE:
+                logger.debug("RLS strict mode skipped for %s (rls_skip_strict()).", label)
+            return
+        if not conf.STRICT_MODE:
+            if record and not self._rls_no_context_recorded:
+                audit.denied("queryset", "no_context", model=label)
+            return
+        model_name = self.model.__name__
         audit.denied("queryset", "strict_mode", model=label)
         msg = f"RLS strict mode: query on {model_name} attempted without an active RLS context."
         hint = (
             f"{HINT_NO_CONTEXT} If {model_name} is meant to be read without a context, list "
-            f"{label!r} in RLS_TENANTS['STRICT_MODE_EXCLUDE']; to disable "
-            f"this guard for every model, set STRICT_MODE=False in RLS_TENANTS."
+            f"{label!r} in RLS_TENANTS['STRICT_MODE_EXCLUDE'], or call rls_skip_strict() on a "
+            f"single query that is meant to run without one (RLS still filters it at the "
+            f"database); to disable this guard for every model, set STRICT_MODE=False in "
+            f"RLS_TENANTS."
         )
         raise NoTenantContextError(msg, hint=hint)
 
@@ -694,6 +757,11 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
     # is intentional defense-in-depth: the direct check catches the call at
     # the public API boundary, while the _fetch_all() check catches any code
     # path that reaches evaluation without going through these overrides.
+    # Only one of the two checks writes the AUDIT_NO_CONTEXT_QUERIES record:
+    # get(), first(), last() and bulk_update() check with record=False (the
+    # clone's _fetch_all() or the inner update() records), and delete(), which
+    # may or may not evaluate a clone, records itself and marks the queryset
+    # so that clone does not. Strict mode raises at the first check either way.
 
     def count(self) -> int:
         """Run ``count()`` in the ``for_user()`` scope; guarded by strict mode.
@@ -745,8 +813,20 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         """
         self._refuse_on_shared_rows("delete")
         self._check_strict_mode()
-        with self._rls_scope(for_write=True, own_transaction=True):
-            return super().delete()
+        conf = rls_tenants_config
+        # Django's delete() evaluates a clone of this queryset unless it can
+        # fast-delete, and that evaluation checks again. When the check just
+        # logged a no_context record, mark this queryset (the clone copies the
+        # mark) so the call logs one; with both options off nothing is set.
+        mark = conf.AUDIT_NO_CONTEXT_QUERIES and not conf.STRICT_MODE
+        previous = self._rls_no_context_recorded
+        if mark:
+            self._rls_no_context_recorded = True
+        try:
+            with self._rls_scope(for_write=True, own_transaction=True):
+                return super().delete()
+        finally:
+            self._rls_no_context_recorded = previous
 
     # QuerySet.delete() is queryset_only, so a manager has no delete() that
     # empties the whole table. Overriding the method drops the flag; restore it.
@@ -877,7 +957,8 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         Refused on an ``including_shared()`` queryset.
         """
         self._refuse_on_shared_rows("bulk_update")
-        self._check_strict_mode()
+        # The inner update() of each batch records; an empty call runs no SQL.
+        self._check_strict_mode(record=False)
         with self._rls_scope(for_write=True, own_transaction=True):
             return super().bulk_update(objs, fields, batch_size=batch_size)
 
@@ -939,8 +1020,8 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
             return super().explain(format=format, **options)
 
     def get(self, *args: Any, **kwargs: Any) -> Any:
-        """Guard ``get()`` with strict mode check."""
-        self._check_strict_mode()
+        """Guard ``get()`` with strict mode check (the clone's fetch records)."""
+        self._check_strict_mode(record=False)
         return super().get(*args, **kwargs)
 
     def first(self) -> Any:
@@ -950,7 +1031,7 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
         other case queries a clone, which ``_fetch_all()`` checks.
         """
         if self._result_cache is None:
-            self._check_strict_mode()
+            self._check_strict_mode(record=False)
         return super().first()
 
     def last(self) -> Any:
@@ -958,7 +1039,7 @@ class TenantQuerySet(models.QuerySet):  # type: ignore[type-arg]
 
         It always queries: Django reverses the ordering on a fresh clone.
         """
-        self._check_strict_mode()
+        self._check_strict_mode(record=False)
         return super().last()
 
     def _fetch_all(self) -> None:
@@ -1259,6 +1340,10 @@ class RLSManager(models.Manager):  # type: ignore[type-arg]
     def for_user(self, as_user: TenantUser) -> TenantQuerySet:
         """Return a queryset scoped to the given user's tenant."""
         return self.get_queryset().for_user(as_user=as_user)
+
+    def rls_skip_strict(self) -> TenantQuerySet:
+        """Return a queryset the ``STRICT_MODE`` guard does not check."""
+        return self.get_queryset().rls_skip_strict()
 
     def including_shared(self) -> TenantQuerySet:
         """Return a queryset of the rows the RLS policies let the current tenant read.

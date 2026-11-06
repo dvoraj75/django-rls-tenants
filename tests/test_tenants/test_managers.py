@@ -1479,6 +1479,156 @@ class TestStrictModeExclude:
             assert _is_strict_mode_excluded(Order) is False
 
 
+class TestRlsSkipStrict:
+    """``rls_skip_strict()`` exempts one queryset from the strict mode check (#168)."""
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_skipped_queries_run_without_a_context_and_rls_hides_rows(
+        self, sample_orders, enforce_rls
+    ):
+        """The guard is skipped; the policy still fails closed at the database."""
+        qs = Order.objects.rls_skip_strict()
+        assert qs.count() == 0
+        assert list(qs) == []
+        assert qs.exists() is False
+        assert qs.first() is None
+        assert list(qs.iterator()) == []
+        assert qs.aggregate(total=Sum("amount"))["total"] is None
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_skipped_async_query_runs_without_a_context(self, sample_orders, enforce_rls):
+        """The async methods honour the flag too."""
+        assert async_to_sync(Order.objects.rls_skip_strict().acount)() == 0
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_queryset_method_marks_a_queryset(self, sample_orders, enforce_rls):
+        """``Order.objects.all().rls_skip_strict()`` works like the manager's."""
+        assert list(Order.objects.all().rls_skip_strict()) == []
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_query_without_the_flag_still_raises(self, sample_orders, enforce_rls):
+        """The skip is per queryset: the next query from the manager is guarded."""
+        Order.objects.rls_skip_strict().count()
+        with pytest.raises(NoTenantContextError, match="strict mode"):
+            Order.objects.count()
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_marking_does_not_mutate_the_original(self, sample_orders):
+        """``rls_skip_strict()`` returns a new queryset and leaves the receiver guarded."""
+        original = Order.objects.all()
+        marked = original.rls_skip_strict()
+        assert marked is not original
+        assert marked._rls_skip_strict is True
+        assert original._rls_skip_strict is False
+        with pytest.raises(NoTenantContextError, match="strict mode"):
+            list(original)
+
+    def test_manager_returns_a_flagged_tenant_queryset(self):
+        """``RLSManager.rls_skip_strict()`` gives a ``TenantQuerySet`` with the flag."""
+        qs = Order.objects.rls_skip_strict()
+        assert isinstance(qs, TenantQuerySet)
+        assert qs._rls_skip_strict is True
+        assert Order.objects.all()._rls_skip_strict is False
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_flag_survives_chained_clones(self, sample_orders, enforce_rls):
+        """Every chained method keeps the flag."""
+        qs = Order.objects.rls_skip_strict().filter(amount__gt=0).exclude(product="x")
+        qs = qs.order_by("pk").select_related("tenant").distinct()[:5]
+        assert qs._rls_skip_strict is True
+        assert list(qs) == []
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_proxy_honours_the_flag(self, sample_orders, enforce_rls):
+        """A proxy of a protected model can be skipped too."""
+        assert OrderProxy.objects.rls_skip_strict().count() == 0
+
+    @pytest.mark.usefixtures("_strict_mode")
+    @pytest.mark.parametrize("op", ["__and__", "__or__", "__xor__"])
+    @pytest.mark.parametrize("flagged", ["left", "right"])
+    def test_combination_carries_the_flag(self, op, flagged, sample_orders, enforce_rls):
+        """``&``, ``|`` and ``^`` keep the flag whichever operand has it."""
+        flag = Order.objects.rls_skip_strict().filter(amount__gt=0)
+        plain = Order.objects.filter(amount__gt=0)
+        left, right = (flag, plain) if flagged == "left" else (plain, flag)
+        combined = getattr(left, op)(right)
+        assert combined._rls_skip_strict is True
+        assert list(combined) == []
+        assert plain._rls_skip_strict is False
+
+    @pytest.mark.usefixtures("_strict_mode")
+    @pytest.mark.parametrize("op", ["__and__", "__or__", "__xor__"])
+    def test_combination_with_none_left_flags_a_clone(self, op, sample_orders, enforce_rls):
+        """``none() <op> flagged``: the flag goes on a clone, not on the caller's none()."""
+        empty = Order.objects.none()
+        flag = Order.objects.rls_skip_strict()
+        combined = getattr(empty, op)(flag)
+        assert combined._rls_skip_strict is True
+        assert combined is not empty
+        assert empty._rls_skip_strict is False
+        assert list(combined) == []
+
+    @pytest.mark.usefixtures("_strict_mode")
+    @pytest.mark.parametrize("op", ["__and__", "__or__", "__xor__"])
+    def test_combination_with_none_right_does_not_mutate_operands(
+        self, op, sample_orders, enforce_rls
+    ):
+        """``flagged <op> none()``: the result is flagged, neither operand changes.
+
+        For ``&`` Django hands back the ``none()`` operand itself, for ``|``
+        and ``^`` the flagged one: the flag goes on a clone either way.
+        """
+        flag = Order.objects.rls_skip_strict()
+        empty = Order.objects.none()
+        combined = getattr(flag, op)(empty)
+        assert empty._rls_skip_strict is False
+        assert flag._rls_skip_strict is True
+        assert combined is not empty
+        assert combined._rls_skip_strict is True
+        assert list(combined) == []
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_unflagged_combination_is_guarded(self, sample_orders):
+        """Combining two plain querysets gives a guarded one."""
+        combined = Order.objects.all() | Order.objects.filter(amount__gt=0)
+        assert combined._rls_skip_strict is False
+        with pytest.raises(NoTenantContextError, match="strict mode"):
+            list(combined)
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_flag_changes_nothing_inside_a_context(self, sample_orders, tenant_a):
+        """In a context the results are the tenant-scoped ones, flag or not."""
+        with tenant_context(tenant_a.pk):
+            plain = sorted(Order.objects.values_list("pk", flat=True))
+            skipped = sorted(Order.objects.rls_skip_strict().values_list("pk", flat=True))
+        assert skipped == plain
+        assert len(skipped) == 2
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_flag_changes_nothing_inside_admin_context(self, sample_orders):
+        """In an admin context the flagged query sees every row."""
+        with admin_context():
+            assert Order.objects.rls_skip_strict().count() == 3
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_for_user_with_the_flag_returns_the_users_rows(
+        self, sample_orders, tenant_a_user, enforce_rls
+    ):
+        """``for_user()`` sets its own context, so the flag raises nothing and scopes nothing."""
+        qs = Order.objects.rls_skip_strict().for_user(tenant_a_user)
+        assert sorted(o.product for o in qs) == ["Widget A1", "Widget A2"]
+
+    @pytest.mark.usefixtures("_strict_mode")
+    def test_error_hint_names_both_ways_out(self, sample_orders):
+        """The hint of a refused query mentions ``STRICT_MODE_EXCLUDE`` and the method."""
+        with pytest.raises(NoTenantContextError) as exc_info:
+            list(Order.objects.all())
+        hint = exc_info.value.hint
+        assert hint is not None
+        assert "STRICT_MODE_EXCLUDE" in hint
+        assert "rls_skip_strict()" in hint
+
+
 class TestStrictModeContextVarLifecycle:
     """Tests that _rls_context_active is properly set and restored."""
 

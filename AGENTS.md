@@ -615,9 +615,24 @@ model (a proxy follows its concrete model, not the other way round) with the lab
 normalized like `apps.get_model()` (app label as given, model name lower-cased) by
 `_strict_mode_excluded_labels()`, an `lru_cache` keyed on the label tuple. The auto-scope
 filter, `for_user()`, the context managers and the RLS policies are unchanged, so an
-excluded model with no context still fails closed at the database. It is not the per-query
-`rls_skip_strict()` of the roadmap. Models without an `RLSConstraint` are never guarded
+excluded model with no context still fails closed at the database. Its per-query
+counterpart is `rls_skip_strict()` (below). Models without an `RLSConstraint` are never guarded
 and need no entry.
+
+`TenantQuerySet.rls_skip_strict()` / `RLSManager.rls_skip_strict()` (#168) skips the check for
+one queryset: a private `_rls_skip_strict` flag, copied by `_clone()` and by `_combined()` (also
+when a side is `none()`) exactly like `_rls_including_shared`. Python-side only, not an admin
+bypass: same as `STRICT_MODE_EXCLUDE`, the auto-scope filter, `for_user()`, the context
+managers and the policies are unchanged. Querysets Django builds itself are not covered. No
+audit event; a `DEBUG` line on `django_rls_tenants` (`RLS strict mode skipped for
+<app_label.Model> (rls_skip_strict()).`, only with `STRICT_MODE` on). The
+`NoTenantContextError` hint names both escape hatches.
+
+`RLS_TENANTS["AUDIT_NO_CONTEXT_QUERIES"]` (#178, bool, default `False`, `RLSConfigurationError`
+otherwise) is the non-strict twin. Order inside `_check_strict_mode()`: both `STRICT_MODE` and
+the setting off -> return at once; not protected / context active / `for_user()` /
+`STRICT_MODE_EXCLUDE` / `rls_skip_strict()` -> return with no record; non-strict -> record
+`no_context` and return; strict -> refuse (`strict_mode` record + `NoTenantContextError`).
 
 ### Audit Logging
 
@@ -668,6 +683,14 @@ Rules:
   `_audited_target_tenants()`: in a savepoint (`_target_tenants(savepoint=True)`), and a
   failure only loses the record, so they never change the errors.
   `gucs.cleared` is logged by the safety net after its clear ran without raising.
+- `AUDIT_NO_CONTEXT_QUERIES` (#178) adds `context.denied` with source `queryset`, reason
+  `no_context` and `rls_model` from `_check_strict_mode()` (see Strict Mode), only with
+  `STRICT_MODE=False`; the query still runs. One record per call: `get()`, `first()`,
+  `last()` and `bulk_update()` check with `record=False` (the clone's `_fetch_all()` or the
+  inner `update()` records; `bulk_update()` once per batch), and `delete()` marks the
+  queryset `_rls_no_context_recorded` for the call so the collector's evaluation of its
+  clone does not record again (so a `pre_delete` receiver that queries `origin` during the
+  call logs nothing either: the cost of keeping `origin` the caller's queryset).
 
 The existing `DEBUG` messages on `django_rls_tenants` are separate and pinned by
 `tests/test_debug_logging.py`. Tests: `tests/test_tenants/test_audit.py`, plus the

@@ -10,12 +10,13 @@ import logging
 from unittest.mock import MagicMock
 
 import pytest
+from django.test import override_settings
 
 from django_rls_tenants.rls.constraints import RLSM2MConstraint
 from django_rls_tenants.tenants.context import admin_context, tenant_context
 from django_rls_tenants.tenants.middleware import RLSTenantMiddleware
 from django_rls_tenants.tenants.models import register_m2m_rls
-from tests.test_app.models import Project
+from tests.test_app.models import Order, Project
 
 pytestmark = pytest.mark.django_db
 
@@ -245,3 +246,53 @@ class TestRegisterM2MRLSDebugLogging:
         # auto-created ones that were already registered at startup.
         all_skip_messages = [m for m in caplog.messages if "register_m2m_rls: skipping" in m]
         assert len(all_skip_messages) > 0
+
+
+class TestRlsSkipStrictDebugLogging:
+    """Verify the DEBUG message of ``rls_skip_strict()`` (#168)."""
+
+    @staticmethod
+    def _settings(*, strict):
+        return override_settings(
+            RLS_TENANTS={
+                "TENANT_MODEL": "test_app.Tenant",
+                "STRICT_MODE": strict,
+                "AUDIT_NO_CONTEXT_QUERIES": True,
+            },
+        )
+
+    def test_logs_the_skip_under_strict_mode(self, caplog):
+        """A skipped query under STRICT_MODE logs the model's label at DEBUG."""
+        with self._settings(strict=True), caplog.at_level(logging.DEBUG, logger=LOGGER_NAME):
+            Order.objects.rls_skip_strict().count()
+
+        skipped = [r for r in caplog.records if "strict mode skipped" in r.getMessage()]
+        assert [(r.name, r.levelno) for r in skipped] == [(LOGGER_NAME, logging.DEBUG)]
+        assert skipped[0].getMessage() == (
+            "RLS strict mode skipped for test_app.Order (rls_skip_strict())."
+        )
+
+    def test_no_output_at_info_level(self, caplog):
+        """The skip message is DEBUG only."""
+        with self._settings(strict=True), caplog.at_level(logging.INFO, logger=LOGGER_NAME):
+            Order.objects.rls_skip_strict().count()
+
+        assert not [m for m in caplog.messages if "strict mode skipped" in m]
+
+    def test_no_output_without_strict_mode(self, caplog):
+        """Strict mode off: nothing would have been refused, so nothing is logged."""
+        with self._settings(strict=False), caplog.at_level(logging.DEBUG, logger=LOGGER_NAME):
+            Order.objects.rls_skip_strict().count()
+
+        assert not [m for m in caplog.messages if "strict mode skipped" in m]
+
+    def test_no_output_inside_a_context(self, tenant_a, caplog):
+        """A skipped query in a context was not going to be refused: no message."""
+        with (
+            self._settings(strict=True),
+            caplog.at_level(logging.DEBUG, logger=LOGGER_NAME),
+            tenant_context(tenant_a.pk),
+        ):
+            Order.objects.rls_skip_strict().count()
+
+        assert not [m for m in caplog.messages if "strict mode skipped" in m]

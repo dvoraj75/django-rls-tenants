@@ -163,6 +163,32 @@ class TestRLSTenantsConfig:
             with pytest.raises(RLSConfigurationError, match=r"must be a list of model labels"):
                 _ = conf.STRICT_MODE_EXCLUDE
 
+    def test_audit_no_context_queries_default(self):
+        """AUDIT_NO_CONTEXT_QUERIES defaults to False."""
+        with override_settings(RLS_TENANTS={"TENANT_MODEL": "x.Y"}):
+            conf = RLSTenantsConfig()
+            assert conf.AUDIT_NO_CONTEXT_QUERIES is False
+
+    def test_audit_no_context_queries_true(self):
+        """AUDIT_NO_CONTEXT_QUERIES reads True from settings, and is a known key."""
+        with override_settings(
+            RLS_TENANTS={"TENANT_MODEL": "x.Y", "AUDIT_NO_CONTEXT_QUERIES": True}
+        ):
+            conf = RLSTenantsConfig()
+            with w.catch_warnings():
+                w.simplefilter("error")  # a known key: no unknown-key warning
+                assert conf.AUDIT_NO_CONTEXT_QUERIES is True
+
+    @pytest.mark.parametrize("value", [None, 1, 0, "true", "yes", [True]])
+    def test_audit_no_context_queries_rejects_non_bool(self, value):
+        """Anything but True or False raises RLSConfigurationError."""
+        with override_settings(
+            RLS_TENANTS={"TENANT_MODEL": "x.Y", "AUDIT_NO_CONTEXT_QUERIES": value}
+        ):
+            conf = RLSTenantsConfig()
+            with pytest.raises(RLSConfigurationError, match="must be True or False"):
+                _ = conf.AUDIT_NO_CONTEXT_QUERIES
+
     def test_external_models_default(self):
         """EXTERNAL_MODELS defaults to an empty dict."""
         with override_settings(RLS_TENANTS={"TENANT_MODEL": "x.Y"}):

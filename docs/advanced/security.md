@@ -572,6 +572,15 @@ the exclusion only turns the loud failure back into a silent one for that model.
 applies to every query on the model, not to one call. System check `W015` reports entries
 that name no installed RLS-protected model.
 
+For one query, `Model.objects.rls_skip_strict()` skips the guard for that queryset
+instead of the whole model. It is equally Python-side only: the policies, the auto-scope
+filter and `for_user()` are unchanged, so with no context the query still fails closed.
+
+With `STRICT_MODE=False`, `AUDIT_NO_CONTEXT_QUERIES=True` logs a `context.denied` record
+(source `queryset`, reason `no_context`) for each query on a protected model that runs
+with no context, so a code path that lost its context can be alerted on. See
+[Audit Logging](../guides/audit-logging.md).
+
 See [Configuration](../getting-started/configuration.md#strict_mode) for setup, and
 [`STRICT_MODE_EXCLUDE`](../getting-started/configuration.md#strict_mode_exclude).
 
