@@ -122,8 +122,15 @@ context is entered, so it runs outside it. The API covers every router mounted o
 Both `def` and `async def` operations are supported. An `async def` operation gets
 `async_admin_context()` / `async_tenant_context()`, entered in the request's
 coroutine; the user lookup and the session read run in one thread-sensitive
-`sync_to_async` hop. Under ASGI, Ninja runs a `def` operation in a thread, and the API
-enters the synchronous context there.
+`sync_to_async` hop. Under ASGI, Ninja runs a whole `def` operation (authentication,
+view, serialization) in one thread-sensitive `sync_to_async` hop, and the API enters
+the synchronous context there.
+
+An `async def` operation cannot return an unevaluated queryset: Ninja serializes the
+result in the event loop, where Django raises `SynchronousOnlyOperation` when the
+queryset is evaluated. Evaluate it in the operation (`[obj async for obj in qs]`);
+the serialization of the returned objects (schema resolvers included) still runs
+inside the context.
 
 ### The user
 
