@@ -569,6 +569,9 @@ The assertion functions work under strict mode. `assert_rls_enabled()` and
 `assert_rls_blocks_without_context()` counts rows with raw SQL, which the `STRICT_MODE`
 check does not cover. You do not have to turn `STRICT_MODE` off to use these helpers.
 
+For a query that intentionally runs without a context, `Order.objects.rls_skip_strict()`
+skips the guard for that queryset (the database still fails closed).
+
 To explicitly test that strict mode raises, use `pytest.raises`:
 
 ```python
