@@ -22,7 +22,11 @@ from django.utils.module_loading import import_string
 
 from django_rls_tenants.exceptions import NoTenantContextError, RLSConfigurationError
 from django_rls_tenants.tenants import audit
-from django_rls_tenants.tenants.affinity import suspect_sessions, write_gucs
+from django_rls_tenants.tenants.affinity import (
+    clear_session_writes,
+    suspect_sessions,
+    write_gucs,
+)
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.context import _context_gucs_of, _resolve_user_guc_vars
 from django_rls_tenants.tenants.selection import (
@@ -300,17 +304,23 @@ def _clear_gucs_on_open_databases(conf: RLSTenantsConfig) -> None:
 def _clear_request_gucs(conf: RLSTenantsConfig) -> None:
     """Clear both GUCs on every configured alias at the end of a request.
 
-    With ``USE_LOCAL_SET=True`` no statement runs: transaction-local values
-    end with their transactions (the request's own, on the synchronous path),
-    and what the sessions hold for themselves only counts as unknown from now
-    on (``affinity.suspect_sessions()``), since the view may have written the
-    GUCs for the session.
+    With ``USE_LOCAL_SET=True`` transaction-local values end with their
+    transactions (the request's own, on the synchronous path), and what the
+    sessions hold for themselves counts as unknown from now on
+    (``affinity.suspect_sessions()``), since the view may have written the
+    GUCs for the session. A session the GUC affinity guard saw written that
+    way is cleared now, one statement per such alias (in the request's
+    transaction on the synchronous path, so at its commit;
+    ``affinity.clear_session_writes()``, #173); for the others no statement
+    runs, and the guard clears them before their next statement.
 
     Args:
         conf: ``RLSTenantsConfig`` instance.
     """
     if conf.USE_LOCAL_SET:
+        # Suspect first: after the clear, it would leave the clear's values unknown.
         suspect_sessions()
+        clear_session_writes()
         return
     for db_alias in conf.DATABASES:
         _clear_alias_gucs(db_alias)

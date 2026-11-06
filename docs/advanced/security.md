@@ -363,7 +363,25 @@ Mitigations:
   after a statement run under a context's values, the sessions' own values count as
   unknown, and the next statement run outside any context, in autocommit or in a
   transaction, clears them first, so such a value does not outlive the context on a
-  persistent or pooled connection. Inside a context in autocommit, the guard's values
+  persistent or pooled connection. Since 1.7.0 (#173) the guard also flags a session when a
+  statement it sees writes a policy GUC at session level (`SET [SESSION]`, comments in it
+  or not, a `set_config()` call, `set_guc()` included, or a `DO` block spelling both; a
+  compound statement that fails counts too, since it can commit such a write before it
+  fails), and a context's exit (a block, a `for_user()` call, a request, the
+  `request_finished` safety net) clears the admin and tenant GUCs of a flagged session at
+  once, with one statement per flagged alias (at the commit in a transaction; a failed
+  transaction is skipped). A session never seen written gets no statement. A write the
+  guard cannot see stays until that lazy clear: one inside a function or procedure (`CALL`,
+  a function a statement calls) or inside a `DO` block that does not spell `set_config` and
+  the name in its text, one through a raw driver cursor, `callproc()` or the driver's
+  `copy` methods, a name passed in a way the guard does not read (from a table column,
+  built inside a computed string), or a statement it cannot read. A write on another
+  thread's connection stays too, such as `set_guc()` run in a `sync_to_async()` hop with
+  `thread_sensitive=False` inside a block: the exit clears only the exiting thread's
+  connections, and the worker thread's session keeps the write until its next statement run
+  outside a context. Only the admin and tenant GUCs are cleared: a bypass flag or another
+  policy GUC written for the session stays set, so never write the policy GUCs for the
+  session from application code. Inside a context in autocommit, the guard's values
   override such a write, so it cannot narrow the context. An external pooler such as
   PgBouncer in transaction mode still needs this mode: with session GUCs the handler and
   the guard do not see that pooler hand the server connection to another client. Nor does

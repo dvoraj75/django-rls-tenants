@@ -27,6 +27,7 @@ from django_rls_tenants.tenants.middleware import RLSTenantMiddleware, _mark_guc
 from django_rls_tenants.tenants.state import _current_live
 from tests import admin_urls
 from tests.rls_views import _database_products
+from tests.session_gucs import session_gucs
 from tests.test_app.models import AdminUser
 
 pytestmark = [
@@ -511,3 +512,15 @@ class TestTransactionLocalMode:
 
         assert result[1:] == ((str(tenant_b.pk), "false", None), ["Gadget B1"])
         assert after == (result[0], (None, None, None))
+
+
+def test_a_session_write_in_a_block_is_cleared_at_its_exit_on_a_pooled_alias(
+    pooled,
+    tenant_a,
+):
+    """With ``USE_LOCAL_SET=True`` the exit clears what the block wrote for the session (#173)."""
+    with _rls_on(pooled, use_local_set=True), tenant_context(tenant_a.pk):
+        connections[pooled].ensure_connection()
+        set_guc("rls.current_tenant", "4242", using=pooled)
+        assert session_gucs(pooled) == ("4242", None)
+    assert session_gucs(pooled) == (None, None)

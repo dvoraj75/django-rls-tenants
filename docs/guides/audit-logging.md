@@ -113,7 +113,7 @@ And, depending on the event:
 | `rls_selected` | `context.denied` (`tenant_not_selectable`, `cross_site_selection`) | The raw value the client sent as the tenant selection, cut to its first 64 characters (followed by `...`) when longer. A string with whitespace, `=` or a non-printable character is quoted in the message. |
 | `rls_via` | `context.denied` (`tenant_not_selectable`, `cross_site_selection`) | Where the selection came from: `header`, `session`, `query` (the admin switcher's query parameter) or `switch` (a `switch_tenant()` call). |
 | `rls_previous` | `tenant.switched` | The selection the session held before (a string), `None` if it held none. |
-| `rls_databases` | `gucs.cleared` | The aliases the safety net covered (`RLS_TENANTS["DATABASES"]`). It skips a closed connection, and with `USE_LOCAL_SET=True` it writes nothing: it marks the sessions for the GUC affinity guard, which clears them before their next statement. |
+| `rls_databases` | `gucs.cleared` | The aliases the safety net covered (`RLS_TENANTS["DATABASES"]`). It skips a closed connection, and with `USE_LOCAL_SET=True` it marks the sessions for the GUC affinity guard, which clears them before their next statement; a session the guard saw written at session level gets one clearing statement at once. |
 
 The user is identified by primary key only. No username, email address or other personal
 data is logged, so the trail stays pseudonymous; resolve a primary key in a system with
