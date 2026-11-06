@@ -154,7 +154,8 @@ The library has two internal layers with a strict import boundary:
   (called before anything is set, so a refusal is a plain 403; a member with no tenant gets no
   context, like an anonymous request, and `_resolve_user_guc_vars(..., tenant_id=)` /
   `_scope_tenant_id()` take the resolved tenant), `RLSTenantAPIViewMixin.get_rls_context()`
-  (turns `PermissionDenied` into DRF's) and `RLSTenantModelAdmin._effective_tenant_id()`. The
+  (turns `PermissionDenied` into DRF's), `RLSTenantNinjaAPI.get_rls_context()` (into an
+  `HttpError(403)`) and `RLSTenantModelAdmin._effective_tenant_id()`. The
   admin switcher for a member (`_user_can_switch_tenant()`: `_other_tenants()` non-empty and
   `TENANT_SESSION_KEY` set) calls `_switch()` / `_clear()` with `source="admin"` and writes the
   site's session key, not `rls_session_key` (a tenant admin's), only for a same-origin
@@ -190,10 +191,11 @@ The library has two internal layers with a strict import boundary:
 
 This boundary is enforced by `tests/test_layering.py`. Never import from `tenants/` in `rls/`.
 
-**`django_rls_tenants/contrib/`** — Integrations behind pip extras: `celery.py`
-(`celery`) and `drf.py` (`drf`, `RLSTenantAPIViewMixin`, `RLSTenantPermission`,
-`RLSTenantSerializerMixin` / `RLSTenantModelSerializer`, `CurrentTenantDefault`). Never
-imported by `rls/`, `tenants/` or the package root, and not re-exported top-level
+**`django_rls_tenants/contrib/`** — Integrations behind pip extras (`celery`, `drf`,
+`ninja`): `celery.py` and `drf.py` (`drf`, `RLSTenantAPIViewMixin`, `RLSTenantPermission`,
+`RLSTenantSerializerMixin` / `RLSTenantModelSerializer`, `CurrentTenantDefault`) and
+`ninja.py` (`ninja`, #167: `RLSTenantNinjaAPI`, `RLSTenantGuard`, `RLSTenantModelSchema`,
+`rls_save()` / `arls_save()`). Never imported by `rls/`, `tenants/` or the package root, and not re-exported top-level
 (`tests/test_layering.py::test_core_layers_never_import_the_optional_integrations`).
 `drf.py` must not import `rest_framework.views` at module level: `RLSTenantPermission`
 can be listed in `DEFAULT_PERMISSION_CLASSES`, which DRF imports while it builds
@@ -208,6 +210,38 @@ current one and is not `ADMIN_GUCS` (#150: a tenant the user selected, which the
 validates), else only in `tenant_context(user.rls_tenant_id)` or, for a `MultiTenantUser`, in
 a tenant context `_may_select()` accepts (#47); the admin bypass always needs
 `is_tenant_admin`.
+
+`ninja.py` (#167) imports Ninja at module level (no Ninja setting is imported while its
+modules load, unlike DRF's). Ninja has no hook between authentication and the operation
+except decorators, so `RLSTenantNinjaAPI.__init__` registers, in order, `rls_guard` and
+`_rls_enter` with `add_decorator(mode="operation")` (wraps the view function; enters the
+context on the `ExitStack` / `AsyncExitStack` kept in a per-request `_RequestState`) and
+`_rls_own_exit` with `mode="view"` (wraps `run()`, owns the exit and `Vary`). Ninja's
+docstring has the two mode names inverted; the code relies on the observed behaviour,
+pinned by tests. Input parsing runs before the context. A generator view (streaming) gets
+no context (consumed after `run()` returns), also behind a `functools.wraps` decorator
+(`_is_streaming()` looks at `inspect.unwrap()`: the guard makes a `def` generator view a
+plain function); decorators added later wrap the library's. An `async def` view's returned
+queryset (also in `Status` / a `(status, body)` tuple) is evaluated in the context by
+`_evaluated()` (async iteration fills its result cache), since Ninja serializes it in the
+event loop (a `Manager`, a `RawQuerySet` or a nested queryset is not: a 500).
+`get_rls_context()` / `aget_rls_context()` (override both) and `get_rls_user()`
+are the override points; the default user (`_default_rls_user()`, the guard's too) is
+`request.auth` if a `TenantUser`, `None` for any other truthy `request.auth` (fail-closed:
+never the session's user once an `auth=` callback authenticated, a CSRF vector), and
+`request.user` only when none did. When `request.auth` is truthy and `get_rls_user()`
+names no authenticated user, the defaults return the no-context block (`_NO_CONTEXT`:
+`context._no_rls_state()`, or `_async_no_rls_state()`, which repeats
+`_settle_after_no_context()` in a thread-sensitive hop after the `ContextVar` reset, as
+`@with_rls_context`'s async wrapper does), so the operation never runs in an enclosing
+context (`RLSTenantMiddleware`'s for the session cookie); it logs no audit record. The
+enter methods resolve `_RequestState.user` before an override's `None` returns, so the
+guard reads the overridden `get_rls_user()`.
+`RLSTenantGuard` applies the #150 rule with `_RequestState.entered`. Every
+`RLSTenantModelSchema` subclass, built or not, refuses a field named or aliased like the
+tenant field (`RLSConfigurationError`). `rls_save()` reuses
+`_checked_foreign_keys()` / `_foreign_keys_of_other_tenants()` (#107): the same 422 for a
+missing and another tenant's target. Audit `source="ninja"`.
 
 ### M2M RLS Support
 

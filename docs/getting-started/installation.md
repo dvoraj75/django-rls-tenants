@@ -127,6 +127,32 @@ Without the extra the core library is unaffected; importing
 `django_rls_tenants.contrib.drf` without Django REST Framework installed raises a
 clear `ImportError`. See the [Django REST Framework guide](../guides/drf.md).
 
+### Django Ninja
+
+Native Django Ninja integration (`RLSTenantNinjaAPI`, `RLSTenantGuard`,
+`RLSTenantModelSchema`) ships behind the `ninja` extra (`django-ninja>=1.5`):
+
+=== "pip"
+
+    ```bash
+    pip install "django-rls-tenants[ninja]"
+    ```
+
+=== "uv"
+
+    ```bash
+    uv add "django-rls-tenants[ninja]"
+    ```
+
+=== "poetry"
+
+    ```bash
+    poetry add "django-rls-tenants[ninja]"
+    ```
+
+Importing `django_rls_tenants.contrib.ninja` without Django Ninja installed raises a
+clear `ImportError`. See the [Django Ninja guide](../guides/ninja.md).
+
 ## Add to INSTALLED_APPS
 
 ```python title="settings.py"

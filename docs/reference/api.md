@@ -337,3 +337,20 @@ for usage, the settings to add, and why there is no authentication class.
 ::: django_rls_tenants.contrib.drf.RLSTenantModelSerializer
 
 ::: django_rls_tenants.contrib.drf.CurrentTenantDefault
+
+### Django Ninja
+
+Native Django Ninja integration. Requires the `ninja` extra
+(`pip install django-rls-tenants[ninja]`); import from
+`django_rls_tenants.contrib.ninja`. See the [Django Ninja guide](../guides/ninja.md)
+for usage and limitations.
+
+::: django_rls_tenants.contrib.ninja.RLSTenantNinjaAPI
+
+::: django_rls_tenants.contrib.ninja.RLSTenantGuard
+
+::: django_rls_tenants.contrib.ninja.RLSTenantModelSchema
+
+::: django_rls_tenants.contrib.ninja.rls_save
+
+::: django_rls_tenants.contrib.ninja.arls_save

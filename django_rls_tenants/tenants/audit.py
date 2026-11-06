@@ -57,6 +57,7 @@ Source = Literal[
     "drf",
     "for_user",
     "middleware",
+    "ninja",
     "queryset",
     "safety_net",
     "selection",

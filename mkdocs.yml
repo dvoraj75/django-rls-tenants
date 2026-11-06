@@ -90,6 +90,7 @@ nav:
       - Raw SQL: guides/raw-sql.md
       - Celery Tasks: guides/celery-tasks.md
       - Django REST Framework: guides/drf.md
+      - Django Ninja: guides/ninja.md
       - Admin: guides/admin.md
       - Audit Logging: guides/audit-logging.md
       - Bypass Mode: guides/bypass-mode.md

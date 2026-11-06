@@ -62,6 +62,12 @@ celery = [
 drf = [
     "djangorestframework>=3.16",
 ]
+# Django Ninja integration (contrib.ninja): RLSTenantNinjaAPI, the guard and the
+# schema helpers. Optional -- the core library never imports ninja. 1.5 is the
+# first release with Router.add_decorator().
+ninja = [
+    "django-ninja>=1.5",
+]
 
 # pytest plugin (django_rls_tenants.pytest_plugin): the enforce_rls fixtures.
 # Loaded in every pytest run with the package installed; -p no:django_rls_tenants
@@ -89,6 +95,8 @@ dev = [
     # plugin boots Django with tests/settings.py, whose INSTALLED_APPS lists DRF.
     "djangorestframework-stubs>=3.16",
     "djangorestframework>=3.16",
+    # Types for contrib.ninja (django-ninja ships py.typed).
+    "django-ninja>=1.5",
     "psycopg2-binary>=2.9",
     # mypy type-checks django_rls_tenants.pytest_plugin, which imports pytest.
     "pytest>=8.0",
@@ -101,6 +109,7 @@ test = [
     "psycopg2-binary>=2.9",
     "celery>=5.3",
     "djangorestframework>=3.16",
+    "django-ninja>=1.5",
     # tests/test_support_matrix.py parses the CI workflows.
     "pyyaml>=6.0",
 ]
@@ -108,9 +117,11 @@ docs = [
     "mkdocs>=1.6",
     "mkdocs-material>=9.5",
     "mkdocstrings[python]>=0.27",
-    # mkdocstrings imports contrib.celery and contrib.drf to render their API reference.
+    # mkdocstrings imports contrib.celery, contrib.drf and contrib.ninja to render their
+    # API reference.
     "celery>=5.3",
     "djangorestframework>=3.16",
+    "django-ninja>=1.5",
 ]
 
 # ---------------------------------------------------------------------------

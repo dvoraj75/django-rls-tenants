@@ -41,11 +41,11 @@ def test_rls_has_no_tenant_imports():
 def test_core_layers_never_import_the_optional_integrations():
     """``rls/``, ``tenants/`` and the package root import neither the extras nor ``contrib/``.
 
-    Celery and Django REST Framework are optional extras: a project without them
+    Celery, Django REST Framework and Django Ninja are optional extras: a project without them
     must be able to import the whole core library.
     """
     package_dir = Path(__file__).resolve().parent.parent / "django_rls_tenants"
-    forbidden = ("celery", "rest_framework", "django_rls_tenants.contrib")
+    forbidden = ("celery", "rest_framework", "ninja", "django_rls_tenants.contrib")
     violations = []
 
     for py_file in sorted(package_dir.rglob("*.py")):

@@ -10,9 +10,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml README.md /lib/
 COPY django_rls_tenants/ /lib/django_rls_tenants/
 # "[celery]" pulls in Celery for the @rls_task demo (notes/tasks.py), "[drf]"
-# Django REST Framework for the API (notes/api.py).
+# Django REST Framework for the API (notes/api.py), "[ninja]" Django Ninja for
+# the second API (notes/ninja_api.py).
 # The Django series matches the locked Django that generated the committed migrations.
-RUN pip install --no-cache-dir "/lib/[celery,drf]" psycopg2-binary "django>=6.1,<6.2" \
+RUN pip install --no-cache-dir "/lib/[celery,drf,ninja]" psycopg2-binary "django>=6.1,<6.2" \
     pytest pytest-django
 
 # Copy the example project
