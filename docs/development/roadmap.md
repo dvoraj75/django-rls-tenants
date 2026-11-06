@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: 2026-10-22
+> Last updated: 2026-11-11
 >
 > Priorities may shift based on community feedback.
 > Have a suggestion? [Open an issue](https://github.com/dvoraj75/django-rls-tenants/issues).
@@ -505,6 +505,43 @@ item are in the [changelog](changelog.md).
 
 ---
 
+## v1.7.0 — Django Ninja & Strict-Mode Tooling
+
+A second API framework on the same contract as DRF, and the per-query and observability
+pieces strict mode was missing. See [1.7.0](changelog.md#170-2026-11-11).
+
+- [x] **Django Ninja integration** (#167, `contrib/ninja.py`, extra `ninja`) —
+  `RLSTenantNinjaAPI` enters the tenant context after Ninja's `auth=` and throttling and
+  keeps it through serialization and error rendering, for sync and `async def`
+  operations; `RLSTenantGuard`, `RLSTenantModelSchema` and `rls_save()` / `arls_save()`
+  match `RLSTenantPermission` and the DRF serializer mixin (cross-tenant foreign keys get
+  the same 422 as a missing row).
+  *Why:* Ninja authenticates inside the operation, so a token client reached the library
+  as an anonymous request; it is the API framework async deployments pick.
+
+- [x] **Per-query strict mode override** (#168) — `Model.objects.rls_skip_strict()` for a
+  one-off query that intentionally runs without a context. Python-side only: the database
+  still fails closed.
+  *Why:* Complements the per-model exclude list (v1.5.0); such queries were wrapped in an
+  `admin_context()` they did not need.
+
+- [x] **No-context audit record** (#178) — opt-in `RLS_TENANTS["AUDIT_NO_CONTEXT_QUERIES"]`:
+  with `STRICT_MODE=False`, a query on a protected model with no context logs
+  `context.denied` (reason `no_context`, source `queryset`) and still runs.
+  *Why:* In production a code path that lost its context answered with an empty result
+  and nothing to alert on.
+
+- [x] **Local-mode session writes cleared at exit** (#173) — with `USE_LOCAL_SET=True`, a
+  session-level write of the admin or tenant GUC the guard saw inside a block is cleared
+  when the block, the `for_user()` call or the request exits; sessions with no such write
+  get no extra statement. Follow-up: #181 (a transaction on another alias still failed at
+  the enclosing exit).
+  *Why:* `USE_LOCAL_SET=True` is the mode for PgBouncer transaction pooling; an admin
+  bypass left on a session there should not depend on application code never calling
+  `set_guc()`.
+
+---
+
 ## v2.0.0 — Advanced Features
 
 Architectural changes that may require migration effort.
@@ -528,12 +565,6 @@ Architectural changes that may require migration effort.
   *Why:* The current binary admin/non-admin split is insufficient for
   applications with fine-grained access control needs.
 
-- [ ] **Per-query strict mode override** —
-  `Model.objects.rls_skip_strict().all()` for one-off queries that
-  intentionally operate without tenant context.
-  *Why:* Complements the per-model exclude list (v1.5.0) with a per-query
-  escape hatch for ad-hoc operations.
-
 - [ ] **Explicit through model helpers** — Templates and mixins for creating
   manually defined M2M through tables that are RLS-protected.
   *Why:* `register_m2m_rls()` only handles auto-generated through tables;
@@ -546,7 +577,6 @@ Architectural changes that may require migration effort.
 No committed timeline. Community interest drives prioritization.
 
 - [ ] GraphQL integration helpers (Strawberry, Graphene)
-- [ ] Django Ninja integration
 - [ ] Benchmarking suite (100k+ rows, 1000+ tenants)
 - [ ] Index-friendly policy shape -- the `CASE WHEN <admin> THEN true ELSE tenant_id = ...`
   policy can only be a post-scan filter; a bare `tenant_id = current_setting(...)::int`

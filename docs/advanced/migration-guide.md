@@ -125,8 +125,26 @@ migration that assigns the correct tenant to each existing record.
 
 ### From 1.6.3 to 1.7.0
 
-No breaking change; nothing to do. Two additions:
+No breaking change; nothing to do. Three behaviours change, and two additions are worth a look:
 
+- **`asgiref` is capped below 3.13** (read the 1.7.0 **Security** entry in the
+  [changelog](../development/changelog.md#170-2026-11-11)). A project that already
+  installed asgiref 3.13 gets 3.12 back with this upgrade. If a project or another package
+  needs asgiref 3.13, the resolver now refuses the combination; stay on 1.7.0's bound
+  until a release lifts it.
+- **`USE_LOCAL_SET=True`: a session-level write of the admin or tenant GUC is cleared when
+  its block exits** (#173). If application code inside a context writes one of them for the
+  session (`set_guc()`, `rls_context()` without `is_local=True`), the exit of the block, the
+  `for_user()` call or the request now clears it on that alias with one statement, where it
+  used to stay until the next statement run outside a context. Exits of sessions with no
+  such write send nothing, as before. See
+  [the GUC affinity guard](architecture.md#guc-affinity-guard).
+- **`including_shared()` combined with `none()`** keeps the `including_shared()` flag (it
+  refuses writes, as any `including_shared()` queryset does); the result is still empty.
+- **Django Ninja** (#167). A Ninja API that authenticates with `auth=` (bearer token, API
+  key) reached the library as an anonymous request and read zero rows. Install the `ninja`
+  extra and build the API with `RLSTenantNinjaAPI`; see the
+  [Django Ninja guide](../guides/ninja.md).
 - **`AUDIT_NO_CONTEXT_QUERIES`** (#178). In production, where `STRICT_MODE` is usually off,
   a code path that lost its context answers with an empty result and nothing to alert on.
   Consider setting `RLS_TENANTS["AUDIT_NO_CONTEXT_QUERIES"] = True` (with

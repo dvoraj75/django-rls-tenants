@@ -7,7 +7,7 @@ build-backend = "hatchling.build"
 # ---------------------------------------------------------------------------
 [project]
 name = "django-rls-tenants"
-version = "1.6.3"
+version = "1.7.0"
 description = "Database-enforced multitenancy for Django using PostgreSQL Row-Level Security."
 readme = "README.md"
 license = "MIT"
@@ -48,6 +48,10 @@ classifiers = [
 ]
 dependencies = [
     "django>=5.2",
+    # asgiref 3.13 compares the ContextVar values it copies back with `is not`, which
+    # defeats _Live.__ne__ (tenants/state.py): a cancelled sync_to_async hop could hand
+    # its context block to the caller. Lift once the guard no longer relies on it.
+    "asgiref<3.13",
 ]
 
 [project.optional-dependencies]

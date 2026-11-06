@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-11-11
+
+Three additions and one fix (#167, #168, #173, #178). A Django Ninja integration gives Ninja
+APIs the tenant context the DRF integration gives DRF views; `rls_skip_strict()` is a
+per-query override of `STRICT_MODE`; `AUDIT_NO_CONTEXT_QUERIES` makes a query that lost its
+context visible in non-strict mode. With `USE_LOCAL_SET=True`, a session-level write of a
+policy GUC by application code no longer outlives its block when the guard saw it. It also
+caps `asgiref` below 3.13, which breaks a tenant-isolation guarantee of 1.4.0–1.6.3 (read
+**Security**); every async deployment should upgrade. No breaking change; read the
+[migration guide](https://dvoraj75.github.io/django-rls-tenants/advanced/migration-guide/#from-163-to-170).
+
 ### Added
 
 - **Django Ninja integration** (#167, `django_rls_tenants.contrib.ninja`, extra
@@ -31,35 +42,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `source="ninja"`. A streaming operation gets no context (keep it out of the guard).
   See the
   [Django Ninja guide](https://dvoraj75.github.io/django-rls-tenants/guides/ninja/).
-### Fixed
-
-- **`USE_LOCAL_SET=True`: a session-level write of the admin or tenant GUC inside a context
-  no longer outlives the context's exit** (#173). With `USE_LOCAL_SET=True`, application
-  code inside a block (`set_guc("rls.is_admin", "true")`, `rls_context()` without
-  `is_local=True`) could leave the value on the session after the block, a `for_user()`
-  call, a request or the `request_finished` safety net ended: the exit only marked the
-  session's values unknown and the guard cleared them before the next statement run outside
-  a context, so a driver cursor, `callproc()` or a server-side cursor's `FETCH` in between
-  read the write. The GUC affinity guard now flags a session when a statement it sees
-  writes a policy GUC at session level, and every such exit clears the admin and tenant
-  GUCs of flagged sessions at once, one statement per open, flagged alias in
-  `RLS_TENANTS["DATABASES"]` on the exiting thread's connections (at once in autocommit,
-  and with `AUTOCOMMIT=False` outside `atomic()`, where the clear is committed at once; at
-  the commit in a transaction). A session the guard did not see written gets no statement,
-  so request ends and `for_user()` calls cost nothing more. The guard sees `SET [SESSION]`
-  (with comments anywhere before the name), a statement that calls `set_config()` and names
-  a policy GUC in its text or as a parameter (what `set_guc()` sends), a compound statement
-  naming one, and a `DO` block that spells `set_config` and the name, also when a compound
-  statement then fails (it can commit the write before the part that fails). A write inside a function or procedure (`CALL`, a function the statement calls),
-  inside a `DO` block that builds the name dynamically, through a raw driver cursor,
-  `callproc()` or the driver's `copy` methods, or with the name passed in a way the guard
-  does not read, stays lazy as before, and so does a write on another thread's connection
-  (`set_guc()` in a `sync_to_async()` hop with `thread_sensitive=False`), which the exiting
-  thread's clear does not reach. Only the admin and tenant GUCs are cleared; a bypass flag
-  written for the session stays set. A session in a failed transaction is skipped until the
-  next exit or the lazy clear.
-### Added
-
 - **`rls_skip_strict()`: a per-query override of the `STRICT_MODE` guard** (#168).
   `Order.objects.rls_skip_strict().count()` (on `RLSManager` and `TenantQuerySet`) does not
   raise `NoTenantContextError` without a context. The flag survives `filter()` and the like
@@ -83,6 +65,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `including_shared()` flag (it refuses writes and adds no tenant filter); before, Django
   could hand back the unflagged `none()` operand. The result is still empty (#59, changed
   while adding #168).
+- **Development lockfile refreshed** (`uv lock --upgrade`), among others Django 6.1.2 →
+  6.1.3, Celery 5.6.3 → 5.7.0, kombu 5.6.2 → 5.7.0, mypy 2.4.0 → 2.4.1, ruff 0.17.1 →
+  0.17.4, pytest 9.1.1 → 9.2.0 and mkdocs-material 9.7.7 → 9.8.0; asgiref stays at 3.12.1
+  (see **Security**).
+
+### Fixed
+
+- **`USE_LOCAL_SET=True`: a session-level write of the admin or tenant GUC inside a context
+  no longer outlives the context's exit** (#173). With `USE_LOCAL_SET=True`, application
+  code inside a block (`set_guc("rls.is_admin", "true")`, `rls_context()` without
+  `is_local=True`) could leave the value on the session after the block, a `for_user()`
+  call, a request or the `request_finished` safety net ended: the exit only marked the
+  session's values unknown and the guard cleared them before the next statement run outside
+  a context, so a driver cursor, `callproc()` or a server-side cursor's `FETCH` in between
+  read the write. The GUC affinity guard now flags a session when a statement it sees
+  writes a policy GUC at session level, and every such exit clears the admin and tenant
+  GUCs of flagged sessions at once, one statement per open, flagged alias in
+  `RLS_TENANTS["DATABASES"]` on the exiting thread's connections (at once in autocommit,
+  and with `AUTOCOMMIT=False` outside `atomic()`, where the clear is committed at once; at
+  the commit in a transaction). A session the guard did not see written gets no statement,
+  so request ends and `for_user()` calls cost nothing more. The guard sees `SET [SESSION]`
+  (with comments anywhere before the name), a statement that calls `set_config()` and names
+  a policy GUC in its text or as a parameter (what `set_guc()` sends), a compound statement
+  naming one, and a `DO` block that spells `set_config` and the name, also when a compound
+  statement then fails (it can commit the write before the part that fails). A write
+  inside a function or procedure (`CALL`, a function the statement calls),
+  inside a `DO` block that builds the name dynamically, through a raw driver cursor,
+  `callproc()` or the driver's `copy` methods, or with the name passed in a way the guard
+  does not read, stays lazy as before, and so does a write on another thread's connection
+  (`set_guc()` in a `sync_to_async()` hop with `thread_sensitive=False`), which the exiting
+  thread's clear does not reach. Only the admin and tenant GUCs are cleared; a bypass flag
+  written for the session stays set. A session in a failed transaction is skipped until the
+  next exit or the lazy clear.
+
+### Security
+
+- **`asgiref<3.13` is now a dependency.** asgiref 3.13.0 (released 2026-10-23) compares
+  the `ContextVar` values it copies back from a `sync_to_async` call with `is not` instead
+  of `!=`. The GUC affinity guard relied on that comparison (`_Live.__ne__`, since 1.4.0,
+  #41) to keep the context block of a cancelled `sync_to_async` call, whose thread keeps
+  running after the cancellation, from becoming the caller's context. With asgiref 3.13,
+  such a block's values, an `admin_context()` included, could reach the caller's later
+  statements, for example a request whose awaited call was cancelled. 1.4.0 to 1.6.3 do
+  not bound `asgiref`: deployments on those versions should upgrade to 1.7.0, or pin
+  `asgiref<3.13` until they can. Found by the test suite while preparing this release; a
+  fix that does not depend on asgiref's comparison will lift the cap.
 
 ## [1.6.3] - 2026-10-22
 
@@ -1896,7 +1924,8 @@ Initial stable release of django-rls-tenants.
   and manager `_fetch_all` could clear GUCs with session scope while setting
   them with transaction scope, causing mismatched lifetimes.
 
-[Unreleased]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.6.3...HEAD
+[Unreleased]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.6.3...v1.7.0
 [1.6.3]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.6.2...v1.6.3
 [1.6.2]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.6.1...v1.6.2
 [1.6.1]: https://github.com/dvoraj75/django-rls-tenants/compare/v1.6.0...v1.6.1
