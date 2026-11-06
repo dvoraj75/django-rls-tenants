@@ -1335,6 +1335,12 @@ class TestWhatTheGuardFlags:
             "SELECT set_config('rls.is_admin', 'true', false); SELECT 1",
             "SELECT 1; SELECT 'rls.is_admin'",
             "DO $$ BEGIN PERFORM set_config('rls.is_admin', 'true', false); END $$",
+            "SET /* c */ rls.is_admin = 'true'",
+            "SET SESSION -- c\n rls.is_admin = 'true'",
+            "SET/*c*/rls.is_admin='true'",
+            "SET /* a /* b */ c */ rls.is_admin = 'true'",
+            "set /*c*/ session /*d*/ rls.is_admin = 'true'",
+            f"SET /* {'c' * 300} */ rls.is_admin = 'true'",
         ],
     )
     def test_flagged_statements(self, sql):
@@ -1385,6 +1391,12 @@ class TestWhatTheGuardFlags:
             ("RESET rls.current_tenant", False),
             ("DISCARD TEMP", False),
             ("SELECT set_config('rls.' || 'is_admin', 'true', false)", False),
+            ("SET /*c*/ LOCAL rls.is_admin = 'true'", True),
+            ("SET /*c*/ statement_timeout = 0", False),
+            (
+                "SET SESSION /*c*/ CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED",
+                False,
+            ),
         ],
         ids=[
             "set-local",
@@ -1398,6 +1410,9 @@ class TestWhatTheGuardFlags:
             "reset",
             "discard",
             "name-built-inside-a-string",
+            "commented-set-local",
+            "commented-other-setting",
+            "commented-session-characteristics",
         ],
     )
     def test_statements_that_are_not_flagged(self, sql, in_atomic):
@@ -1453,6 +1468,58 @@ class TestWhatTheGuardFlags:
         _gucs()  # outside a context the guard clears the session's own values first
         assert _tracker().session_written is False
 
+    def test_a_flagged_session_is_not_read_again(self, monkeypatch):
+        set_guc("rls.current_tenant", _WRITTEN)
+        assert _tracker().session_written is True
+        calls = []
+        real = affinity._writes_policy_gucs_for_the_session
+
+        def counting(*args, **kwargs):
+            calls.append(args)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(affinity, "_writes_policy_gucs_for_the_session", counting)
+        _gucs()
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+        assert calls == []
+
+    def test_a_compound_statement_that_fails_after_writing_is_flagged_and_cleared(
+        self,
+        tenant_a,
+    ):
+        """Its ``COMMIT`` made the write stick before the error."""
+        sql = "SELECT set_config('rls.is_admin', 'true', false); COMMIT; SELECT 1 / 0"
+        with tenant_context(tenant_a.pk):
+            with pytest.raises(DatabaseError), connection.cursor() as cursor:
+                cursor.execute(sql)
+            assert _tracker().session_written is True
+            with connection.connection.cursor() as cursor:  # control: the write is in force
+                cursor.execute("SELECT current_setting('rls.is_admin', true)")
+                assert cursor.fetchone() == ("true",)
+        assert session_gucs() == _NO_GUCS
+
+    def test_a_comment_before_the_name_is_cleared_at_the_exit(self, tenant_a):
+        with tenant_context(tenant_a.pk), connection.cursor() as cursor:
+            cursor.execute("SET /* c */ rls.is_admin = 'true'")
+        assert session_gucs() == _NO_GUCS
+
+    @pytest.mark.parametrize("flagged", ["before", "inside"])
+    def test_prepare_transaction_keeps_the_flag(self, flagged):
+        """The test server allows no prepared transactions: ``_follow()`` is called directly."""
+        tracker = _tracker()
+        if flagged == "before":
+            set_guc("rls.current_tenant", _WRITTEN)
+        with transaction.atomic():
+            connection.cursor().close()
+            if flagged == "inside":
+                set_guc("rls.current_tenant", _WRITTEN)
+            tracker.sync_transaction()
+            assert tracker.session_written is True
+            statement = affinity._parse("PREPARE TRANSACTION 'x'")
+            affinity._follow(statement, _IN_TRANSACTION, connection, tracker)
+            assert tracker.session_written is True
+
 
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.usefixtures("settled")
@@ -1504,3 +1571,121 @@ class TestFlagBookkeeping:
             assert session_gucs() == _NO_GUCS
         assert session_gucs() == _NO_GUCS
         assert _tracker().session_written is False
+
+    def test_a_guard_clear_of_an_unflagged_session_leaves_no_flag_after_rollback_to(
+        self,
+        tenant_a,
+        monkeypatch,
+    ):
+        """The guard's lazy clear took off no write it saw, so ``ROLLBACK TO`` re-flags nothing."""
+        cleared = []
+        real = affinity._clear_session_values
+        monkeypatch.setattr(
+            affinity,
+            "_clear_session_values",
+            lambda *args: cleared.append(args) or real(*args),
+        )
+        with transaction.atomic():
+            savepoint = connection.savepoint()
+            # In a transaction a block exit's ``suspect_sessions()`` takes effect at the commit;
+            # forgetting is what it leaves then, which the guard clears before its next statement.
+            _tracker().forget()
+            _gucs()  # outside a context: the guard clears the session's unknown values
+            connection.savepoint_rollback(savepoint)
+            assert _tracker().session_written is False
+            with tenant_context(tenant_a.pk):
+                _gucs()
+            assert _tracker().session_written is False
+            assert cleared == []  # the exit sent no clear of a flagged session
+
+    def test_a_for_user_call_after_that_runs_no_clear_of_a_flagged_session(
+        self,
+        tenant_a_user,
+        monkeypatch,
+    ):
+        cleared = []
+        real = affinity._clear_session_values
+        monkeypatch.setattr(
+            affinity,
+            "_clear_session_values",
+            lambda *args: cleared.append(args) or real(*args),
+        )
+        with transaction.atomic():
+            savepoint = connection.savepoint()
+            _tracker().forget()
+            _gucs()
+            connection.savepoint_rollback(savepoint)
+            Order.objects.for_user(tenant_a_user).count()
+        assert cleared == []
+
+
+_REPLICA_NOT_CONFIGURED = {**_LOCAL, "DATABASES": [DEFAULT_DB_ALIAS]}
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.usefixtures("settled")
+class TestExitEdgeCases:
+    """The clear at the exit with ``AUTOCOMMIT=False``, on a snapshot restore and when it fails."""
+
+    def test_autocommit_off_exit_commits_the_clear_and_leaves_no_transaction(self, tenant_a):
+        connection.set_autocommit(False)
+        try:
+            with tenant_context(tenant_a.pk):
+                set_guc("rls.current_tenant", _WRITTEN)
+                connection.commit()
+                assert _tracker().session_written is True
+            assert _tracker().session_written is False
+            assert _status() == _IDLE
+            with connection.cursor() as cursor:
+                cursor.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            connection.rollback()
+            assert session_gucs() == _NO_GUCS
+            connection.rollback()
+            assert session_gucs() == _NO_GUCS
+        finally:
+            connection.rollback()
+            connection.set_autocommit(True)
+
+    def test_a_snapshot_restore_clears_a_session_write_on_the_default_alias(
+        self,
+        replica,
+        tenant_a,
+    ):
+        """The block alias is outside ``DATABASES``: it writes ``SET LOCAL`` itself."""
+        with override_settings(RLS_TENANTS=_REPLICA_NOT_CONFIGURED):
+            _gucs()
+            with transaction.atomic(replica):
+                queries = _queries_at_exit(
+                    tenant_context(tenant_a.pk, using=replica),
+                    lambda: set_guc("rls.is_admin", "true"),
+                )
+            assert [_set_configs(q) for q in queries.captured_queries] == [2]
+            assert session_gucs() == _NO_GUCS
+            assert _tracker().session_written is False
+
+    def test_a_failing_clear_does_not_raise_and_leaves_the_session_to_the_guard(
+        self,
+        tenant_a,
+        monkeypatch,
+    ):
+        def fail(conn, status):
+            _tracker(conn).set_values(None)  # as if the statement had written before it failed
+            raise DatabaseError("clear failed")
+
+        monkeypatch.setattr(affinity, "_clear_session_values", fail)
+        with tenant_context(tenant_a.pk):
+            set_guc("rls.is_admin", "true")
+        assert _tracker().values is affinity.UNKNOWN
+        assert _tracker().session_written is True
+        monkeypatch.undo()
+        assert _gucs() == _NO_GUCS  # the guard clears the session before this statement
+        assert session_gucs() == _NO_GUCS
+
+    def test_a_bad_connection_status_gets_no_statement_and_stays_flagged(self, monkeypatch):
+        set_guc("rls.current_tenant", _WRITTEN)
+        tracker = _tracker()
+        monkeypatch.setattr(tracker, "read_status", lambda: 4)
+        with CaptureQueriesContext(connection) as queries:
+            affinity.clear_session_writes()
+        assert queries.captured_queries == []
+        assert tracker.session_written is True
