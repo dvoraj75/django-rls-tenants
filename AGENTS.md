@@ -456,7 +456,31 @@ connections of other threads that no block exit reaches. In a transaction the ma
 effect at the commit. `_settle_after_no_context()` calls it in both modes; in session
 mode with `under_local_values=False`, which makes the values `UNKNOWN` at once, in a
 transaction too, so the settle right after records what it writes and a commit keeps it
-known (#163). With `USE_LOCAL_SET=True` the context managers, `_rls_scope()` and
+known (#163). With `USE_LOCAL_SET=True` an exit also clears at once the sessions the guard
+saw written at session level (#173): `_guard` sets `_SessionGUCs.session_written` after a
+statement succeeds, outside `writing()`, on a configured alias, in local mode, when
+`_writes_policy_gucs_for_the_session()` reads a write (`SET [SESSION]` of a policy GUC,
+never `SET LOCAL`; a statement with `set_config` naming one in its text or as a parameter,
+`set_config(..., true)` counted too; a compound statement naming one; a `DO` block holding
+`set_config` and the name; names compared case-insensitively against
+`pool._policy_guc_names()`). `session_written_base` / `cleared_in_transaction` follow it
+through transactions: a rollback restores it, `ROLLBACK TO` flags again after a clear, a
+library session-level clear of the pair resets it. `affinity.clear_session_writes()` sends
+one statement per open, flagged alias in `conf.DATABASES` on the exiting thread's
+connections (in autocommit at once; in a transaction at the commit, and the same statement
+sets the enclosing context's values again transaction-locally); an unflagged session gets no
+statement (no cost on request ends or `for_user()` calls), and a failed or `needs_rollback`
+transaction is skipped and stays flagged. Callers: `suspect_sessions()` first,
+`clear_session_writes()` second (the other order leaves the clear's values unknown), from
+`_restore_tenant_gucs(previous=None)`, `_settle_after_no_context()`,
+`middleware._clear_request_gucs()` and `apps._clear_finished_request_gucs()`; the restore
+runs suspect, clear, settle, so the settle writes nothing more. Not seen, so lazy (cleared
+before the next statement run outside a context): a write inside a function, a procedure
+(`CALL`) or a `DO` block that does not spell `set_config` and the name, one through a raw
+driver cursor, `callproc()` or `copy`, a name the guard does not read (a table column, a
+computed string), a statement it cannot read. Only the admin and tenant GUCs are cleared; a
+bypass flag or other policy GUC stays (a write of one still flags the session, so the exit
+clears the pair). With `USE_LOCAL_SET=True` the context managers, `_rls_scope()` and
 the middleware write nothing on a configured alias, inside `transaction.atomic()` or not
 (#137; `context._writes_gucs()` is `not is_local or alias not in conf.DATABASES`, and
 `_rls_scope()` decides it before its own transaction opens): the guard applies the values
@@ -533,9 +557,11 @@ Rules for code that sets a context or writes the admin/tenant GUCs:
   configured aliases): the guard reconciled the snapshot reads, so the snapshot holds the
   enclosing context's values. A snapshot taken inside `writing()` needs
   `apply_active_context()` first (`_enter_tenant_gucs()`).
-- Writes by other code (`set_guc()`, `rls_context()`) are deliberately not recorded. With
-  `USE_LOCAL_SET=True` they do not narrow a context in autocommit: the guard's own
-  transaction sets the context's values over them.
+- Writes by other code (`set_guc()`, `rls_context()`) are not recorded as the session's
+  values. With `USE_LOCAL_SET=True` they do not narrow a context in autocommit (the guard's
+  own transaction sets the context's values over them), but `_guard` flags the session
+  (`session_written`, #173), so a new local-mode exit must call `suspect_sessions()` and
+  then `clear_session_writes()`, or the write outlives the exit until the lazy clear.
 - `contrib/celery._capture()` reads the holder too: inside a request or block the library
   set up, `_values_of(_current_live())` is authoritative (a cancelled hop copies the public
   `ContextVar`s by value, not the holder); only with no holder at all does it fall back to

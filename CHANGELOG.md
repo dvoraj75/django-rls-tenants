@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`USE_LOCAL_SET=True`: a session-level write of the admin or tenant GUC inside a context
+  no longer outlives the context's exit** (#173). With `USE_LOCAL_SET=True`, application
+  code inside a block (`set_guc("rls.is_admin", "true")`, `rls_context()` without
+  `is_local=True`) could leave the value on the session after the block, a `for_user()`
+  call, a request or the `request_finished` safety net ended: the exit only marked the
+  session's values unknown and the guard cleared them before the next statement run outside
+  a context, so a driver cursor, `callproc()` or a server-side cursor's `FETCH` in between
+  read the write. The GUC affinity guard now flags a session when a statement it sees
+  writes a policy GUC at session level, and every such exit clears the admin and tenant
+  GUCs of flagged sessions at once, one statement per open, flagged alias in
+  `RLS_TENANTS["DATABASES"]` on the exiting thread's connections (at once in autocommit,
+  at the commit in a transaction). A session the guard did not see written gets no
+  statement, so request ends and `for_user()` calls cost nothing more. The guard sees
+  `SET [SESSION]`, a statement that calls `set_config()` and names a policy GUC in its
+  text or as a parameter (what `set_guc()` sends), a compound statement naming one, and a
+  `DO` block that spells `set_config` and the name. A write inside a function or procedure
+  (`CALL`, a function the statement calls), inside a `DO` block that builds the name
+  dynamically, through a raw driver cursor, `callproc()` or the driver's `copy` methods,
+  or with the name passed in a way the guard does not read, stays lazy as before. Only the
+  admin and tenant GUCs are cleared; a bypass flag written for the session stays set. A
+  session in a failed transaction is skipped until the next exit or the lazy clear.
+
 ## [1.6.3] - 2026-10-22
 
 A maintenance release with no change to the library: the wheel built from 1.6.3 holds the

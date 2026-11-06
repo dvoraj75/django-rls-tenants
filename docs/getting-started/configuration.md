@@ -334,7 +334,9 @@ middleware only record the context (*changed in 1.5.0*: also inside
   values, the values a session holds for itself count as unknown. The next statement run
   outside any context, in autocommit or in a transaction, clears them first for the
   session (one extra statement), in case code inside the context wrote the GUCs for the
-  session.
+  session. A session the guard saw written at session level (`SET`, `set_guc()`) is cleared
+  at the context's exit instead, with one statement; see
+  [Security](../advanced/security.md).
 - On the synchronous path, middleware implementing `process_exception`, and function-based
   middleware factories, must precede `RLSTenantMiddleware`; unsafe ordering raises
   `RLSConfigurationError` when the middleware is loaded. See

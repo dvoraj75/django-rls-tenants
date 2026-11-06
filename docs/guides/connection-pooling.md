@@ -230,6 +230,19 @@ request's session lookup on a persistent connection. That clear is for the sessi
 once its transaction commits it sticks. Inside a transaction the mark itself takes effect
 at the commit; a rollback undoes such a write anyway.
 
+*1.7.0+* (#173): the guard also flags a session when a statement it sees writes a policy
+GUC at session level (`SET [SESSION]`, a `set_config()` call such as `set_guc()` sends, a
+`DO` block spelling both). When a context ends, it clears the admin and tenant GUCs of a
+flagged session at once, one statement per flagged alias (at the commit in a transaction;
+a failed transaction is skipped), so a driver cursor or `callproc()` right after the block
+does not read the write. A session never seen written gets no statement. A write the guard
+cannot see stays until that lazy clear: one inside a function or procedure (`CALL`, a
+function a statement calls) or inside a `DO` block that does not spell `set_config` and
+the name in its text, one through a raw driver cursor, `callproc()` or the driver's `copy`
+methods, a name passed in a way the guard does not read (from a table column, built inside
+a computed string), or a statement it cannot read. Only the admin and tenant GUCs are
+cleared: a bypass flag or another policy GUC written for the session stays set.
+
 ## PgBouncer
 
 PgBouncer gives a client a server connection for its whole session, for one transaction or
