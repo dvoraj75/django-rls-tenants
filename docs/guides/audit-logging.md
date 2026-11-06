@@ -151,6 +151,7 @@ handler.
 |--------------|-----------|------------|
 | `middleware` | `RLSTenantMiddleware`, on every path (WSGI, ASGI, a subclass with its own hooks). The context ends with the request, before a streaming body is sent. | yes |
 | `drf` | `RLSTenantAPIViewMixin` (the context `get_rls_context()` returned, an override's too), `RLSTenantPermission`, `RLSTenantSerializerMixin`, `CurrentTenantDefault` | yes (the serializer: when its `context` has the `request`) |
+| `ninja` | `RLSTenantNinjaAPI` (the context `get_rls_context()` returned, an override's too), `RLSTenantGuard`, `rls_save()` / `arls_save()`, and a `MultiTenantUser`'s tenant selection on a Ninja request | yes |
 | `admin` | `RLSTenantModelAdmin`'s view wrappers, its forms' dropdowns rejecting another tenant's row, and the tenant switcher of a user who belongs to several tenants (`tenant.switched`, `tenant_not_selectable`, `cross_site_selection`) | yes |
 | `selection` | `switch_tenant()` and `clear_tenant_selection()` called by your code | yes (the request's user) |
 | `decorator` | `@with_rls_context`, sync and async | yes |

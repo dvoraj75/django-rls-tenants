@@ -59,6 +59,11 @@ returns zero rows, never leaked data.
   `RLSTenantModelSerializer` fills the tenant FK from it
   (`pip install "django-rls-tenants[drf]"`).
   [DRF guide →](https://dvoraj75.github.io/django-rls-tenants/guides/drf/)
+- **Django Ninja integration** -- `RLSTenantNinjaAPI` opens the RLS context after Ninja
+  authenticates the user, `RLSTenantGuard` refuses an operation that runs outside it, and
+  `RLSTenantModelSchema` with `rls_save()` writes a payload in the active tenant
+  (`pip install "django-rls-tenants[ninja]"`).
+  [Ninja guide →](https://dvoraj75.github.io/django-rls-tenants/guides/ninja/)
 - **Async context managers** -- `async with async_tenant_context(...)` for async views,
   consumers and tasks; tenant state is set in the coroutine, so the async ORM is scoped.
   [Async context managers →](https://dvoraj75.github.io/django-rls-tenants/guides/context-managers/#async-code)

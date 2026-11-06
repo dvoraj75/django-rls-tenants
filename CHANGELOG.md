@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Django Ninja integration** (#167, `django_rls_tenants.contrib.ninja`, extra
+  `pip install "django-rls-tenants[ninja]"`, `django-ninja>=1.5`). Ninja authenticates
+  inside the operation, so a bearer-token or API-key client reaches
+  `RLSTenantMiddleware` as an anonymous user and reads zero rows. `RLSTenantNinjaAPI`
+  enters `tenant_context()` / `admin_context()` (async forms for `async def`
+  operations) for the authenticated user after Ninja's `auth=` and throttling, keeps it
+  through serialization and error rendering, and exits it before the response is
+  returned; `get_rls_user()`, `get_rls_context()` and `aget_rls_context()` are the
+  override points, and a `MultiTenantUser` selects its tenant by header or session as
+  elsewhere. `RLSTenantGuard` refuses a request outside its user's context (`rls_guard=`
+  or `@guard`), `RLSTenantModelSchema` leaves the tenant field out, and `rls_save()` /
+  `arls_save()` write a payload in the active tenant and reject a foreign key to a row
+  that is not the tenant's with the same 422 as a missing one. Audit records carry
+  `source="ninja"`. A streaming operation gets no context. See the
+  [Django Ninja guide](https://dvoraj75.github.io/django-rls-tenants/guides/ninja/).
+
 ## [1.6.3] - 2026-10-22
 
 A maintenance release with no change to the library: the wheel built from 1.6.3 holds the

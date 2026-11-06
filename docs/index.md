@@ -40,6 +40,7 @@ the [Security Model](advanced/security.md) for what that does and does not cover
 - **Cross-tenant foreign key validation** -- `full_clean()`, forms, the admin and DRF serializers reject a foreign key to another tenant's row, which RLS cannot catch; `validate_cross_tenant_fks()` covers service code. See [Protecting Models](guides/protecting-models.md#cross-tenant-foreign-keys).
 - **Native Celery integration** -- `@rls_task` carries the active tenant context from enqueue to the worker, across chains, groups, and chords. See the [Celery Tasks guide](guides/celery-tasks.md).
 - **Django REST Framework integration** -- `RLSTenantAPIViewMixin` opens the RLS context after DRF authenticates the user (token and JWT clients included, which the middleware cannot see), `RLSTenantPermission` refuses a view that runs outside it, and `RLSTenantModelSerializer` fills the tenant FK from it. See the [Django REST Framework guide](guides/drf.md).
+- **Django Ninja integration** -- `RLSTenantNinjaAPI` opens the RLS context after Ninja authenticates the user (bearer and API-key clients included, which the middleware cannot see), `RLSTenantGuard` refuses an operation that runs outside it, and `RLSTenantModelSchema` with `rls_save()` writes a payload in the active tenant. See the [Django Ninja guide](guides/ninja.md).
 - **Per-tenant management commands** -- `run_as_tenant` runs any management command inside one tenant's context and `run_for_all_tenants` runs it once per tenant, with filters, `--parallel`, `--json` output and a failure summary. See the [Management Commands guide](guides/management-commands.md#run_as_tenant).
 - **Audit logging** -- structured records on the `django_rls_tenants.audit` logger each time a tenant or admin context is entered, exited or refused, routed with Django's `LOGGING`. See the [Audit Logging guide](guides/audit-logging.md).
 - **Users in several tenants** -- a user model that adds `rls_tenant_ids` (`MultiTenantUser`) selects the tenant a request runs in with an `X-Tenant` header or `switch_tenant()`; the middleware, the DRF mixin and the admin check every selection against the user's tenants and refuse any other with a 403. See the [Users in Several Tenants guide](guides/multi-tenant-users.md).
@@ -60,6 +61,7 @@ the [Security Model](advanced/security.md) for what that does and does not cover
 | Run a management command as one tenant, or for every tenant | [`run_as_tenant` / `run_for_all_tenants`](guides/management-commands.md#run_as_tenant) |
 | Run a Celery task under the right tenant | [Celery Tasks](guides/celery-tasks.md) |
 | Scope a DRF API to the user's tenant | [Django REST Framework](guides/drf.md) |
+| Scope a Django Ninja API to the user's tenant | [Django Ninja](guides/ninja.md) |
 | Use the tenant context in an async view or consumer | [Async Code](guides/context-managers.md#async-code) |
 | Use the Django admin across tenants | [Admin](guides/admin.md) |
 | Keep an audit trail of tenant context changes | [Audit Logging](guides/audit-logging.md) |

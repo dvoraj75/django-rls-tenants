@@ -212,7 +212,7 @@ Every push and pull request runs:
   `-m "not superuser_only"` (PostgreSQL 16, Python 3.12, the locked Django).
 - **Example app against the built wheel** -- `uv build`, an assertion on the wheel's
   file list (only `django_rls_tenants/` and `*.dist-info/`, every package directory has
-  an `__init__.py`, `py.typed`, the management commands, `contrib.celery`, `contrib.drf`,
+  an `__init__.py`, `py.typed`, the management commands, `contrib.celery`, `contrib.drf`, `contrib.ninja`,
   `pytest_plugin.py` and its `pytest11` entry point are present,
   no `tests/` or `example/`), then an install into a clean virtualenv -- never editable,
   never with the source tree on `sys.path` -- followed by `manage.py check`,

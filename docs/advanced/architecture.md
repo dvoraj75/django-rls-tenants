@@ -58,7 +58,7 @@ The upper layer builds Django multitenancy on top of `rls/`:
 | `tenants/checks.py` | Django system checks (W001--W019, E001) |
 | `pytest_plugin.py` | The `rls_role`, `enforce_rls` and `enforce_rls_on_other_threads` fixtures, registered through the `pytest11` entry point; imports nothing from Django at module level |
 | `management/` | `check_rls` (with `--generate`, backed by `_rls_migrations.py`), `setup_m2m_rls`, `run_as_tenant` and `run_for_all_tenants` (`_worker.py` holds the `--parallel` worker entry points) |
-| `contrib/drf.py`, `contrib/celery.py` | Optional integrations behind the `drf` and `celery` extras; never imported by the core layers |
+| `contrib/drf.py`, `contrib/ninja.py`, `contrib/celery.py` | Optional integrations behind the `drf`, `ninja` and `celery` extras; never imported by the core layers |
 
 ### Import Boundary
 
@@ -74,11 +74,12 @@ This constraint ensures:
 ### Optional integrations
 
 `contrib/` holds integrations with third-party libraries, each behind a pip extra:
-`contrib/celery.py` (`celery`) and `contrib/drf.py` (`drf`). Neither `rls/` nor
-`tenants/` imports them, nor Celery or Django REST Framework themselves (enforced by
+`contrib/celery.py` (`celery`), `contrib/drf.py` (`drf`) and `contrib/ninja.py`
+(`ninja`). Neither `rls/` nor `tenants/` imports them, nor Celery, Django REST Framework
+or Django Ninja themselves (enforced by
 `tests/test_layering.py`), so the core library imports without the extras. See the
 [Celery](../guides/celery-tasks.md) and
-[Django REST Framework](../guides/drf.md) guides.
+[Django REST Framework](../guides/drf.md) and [Django Ninja](../guides/ninja.md) guides.
 
 ## GUC Variable Flow
 
