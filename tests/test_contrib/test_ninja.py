@@ -234,6 +234,28 @@ class TestTenantIsolation:
         assert all(item["seen_tenant"] == tenant_a.pk for item in response.json())
         _assert_context_closed()
 
+    @pytest.mark.parametrize("operation", ["lazy-status", "lazy-for-user", "lazy-prefetch"])
+    def test_an_async_operation_may_return_other_unevaluated_querysets(
+        self, enforce_rls, user_a, sample_orders, operation
+    ):
+        send = Flavour("async", is_async=True, via_asgi=True)
+
+        response = send.call("get", f"/api/a{operation}", user=user_a)
+
+        assert response.status_code == 200, response.content
+        assert _products(response) == ["Widget A1", "Widget A2"]
+        _assert_context_closed()
+
+    def test_a_relation_the_async_serialization_reaches_lazily_is_a_500(
+        self, enforce_rls, user_a, sample_orders
+    ):
+        send = Flavour("async", is_async=True, via_asgi=True)
+
+        response = send.call("get", "/api/alazy-relation", user=user_a)
+
+        assert response.status_code == 500
+        _assert_context_closed()
+
     def test_auth_runs_before_the_entry_and_serialization_before_the_exit(
         self, enforce_rls, flavour, user_a, sample_orders, tenant_a
     ):
@@ -427,11 +449,11 @@ class TestAuthentication:
         _assert_context_closed()
 
     def test_an_api_without_auth_enters_nothing_for_an_anonymous_request(
-        self, enforce_rls, sample_orders, caplog
+        self, enforce_rls, twin, sample_orders, caplog
     ):
         caplog.set_level(logging.INFO, logger=AUDIT_LOGGER_NAME)
 
-        response = Client().get("/open/state")
+        response = twin.call("get", twin.path("state", "/open"))
 
         assert response.status_code == 200, response.content
         body = response.json()
@@ -453,6 +475,32 @@ class TestAuthentication:
         assert response.json()["database_products"] == ["Widget A1", "Widget A2"]
         assert response.json()["tenant_id"] == tenant_a.pk
         _assert_context_closed()
+
+    def test_an_auth_result_that_is_not_a_user_never_falls_back_to_the_session(
+        self, enforce_rls, twin, user_a, sample_orders, audit_records
+    ):
+        client = Client(raise_request_exception=False)
+        client.force_login(user_a)
+
+        response = client.get(twin.path("state", "/key"), headers={"X-User": user_a.username})
+
+        assert response.status_code == 401, response.content
+        assert [r for r in audit_records() if r.rls_event == "context.entered"] == []
+        _assert_context_closed()
+
+    def test_a_missing_auth_result_falls_back_to_the_session_user(self, user_a):
+        # Ninja's test client leaves ``request.auth`` as None.
+        request = _request_of(None)
+        request.user = user_a
+
+        assert ninja_views.api.get_rls_user(request) is user_a
+
+    def test_a_key_object_is_nobody(self, user_a):
+        request = _request_of(None)
+        request.auth = ninja_views.KeyObject("k")
+        request.user = user_a
+
+        assert ninja_views.api.get_rls_user(request) is None
 
     def test_tenantless_non_admin_gets_a_403(
         self, enforce_rls, flavour, tenantless_user, sample_orders
@@ -649,6 +697,24 @@ class TestGuardOnTheApi:
 
         assert response.status_code == 200, response.content
         assert response.json()["database_products"] == ["Gadget B1"]
+
+    def test_a_context_that_is_already_the_users_is_kept(
+        self, enforce_rls, twin, user_a, sample_orders, tenant_a, audit_records
+    ):
+        with tenant_context(tenant_a.pk):
+            response = twin.get("state", user_a)
+
+            assert response.status_code == 200, response.content
+            assert response.json()["database_products"] == ["Widget A1", "Widget A2"]
+            assert get_current_tenant_id() == tenant_a.pk
+            assert get_rls_context_active() is True
+        entered = [
+            r
+            for r in audit_records()
+            if r.rls_event == "context.entered" and r.rls_source == "ninja"
+        ]
+        assert entered == []
+        _assert_context_closed()
 
     def test_the_same_tenant_entered_by_other_code_is_refused(
         self, enforce_rls, user_a, member_of, sample_orders, tenant_b
@@ -854,6 +920,21 @@ class TestRLSTenantModelSchema:
                 class Meta:
                     model = Order
                     fields = "__all__"
+
+    @pytest.mark.parametrize("name", ["tenant", "tenant_id"])
+    def test_a_subclass_of_a_built_schema_cannot_declare_the_tenant_field(self, name):
+        with pytest.raises(RLSConfigurationError, match=name):
+
+            class Declared(ByAll):
+                __annotations__ = {name: "int | None"}
+                locals()[name] = None
+
+    def test_a_subclass_of_a_built_schema_may_add_another_field(self):
+        class Extended(ByAll):
+            note: str = ""
+
+        assert "note" in Extended.model_fields
+        assert "tenant_id" not in Extended.model_fields
 
     def test_a_meta_without_fields_is_still_ninjas_error(self):
         with pytest.raises(Exception, match=r"fields|exclude"):
@@ -1081,6 +1162,37 @@ class TestStreaming:
             {"tenant_id": None, "context_active": False}
         ]
         assert [r for r in caplog.records if r.name == AUDIT_LOGGER_NAME] == []
+        _assert_context_closed()
+
+    def test_a_guarded_sync_stream_is_a_403_before_it_starts(
+        self, enforce_rls, user_a, sample_orders, audit_records
+    ):
+        response = Client(raise_request_exception=False).get(
+            "/guarded-stream/stream", headers={"X-User": user_a.username}
+        )
+
+        assert response.status_code == 403
+        assert not response.streaming
+        assert [r for r in audit_records() if r.rls_event == "context.entered"] == []
+        assert _denials(audit_records()) == [("ninja", "no_context", None, None, user_a.pk)]
+        _assert_context_closed()
+
+    def test_a_guarded_async_stream_enters_no_context(
+        self, enforce_rls, user_a, sample_orders, audit_records
+    ):
+        async def fetch():
+            client = AsyncClient(raise_request_exception=False)
+            response = await client.get(
+                "/guarded-stream/astream", headers={"X-User": user_a.username}
+            )
+            try:
+                return [chunk async for chunk in response.streaming_content]
+            except Exception:  # the guard ends the stream with an error
+                return None
+
+        async_to_sync(fetch)()
+
+        assert [r for r in audit_records() if r.rls_event == "context.entered"] == []
         _assert_context_closed()
 
 

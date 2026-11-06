@@ -7,6 +7,8 @@ from django.urls import path
 from tests.ninja_views import (
     admin_for_all_api,
     api,
+    guarded_stream_api,
+    key_api,
     open_api,
     pick_api,
     plain_api,
@@ -20,4 +22,6 @@ urlpatterns = [
     path("plain/", plain_api.urls),
     path("open/", open_api.urls),
     path("stream/", stream_api.urls),
+    path("guarded-stream/", guarded_stream_api.urls),
+    path("key/", key_api.urls),
 ]

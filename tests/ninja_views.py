@@ -12,7 +12,7 @@ from typing import Any
 
 from asgiref.sync import sync_to_async
 from django.db import DEFAULT_DB_ALIAS, connections
-from ninja import JSONL, NinjaAPI, Router, Schema
+from ninja import JSONL, NinjaAPI, Router, Schema, Status
 from ninja.security import APIKeyHeader
 
 from django_rls_tenants.contrib.ninja import (
@@ -91,6 +91,17 @@ class OrderOut(RLSTenantModelSchema):
         return get_current_tenant_id()
 
 
+class OrderWithTenantOut(Schema):
+    """Reads a foreign key lazily while Ninja serializes."""
+
+    product: str
+    tenant_name: str
+
+    @staticmethod
+    def resolve_tenant_name(obj):
+        return obj.tenant.name
+
+
 class ItemIn(RLSTenantModelSchema):
     """An ``OrderItem`` payload: no ``id``, and the tenant is never part of it."""
 
@@ -165,10 +176,31 @@ def lazy(request):
 
 @api.get("/alazy", response=list[OrderOut])
 async def alazy(request):
-    # Ninja serializes in the event loop, where an unevaluated queryset would raise
-    # SynchronousOnlyOperation: fetch the rows, and let the schema read the context.
+    # An unevaluated queryset: Ninja serializes in the event loop, where evaluating it
+    # would raise SynchronousOnlyOperation, so the API evaluates it in the context.
     EVENTS.append(("view", get_current_tenant_id()))
-    return [order async for order in Order.objects.order_by("product")]
+    return Order.objects.order_by("product")
+
+
+@api.get("/alazy-status", response={200: list[OrderOut]})
+async def alazy_status(request):
+    return Status(200, Order.objects.order_by("product"))
+
+
+@api.get("/alazy-for-user", response=list[OrderOut])
+async def alazy_for_user(request):
+    return Order.objects.for_user(request.auth).order_by("product")
+
+
+@api.get("/alazy-prefetch", response=list[OrderOut])
+async def alazy_prefetch(request):
+    return Order.objects.prefetch_related("tenant").order_by("product")
+
+
+@api.get("/alazy-relation", response=list[OrderWithTenantOut])
+async def alazy_relation(request):
+    # The schema reaches ``order.tenant`` lazily, in the event loop: documented limitation.
+    return Order.objects.order_by("product")
 
 
 @api.get("/boom")
@@ -324,6 +356,11 @@ def open_state(request):
     return request_state()
 
 
+@open_api.get("/astate")
+async def open_astate(request):
+    return await arequest_state()
+
+
 @open_api.get("/guarded")
 @guard
 def open_guarded(request):
@@ -342,3 +379,54 @@ def stream(request):
 @stream_api.get("/astream", response=JSONL[dict])
 async def astream(request):
     yield {"tenant_id": get_current_tenant_id(), "context_active": get_rls_context_active()}
+
+
+# A guarded API: a streaming operation gets no context, so the guard refuses it.
+guarded_stream_api = RLSTenantNinjaAPI(
+    auth=UserKey(), rls_guard=RLSTenantGuard(), urls_namespace="rls_ninja_guarded_stream"
+)
+
+
+@guarded_stream_api.get("/stream", response=JSONL[dict])
+def guarded_stream(request):
+    yield {"tenant_id": get_current_tenant_id(), "context_active": get_rls_context_active()}
+
+
+@guarded_stream_api.get("/astream", response=JSONL[dict])
+async def guarded_astream(request):
+    yield {"tenant_id": get_current_tenant_id(), "context_active": get_rls_context_active()}
+
+
+# An ``auth=`` callback whose result is a key object, not a ``TenantUser``.
+class KeyObject:
+    """What a key-based ``auth=`` callback returns: no tenant, not a user."""
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+
+    def __str__(self) -> str:
+        return self.key
+
+
+class ObjectKey(APIKeyHeader):
+    """Authenticate with ``X-User: <username>``, returning a ``KeyObject``."""
+
+    param_name = "X-User"
+
+    def authenticate(self, request, key):
+        return KeyObject(key) if AdminUser.objects.filter(username=key).exists() else None
+
+
+key_api = RLSTenantNinjaAPI(
+    auth=ObjectKey(), rls_guard=RLSTenantGuard(), urls_namespace="rls_ninja_key"
+)
+
+
+@key_api.get("/state")
+def key_state(request):
+    return request_state()
+
+
+@key_api.get("/astate")
+async def key_astate(request):
+    return await arequest_state()

@@ -110,3 +110,10 @@ class TestNinjaNotesApi:
         assert missing.status_code == HTTPStatus.UNPROCESSABLE_ENTITY
         # The same error, except for the id each client sent.
         assert normalized(rejected, foreign.pk) == normalized(missing, foreign.pk + 1000)
+
+    def test_an_inactive_users_token_is_refused(self, acme_user, notes):
+        client = token_client(acme_user)
+        acme_user.is_active = False
+        acme_user.save()
+
+        assert client.get(NOTES).status_code == HTTPStatus.UNAUTHORIZED

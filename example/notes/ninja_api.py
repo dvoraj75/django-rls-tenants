@@ -34,7 +34,7 @@ class TokenAuth(HttpBearer):
 
     def authenticate(self, request, token):
         found = Token.objects.select_related("user").filter(key=token).first()
-        return found.user if found else None
+        return found.user if found and found.user.is_active else None
 
 
 class NoteOut(RLSTenantModelSchema):
