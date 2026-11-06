@@ -43,13 +43,24 @@ counts as unknown, since code may have written the GUCs for the session there
 (``set_guc()``, ``rls_context()`` without ``is_local=True``). Outside any
 context the guard clears the session's own values when they are unknown, or
 a context's (after a mode change, say), for the session, in a transaction too.
+That clear is lazy: it runs before the next statement. A session the guard
+saw written is cleared at the context's exit instead (#173, see
+:func:`clear_session_writes`).
 
 The library's own GUC writes run inside :func:`writing`, which keeps the guard
 out of the way and records the values they leave. Writes of the same GUCs by
 other code (``set_guc()``, ``rls_context()``) are not recorded, so they stay
 in force until the context changes, as before, with one exception: with
 ``USE_LOCAL_SET=True`` a statement run in autocommit inside a context gets
-the context's values in its own transaction, which override them.
+the context's values in its own transaction, which override them. In that
+mode the guard notes, though, that a statement it ran wrote a GUC the RLS
+policies read for the session (a ``SET`` without ``LOCAL`` of one, or a
+statement calling ``set_config()`` that names one), and the exit of a
+context (a block, a request, a ``for_user()`` call) clears the admin and
+tenant GUCs of such a session at once, in one statement, so SQL past
+Django's cursor (a driver cursor, ``callproc()``, a server-side cursor's
+``FETCH``) does not read the write after the context. Other sessions keep
+the lazy clear and get no statement at the exit.
 
 PostgreSQL undoes a ``set_config()`` made in a transaction or savepoint that
 is rolled back, and a transaction-local one at the end of its transaction,
@@ -74,7 +85,13 @@ that bypasses Django's execute wrappers (a driver cursor,
 ``CursorWrapper.callproc()``, the driver's ``copy`` methods, the ``FETCH`` of
 a server-side cursor that is already open); on a connection the guard has
 used, such SQL sees whatever values it left there until the next statement it
-sees (with ``USE_LOCAL_SET=True``, outside a transaction, none). It assumes
+sees (with ``USE_LOCAL_SET=True``, outside a transaction, none, unless code
+wrote them for the session in a way the guard did not see: inside a
+procedure or ``DO`` block, through such SQL, or with the name passed in a way
+it does not read, such as inside a string it builds; such a write outlives
+the context until the next statement the guard runs outside one). The eager
+clear at a context's exit takes off the admin and tenant GUCs only, not
+another policy GUC (a bypass flag) the session was written. It assumes
 that a new session holds no value for the two GUCs: a default set with
 ``ALTER DATABASE ... SET`` or ``ALTER ROLE ... SET`` is in force in every new
 session and is never cleared (system check ``W011`` warns about one).
@@ -83,8 +100,10 @@ session and is never cleared (system check ``W011`` warns about one).
 from __future__ import annotations
 
 import logging
+import re
 import string
 import threading
+from collections.abc import Mapping
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple
 
@@ -92,11 +111,12 @@ from django.db import DatabaseError, connections
 from django.db.backends.utils import debug_transaction
 from django.utils.connection import ConnectionDoesNotExist
 
+from django_rls_tenants.pool import _policy_guc_names
 from django_rls_tenants.tenants.conf import rls_tenants_config
 from django_rls_tenants.tenants.state import ContextGucs, _get_context_gucs
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
 
     from django.db.backends.base.base import BaseDatabaseWrapper
 
@@ -109,6 +129,14 @@ _CONNECTION_BAD: Final = 4
 
 # One statement for both GUCs: names and values are bind parameters.
 _SET_GUCS_SQL: Final = "SELECT set_config(%s, %s, %s), set_config(%s, %s, %s)"
+
+# Clears both GUCs for the session, then sets them transaction-locally again,
+# left to right (see clear_session_writes()). In a transaction PostgreSQL shows
+# the local values until it ends, and the session's after a commit.
+_CLEAR_SESSION_KEEP_LOCAL_SQL: Final = (
+    "SELECT set_config(%s, '', false), set_config(%s, '', false), "
+    "set_config(%s, %s, true), set_config(%s, %s, true)"
+)
 
 # Attributes of a guarded connection: its tracker, and the marker that its
 # commit and rollback are followed.
@@ -138,6 +166,18 @@ _DDL_COMMANDS: Final = frozenset({"ALTER", "CREATE", "DROP"})
 
 # PostgreSQL folds unquoted identifiers to lower case for ASCII letters only.
 _ASCII_LOWER: Final = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+# What follows SET when it writes no setting for the session (the first after
+# SET, or after SET SESSION); see _set_session_target().
+_SET_NOT_FOR_THE_SESSION: Final = frozenset({"LOCAL", "TRANSACTION"})
+_SET_SESSION_NOT_A_SETTING: Final = frozenset({"AUTHORIZATION", "CHARACTERISTICS"})
+
+# A setting name as SET takes it: identifiers, plain or double-quoted, joined by
+# dots (spaces around a dot allowed). What follows (TO, =, FROM) ends it.
+_IDENTIFIER_PATTERN: Final = r'(?:"(?:[^"]|"")*"|[^\W\d][\w$]*)'
+_SETTING_NAME_RE: Final = re.compile(
+    rf"{_IDENTIFIER_PATTERN}(?:\s*\.\s*{_IDENTIFIER_PATTERN})*",
+)
 
 
 class _WriteDepth(threading.local):
@@ -207,15 +247,26 @@ class _SessionGUCs:
             changed in a way that was not followed.
         savepoints: The transaction's savepoints, oldest first: each name with
             ``values`` when it was set.
+        session_written: With ``USE_LOCAL_SET=True``, a statement the guard
+            ran wrote a GUC the RLS policies read for the session (``set_guc()``,
+            ``SET``), and the library has not cleared the admin and tenant GUCs
+            for the session since (#173): :func:`clear_session_writes` clears
+            them when a context ends.
+        session_written_base: ``session_written`` when the transaction started.
+        cleared_in_transaction: The library cleared the admin and tenant GUCs
+            for the session during the transaction.
     """
 
     __slots__ = (
         "base",
         "changed",
+        "cleared_in_transaction",
         "in_transaction",
         "raw",
         "read_status",
         "savepoints",
+        "session_written",
+        "session_written_base",
         "values",
         "wrote_local",
         "wrote_session",
@@ -231,6 +282,9 @@ class _SessionGUCs:
         self.wrote_local = False
         self.wrote_session = False
         self.savepoints: list[tuple[str, _Tracked]] = []
+        self.session_written = False
+        self.session_written_base = False
+        self.cleared_in_transaction = False
 
     def attach(self, raw: Any, values: _Tracked) -> None:  # Any: a DB-API connection
         """Start tracking a new session, ``raw``, whose GUCs hold ``values``."""
@@ -241,6 +295,8 @@ class _SessionGUCs:
         self.base = values
         self.changed = self.wrote_local = self.wrote_session = False
         self.savepoints.clear()
+        self.session_written = self.session_written_base = False
+        self.cleared_in_transaction = False
 
     def sync_transaction(self) -> int:
         """Bring the record up to date with the session's transaction status, and return it.
@@ -257,6 +313,8 @@ class _SessionGUCs:
             self.base = self.values
             self.changed = self.wrote_local = self.wrote_session = False
             self.savepoints.clear()
+            self.session_written_base = self.session_written
+            self.cleared_in_transaction = False
         return status
 
     def set_values(self, values: _Tracked, *, local: bool = False) -> None:
@@ -302,6 +360,36 @@ class _SessionGUCs:
         else:
             self.forget()
 
+    def saw_session_write(self) -> None:
+        """Record that a statement wrote a policy GUC for the session (#173).
+
+        :func:`clear_session_writes` clears the admin and tenant GUCs of the
+        session when the context ends. A rollback of the transaction the
+        write ran in undoes the record (:meth:`end_transaction`).
+        """
+        self.session_written = True
+
+    def session_cleared(self) -> None:
+        """Record that the library cleared the admin and tenant GUCs for the session.
+
+        In a transaction the clear takes effect at the commit: a rollback
+        restores the record the transaction started with
+        (:meth:`end_transaction`), and a ``ROLLBACK TO`` a savepoint may undo
+        the clear (:meth:`rolled_back_to_savepoint`).
+        """
+        self.session_written = False
+        if self.in_transaction:
+            self.cleared_in_transaction = True
+
+    def rolled_back_to_savepoint(self) -> None:
+        """Follow a ``ROLLBACK TO`` a savepoint, which may undo a clear made after it.
+
+        Which savepoint a clear came after is not tracked, so a clear made
+        during the transaction counts as undone: the session counts as
+        written again (at worst, one statement more at the next exit).
+        """
+        self.session_written = self.session_written or self.cleared_in_transaction
+
     def end_transaction(self, *, committed: bool | None) -> None:
         """Follow the end of the transaction, and what it leaves on the session.
 
@@ -310,6 +398,10 @@ class _SessionGUCs:
         for the session. When both kinds were written, a commit keeps the last
         value written for the session, which the tracker does not hold
         separately from the local one, so the values become unknown.
+
+        ``session_written`` follows the same rules (#173): a commit keeps it,
+        a rollback restores the one the transaction started with, and an end
+        not known keeps it set when either outcome would.
 
         Args:
             committed: Whether the transaction committed; ``None`` if that is
@@ -321,7 +413,12 @@ class _SessionGUCs:
                 self.values = self.base
             elif self.wrote_local or (committed is None and self.values != self.base):
                 self.values = UNKNOWN
+            if committed is False:
+                self.session_written = self.session_written_base
+            elif committed is None:
+                self.session_written = self.session_written or self.session_written_base
             self.in_transaction = False
+        self.cleared_in_transaction = False
         self.savepoints.clear()
 
     def savepoint_index(self, name: str) -> int | None:
@@ -511,7 +608,9 @@ def _record(target: BaseDatabaseWrapper | str, values: _Tracked, *, local: bool 
     handler was connected (during another app's ``ready()``, say) gets the
     guard installed here, with ``UNKNOWN`` values. An alias the guard leaves
     alone (not in ``RLS_TENANTS["DATABASES"]``) gets ``UNKNOWN`` too, since
-    the guard did not reconcile the session before the write.
+    the guard did not reconcile the session before the write. A clear for the
+    session on a guarded connection also ends the record of a session write
+    the guard saw (#173, :meth:`_SessionGUCs.session_cleared`).
 
     Args:
         target: The connection written to, or its alias.
@@ -526,7 +625,10 @@ def _record(target: BaseDatabaseWrapper | str, values: _Tracked, *, local: bool 
         install(connection, values=UNKNOWN)
         return
     _observe(connection, tracker)
-    tracker.set_values(values if _is_guarded(connection) else UNKNOWN, local=local)
+    guarded = _is_guarded(connection)
+    tracker.set_values(values if guarded else UNKNOWN, local=local)
+    if values is None and not local and guarded:
+        tracker.session_cleared()
 
 
 def _forget(target: BaseDatabaseWrapper | str) -> None:
@@ -735,7 +837,10 @@ def suspect_sessions(*, under_local_values: bool = True) -> None:
     (``set_guc()``, ``rls_context()`` without ``is_local=True``), and such a
     value would outlast the context, unlike in session mode, where the
     context's exit restores the GUCs. The next statement run outside any
-    context in autocommit clears them first. No statement runs here.
+    context in autocommit clears them first. No statement runs here; a
+    session the guard saw written is cleared right after, by
+    :func:`clear_session_writes` (#173), which must run after this function,
+    since a suspect after its clear would leave the values it wrote unknown.
 
     Also called in both modes by the exit of a ``None``-user
     ``@with_rls_context`` call (``context._settle_after_no_context()``),
@@ -760,6 +865,97 @@ def suspect_sessions(*, under_local_values: bool = True) -> None:
             # so nothing is raised here.
             logger.debug("GUC affinity guard: could not read alias %r", alias, exc_info=True)
         tracker.suspect_session(under_local_values=under_local_values)
+
+
+def clear_session_writes() -> None:
+    """Clear the admin and tenant GUCs of this thread's sessions the guard saw written.
+
+    Called with ``USE_LOCAL_SET=True`` when a context ends, right after
+    :func:`suspect_sessions` (#173). A statement the guard ran during the
+    context may have written a GUC the RLS policies read for the session
+    (``set_guc()``, ``rls_context()`` without ``is_local=True``, a ``SET``
+    without ``LOCAL``: see :attr:`_SessionGUCs.session_written`). Such a
+    session, on an open connection of an alias in ``RLS_TENANTS["DATABASES"]``,
+    gets one statement now, instead of the guard's clear before its next
+    statement, so SQL past Django's cursor (a driver cursor, ``callproc()``,
+    a server-side cursor's ``FETCH``) does not read the write after the
+    context. Every other session gets no statement.
+
+    The statement clears both GUCs for the session. In autocommit, or with no
+    active context, that is a plain clear: at once in autocommit, at the
+    commit in a transaction, as the guard's clear outside a context does. In
+    a transaction with an active context (the block's enclosing one), the
+    same statement sets the context's values again transaction-locally: they
+    are what the transaction's statements see until it ends, and a commit
+    leaves the cleared session values.
+
+    Only the admin and tenant GUCs are cleared, the two the guard covers: a
+    bypass flag or another policy GUC written for the session stays. A
+    session in a failed transaction, or one Django has marked for rollback,
+    is skipped and stays recorded as written. A ``DatabaseError`` is logged
+    and leaves the values unknown, so the guard applies the context again
+    before the next statement; it is not raised.
+    """
+    for alias in rls_tenants_config.DATABASES:
+        connection = _connection_of(alias)
+        tracker = _tracker_of(connection)
+        if (
+            connection is None
+            or connection.connection is None
+            or tracker is None
+            or not tracker.session_written
+        ):
+            continue
+        try:
+            status = _observe(connection, tracker)
+        except Exception:
+            # Called while unwinding a block, as suspect_sessions() is.
+            logger.debug("GUC affinity guard: could not read alias %r", alias, exc_info=True)
+            continue
+        if status in {_IN_ERROR, _CONNECTION_BAD} or connection.needs_rollback:
+            continue
+        try:
+            _clear_session_values(connection, status)
+        except DatabaseError:
+            tracker.forget()
+            logger.debug(
+                "GUC affinity guard: could not clear alias %r on exit",
+                alias,
+                exc_info=True,
+            )
+
+
+def _clear_session_values(connection: BaseDatabaseWrapper, status: int) -> None:
+    """Clear the admin and tenant GUCs of ``connection`` for the session, in one statement.
+
+    The part of :func:`clear_session_writes` for one connection; ``status``
+    is the session's transaction status.
+    """
+    context_gucs = _get_context_gucs()
+    if context_gucs is None or not _will_run_in_transaction(connection, status):
+        write_gucs(connection, None)
+        return
+    conf = rls_tenants_config
+    is_admin, tenant = context_gucs
+    # Recorded as two writes, in the statement's order: the clear for the
+    # session (which ends the session-write record), then the context's
+    # transaction-local values, which the statements see until the end.
+    with (
+        writing(connection, context_gucs, local=True),
+        writing(connection, None),
+        connection.cursor() as cursor,
+    ):
+        cursor.execute(
+            _CLEAR_SESSION_KEEP_LOCAL_SQL,
+            [
+                conf.GUC_IS_ADMIN,
+                conf.GUC_CURRENT_TENANT,
+                conf.GUC_IS_ADMIN,
+                is_admin,
+                conf.GUC_CURRENT_TENANT,
+                tenant,
+            ],
+        )
 
 
 # ---- Following the SQL that runs ----
@@ -848,12 +1044,13 @@ def _skip_leading_comments(sql: str) -> str:
     return text
 
 
-def _parse(sql: object, cursor: Any = None) -> _Statement | None:  # Any: a driver cursor
-    """Read the command of ``sql``; ``None`` if it cannot be read (not text, or only comments).
+def _sql_text(sql: object, cursor: Any = None) -> str | None:  # Any: a driver cursor
+    """Return the text of ``sql``, or ``None`` if it has none.
 
     A statement composed with ``psycopg2.sql`` / ``psycopg.sql`` is rendered
     with ``cursor``, the driver cursor it runs on; one that cannot be rendered
-    is unreadable.
+    has none. Bytes are decoded as Latin-1: only ASCII keywords and GUC names
+    are looked for.
     """
     render = getattr(sql, "as_string", None)
     if render is not None:
@@ -862,8 +1059,23 @@ def _parse(sql: object, cursor: Any = None) -> _Statement | None:  # Any: a driv
         except Exception:
             return None
     if isinstance(sql, bytes):
-        sql = sql.decode("latin-1")  # only ASCII keywords are looked at
-    if not isinstance(sql, str):
+        sql = sql.decode("latin-1")
+    return sql if isinstance(sql, str) else None
+
+
+def _parse(sql: object, cursor: Any = None) -> _Statement | None:  # Any: a driver cursor
+    """Read the command of ``sql``; ``None`` if it cannot be read (not text, or only comments).
+
+    A statement composed with ``psycopg2.sql`` / ``psycopg.sql`` is rendered
+    with ``cursor``, the driver cursor it runs on; one that cannot be rendered
+    is unreadable.
+    """
+    return _read_statement(_sql_text(sql, cursor))
+
+
+def _read_statement(sql: str | None) -> _Statement | None:
+    """The part of :func:`_parse` that reads the text :func:`_sql_text` returned."""
+    if sql is None:
         return None
     text = _skip_leading_comments(sql[:_SQL_HEAD])
     if not text and len(sql) > _SQL_HEAD:
@@ -950,6 +1162,8 @@ def _savepoint_name(words: list[str], *, after: str) -> str | None:
 
 def _follow_savepoint_end(name: str | None, tracker: _SessionGUCs, *, rolled_back: bool) -> None:
     """Follow ``RELEASE`` or ``ROLLBACK TO`` of the savepoint ``name`` (``None``: unclear)."""
+    if rolled_back:
+        tracker.rolled_back_to_savepoint()
     if name is None:
         tracker.forget()
         return
@@ -964,6 +1178,111 @@ def _follow_savepoint_end(name: str | None, tracker: _SessionGUCs, *, rolled_bac
         del tracker.savepoints[index + 1 :]
     else:
         del tracker.savepoints[index:]
+
+
+# ---- Session writes of the policy GUCs (USE_LOCAL_SET=True, #173) ----
+
+
+def _writes_policy_gucs_for_the_session(
+    statement: _Statement | None,
+    text: str | None,
+    params: Any,  # Any: Django's execute-wrapper signature
+    many: bool,
+) -> bool:
+    """Whether a statement that ran may have written a policy GUC for the session.
+
+    A policy GUC is one :func:`django_rls_tenants.pool._policy_guc_names`
+    returns, compared lower-cased (PostgreSQL compares setting names without
+    regard to case). True for:
+
+    - ``SET [SESSION] name ...`` of one (see :func:`_set_session_target`);
+    - a statement whose text calls ``set_config`` and names one, in the text
+      or as a string parameter (see :func:`_names_a_policy_guc`), whatever
+      its third argument: a transaction-local ``set_config()`` counts too;
+    - a compound statement whose text names one.
+
+    An unreadable statement (``_parse()`` returned ``None``) is not.
+    ``_policy_guc_names()`` is called only for those three kinds.
+
+    Args:
+        statement: The statement, as ``_read_statement()`` read ``text``.
+        text: Its text, from :func:`_sql_text`.
+        params: Its parameters, as Django's execute wrappers get them.
+        many: It ran with ``executemany()``: ``params`` is a sequence of
+            parameter sets.
+    """
+    if statement is None or text is None:
+        return False
+    if statement.command == "SET" and not statement.compound:
+        target = _set_session_target(statement.words)
+        return target is not None and target in _lowered_policy_guc_names()
+    lowered = text.lower()
+    if statement.compound:
+        return any(name in lowered for name in _lowered_policy_guc_names())
+    if "set_config" not in lowered:
+        return False
+    names = _lowered_policy_guc_names()
+    return any(name in lowered for name in names) or _names_a_policy_guc(params, many, names)
+
+
+def _lowered_policy_guc_names() -> frozenset[str]:
+    """Every GUC the RLS policies read (``pool._policy_guc_names()``), lower-cased."""
+    return frozenset(name.lower() for name in _policy_guc_names())
+
+
+def _set_session_target(words: list[str]) -> str | None:
+    """Return the setting a ``SET`` statement writes for the session, lower-cased.
+
+    ``SET [SESSION] name {TO | =} value``, also ``name=value`` with no
+    space and ``name FROM CURRENT``; the parts of a dotted name may be
+    double-quoted, and the quotes are dropped. ``None`` for ``SET LOCAL``,
+    ``SET TRANSACTION``, ``SET SESSION CHARACTERISTICS`` and
+    ``SET SESSION AUTHORIZATION``, which write no setting for the session,
+    and for a statement with no name to read.
+
+    Args:
+        words: The statement's first words, as ``_parse()`` read them,
+            ``SET`` first.
+    """
+    rest = words[1:]
+    first = rest[0].upper() if rest else ""
+    if first in _SET_NOT_FOR_THE_SESSION:
+        return None
+    if first == "SESSION":
+        rest = rest[1:]
+        if rest and rest[0].upper() in _SET_SESSION_NOT_A_SETTING:
+            return None
+    match = _SETTING_NAME_RE.match(" ".join(rest))
+    if match is None:
+        return None
+    return "".join(match.group(0).split()).replace('"', "").lower()
+
+
+def _names_a_policy_guc(params: Any, many: bool, names: frozenset[str]) -> bool:  # Any: as _guard
+    """Whether a statement's parameters hold one of ``names`` as a string, lower-cased.
+
+    Reads a list or tuple of values and a mapping's values; with ``many``,
+    each parameter set of a list or tuple of them. Parameters that cannot be
+    read again after the statement ran (an iterator of parameter sets, say)
+    count as naming one.
+    """
+    if params is None:
+        return False
+    param_sets = params if many else (params,)
+    if not isinstance(param_sets, (list, tuple)):
+        return True
+    for param_set in param_sets:
+        if param_set is None:
+            continue
+        if isinstance(param_set, Mapping):
+            values: Iterable[object] = param_set.values()
+        elif isinstance(param_set, (list, tuple)):
+            values = param_set
+        else:
+            return True
+        if any(isinstance(value, str) and value.lower() in names for value in values):
+            return True
+    return False
 
 
 # ---- A transaction of its own (USE_LOCAL_SET=True) ----
@@ -1099,13 +1418,22 @@ def _guard(
     many: bool,
     context: dict[str, Any],
 ) -> Any:
-    """Execute wrapper: apply the active context's GUCs before the statement if needed."""
+    """Execute wrapper: apply the active context's GUCs before the statement if needed.
+
+    With ``USE_LOCAL_SET=True``, after a statement that ran and may have
+    written a policy GUC for the session (see
+    :func:`_writes_policy_gucs_for_the_session`), the session is noted as
+    written, for :func:`clear_session_writes` (#173); not for the library's
+    own writes, inside :func:`writing`.
+    """
     connection: BaseDatabaseWrapper = context["connection"]
     tracker = _tracker_of(connection)
     if tracker is None:
         return execute(sql, params, many, context)
     # context["cursor"] is Django's CursorWrapper; its .cursor is the driver's.
-    statement = _parse(sql, getattr(context.get("cursor"), "cursor", None))
+    # Rendered once: a composed statement is rendered with the driver cursor.
+    text = _sql_text(sql, getattr(context.get("cursor"), "cursor", None))
+    statement = _read_statement(text)
     control = _controls_the_transaction(statement)
     own_transaction = False
     if _writes.depth or control:
@@ -1137,4 +1465,15 @@ def _guard(
     elif tracker.wrote_local and tracker.in_transaction and not _writes.depth:
         # The same in a transaction holding local values: unknown after a commit.
         tracker.suspect_session()
+    if (
+        not _writes.depth
+        and rls_tenants_config.USE_LOCAL_SET
+        and _is_guarded(connection)
+        and _writes_policy_gucs_for_the_session(statement, text, params, many)
+    ):
+        # Noted for the context's exit, which clears the session at once
+        # (#173). The transaction the statement may have opened is picked up
+        # first, so a rollback of it also undoes the note.
+        _observe(connection, tracker)
+        tracker.saw_session_write()
     return result

@@ -25,6 +25,7 @@ from django_rls_tenants.tenants.affinity import (
     UNKNOWN,
     _forget,
     apply_active_context,
+    clear_session_writes,
     settle_other_aliases,
     suspect_sessions,
     writing,
@@ -192,9 +193,19 @@ def _settle_after_no_context() -> None:
     those values off the other aliases again; written after it, the suspect
     would leave them unknown, which that exit skips in session mode, and the
     enclosing context's values would outlive it.
+
+    With ``USE_LOCAL_SET=True``, between the two, a session the GUC affinity
+    guard saw written for the session in the block is cleared now
+    (``affinity.clear_session_writes()``, #173), with the enclosing context's
+    values set again transaction-locally in a transaction; the settle then
+    finds them recorded and writes nothing more there. Other sessions stay
+    lazy. In session mode the settle's session-level write already overwrites
+    the block's.
     """
     try:
         suspect_sessions(under_local_values=rls_tenants_config.USE_LOCAL_SET)
+        if rls_tenants_config.USE_LOCAL_SET:
+            clear_session_writes()
     finally:
         settle_other_aliases(None, cleared=True)
 
@@ -440,9 +451,17 @@ def _restore_tenant_gucs(
     every configured alias is settled: one ``set_config()`` statement each
     where the block's values are still in force, which puts the enclosing
     context's values back or clears them. With
-    ``USE_LOCAL_SET=True`` the values the sessions hold for themselves then
+    ``USE_LOCAL_SET=True`` the values the sessions hold for themselves also
     count as unknown (``affinity.suspect_sessions()``): code in the block may
-    have written them for the session.
+    have written them for the session. A session the guard saw written that
+    way is cleared now (``affinity.clear_session_writes()``, #173: one
+    statement per such alias, in autocommit at once, in a transaction at its
+    commit, where it also sets the enclosing context's values again
+    transaction-locally); the others are cleared before their next statement
+    run outside a context, as before. For a block that wrote nothing, the
+    suspect and the clear come before the settle, which then writes nothing
+    more on a session the clear wrote; after a snapshot restore, they come
+    last.
 
     Args:
         previous: The snapshot taken on entry, or ``None`` for a block that
@@ -454,21 +473,32 @@ def _restore_tenant_gucs(
             from ``state._current_live()``.
         session: The DB-API connection of ``using`` the block entered on.
     """
-    try:
-        if previous is None:
+    if previous is None:
+        # A block that wrote nothing has is_local (see _writes_gucs()). As in
+        # _settle_after_no_context(): suspect, clear, then settle, so the
+        # settle finds the values the clear set again in a transaction and
+        # writes nothing more there. A suspect after the clear would leave
+        # its values unknown.
+        try:
+            if is_local:
+                suspect_sessions()
+                clear_session_writes()
+        finally:
             settle_other_aliases(None)
-        else:
-            _restore_snapshot(
-                previous,
-                is_local=is_local,
-                using=using,
-                exc_pending=exc_pending,
-                enclosing=enclosing,
-                session=session,
-            )
+        return
+    try:
+        _restore_snapshot(
+            previous,
+            is_local=is_local,
+            using=using,
+            exc_pending=exc_pending,
+            enclosing=enclosing,
+            session=session,
+        )
     finally:
         if is_local:
             suspect_sessions()
+            clear_session_writes()
 
 
 def _restore_snapshot(

@@ -112,17 +112,26 @@ def _clear_finished_request_gucs() -> None:
     receiver does first, and the next checkout clears it. Reopening it here
     would check out another pooled connection and keep it. With
     ``USE_LOCAL_SET=True`` the transaction-local values are gone with their
-    transactions, and what the sessions hold for themselves only counts as
-    unknown (``affinity.suspect_sessions()``, #96).
+    transactions, and what the sessions hold for themselves counts as unknown
+    (``affinity.suspect_sessions()``, #96). A session the GUC affinity guard
+    saw written for the session is cleared now, one statement per such open
+    alias (``affinity.clear_session_writes()``, #173); the others get no
+    statement, and the guard clears them before their next statement.
     """
     from django.db import connections  # noqa: PLC0415
 
-    from django_rls_tenants.tenants.affinity import suspect_sessions, write_gucs  # noqa: PLC0415
+    from django_rls_tenants.tenants.affinity import (  # noqa: PLC0415
+        clear_session_writes,
+        suspect_sessions,
+        write_gucs,
+    )
     from django_rls_tenants.tenants.conf import rls_tenants_config  # noqa: PLC0415
 
     conf = rls_tenants_config
     if conf.USE_LOCAL_SET:
+        # Suspect first: after the clear, it would leave the clear's values unknown.
         suspect_sessions()
+        clear_session_writes()
         return
     failed: list[str] = []
     for db_alias in conf.DATABASES:
