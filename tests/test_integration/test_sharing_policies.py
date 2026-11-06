@@ -313,6 +313,24 @@ class TestWriting:
             assert not own._rls_including_shared
             assert own.update(title="B own") == 1
 
+    @pytest.mark.parametrize("operator", ["__or__", "__and__", "__xor__"])
+    def test_flagged_left_with_none_right_keeps_the_flag_on_a_clone(
+        self, notes, tenant_b, operator
+    ):
+        """``shared <op> none()``: Django may return the ``none()`` operand; it stays clean."""
+        with tenant_context(tenant_b.pk):
+            shared = SharedNote.objects.including_shared().filter(title="B own")
+            empty = SharedNote.objects.none()
+            combined = getattr(shared, operator)(empty)
+            assert combined._rls_including_shared
+            assert combined is not empty
+            assert not empty._rls_including_shared
+            assert shared._rls_including_shared
+            with pytest.raises(TypeError, match="Cannot call delete"):
+                combined.delete()
+            with pytest.raises(TypeError, match="Cannot call update"):
+                combined.update(title="x")
+
     def test_empty_left_operand_is_not_marked(self, notes, tenant_b):
         """``none() & shared``: Django returns the (empty) left operand itself."""
         with tenant_context(tenant_b.pk):

@@ -20,6 +20,7 @@ _HEADER_NAME = re.compile(r"[A-Za-z0-9-]+")
 # All recognized keys in the RLS_TENANTS configuration dict.
 _KNOWN_KEYS = frozenset(
     {
+        "AUDIT_NO_CONTEXT_QUERIES",
         "DATABASES",
         "EXTERNAL_MODELS",
         "GUC_PREFIX",
@@ -48,6 +49,7 @@ class RLSTenantsConfig:
             "GUC_PREFIX": "rls",                   # Default: "rls"
             "STRICT_MODE": False,                  # Default: False
             "STRICT_MODE_EXCLUDE": [],             # Default: []
+            "AUDIT_NO_CONTEXT_QUERIES": False,     # Default: False
             "TENANT_FK_FIELD": "tenant",           # Default: "tenant"
             "USER_PARAM_NAME": "as_user",          # Default: "as_user"
             "TENANT_PK_TYPE": "int",               # Default: "int"
@@ -114,6 +116,33 @@ class RLSTenantsConfig:
         or ``RLSTenantMiddleware``).
         """
         return self._get("STRICT_MODE", default=False)  # type: ignore[no-any-return]
+
+    @property
+    def AUDIT_NO_CONTEXT_QUERIES(self) -> bool:
+        """Log queries that run with no RLS context. Default: ``False``.
+
+        When on and ``STRICT_MODE`` is off, a query on an RLS-protected
+        model evaluated with no RLS context logs a ``context.denied`` record
+        at ``WARNING`` on ``django_rls_tenants.audit`` (source ``queryset``,
+        reason ``no_context``, ``rls_model``). The query still runs and
+        returns what it returned before. It has no effect with
+        ``STRICT_MODE=True``, which raises instead. Models listed in
+        ``STRICT_MODE_EXCLUDE`` and querysets marked with
+        ``rls_skip_strict()`` log nothing::
+
+            RLS_TENANTS = {"AUDIT_NO_CONTEXT_QUERIES": True}
+
+        Raises:
+            RLSConfigurationError: If the value is not a ``bool``.
+        """
+        value = self._config().get("AUDIT_NO_CONTEXT_QUERIES", False)
+        if not isinstance(value, bool):
+            msg = (
+                f"RLS_TENANTS['AUDIT_NO_CONTEXT_QUERIES'] must be True or False, "
+                f"got {value!r}. Example: True."
+            )
+            raise RLSConfigurationError(msg)
+        return value
 
     @property
     def STRICT_MODE_EXCLUDE(self) -> tuple[str, ...]:
